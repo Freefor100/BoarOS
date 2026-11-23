@@ -1,11 +1,13 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <net/if.h>
 #include <netinet/tcp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/reboot.h>
 #include <sys/socket.h>
@@ -31,6 +33,33 @@ static void ipv6_case(void)
     CHECK(!shutdown(server,SHUT_WR) && !recv(client,&c,1,0));
     CHECK(!close(client) && !close(server) && !close(listener));
 }
+
+static void ipv4_path_mtu_case(void)
+{
+    struct sockaddr_in address={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
+    socklen_t size=sizeof(address);
+    int listener=socket(AF_INET,SOCK_STREAM,0);
+    CHECK(listener>=0 && !bind(listener,(void *)&address,size) && !listen(listener,1));
+    CHECK(!getsockname(listener,(void *)&address,&size));
+    int client=socket(AF_INET,SOCK_STREAM,0);
+    CHECK(client>=0 && !connect(client,(void *)&address,size));
+    int server=accept(listener,NULL,NULL);
+    CHECK(server>=0);
+
+    struct ifreq interface={.ifr_name="lo"};
+    CHECK(!ioctl(client,SIOCGIFMTU,&interface));
+    int original=interface.ifr_mtu;
+    const int mtu[]={original,1500,original};
+    for (unsigned i=0;i<sizeof(mtu)/sizeof(mtu[0]);i++) {
+        interface.ifr_mtu=mtu[i];
+        CHECK(!ioctl(client,SIOCSIFMTU,&interface));
+        char byte;
+        CHECK(send(client,"a",1,0)==1 && recv(server,&byte,1,MSG_WAITALL)==1 && byte=='a');
+        CHECK(info(client).tcpi_pmtu==(mtu[i]==65536?0U:(uint32_t)mtu[i]));
+    }
+    CHECK(!close(client) && !close(server) && !close(listener));
+}
+
 int main(void)
 {
     setvbuf(stdout,NULL,_IONBF,0);alarm(30);
@@ -91,6 +120,7 @@ int main(void)
     memcpy(&acked,extended+120,sizeof(acked));CHECK(acked==sizeof(payload)+2); /* active SYN and FIN */
     CHECK(!close(client) && !close(server) && !close(listener));
     ipv6_case();
+    if (getpid()==1) ipv4_path_mtu_case();
     int udp=socket(AF_INET,SOCK_DGRAM,0);CHECK(udp>=0);n=sizeof(after);
     CHECK(getsockopt(udp,IPPROTO_TCP,TCP_INFO,&after,&n)==-1 && errno==EOPNOTSUPP);
     CHECK(!close(udp));

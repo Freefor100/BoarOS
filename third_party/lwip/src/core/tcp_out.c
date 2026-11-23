@@ -213,8 +213,14 @@ tcp_ip_output(const struct tcp_pcb *pcb, struct pbuf *p, struct netif *netif,
     if (local_result == ERR_OK && pcb->state != LISTEN) {
       LWIP_CONST_CAST(struct tcp_pcb *, pcb)->boaros_segs_out++;
       if (path_mtu) {
-        BOAROS_LWIP_IP_SCOPE(ip);
-        *path_mtu = IP_IS_V6(dst) ? nd6_get_destination_mtu(ip_2_ip6(dst), netif) : netif->mtu;
+        /* Direct IPv4 loopback admission already checked the unbounded MTU.
+         * Only IPv6 still needs the shared destination cache. */
+        if (IP_IS_V6(dst)) {
+          BOAROS_LWIP_IP_SCOPE(ip);
+          *path_mtu = nd6_get_destination_mtu(ip_2_ip6(dst), netif);
+        } else {
+          *path_mtu = 0;
+        }
       }
     }
 #endif
