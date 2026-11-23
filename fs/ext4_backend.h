@@ -84,6 +84,8 @@ struct lwext4_node {
     struct kernel_vfs_stat metadata;
     uint64_t metadata_epoch, metadata_seen;
     struct lwext4_directory_mapping *directory_mapping;
+    uint8_t inline_link_length;
+    char inline_link[sizeof(((struct ext4_inode *)0)->blocks)];
 };
 _Static_assert(offsetof(struct lwext4_mount_adapter, instance) == 0,
                "mount private_data begins with its VFS instance");
