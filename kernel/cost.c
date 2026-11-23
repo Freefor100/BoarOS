@@ -227,20 +227,20 @@ void kernel_cost_page_metadata(struct kernel_cost_tag tag, uint64_t checked,
     record(tag, COST_ALLOCATOR_META_TICKS, ticks);
     observer(start);
 }
-void kernel_cost_tcp_input_dequeue(uint64_t queued, uint64_t locking, uint64_t locked)
+void kernel_cost_tcp_input_dequeue(uint64_t queued, uint64_t locking, uint64_t locked,
+                                  uint64_t dispatch)
 {
     struct kernel_cost_tag tag = kernel_cost_capture();
     if (!tag.epoch) return;
-    uint64_t now = kernel_cost_clock();
     if (locking < queued) locking = queued;
     if (locked < locking) locked = locking;
     ATOMIC_SCOPE;
     if (!cost.active || tag.epoch != cost.epoch) return;
     uint64_t started = kernel_cost_clock();
-    record(tag, COST_TCP_INPUT_QUEUE_TICKS, now - queued);
+    record(tag, COST_TCP_INPUT_QUEUE_TICKS, dispatch - queued);
     record(tag, COST_TCP_INPUT_BEFORE_LOCK_TICKS, locking - queued);
     record(tag, COST_TCP_INPUT_LOCK_TICKS, locked - locking);
-    record(tag, COST_TCP_INPUT_AFTER_LOCK_TICKS, now - locked);
+    record(tag, COST_TCP_INPUT_AFTER_LOCK_TICKS, dispatch - locked);
     observer(started);
 }
 void kernel_cost_raw_lock(struct kernel_cost_tag tag, unsigned rank, uint64_t wait, uint64_t hold)

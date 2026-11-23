@@ -8,6 +8,8 @@
 static jmp_buf stopped;
 static uint64_t blocked_deadline;
 static unsigned expired, errors, worker_mode, service_calls, protocol_attempts, sent, held, yields;
+static unsigned local_tx_attempts;
+static struct pbuf *completed_tx;
 static unsigned rx_refill;
 uint64_t riscv_time_read(void) { return 1000; }
 uint64_t virtio_net_watchdog_deadline(struct virtio_net_device *d)
@@ -156,7 +158,20 @@ unsigned virtio_net_tx_release(struct virtio_net_device *d,
 }
 int virtio_net_tx_reclaim(struct virtio_net_device *d,
     void (*release)(void *const *, unsigned))
-{ (void)d; (void)release; return 0; }
+{
+    if (!d->tx_done_count) return 0;
+    void *owner = completed_tx;
+    d->tx_done_count--;
+    release(&owner, 1);
+    return 1;
+}
+int virtio_net_send_copy(struct virtio_net_device *d, uint32_t size,
+    int (*copy)(const void *, void *, uint32_t), const void *context, int more)
+{
+    (void)copy; (void)context; (void)more;
+    local_tx_attempts++;
+    return d->tx_done_count ? -KERNEL_EAGAIN : (int)size;
+}
 int virtio_net_send_segments(struct virtio_net_device *d,
     const struct virtio_net_tx_segment *s, unsigned count, void *owner, int more)
 { (void)d; (void)s; (void)count; (void)owner; (void)more; return -KERNEL_ENOTSUP; }
@@ -236,6 +251,25 @@ static void wait_contract(void)
     }
     wait_inject=0;wait_device=NULL;
     puts("PASS worker wait: recheck sees capacity, RX refill, device failure, link change and polling; early wake is retained");
+}
+
+static void caller_tx_reclaims_completed_slot(void)
+{
+    struct virtio_net_device d = {.tx_done_count = 1};
+    struct kernel_network n = {.device = &d};
+    n.interface.state = &n;
+    struct pbuf payload = {.tot_len = 64};
+    completed_tx = calloc(1, sizeof(struct network_rx));
+    if (!completed_tx) abort();
+    completed_tx->ref = 2;
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    err_t status = submit_link_frame(&n.interface, &payload, 0);
+    kernel_socket_protocol_leave(&scope);
+    if (status != ERR_OK || d.tx_done_count || completed_tx->ref != 1 ||
+        local_tx_attempts != 2) abort();
+    free(completed_tx);
+    puts("PASS serial submit reclaims completed TX ownership and retries once");
 }
 static void current_work_contract(void)
 {
@@ -332,6 +366,7 @@ int main(void)
     puts("PASS timer-only worker drains runnable software with one outer owner through wait registration");
     worker_mode = 0;
     wait_contract(); current_work_contract(); stop_contract();
+    caller_tx_reclaims_completed_slot();
     return receive_contract();
 }
 

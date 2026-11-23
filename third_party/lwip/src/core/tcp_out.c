@@ -192,8 +192,18 @@ tcp_output_route(struct tcp_pcb *pcb, int choose_source)
   pcb->boaros_path4.generation = 0;
   if ((pcb->boaros_owner || !boaros_lwip_parallel_enabled()) &&
       IP_IS_V4(&pcb->local_ip) && IP_IS_V4(&pcb->remote_ip)) {
-    boaros_ipv4_path_resolve(&pcb->boaros_path4, netif, ip_2_ip4(&pcb->local_ip),
-                            ip_2_ip4(&pcb->remote_ip), pcb->netif_idx);
+    if (pcb->boaros_owner && pcb->boaros_loopback && netif == netif_get_loopif() && !netif->mtu) {
+      /* An internal route needs no link addresses. Zero MTU distinguishes
+       * this route snapshot from a resolved Ethernet transmit path. */
+      pcb->boaros_path4 = (struct boaros_ipv4_path) {
+        .generation = boaros_lwip_ipv4_path_generation(), .interface = netif,
+        .source = *ip_2_ip4(&pcb->local_ip), .destination = *ip_2_ip4(&pcb->remote_ip),
+        .bound_if = pcb->netif_idx,
+      };
+    } else {
+      boaros_ipv4_path_resolve(&pcb->boaros_path4, netif, ip_2_ip4(&pcb->local_ip),
+                              ip_2_ip4(&pcb->remote_ip), pcb->netif_idx);
+    }
   }
 #endif
   return netif;
@@ -205,9 +215,16 @@ tcp_ip_output(const struct tcp_pcb *pcb, struct pbuf *p, struct netif *netif,
               const ip_addr_t *src, const ip_addr_t *dst, u16_t *path_mtu,
               struct netif **batch)
 {
+#if BOAROS_USER_SMP
+  int route_only = pcb && pcb->boaros_path4.generation && !pcb->boaros_path4.mtu &&
+                   pcb->boaros_path4.interface == netif;
+#endif
 #ifdef BOAROS_LWIP_TCP_CONTEXT
   int local_result;
   if (boaros_lwip_parallel_enabled() && pcb && pcb->boaros_owner &&
+#if BOAROS_USER_SMP
+      (!route_only || tcp_path4_current(pcb)) &&
+#endif
       boaros_lwip_tcp_local_output(pcb, p, netif, src, dst, &local_result)) {
 #ifdef BOAROS_LWIP_TCP_INFO
     if (local_result == ERR_OK && pcb->state != LISTEN) {
@@ -228,6 +245,12 @@ tcp_ip_output(const struct tcp_pcb *pcb, struct pbuf *p, struct netif *netif,
   }
 #endif
   BOAROS_LWIP_IP_SCOPE(ip);
+#if BOAROS_USER_SMP
+  /* A packet prepared for lo may omit the TCP checksum. A route change
+   * cannot send that packet to an Ethernet interface. */
+  if (route_only && !tcp_path4_current(pcb) && tcp_route(pcb, src, dst) != netif)
+    return ERR_RTE;
+#endif
   int more = batch && netif->boaros_link_flush;
   int split = more;
 #if BOAROS_USER_SMP
@@ -2069,7 +2092,7 @@ tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb, struct netif *netif
 #endif
 #if BOAROS_USER_SMP
   const struct boaros_ipv4_path *path = &pcb->boaros_path4;
-  if (seg->len && path->interface == netif && path->generation &&
+  if (seg->len && path->interface == netif && path->generation && path->mtu &&
       seg->p->tot_len <= path->mtu - IP_HLEN &&
       path->generation == boaros_lwip_ipv4_path_generation()) {
     /* The owner serializes the PCB and the descriptors retain the pbuf
@@ -2448,7 +2471,7 @@ tcp_output_control_segment_netif(const struct tcp_pcb *pcb, struct pbuf *p,
   TCP_STATS_INC(tcp.xmit);
 #if BOAROS_USER_SMP
   struct netif **ack_batch = boaros_lwip_tcp_context_current()->input_ack_batch;
-  if (use_resolved_path && pcb->boaros_path4.interface == netif &&
+  if (use_resolved_path && pcb->boaros_path4.interface == netif && pcb->boaros_path4.mtu &&
       tcp_path4_current(pcb) && p->tot_len <= pcb->boaros_path4.mtu - IP_HLEN) {
     int more = ack_batch && netif->boaros_link_flush;
     if (ack_batch && *ack_batch && *ack_batch != netif) {

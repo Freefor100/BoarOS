@@ -23,6 +23,8 @@ enum {
     BOAROS_UDP_LOOPBACK_INLINE,
 };
 void boaros_lwip_udp_loopback_input(struct netif *, struct pbuf *);
+struct udp_pcb *boaros_lwip_udp4_local_target(struct netif *, const struct ip_addr *,
+                                             const struct ip_addr *, uint16_t, uint16_t);
 int boaros_lwip_raw_input_idle(void);
 struct pbuf *boaros_lwip_udp_copy_borrowed(struct pbuf *);
 struct boaros_lwip_hooks {
@@ -52,6 +54,7 @@ int boaros_lwip_udp_multicast_receive(struct udp_pcb *,struct pbuf *,struct neti
 int boaros_lwip_udp_ingress_filter(struct udp_pcb *,struct pbuf *,struct netif *,int,const void *,uint16_t,uint16_t);
 int boaros_lwip_tcp_ingress_filter(struct tcp_pcb *,struct pbuf *,struct netif *,int,const void *,uint16_t,uint16_t);
 void boaros_lwip_set_hooks(const struct boaros_lwip_hooks *hooks);
+int boaros_lwip_tcp_socket_unfiltered(struct tcp_pcb *pcb);
 void boaros_lwip_tcp_output(struct tcp_pcb *pcb);
 /* A serialized Ethernet receive pass may coalesce adjacent plain ACKs.
  * Flush before handing other traffic to a protocol or returning the scope. */

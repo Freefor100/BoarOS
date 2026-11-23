@@ -32,6 +32,7 @@
 #include "lwip/init.h"
 #include "boaros_lwip.h"
 #include "lwip/etharp.h"
+#include "lwip/snmp.h"
 #include "lwip/memp.h"
 #include "lwip/ip.h"
 #include "lwip/ip_addr.h"
@@ -463,6 +464,12 @@ static int socket_tcp_ingress_filter(struct tcp_pcb *pcb,struct pbuf *p,struct n
     int ipv6,const void *network,uint16_t network_length,uint16_t header)
 {
     return socket_ingress_filter(tcp_filter_socket(pcb),p,input,ipv6,network,network_length,header);
+}
+
+int boaros_lwip_tcp_socket_unfiltered(struct tcp_pcb *pcb)
+{
+    struct kernel_socket *socket=tcp_filter_socket(pcb);
+    return socket && !socket_filter_attached(socket);
 }
 
 /* Connection lifetime and record boundaries are independent properties. */
@@ -2679,15 +2686,16 @@ static int udp_receive_fits_locked(const struct kernel_socket *socket, uint32_t 
     return charge<=socket->rx_limit && socket->rx_bytes<=socket->rx_limit-charge;
 }
 
-static void udp_received(void *context, struct udp_pcb *pcb,
-                         struct pbuf *payload, const ip_addr_t *peer,
-                         u16_t port)
+static int udp_queue_received(struct kernel_socket *socket, struct pbuf *payload,
+    const ip_addr_t *peer, u16_t port, int loopback, int headerless)
 {
-    struct kernel_socket *socket = context;
-    (void)pcb;
     uint32_t charge = payload->tot_len ? payload->tot_len : 1U;
+    int serial_local=headerless && !boaros_lwip_parallel_enabled();
     if (udp_receive_capacity()) {
         SOCKET_ENDPOINT(state,socket);
+        /* Once a serial receiver is backlogged, keep the ordinary path
+         * instead of accelerating the sender into an already busy queue. */
+        if (headerless && (socket->filter || (serial_local && socket->packets_head))) return 0;
         if (udp_receive_fits_locked(socket,charge)) {
             struct socket_packet *packet=socket->udp_spares;
             if (packet) {
@@ -2698,27 +2706,41 @@ static void udp_received(void *context, struct udp_pcb *pcb,
                 packet=udp_packet_allocate(socket);
                 if (!packet) {
                     kernel_socket_pbuf_free(payload);
-                    return;
+                    return 1;
                 }
                 socket_state_acquire_lock(&state,socket_endpoint_lock(socket));
+                if (headerless && (socket->filter || (serial_local && socket->packets_head))) {
+                    socket_state_release(&state);
+                    kernel_heap_release(socket->heap,packet);
+                    return 0;
+                }
                 if (!udp_receive_fits_locked(socket,charge)) {
                     socket_state_release(&state);
                     kernel_heap_release(socket->heap,packet);
                     goto drop;
                 }
             }
-            struct netif *input=boaros_lwip_parallel_enabled()?ip_current_input_netif():NULL;
             *packet=(struct socket_packet){
-                .payload=payload, .loopback=input && input==netif_get_loopif(),
+                .payload=payload, .loopback=loopback,
             };
             address_export(socket,peer,port,&packet->address);
             packet_publish_locked(socket,packet,charge);
-            return;
+            return 1;
         }
     }
 drop:
     UDP_STATS_INC(udp.memerr);
     kernel_socket_pbuf_free(payload);
+    return 1;
+}
+
+static void udp_received(void *context, struct udp_pcb *pcb,
+                         struct pbuf *payload, const ip_addr_t *peer,
+                         u16_t port)
+{
+    (void)pcb;
+    struct netif *input=boaros_lwip_parallel_enabled()?ip_current_input_netif():NULL;
+    (void)udp_queue_received(context,payload,peer,port,input && input==netif_get_loopif(),0);
 }
 
 /* UDP multicast keeps one immutable pbuf including its UDP header. Each
@@ -4399,7 +4421,8 @@ int kernel_socket_read_user(struct kernel_socket_read_request *request,
         uint32_t take = packet_available(packet) - skip;
         if (take > remaining) take = remaining;
         const struct pbuf *part = packet->payload;
-        uint32_t offset = packet->consumed + skip, pending = take;
+        int coalesced = part && part->boaros_tcp_coalesced;
+        uint32_t offset = packet->consumed + skip, pending = take, good_prefix = 0;
         skip = 0;
         while (pending) {
             const void *source;
@@ -4419,9 +4442,14 @@ int kernel_socket_read_user(struct kernel_socket_read_request *request,
             if (status == KERNEL_UACCESS_STATUS_FAULT) { result = -KERNEL_EFAULT; goto out; }
             if (status || copied != length) __builtin_trap();
             pending -= (uint32_t)length; offset += (uint32_t)length;
+            if (coalesced && offset == part->len) {
+                request->completed_bytes += (uint32_t)length;
+                good_prefix += (uint32_t)length;
+            }
         }
-        /* 故障packet即使写入用户前缀也不消费；此前完整成功的packet可提交短读。 */
-        request->completed_bytes += take;
+        /* A TCP train still has one pbuf per wire segment. Keep exactly the
+         * completed prefix if a later segment faults. */
+        request->completed_bytes += take - good_prefix;
         remaining -= take; if(remaining)packet = packet->next;
     }
 out:
@@ -5756,6 +5784,44 @@ static void udp4_remember_path(struct kernel_socket *socket, struct netif *inter
 }
 #endif
 
+static int datagram_loopback_deliver(struct udp_pcb *sender, struct pbuf *payload,
+    struct netif *route, const ip_addr_t *source, const ip_addr_t *destination, uint16_t port)
+{
+    if (route!=netif_get_loopif() || route->loop_first || route->mtu || !sender->local_port ||
+        !IP_IS_V4(source) || !IP_IS_V4(destination) ||
+        !ip4_addr_isloopback(netif_ip4_addr(route)) ||
+        !ip4_addr_isloopback(ip_2_ip4(source)) || !ip4_addr_isloopback(ip_2_ip4(destination)) ||
+        !IP_ADDR_PCB_VERSION_MATCH(sender,source) || ip_addr_isbroadcast(destination,route) ||
+        (sender->flags&UDP_FLAGS_UDPLITE) || packet_taps_active() || !boaros_lwip_raw_input_idle())
+        return 0;
+    struct udp_pcb *target=boaros_lwip_udp4_local_target(route,source,destination,sender->local_port,port);
+    /* Preserve ordinary IP delivery when a packet needs headers for a
+     * filter or tap, or when a missing recipient can generate ICMP. */
+    if (!target || target->recv!=udp_received || (target->flags&UDP_FLAGS_UDPLITE) ||
+        socket_filter_attached(target->recv_arg)) return 0;
+    uint16_t bytes=payload->tot_len+UDP_HLEN+IP_HLEN;
+    payload->if_idx=netif_get_index(route);
+    if (!udp_queue_received(target->recv_arg,payload,source,sender->local_port,
+                            boaros_lwip_parallel_enabled(),1)) return 0;
+    UDP_STATS_INC(udp.xmit);
+    UDP_STATS_INC(udp.recv);
+    IP_STATS_INC(ip.xmit);
+    IP_STATS_INC(ip.recv);
+    LINK_STATS_INC(link.xmit);
+    LINK_STATS_INC(link.recv);
+    MIB2_STATS_INC(mib2.udpoutdatagrams);
+    MIB2_STATS_INC(mib2.udpindatagrams);
+    MIB2_STATS_INC(mib2.ipoutrequests);
+    MIB2_STATS_INC(mib2.ipinreceives);
+    MIB2_STATS_INC(mib2.ipindelivers);
+    MIB2_STATS_NETIF_ADD(route,ifinoctets,bytes);
+    MIB2_STATS_NETIF_ADD(route,ifoutoctets,bytes);
+    MIB2_STATS_NETIF_INC(route,ifinucastpkts);
+    MIB2_STATS_NETIF_INC(route,ifoutucastpkts);
+    (void)bytes;
+    return 1;
+}
+
 static int datagram_send_owned(struct kernel_socket_write_request *request, int caller_only)
 {
     struct kernel_socket *socket=request->socket;
@@ -5795,6 +5861,12 @@ static int datagram_send_owned(struct kernel_socket_write_request *request, int 
         length+48U>nd6_get_destination_mtu(ip_2_ip6(&remote),route)) failure=-KERNEL_EMSGSIZE;
 
     int more=!!(request->flags&KERNEL_SOCKET_MSG_MORE);
+    if (!failure && !more && !pending && socket->udp && protocol_depth==1 && !payload->next &&
+        datagram_loopback_deliver(socket->udp,payload,route,source,&remote,port)) {
+        request->protocol_payload=NULL;
+        if (!loopback_pending) request->progressed|=SOCKET_WRITE_LOOPBACK_INLINE;
+        return (int)request->payload_size;
+    }
     if (!failure && socket->udp && (pending || more)) {
         if (!socket->udp->local_port)
             failure=lwip_error(udp_bind(socket->udp,&socket->udp->local_ip,0));
@@ -7281,12 +7353,43 @@ static unsigned tcp_owner_receive_batch(struct socket_tcp_owner *owner,unsigned 
     /* The connection owner already holds this prefix. Do not wait for
      * subsequent input or retain the interface beyond this protocol turn. */
     if (count>1 && !stopping) owner->context.input_ack_batch=&ack_interface;
-    for (unsigned i=0;i<count;i++) {
+    for (unsigned i=0;i<count;) {
 #if BOAROS_COST_DIAGNOSTICS
-        kernel_cost_tcp_input_dequeue(input[i].queued_ticks,locking,locked);
+        uint64_t dispatch=kernel_cost_clock();
+#endif
+        unsigned train=0;
+        if (!stopping && i+1<count && input[i].interface->hwaddr_len &&
+            input[i].network_length==IP_HLEN && IP_IS_V4(&input[i].src)) {
+            struct pbuf *packets[TCP_RX_BATCH] = {input[i].packet};
+            unsigned run=1;
+            while (i+run<count && input[i+run].interface==input[i].interface &&
+                input[i+run].route_bucket==input[i].route_bucket &&
+                input[i+run].network_length==IP_HLEN &&
+                ip_addr_eq(&input[i].src,&input[i+run].src) &&
+                ip_addr_eq(&input[i].dst,&input[i+run].dst)) {
+                packets[run]=input[i+run].packet;
+                run++;
+            }
+            if (run>1) {
+                COST_SCOPE(input_cost,TCP_INPUT_PROCESS_TICKS);
+                train=boaros_lwip_tcp_receive_train(packets,run,input[i].interface,
+                    &input[i].src,&input[i].dst,&owner->input_buckets[input[i].route_bucket]);
+            }
+        }
+        if (train) {
+#if BOAROS_COST_DIAGNOSTICS
+            for (unsigned j=0;j<train;j++)
+                kernel_cost_tcp_input_dequeue(input[i+j].queued_ticks,locking,locked,dispatch);
+#endif
+            i+=train;
+            continue;
+        }
+#if BOAROS_COST_DIAGNOSTICS
+        kernel_cost_tcp_input_dequeue(input[i].queued_ticks,locking,locked,dispatch);
 #endif
         if (!stopping) tcp_owner_receive(owner,&input[i]);
         else pbuf_free(input[i].packet);
+        i++;
     }
     owner->context.input_ack_batch=NULL;
     if (ack_interface) ack_interface->boaros_link_flush(ack_interface);

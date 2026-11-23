@@ -26,6 +26,7 @@ static err_t held_completion_tcp_output(struct tcp_pcb *);
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __func__, __LINE__, #x); exit(1); } } while (0)
 static struct {unsigned references,calls;uint32_t keep;} raw_filter_test,mld_filter_test[2];
+static struct {unsigned references,calls;} tcp_train_filter;
 static pthread_mutex_t raw_gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t raw_changed=PTHREAD_COND_INITIALIZER;
 static unsigned raw_pause,raw_filter_entered,raw_close_waiting,raw_resume;
@@ -34,9 +35,11 @@ static struct kernel_socket *accept_binding_probe;
 static unsigned accept_binding_changed;
 void __wrap_kernel_bpf_program_get(struct kernel_bpf_program *program)
 {for(unsigned i=0;i<2;i++)if(program==(void *)&mld_filter_test[i]){mld_filter_test[i].references++;return;}
+ if(program==(void *)&tcp_train_filter){tcp_train_filter.references++;return;}
  CHECK(program==(void *)&raw_filter_test);__atomic_fetch_add(&raw_filter_test.references,1,__ATOMIC_RELAXED);}
 void __wrap_kernel_bpf_program_put(struct kernel_bpf_program *program)
 {for(unsigned i=0;i<2;i++)if(program==(void *)&mld_filter_test[i]){CHECK(mld_filter_test[i].references--);return;}
+ if(program==(void *)&tcp_train_filter){CHECK(tcp_train_filter.references--);return;}
  CHECK(program==(void *)&raw_filter_test && __atomic_fetch_sub(&raw_filter_test.references,1,__ATOMIC_RELAXED));}
 uint32_t __wrap_kernel_bpf_filter(struct kernel_bpf_program *program,const struct kernel_bpf_packet *packet)
 {
@@ -45,6 +48,12 @@ uint32_t __wrap_kernel_bpf_filter(struct kernel_bpf_program *program,const struc
         unsigned char data[16];CHECK(!packet->read(packet->object,8,data,16));
         for(unsigned j=0;j<16;j++)CHECK(data[j]==(unsigned char)((j+8)*13));
         mld_filter_test[i].calls++;return mld_filter_test[i].keep;
+    }
+    if (program==(void *)&tcp_train_filter) {
+        CHECK(tcp_train_filter.references && packet->protocol==0x0800 &&
+              packet->payload_offset==TCP_HLEN && packet->length==TCP_HLEN+2);
+        tcp_train_filter.calls++;
+        return UINT32_MAX;
     }
     CHECK(program==(void *)&raw_filter_test && raw_filter_test.references);
     CHECK(packet->protocol==0x0800 && packet->network_offset==0 && packet->payload_offset==28 && packet->length>=28);
@@ -169,8 +178,9 @@ void kernel_cost_raw_lock(struct kernel_cost_tag tag,unsigned rank,uint64_t wait
 {(void)tag;(void)rank;(void)wait;(void)hold;}
 void kernel_cost_page_metadata(struct kernel_cost_tag tag,uint64_t checked,uint64_t written,uint64_t elapsed)
 {(void)tag;(void)checked;(void)written;(void)elapsed;}
-void kernel_cost_tcp_input_dequeue(uint64_t queued,uint64_t locking,uint64_t locked)
-{(void)queued;(void)locking;(void)locked;}
+void kernel_cost_tcp_input_dequeue(uint64_t queued,uint64_t locking,uint64_t locked,
+                                   uint64_t dispatch)
+{(void)queued;(void)locking;(void)locked;(void)dispatch;}
 void kernel_cost_add_io(unsigned offset,uint64_t value) { (void)offset;(void)value; }
 void kernel_console_putc(char byte) { fputc((unsigned char)byte,stderr); }
 
@@ -1224,12 +1234,29 @@ static void udp_loopback_payload(void)
 
         /* An isolated syscall delivers its own record without waking the
          * worker. Delivery still publishes normal receive readiness. */
+        while (receiver->packets_head) {
+            struct kernel_open_file_description *read_pin=(void *)receiver;
+            struct kernel_socket_read_request read={0};
+            int received=kernel_socket_reserve_read(receiver,NULL,&read,&read_pin,sizeof(data),0,NULL);
+            CHECK(received>=0 && read.socket==receiver);
+            CHECK(kernel_socket_finish_read(&read,0)==(unsigned)received);
+        }
+        (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+        unsigned wakes_after_reads=wakes;
         CHECK(!kernel_socket_packet_prepare(&request,&pin,sizeof(data),0,&address,1,NULL));
         struct pbuf *inline_payload=request.protocol_payload;
+        unsigned char *ip_headroom=NULL;
+        if (!ipv6) {
+            CHECK(!pbuf_add_header(inline_payload,28));
+            ip_headroom=inline_payload->payload;
+            memset(ip_headroom,0xa5,28);
+            CHECK(!pbuf_remove_header(inline_payload,28));
+        }
         CHECK(kernel_socket_packet_write(&request,NULL,NULL,"now",NULL,NULL)==sizeof(data));
         CHECK(pin==(void *)sender && receiver->packets_tail->payload==inline_payload);
         CHECK(pbuf_copy_partial(inline_payload,data,sizeof(data),0)==sizeof(data) && !memcmp(data,"now",3));
-        CHECK(!loop->loop_first && wakes==1 && (kernel_socket_poll(receiver,NULL)&KERNEL_POLLIN));
+        CHECK(!loop->loop_first && wakes==wakes_after_reads && (kernel_socket_poll(receiver,NULL)&KERNEL_POLLIN));
+        if (ip_headroom) for (unsigned i=0;i<28;i++) CHECK(ip_headroom[i]==0xa5);
         kernel_socket_destroy(sender);kernel_socket_destroy(receiver);
         kernel_socket_network_hooks(NULL,NULL,NULL,NULL,NULL);
         CHECK(STATS_GET(mem.used)==memory && !heap_live);
@@ -2454,6 +2481,127 @@ static void tcp_loopback_checksum(void)
     kernel_socket_destroy(server);kernel_socket_destroy(client);kernel_socket_destroy(listener);
     (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,0});
     puts("PASS TCP checksum: the same bad checksum is rejected on Ethernet ingress and ignored on internal lo");
+}
+
+static struct pbuf *tcp_train_test_packet(const struct tcp_pcb *pcb,
+                                         uint32_t seq, const char data[2], int bad_checksum)
+{
+    struct pbuf *p=pbuf_alloc(PBUF_RAW,IP_HLEN+TCP_HLEN+2,PBUF_RAM);
+    CHECK(p);
+    memset(p->payload,0,p->len);
+    CHECK(!pbuf_remove_header(p,IP_HLEN));
+    struct tcp_hdr *h=p->payload;
+    h->src=lwip_htons(pcb->remote_port);
+    h->dest=lwip_htons(pcb->local_port);
+    h->seqno=lwip_htonl(seq);
+    h->ackno=lwip_htonl(pcb->lastack);
+    h->wnd=lwip_htons(8192);
+    TCPH_HDRLEN_FLAGS_SET(h,5,TCP_ACK);
+    memcpy((char *)p->payload+TCP_HLEN,data,2);
+    h->chksum=ip_chksum_pseudo(p,IP_PROTO_TCP,p->tot_len,&pcb->remote_ip,&pcb->local_ip);
+    if (bad_checksum) h->chksum^=1;
+    return p;
+}
+
+static void tcp_train_input(struct kernel_socket *server, struct netif *ethernet, int bad_checksum)
+{
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    struct tcp_pcb *pcb=server->tcp;
+    const struct ip_globals old=ip_data;
+    ip_data.current_netif=ethernet;
+    ip_data.current_input_netif=ethernet;
+    ip_addr_copy(ip_data.current_iphdr_src,pcb->remote_ip);
+    ip_addr_copy(ip_data.current_iphdr_dest,pcb->local_ip);
+    ip_data.current_ip_header_tot_len=IP_HLEN;
+#if BOAROS_USER_SMP
+    int serial=!tcp_socket_cpu(server);
+#else
+    int serial=1;
+#endif
+    if (serial) boaros_lwip_tcp_ack_batch_begin();
+    struct pbuf *frames[]={tcp_train_test_packet(pcb,pcb->rcv_nxt,"ab",0),
+                          tcp_train_test_packet(pcb,pcb->rcv_nxt+2,"cd",bad_checksum)};
+    for (unsigned i=0;i<2;i++) {
+        ip_data.current_ip4_header=(void *)((char *)frames[i]->payload-IP_HLEN);
+        tcp_input(frames[i],ethernet);
+    }
+    if (serial) boaros_lwip_tcp_ack_batch_end();
+    ip_data=old;
+    kernel_socket_protocol_leave(&scope);
+#if BOAROS_USER_SMP
+    if (!serial) CHECK(tcp_try_receive_prefix(tcp_owner_at(tcp_socket_cpu(server)))==2);
+#endif
+}
+
+static void tcp_receive_train_contract(int multicores)
+{
+    struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
+    kernel_socket_network_initialize();
+    connected_pair(&listener,&client,&server);
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    struct netif ethernet={0};
+    ip4_addr_t local,mask,empty;
+    IP4_ADDR(&local,10,77,0,2);IP4_ADDR(&mask,255,255,255,0);ip4_addr_set_zero(&empty);
+    CHECK(netif_add(&ethernet,&local,&mask,&empty,NULL,route_interface_init,ip_input));
+#if BOAROS_USER_SMP
+    if (multicores) {
+        tcp_lookup_test_start();
+        CHECK(tcp_promote(server,&scope));
+    }
+#else
+    (void)multicores;
+#endif
+    kernel_socket_protocol_leave(&scope);
+
+    uint32_t seq=server->tcp->rcv_nxt;
+    uint32_t segments=server->tcp->boaros_segs_in;
+    tcp_train_input(server,&ethernet,0);
+    CHECK(server->tcp->rcv_nxt==seq+4 && server->tcp->snd_wl1==seq+2 &&
+          server->tcp->boaros_segs_in==segments+2 && server->tcp->boaros_rcv_mss==2 && server->rx_bytes==4 &&
+          server->packets_head==server->packets_tail && server->packets_head->payload->boaros_tcp_coalesced);
+    struct kernel_open_file_description *pin=(void *)server;
+    struct kernel_socket_read_request request={0};
+    char data[8]={0};
+    struct kernel_uaccess_iovec iov={(uintptr_t)data,4};
+    struct kernel_uaccess_iov_cursor cursor={&iov,1,0,0};
+    CHECK(kernel_socket_reserve_read(server,NULL,&request,&pin,4,0,NULL)==4);
+    user_remaining=3;
+    CHECK(kernel_socket_read_user(&request,NULL,&cursor)==-KERNEL_EFAULT && request.completed_bytes==2);
+    user_remaining=SIZE_MAX;
+    CHECK(kernel_socket_finish_read(&request,1)==2 && server->rx_bytes==2);
+    CHECK(kernel_socket_reserve_read(server,NULL,&request,&pin,2,0,NULL)==2);
+    kernel_socket_copy_read(&request,0,data,2);
+    CHECK(!memcmp(data,"cd",2) && kernel_socket_finish_read(&request,0)==2);
+
+    unsigned errors=STATS_GET(tcp.chkerr);
+    tcp_train_input(server,&ethernet,1);
+    CHECK(STATS_GET(tcp.chkerr)==errors+1 && server->rx_bytes==2);
+    CHECK(kernel_socket_reserve_read(server,NULL,&request,&pin,2,0,NULL)==2);
+    CHECK(kernel_socket_finish_read(&request,0)==2);
+    tcp_train_filter.references=1;
+    CHECK(!kernel_socket_filter_set(server,(void *)&tcp_train_filter));
+    tcp_train_input(server,&ethernet,0);
+    CHECK(tcp_train_filter.calls==2 && server->rx_bytes==4 &&
+          server->packets_head!=server->packets_tail && !server->packets_head->payload->boaros_tcp_coalesced);
+    CHECK(!kernel_socket_filter_set(server,NULL) && !tcp_train_filter.references);
+
+#if BOAROS_USER_SMP
+    if (multicores) {
+        CHECK(tcp_owner_lock(&scope,tcp_owner_at(tcp_socket_cpu(server)),0));
+        if (server->tcp) tcp_abandon(server->tcp,0);
+        kernel_socket_protocol_leave(&scope);
+    }
+#endif
+    kernel_socket_protocol_enter(&scope);
+    if (server->tcp) tcp_abandon(server->tcp,0);
+    if (client->tcp) tcp_abandon(client->tcp,0);
+    netif_remove(&ethernet);
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_destroy(server);kernel_socket_destroy(client);kernel_socket_destroy(listener);
+    (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,0});
+    puts("PASS TCP receive train: wire accounting, original copy-fault boundary, bad checksum and per-frame filter");
 }
 
 static void deliver_plain_ack(struct tcp_pcb *pcb, struct netif *inp, u32_t ack)
@@ -6228,10 +6376,12 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "tcp-loopback-checksum")) tcp_loopback_checksum();
     else if (!strcmp(argv[1], "serial-tcp-credit")) serial_tcp_receive_credit();
     else if (!strcmp(argv[1], "tcp-ack-batch")) tcp_ack_receive_batch();
+    else if (!strcmp(argv[1], "tcp-serial-train")) tcp_receive_train_contract(0);
 #if BOAROS_USER_SMP
     else if (!strcmp(argv[1], "tcp-single-cpu-service")) tcp_single_cpu_service();
     else if (!strcmp(argv[1], "tcp-shard-receive-before-wait")) tcp_shard_receive_before_wait();
     else if (!strcmp(argv[1], "tcp-owner-lookup")) tcp_owner_lookup();
+    else if (!strcmp(argv[1], "tcp-owner-train")) tcp_receive_train_contract(1);
     else if (!strcmp(argv[1], "tcp-owner-placement")) tcp_owner_placement();
     else if (!strcmp(argv[1], "tcp-physical-submit")) tcp_physical_submit_contract();
     else if (!strcmp(argv[1], "tcp-resolved-output")) tcp_resolved_output_contract(0);

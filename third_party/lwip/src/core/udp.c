@@ -167,7 +167,7 @@ again:
  * @return 1 on match, 0 otherwise
  */
 static u8_t
-udp_input_local_match(struct udp_pcb *pcb, struct netif *inp, u8_t broadcast)
+udp_input_local_match(struct udp_pcb *pcb, struct netif *inp, const ip_addr_t *dst, u8_t broadcast)
 {
   LWIP_UNUSED_ARG(inp);       /* in IPv6 only case */
   LWIP_UNUSED_ARG(broadcast); /* in IPv6 only case */
@@ -177,7 +177,7 @@ udp_input_local_match(struct udp_pcb *pcb, struct netif *inp, u8_t broadcast)
 
   /* check if PCB is bound to specific netif */
   if ((pcb->netif_idx != NETIF_NO_INDEX) &&
-      (pcb->netif_idx != netif_get_index(ip_data.current_input_netif))) {
+      (pcb->netif_idx != netif_get_index(inp))) {
     return 0;
   }
 
@@ -192,7 +192,7 @@ udp_input_local_match(struct udp_pcb *pcb, struct netif *inp, u8_t broadcast)
   }
 
   /* Only need to check PCB if incoming IP version matches PCB IP version */
-  if (IP_ADDR_PCB_VERSION_MATCH_EXACT(pcb, ip_current_dest_addr())) {
+  if (IP_ADDR_PCB_VERSION_MATCH_EXACT(pcb, dst)) {
 #if LWIP_IPV4
     /* Special case: IPv4 broadcast: all or broadcasts in my subnet
      * Note: broadcast variable can only be 1 if it is an IPv4 broadcast */
@@ -202,15 +202,15 @@ udp_input_local_match(struct udp_pcb *pcb, struct netif *inp, u8_t broadcast)
 #endif /* IP_SOF_BROADCAST_RECV */
       {
         if (ip4_addr_isany(ip_2_ip4(&pcb->local_ip)) ||
-            ((ip4_current_dest_addr()->addr == IPADDR_BROADCAST)) ||
-            ip4_addr_net_eq(ip_2_ip4(&pcb->local_ip), ip4_current_dest_addr(), netif_ip4_netmask(inp))) {
+            ((ip_2_ip4(dst)->addr == IPADDR_BROADCAST)) ||
+            ip4_addr_net_eq(ip_2_ip4(&pcb->local_ip), ip_2_ip4(dst), netif_ip4_netmask(inp))) {
           return 1;
         }
       }
     } else
 #endif /* LWIP_IPV4 */
       /* Handle IPv4 and IPv6: all or exact match */
-      if (ip_addr_isany(&pcb->local_ip) || ip_addr_eq(&pcb->local_ip, ip_current_dest_addr())) {
+      if (ip_addr_isany(&pcb->local_ip) || ip_addr_eq(&pcb->local_ip, dst)) {
         return 1;
       }
   }
@@ -282,7 +282,7 @@ udp_input_multicast(struct pbuf *p, struct netif *inp, struct udp_pcb *target,
   u16_t header_length = ip_current_header_tot_len();
   const void *network = (const unsigned char *)ip_next_header_ptr() - header_length;
   for (; target; target = target->next) {
-    if (target->local_port != dest || !udp_input_local_match(target, inp, broadcast)) {
+    if (target->local_port != dest || !udp_input_local_match(target, inp, ip_current_dest_addr(), broadcast)) {
       continue;
     }
     if ((target->flags & UDP_FLAGS_CONNECTED) && (target->remote_port != src ||
@@ -312,6 +312,78 @@ udp_input_multicast(struct pbuf *p, struct netif *inp, struct udp_pcb *target,
   return 1;
 }
 
+static struct udp_pcb *
+udp_unicast_target(struct netif *inp, struct udp_pcb **bucket, const ip_addr_t *src_ip,
+                  const ip_addr_t *dst_ip, u16_t src, u16_t dest, u8_t broadcast)
+{
+  struct udp_pcb *uncon_pcb = NULL;
+  struct udp_pcb *pcb;
+  /* Iterate through the UDP pcb list for a matching pcb.
+   * 'Perfect match' pcbs (connected to the remote port & ip address) are
+   * preferred. If no perfect match is found, the first unconnected pcb that
+   * matches the local port and ip address gets the datagram. */
+  for (pcb = *bucket; pcb != NULL; pcb = pcb->next) {
+    /* print the PCB local and remote address */
+    LWIP_DEBUGF(UDP_DEBUG, ("pcb ("));
+    ip_addr_debug_print_val(UDP_DEBUG, pcb->local_ip);
+    LWIP_DEBUGF(UDP_DEBUG, (", %"U16_F") <-- (", pcb->local_port));
+    ip_addr_debug_print_val(UDP_DEBUG, pcb->remote_ip);
+    LWIP_DEBUGF(UDP_DEBUG, (", %"U16_F")\n", pcb->remote_port));
+
+    /* compare PCB local addr+port to UDP destination addr+port */
+    if ((pcb->local_port == dest) &&
+        (udp_input_local_match(pcb, inp, dst_ip, broadcast) != 0)) {
+      if ((pcb->flags & UDP_FLAGS_CONNECTED) == 0) {
+        if (uncon_pcb == NULL) {
+          /* the first unconnected matching PCB */
+          uncon_pcb = pcb;
+#if LWIP_IPV4
+        } else if (broadcast && ip_2_ip4(dst_ip)->addr == IPADDR_BROADCAST) {
+          /* global broadcast address (only valid for IPv4; match was checked before) */
+          if (!IP_IS_V4_VAL(uncon_pcb->local_ip) || !ip4_addr_eq(ip_2_ip4(&uncon_pcb->local_ip), netif_ip4_addr(inp))) {
+            /* uncon_pcb does not match the input netif, check this pcb */
+            if (IP_IS_V4_VAL(pcb->local_ip) && ip4_addr_eq(ip_2_ip4(&pcb->local_ip), netif_ip4_addr(inp))) {
+              /* better match */
+              uncon_pcb = pcb;
+            }
+          }
+#endif /* LWIP_IPV4 */
+        }
+#if SO_REUSE
+        else if (!ip_addr_isany(&pcb->local_ip)) {
+          /* prefer specific IPs over catch-all */
+          uncon_pcb = pcb;
+        }
+#endif /* SO_REUSE */
+      }
+
+      /* compare PCB remote addr+port to UDP source addr+port */
+      if ((pcb->remote_port == src) &&
+          (ip_addr_isany_val(pcb->remote_ip) ||
+           ip_addr_eq(&pcb->remote_ip, src_ip))) {
+        /* the first fully matching PCB */
+        if (pcb->previous != bucket) {
+          udp_port_unlink(pcb);
+          udp_port_insert(pcb);
+        } else {
+          UDP_STATS_INC(udp.cachehit);
+        }
+        break;
+      }
+    }
+
+  }
+  return pcb ? pcb : uncon_pcb;
+}
+
+struct udp_pcb *
+boaros_lwip_udp4_local_target(struct netif *inp, const ip_addr_t *src_ip,
+                            const ip_addr_t *dst_ip, u16_t src, u16_t dst)
+{
+  LWIP_ASSERT_CORE_LOCKED();
+  return udp_unicast_target(inp, udp_port_bucket(dst), src_ip, dst_ip, src, dst, 0);
+}
+
 /**
  * Process an incoming UDP datagram.
  *
@@ -329,7 +401,6 @@ udp_input(struct pbuf *p, struct netif *inp)
 {
   struct udp_hdr *udphdr;
   struct udp_pcb *pcb;
-  struct udp_pcb *uncon_pcb;
   u16_t src, dest;
   u8_t broadcast;
 
@@ -387,66 +458,8 @@ udp_input(struct pbuf *p, struct netif *inp)
     goto end;
   }
 
-  uncon_pcb = NULL;
-  /* Iterate through the UDP pcb list for a matching pcb.
-   * 'Perfect match' pcbs (connected to the remote port & ip address) are
-   * preferred. If no perfect match is found, the first unconnected pcb that
-   * matches the local port and ip address gets the datagram. */
-  for (pcb = *bucket; pcb != NULL; pcb = pcb->next) {
-    /* print the PCB local and remote address */
-    LWIP_DEBUGF(UDP_DEBUG, ("pcb ("));
-    ip_addr_debug_print_val(UDP_DEBUG, pcb->local_ip);
-    LWIP_DEBUGF(UDP_DEBUG, (", %"U16_F") <-- (", pcb->local_port));
-    ip_addr_debug_print_val(UDP_DEBUG, pcb->remote_ip);
-    LWIP_DEBUGF(UDP_DEBUG, (", %"U16_F")\n", pcb->remote_port));
-
-    /* compare PCB local addr+port to UDP destination addr+port */
-    if ((pcb->local_port == dest) &&
-        (udp_input_local_match(pcb, inp, broadcast) != 0)) {
-      if ((pcb->flags & UDP_FLAGS_CONNECTED) == 0) {
-        if (uncon_pcb == NULL) {
-          /* the first unconnected matching PCB */
-          uncon_pcb = pcb;
-#if LWIP_IPV4
-        } else if (broadcast && ip4_current_dest_addr()->addr == IPADDR_BROADCAST) {
-          /* global broadcast address (only valid for IPv4; match was checked before) */
-          if (!IP_IS_V4_VAL(uncon_pcb->local_ip) || !ip4_addr_eq(ip_2_ip4(&uncon_pcb->local_ip), netif_ip4_addr(inp))) {
-            /* uncon_pcb does not match the input netif, check this pcb */
-            if (IP_IS_V4_VAL(pcb->local_ip) && ip4_addr_eq(ip_2_ip4(&pcb->local_ip), netif_ip4_addr(inp))) {
-              /* better match */
-              uncon_pcb = pcb;
-            }
-          }
-#endif /* LWIP_IPV4 */
-        }
-#if SO_REUSE
-        else if (!ip_addr_isany(&pcb->local_ip)) {
-          /* prefer specific IPs over catch-all */
-          uncon_pcb = pcb;
-        }
-#endif /* SO_REUSE */
-      }
-
-      /* compare PCB remote addr+port to UDP source addr+port */
-      if ((pcb->remote_port == src) &&
-          (ip_addr_isany_val(pcb->remote_ip) ||
-           ip_addr_eq(&pcb->remote_ip, ip_current_src_addr()))) {
-        /* the first fully matching PCB */
-        if (pcb->previous != bucket) {
-          udp_port_unlink(pcb);
-          udp_port_insert(pcb);
-        } else {
-          UDP_STATS_INC(udp.cachehit);
-        }
-        break;
-      }
-    }
-
-  }
-  /* no fully matching pcb found? then look for an unconnected pcb */
-  if (pcb == NULL) {
-    pcb = uncon_pcb;
-  }
+  pcb = udp_unicast_target(inp, bucket, ip_current_src_addr(), ip_current_dest_addr(),
+                           src, dest, broadcast);
 
   /* Check checksum if this is a match or if it was directed at us. */
   if (pcb != NULL || udp_input_local_destination(inp, ipv6)) {
@@ -478,7 +491,7 @@ udp_input(struct pbuf *p, struct netif *inp)
           if (mpcb != pcb) {
             /* compare PCB local addr+port to UDP destination addr+port */
             if ((mpcb->local_port == dest) &&
-                (udp_input_local_match(mpcb, inp, broadcast) != 0)) {
+                (udp_input_local_match(mpcb, inp, ip_current_dest_addr(), broadcast) != 0)) {
               /* pass a copy of the packet to all local matches */
               if (mpcb->recv != NULL) {
                 struct pbuf *q;

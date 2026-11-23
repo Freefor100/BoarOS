@@ -52,12 +52,10 @@ static void rx_free(struct pbuf *p)
 }
 static int copy_pbuf(const void *context, void *destination, uint32_t length)
 { return pbuf_copy_partial(context, destination, (u16_t)length, 0) == length; }
-#if BOAROS_USER_SMP
 static void free_tx_pbuf_direct(void *const *payloads, unsigned count)
 {
     for (unsigned i = 0; i < count; i++) pbuf_free(payloads[i]);
 }
-#endif
 static err_t submit_link_frame(struct netif *interface, struct pbuf *p, int more)
 {
     COST_SCOPE(output_cost, NET_TX_OUTPUT_TICKS);
@@ -81,11 +79,11 @@ static err_t submit_link_frame(struct netif *interface, struct pbuf *p, int more
         if (eligible && count != 0) {
             pbuf_ref(p);
             int result = virtio_net_send_segments(n->device, segments, count, p, more);
-#if BOAROS_USER_SMP
-            if (result == -KERNEL_EAGAIN && boaros_lwip_parallel_enabled() &&
+            /* The submitter can return an already completed slot even when
+             * it is the serial protocol owner and the worker cannot run. */
+            if (result == -KERNEL_EAGAIN &&
                 virtio_net_tx_reclaim(n->device, free_tx_pbuf_direct))
                 result = virtio_net_send_segments(n->device, segments, count, p, more);
-#endif
             if (result == 0) return ERR_OK;
             pbuf_free(p);
             if (result == -KERNEL_EAGAIN) { kernel_socket_network_blocked(); return ERR_MEM; }
@@ -94,11 +92,9 @@ static err_t submit_link_frame(struct netif *interface, struct pbuf *p, int more
         }
     }
     int result = virtio_net_send_copy(n->device, p->tot_len, copy_pbuf, p, more);
-#if BOAROS_USER_SMP
-    if (result == -KERNEL_EAGAIN && boaros_lwip_parallel_enabled() &&
+    if (result == -KERNEL_EAGAIN &&
         virtio_net_tx_reclaim(n->device, free_tx_pbuf_direct))
         result = virtio_net_send_copy(n->device, p->tot_len, copy_pbuf, p, more);
-#endif
     /* 复制回退耗尽的仍是 NIC 槽；只等协议池归还会漏掉真实 TX 完成。 */
     if (result == -KERNEL_EAGAIN) { kernel_socket_network_blocked(); return ERR_MEM; }
     return result >= 0 ? ERR_OK : result == -KERNEL_EMSGSIZE ? ERR_BUF : ERR_IF;
@@ -364,11 +360,11 @@ static unsigned receive_inline(void *context)
         for (unsigned i = 0; i < ready; i++) {
             const struct virtio_net_frame *frame = &frames[i];
             const unsigned char *data = frame->data;
-            /* Flush before other link or network traffic. TCP verifies the
-             * checksum, ingress filter, tuple and each advancing sequence. */
+            /* Finish pending TCP work before any other link/network traffic.
+             * TCP checks the tuple, original headers and sequence on admission. */
             if (batching && (frame->size < 54 || data[12] != 8 || data[13] || data[14] != 0x45 ||
-                             data[16] || data[17] != 40 || (data[20] & 0x3f) || data[21] ||
-                             data[23] != 6 || data[46] != 0x50 || data[47] != 0x10))
+                             (data[20] & 0x3f) || data[21] ||
+                             data[23] != 6 || data[46] != 0x50 || (data[47] & ~8U)!=0x10))
                 boaros_lwip_tcp_ack_batch_flush();
             input_frame_owned(n, frame);
         }
