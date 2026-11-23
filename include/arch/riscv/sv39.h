@@ -215,8 +215,8 @@ enum riscv_sv39_status riscv_sv39_user_fork_commit_window(
 unsigned riscv_sv39_user_map_owned_window(struct riscv_sv39_user_space *, uint64_t,
     unsigned, const uint64_t *, uint32_t, int cow);
 /* Publish the window only if its required demand slot is still empty. */
-unsigned riscv_sv39_user_map_zero_window(struct riscv_sv39_user_space *, uint64_t,
-    unsigned, const uint64_t *, uint32_t, unsigned required_slot);
+unsigned riscv_sv39_user_map_required_window(struct riscv_sv39_user_space *, uint64_t,
+    unsigned, const uint64_t *, uint32_t, int cow, unsigned required_slot);
 enum riscv_sv39_status riscv_sv39_user_mark_cow_page(
     struct riscv_sv39_user_space *, uint64_t);
 enum riscv_sv39_status riscv_sv39_user_space_fork_prepare(
@@ -287,6 +287,10 @@ enum riscv_sv39_status riscv_sv39_user_leaf_snapshot(const struct riscv_sv39_use
     uint64_t, struct kernel_mm_leaf *);
 enum riscv_sv39_status riscv_sv39_user_leaf_probe(const struct riscv_sv39_user_space *,
     uint64_t, struct kernel_mm_leaf *, unsigned *missing_tables);
+/* Only a mapped base page supplies a slot. Keep the MM metadata writer
+ * continuously held from this lookup through any use of the slot. */
+enum riscv_sv39_status riscv_sv39_user_leaf_probe_slot(const struct riscv_sv39_user_space *,
+    uint64_t, struct kernel_mm_leaf *, unsigned *missing_tables, uint64_t **slot);
 enum riscv_sv39_status riscv_sv39_user_empty_window(const struct riscv_sv39_user_space *,
     uint64_t, unsigned, unsigned *);
 enum riscv_sv39_status riscv_sv39_user_leaf_missing_order(struct riscv_sv39_user_space *,
@@ -295,4 +299,8 @@ enum riscv_sv39_status riscv_sv39_user_map_prepared_order(struct riscv_sv39_user
     uint64_t, uint64_t, uint32_t, int, uint32_t, struct kernel_mm_leaf_preparation *);
 enum riscv_sv39_status riscv_sv39_user_cow_commit_order(struct riscv_sv39_user_space *,
     uint64_t, uint64_t, uint64_t, uint32_t, uint32_t, struct kernel_mm_retirement *);
+/* Requires the same metadata writer as the slot lookup and a sole PTE
+ * reference observed by physical_page_cow_borrow under that writer. */
+enum riscv_sv39_status riscv_sv39_user_cow_upgrade(struct riscv_sv39_user_space *,
+    uint64_t *slot, uint64_t cookie, uint32_t permissions);
 #endif

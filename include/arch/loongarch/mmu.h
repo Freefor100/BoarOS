@@ -53,6 +53,7 @@ enum arch_mmu_user_space_state {
 struct arch_mmu_user_space {
     struct physical_page_allocator *allocator;
     uint64_t root_address;
+    uint64_t *root_entries; /* Borrowed from the address space's root owner. */
     uint32_t table_pages;
     uint32_t leaf_pages;
     uint32_t protected_pages;
@@ -79,6 +80,11 @@ enum arch_mmu_status arch_mmu_user_leaf_snapshot(
     const struct arch_mmu_user_space *, uint64_t, struct kernel_mm_leaf *);
 enum arch_mmu_status arch_mmu_user_leaf_probe(
     const struct arch_mmu_user_space *, uint64_t, struct kernel_mm_leaf *, unsigned *missing_tables);
+/* Only a mapped base page supplies a slot. Keep the MM metadata writer
+ * continuously held from this lookup through any use of the slot. */
+enum arch_mmu_status arch_mmu_user_leaf_probe_slot(
+    const struct arch_mmu_user_space *, uint64_t, struct kernel_mm_leaf *, unsigned *missing_tables,
+    uint64_t **slot);
 enum arch_mmu_status arch_mmu_user_empty_window(const struct arch_mmu_user_space *,
     uint64_t, unsigned, unsigned *);
 enum arch_mmu_status arch_mmu_user_leaf_missing_order(
@@ -114,6 +120,10 @@ enum arch_mmu_status arch_mmu_user_cow_snapshot(
 enum arch_mmu_status arch_mmu_user_cow_commit(
     struct arch_mmu_user_space *, uint64_t, uint64_t, uint64_t, uint32_t,
     struct kernel_mm_retirement *);
+/* Requires the same metadata writer as the slot lookup and a sole PTE
+ * reference observed by physical_page_cow_borrow under that writer. */
+enum arch_mmu_status arch_mmu_user_cow_upgrade(
+    struct arch_mmu_user_space *, uint64_t *slot, uint64_t cookie, uint32_t permissions);
 enum arch_mmu_status arch_mmu_user_next_owned(
     struct arch_mmu_user_space *, uint64_t *, uint64_t end, uint64_t *);
 enum arch_mmu_status arch_mmu_user_owned_snapshot(
