@@ -2,6 +2,7 @@
 #include <kernel/event_fd.h>
 #include <kernel/inotify.h>
 #include <kernel/fanotify.h>
+#include <kernel/userfaultfd.h>
 #include <kernel/errno.h>
 #include <kernel/task.h>
 enum kernel_syscall_status syscall_handle_eventfd(struct kernel_task *caller,
@@ -57,5 +58,18 @@ enum kernel_syscall_status syscall_handle_fanotify(struct kernel_task *caller,
     enum kernel_files_status status = kernel_files_fanotify(files, fs, mm, request->number,
         (int32_t)request->arguments[0], (uint32_t)request->arguments[1], request->arguments[2],
         (int32_t)request->arguments[3], request->arguments[4], &decoded->value);
+    return status ? KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT : KERNEL_SYSCALL_STATUS_OK;
+}
+
+enum kernel_syscall_status syscall_handle_userfaultfd(struct kernel_task *caller,
+    const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;
+    struct kernel_mm *mm;
+    if (kernel_task_files_borrow(caller, &files) || kernel_task_mm_borrow_mutable(caller, &mm))
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    enum kernel_files_status status = kernel_files_userfaultfd_create(files, mm,
+        (uint32_t)request->arguments[0], &decoded->value);
     return status ? KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT : KERNEL_SYSCALL_STATUS_OK;
 }

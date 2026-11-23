@@ -261,6 +261,7 @@ struct kernel_flock_identity *kernel_open_file_flock_identity(
     case KERNEL_OPEN_FILE_KIND_BPF:
     case KERNEL_OPEN_FILE_KIND_INOTIFY:
     case KERNEL_OPEN_FILE_KIND_FANOTIFY:
+    case KERNEL_OPEN_FILE_KIND_USERFAULTFD:
     case KERNEL_OPEN_FILE_KIND_SIGNALFD: return kernel_flock_anonymous_identity();
     case KERNEL_OPEN_FILE_KIND_PIDFD: return kernel_pidfd_flock_identity(file);
     case KERNEL_OPEN_FILE_KIND_CONSOLE: return kernel_flock_bootstrap_console_identity();
@@ -872,6 +873,7 @@ int kernel_open_file_pseudo_stat(
         mode = 0700U; /* pidfs getattr deliberately masks S_IFMT. */
     else if (file->kind == KERNEL_OPEN_FILE_KIND_BPF || file->kind == KERNEL_OPEN_FILE_KIND_INOTIFY ||
              file->kind == KERNEL_OPEN_FILE_KIND_FANOTIFY || file->kind == KERNEL_OPEN_FILE_KIND_EPOLL ||
+             file->kind == KERNEL_OPEN_FILE_KIND_USERFAULTFD ||
              file->kind == KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind == KERNEL_OPEN_FILE_KIND_TIMERFD ||
              file->kind == KERNEL_OPEN_FILE_KIND_SIGNALFD)
         mode = 0600U;
@@ -959,6 +961,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_INOTIFY;
     case KERNEL_OPEN_FILE_KIND_FANOTIFY:
         return KERNEL_OPEN_FILE_KIND_FANOTIFY;
+    case KERNEL_OPEN_FILE_KIND_USERFAULTFD:
+        return KERNEL_OPEN_FILE_KIND_USERFAULTFD;
     case KERNEL_OPEN_FILE_KIND_MQUEUE:
         return KERNEL_OPEN_FILE_KIND_MQUEUE;
     case KERNEL_OPEN_FILE_KIND_PIDFD:
@@ -1014,6 +1018,7 @@ int kernel_open_file_supports_epoll(
     case KERNEL_OPEN_FILE_KIND_MQUEUE:
     case KERNEL_OPEN_FILE_KIND_INOTIFY:
     case KERNEL_OPEN_FILE_KIND_FANOTIFY:
+    case KERNEL_OPEN_FILE_KIND_USERFAULTFD:
     case KERNEL_OPEN_FILE_KIND_PIDFD:
     case KERNEL_OPEN_FILE_KIND_SIGNALFD:
     case KERNEL_OPEN_FILE_KIND_TIMERFD:
@@ -1131,7 +1136,8 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
                 return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
             file->vfs_closed = 1U;
         } else if (file->kind==KERNEL_OPEN_FILE_KIND_INOTIFY ||
-                   file->kind==KERNEL_OPEN_FILE_KIND_FANOTIFY || file->kind==KERNEL_OPEN_FILE_KIND_BPF) {
+                   file->kind==KERNEL_OPEN_FILE_KIND_FANOTIFY || file->kind==KERNEL_OPEN_FILE_KIND_BPF ||
+                   file->kind==KERNEL_OPEN_FILE_KIND_USERFAULTFD) {
             file->device->release(file->device_instance);
             file->device_instance=NULL;file->vfs_closed=1;
         } else if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
@@ -1344,6 +1350,7 @@ int kernel_open_file_readable(
     case KERNEL_OPEN_FILE_KIND_BPF:
     case KERNEL_OPEN_FILE_KIND_INOTIFY:
     case KERNEL_OPEN_FILE_KIND_FANOTIFY:
+    case KERNEL_OPEN_FILE_KIND_USERFAULTFD:
     case KERNEL_OPEN_FILE_KIND_MQUEUE:
     case KERNEL_OPEN_FILE_KIND_BLOCK:
     case KERNEL_OPEN_FILE_KIND_GENERATED:

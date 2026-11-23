@@ -15,6 +15,7 @@
 #include <kernel/page.h>
 #include <kernel/memory_object.h>
 #include <kernel/task.h>
+#include <kernel/task_state.h>
 #include <kernel/sync.h>
 #include <kernel/shm.h>
 #include <kernel/scheduler.h>
@@ -24,6 +25,7 @@
 #include <kernel/tmpfs.h>
 #include <arch/elf.h>
 #include "../fs/vfs_internal.h"
+#include "userfaultfd_internal.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -137,7 +139,8 @@ struct kernel_mm_record {
     uint64_t futex_id;
     uint32_t references;
     uint32_t users;
-    uint32_t record_references; /* MM owner plus weak /proc pagemap references. */
+    uint32_t record_references; /* MM owner and weak pagemap/userfaultfd handles. */
+    struct kernel_userfault_ctx *userfaults; /* MM operations writer updates the list. */
     struct kernel_aio_context *aio_contexts;
     uint32_t aio_destinations, aio_fork_waiters;
     uint32_t coredump_filter; /* MM-owned: CLONE_VM shares; fork/exec copy */
@@ -340,6 +343,7 @@ static inline uint32_t user_vma_permissions(uint32_t permissions)
 
 static uint32_t backend_permissions_from_mm(uint32_t permissions);
 static enum kernel_mm_status unmap_space_range(struct kernel_mm_record *,uint64_t,uint64_t);
+static enum kernel_mm_status unmap_vma_space_range(struct kernel_mm_record *,uint64_t,uint64_t);
 static uint32_t note_tlb_change_locked(struct kernel_mm_record *,
     const struct kernel_mm_retirement *, int);
 static void finish_tlb_change(struct kernel_mm_record *,
@@ -2137,6 +2141,7 @@ struct mm_operation {
     const struct kernel_mm *mm;
     struct kernel_lock_guard guard;
     unsigned shared, populate;
+    enum kernel_userfault_origin fault_origin;
     struct kernel_mm_user_pin *fault_pin;
 #if BOAROS_MAX_CPUS > 1
     uint64_t sync_start, sync_end;
@@ -3191,6 +3196,266 @@ uint32_t kernel_mm_user_count(const struct kernel_mm *mm)
     if (!count) __builtin_trap();
     return count;
 }
+enum { UFFD_EVENT_PAGEFAULT = 0x12, UFFD_PAGEFAULT_WRITE = 1 };
+
+/* The active list owns one reference. Each enrolled fault owns one until its
+ * wait token is finished. Wake removes the list owner before notifying. */
+struct kernel_userfault_page {
+    RB_ENTRY(kernel_userfault_page) index;
+    struct kernel_userfault_page *next, **previous; /* Unread FIFO. */
+    struct kernel_userfault_page *wake_next;
+    struct kernel_wait_queue waiters;
+    struct uffd_message message;
+    unsigned references, enrolled;
+    int active;
+};
+
+static int compare_pages(struct kernel_userfault_page *a, struct kernel_userfault_page *b)
+{
+    return (a->message.address > b->message.address) - (a->message.address < b->message.address);
+}
+RB_GENERATE_INTERNAL(userfault_pages, kernel_userfault_page, index, compare_pages, static inline)
+
+void kernel_userfault_context_put(struct kernel_userfault_ctx *ctx)
+{
+    if (__atomic_fetch_sub(&ctx->references, 1, __ATOMIC_ACQ_REL) != 1) return;
+    if (!RB_EMPTY(&ctx->pages) || kernel_wait_queue_close(&ctx->ready) ||
+        kernel_wait_queue_destroy(&ctx->ready)) __builtin_trap();
+    kernel_mm_pagemap_put(&ctx->target);
+    kernel_heap_release(ctx->heap, ctx);
+}
+
+static void page_put(struct kernel_userfault_ctx *ctx, struct kernel_userfault_page *page)
+{
+    if (__atomic_fetch_sub(&page->references, 1, __ATOMIC_ACQ_REL) != 1) return;
+    if (page->active || page->previous || page->enrolled ||
+        kernel_wait_queue_close(&page->waiters) ||
+        kernel_wait_queue_destroy(&page->waiters)) __builtin_trap();
+    kernel_heap_release(ctx->heap, page);
+}
+
+static void dequeue_message(struct kernel_userfault_ctx *ctx, struct kernel_userfault_page *page)
+{
+    if (!page->previous) return;
+    *page->previous = page->next;
+    if (page->next) page->next->previous = page->previous;
+    else ctx->pending_tail = page->previous;
+    page->previous = NULL;
+}
+
+static void unlink_page(struct kernel_userfault_ctx *ctx, struct kernel_userfault_page *page)
+{
+    RB_REMOVE(userfault_pages, &ctx->pages, page);
+    page->active = 0;
+    dequeue_message(ctx, page);
+}
+
+static int kernel_userfault_prepare(struct kernel_userfault_ctx *ctx, uint64_t address,
+    uint32_t access, enum kernel_userfault_origin origin, struct kernel_userfault_wait *wait)
+{
+    if (origin == KERNEL_USERFAULT_INTERNAL ||
+        (origin == KERNEL_USERFAULT_COPY && (ctx->flags & UFFD_USER_MODE_ONLY)))
+        return -KERNEL_EFAULT;
+
+    struct kernel_userfault_page key;
+    key.message.address = address;
+    struct kernel_userfault_page *candidate = NULL;
+    int allocated = 0;
+    for (;;) {
+        KERNEL_RAW_SCOPE(guard, &ctx->lock);
+        struct kernel_userfault_page *page = RB_FIND(userfault_pages, &ctx->pages, &key);
+        if (ctx->dead || (!page && allocated && !candidate)) {
+            int error = ctx->dead ? -KERNEL_EAGAIN : -KERNEL_ENOMEM;
+            kernel_raw_lock_release(&guard);
+            if (candidate) page_put(ctx, candidate);
+            return error;
+        }
+        if (!page && !candidate) {
+            kernel_raw_lock_release(&guard);
+            allocated = 1;
+            if (!kernel_heap_allocate_zeroed_nosleep(ctx->heap, 1, sizeof(*candidate),
+                    (void **)&candidate)) {
+                candidate->references = 1;
+                kernel_wait_queue_init(&candidate->waiters);
+            }
+            continue;
+        }
+        if (!page) {
+            page = candidate;
+            candidate = NULL;
+            page->message = (struct uffd_message){
+                .event = UFFD_EVENT_PAGEFAULT, .address = address,
+                .flags = access == KERNEL_MM_WRITE ? UFFD_PAGEFAULT_WRITE : 0,
+            };
+            if (RB_INSERT(userfault_pages, &ctx->pages, page)) __builtin_trap();
+            page->active = 1;
+            page->previous = ctx->pending_tail;
+            *ctx->pending_tail = page;
+            ctx->pending_tail = &page->next;
+            (void)kernel_wait_cursor_prepare_event(&ctx->ready, &wait->ready, KERNEL_POLLIN, NULL);
+        }
+        if (page->previous && access == KERNEL_MM_WRITE)
+            page->message.flags |= UFFD_PAGEFAULT_WRITE;
+        if (kernel_wait_prepare(&page->waiters, 0, KERNEL_WAIT_KILLABLE, &wait->token))
+            __builtin_trap();
+        __atomic_fetch_add(&ctx->references, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&page->references, 1, __ATOMIC_RELAXED);
+        page->enrolled++;
+        wait->page = page;
+        kernel_raw_lock_release(&guard);
+        if (candidate) page_put(ctx, candidate);
+        return 0;
+    }
+}
+
+static enum kernel_wait_wake_reason kernel_userfault_wait(struct kernel_userfault_ctx *ctx,
+    struct kernel_userfault_wait *wait)
+{
+    if (wait->ready.queue) kernel_wait_cursor_wake(&wait->ready, 1);
+    enum kernel_wait_wake_reason reason;
+    if (kernel_wait_park(&wait->token, &reason) || kernel_wait_finish(&wait->token))
+        __builtin_trap();
+    struct kernel_userfault_page *page = wait->page;
+    int drop_list = 0;
+    {
+        KERNEL_RAW_SCOPE(guard, &ctx->lock);
+        if (!--page->enrolled && page->active) {
+            unlink_page(ctx, page);
+            drop_list = 1;
+        }
+    }
+    if (drop_list) page_put(ctx, page);
+    page_put(ctx, page);
+    kernel_userfault_context_put(ctx);
+    return reason;
+}
+
+void kernel_userfault_wake(struct kernel_userfault_ctx *ctx, uint64_t start, uint64_t end)
+{
+    struct kernel_userfault_page *woken = NULL;
+    {
+        KERNEL_RAW_SCOPE(guard, &ctx->lock);
+        struct kernel_userfault_page key;
+        key.message.address = start;
+        struct kernel_userfault_page *page = RB_NFIND(userfault_pages, &ctx->pages, &key);
+        while (page && page->message.address < end) {
+            struct kernel_userfault_page *next = RB_NEXT(userfault_pages, &ctx->pages, page);
+            unlink_page(ctx, page);
+            page->wake_next = woken;
+            woken = page;
+            page = next;
+        }
+    }
+    while (woken) {
+        struct kernel_userfault_page *page = woken;
+        woken = page->wake_next;
+        {
+            KERNEL_IRQ_SCOPE(irq);
+            if (kernel_wait_queue_wake_all(&page->waiters)) __builtin_trap();
+        }
+        page_put(ctx, page);
+    }
+}
+
+static void kernel_userfault_dead(struct kernel_userfault_ctx *ctx)
+{
+    struct kernel_wait_cursor ready = {0};
+    {
+        KERNEL_RAW_SCOPE(guard, &ctx->lock);
+        if (ctx->dead) return;
+        ctx->dead = 1;
+        (void)kernel_wait_cursor_prepare_event(&ctx->ready, &ready, KERNEL_POLLHUP, NULL);
+    }
+    kernel_userfault_wake(ctx, 0, ARCH_MMU_USER_LIMIT);
+    if (ready.queue) kernel_wait_cursor_wake(&ready, 1);
+}
+
+int kernel_userfault_next(struct kernel_userfault_ctx *ctx, struct uffd_message *message, int no_wait)
+{
+    for (;;) {
+        struct kernel_wait_token token;
+        {
+            KERNEL_RAW_SCOPE(guard, &ctx->lock);
+            if (!__atomic_load_n(&ctx->initialized, __ATOMIC_RELAXED)) return -KERNEL_EINVAL;
+            if (ctx->dead) return 0;
+            struct kernel_userfault_page *page = ctx->pending;
+            if (page) {
+                *message = page->message;
+                dequeue_message(ctx, page);
+                return 1;
+            }
+            if (no_wait) return -KERNEL_EAGAIN;
+            if (kernel_wait_prepare(&ctx->ready, 0, KERNEL_WAIT_INTERRUPTIBLE, &token))
+                __builtin_trap();
+        }
+        enum kernel_wait_wake_reason reason;
+        if (kernel_wait_park(&token, &reason) || kernel_wait_finish(&token)) __builtin_trap();
+        if (reason == KERNEL_WAIT_SIGNALLED) return -KERNEL_ERESTARTSYS;
+    }
+}
+
+int kernel_mm_userfault_attach(struct kernel_mm *mm, struct kernel_userfault_ctx *ctx)
+{
+    struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
+    if (mm_operation_begin(mm, &operation)) return -KERNEL_EAGAIN;
+    struct kernel_mm_record *record = operation.record;
+    if (!__atomic_load_n(&record->users, __ATOMIC_ACQUIRE)) return -KERNEL_ESRCH;
+    kernel_mm_pagemap_hold(mm, &ctx->target);
+    ctx->next = record->userfaults;
+    __atomic_store_n(&record->userfaults, ctx, __ATOMIC_RELEASE);
+    return 0;
+}
+
+void kernel_mm_userfault_detach(struct kernel_userfault_ctx *ctx)
+{
+    struct kernel_mm_record *record = ctx->target.record;
+    KERNEL_LOCK_SCOPE(gate);
+    kernel_rwlock_write(&record->operations, &gate);
+    struct kernel_userfault_ctx *head = record->userfaults;
+    struct kernel_userfault_ctx **link = &head;
+    while (*link != ctx) {
+        if (!*link) __builtin_trap();
+        link = &(*link)->next;
+    }
+    *link = ctx->next;
+    __atomic_store_n(&record->userfaults, head, __ATOMIC_RELEASE);
+    {
+        KERNEL_RAW_SCOPE(guard, &ctx->lock);
+        /* The last task clears the VMA registrations before marking its
+         * contexts dead. If close wins the writer gate, it still owns the
+         * VMA cleanup, even after users reached zero. */
+        if (ctx->dead) return;
+    }
+    kernel_vma_set_clear_userfault(record->vmas, ctx);
+    mm_gate_release(record, &gate);
+    kernel_userfault_dead(ctx);
+}
+
+int kernel_mm_userfault_register(struct kernel_userfault_ctx *ctx,
+    uint64_t start, uint64_t end, int enable)
+{
+    struct kernel_mm_record *record = ctx->target.record;
+    KERNEL_LOCK_SCOPE(gate);
+    kernel_rwlock_write(&record->operations, &gate);
+    if (!kernel_mm_pagemap_live(&ctx->target)) return -KERNEL_ENOMEM;
+    int error = kernel_vma_set_userfault(record->vmas, start, end, ctx, enable);
+    if (!error && !enable) kernel_userfault_wake(ctx, start, end);
+    mm_gate_release(record, &gate);
+    return error;
+}
+
+static void userfault_mm_dead(struct kernel_mm_record *record)
+{
+    KERNEL_LOCK_SCOPE(gate);
+    kernel_rwlock_write(&record->operations, &gate);
+    if (record->userfaults) {
+        kernel_vma_set_clear_userfault(record->vmas, NULL);
+        for (struct kernel_userfault_ctx *ctx = record->userfaults; ctx; ctx = ctx->next)
+            kernel_userfault_dead(ctx);
+    }
+    mm_gate_release(record, &gate);
+}
+
 uint32_t kernel_mm_remove_user(struct kernel_mm *mm)
 {
     struct kernel_mm_record *record;
@@ -3198,6 +3463,8 @@ uint32_t kernel_mm_remove_user(struct kernel_mm *mm)
         __builtin_trap();
     uint32_t old = __atomic_fetch_sub(&record->users, 1U, __ATOMIC_ACQ_REL);
     if (!old) __builtin_trap();
+    if (old == 1U && __atomic_load_n(&record->userfaults, __ATOMIC_ACQUIRE))
+        userfault_mm_dead(record);
     return old - 1U;
 }
 
@@ -3641,6 +3908,16 @@ restart_round:
 }
 
 /* 调用者拥有资源限制；MM只拥有用量。检查和提交都在同一个操作锁内。 */
+/* The editor holds the MM writer or an overlapping range claim through
+ * PTE removal and VMA publication. Faults cannot enroll against the removed VMA. */
+static enum kernel_mm_status unmap_vma_space_range(struct kernel_mm_record *record,
+    uint64_t start, uint64_t end)
+{
+    for (struct kernel_userfault_ctx *ctx = record->userfaults; ctx; ctx = ctx->next)
+        kernel_userfault_wake(ctx, start, end);
+    return unmap_space_range(record, start, end);
+}
+
 static int may_expand_usage(uint64_t total, uint64_t data,
     const struct kernel_vma *vma, uint64_t growth,
     const struct kernel_memory_limits *limits)
@@ -3872,7 +4149,7 @@ static enum kernel_mm_status mm_mmap_anonymous_impl(
         status = status_from_vma(vma_status);
         goto discard_shared;
     }
-    status = unmap_space_range(record, start, end);
+    status = unmap_vma_space_range(record, start, end);
     if (status != KERNEL_MM_STATUS_OK) {
         goto discard_shared;
     }
@@ -4181,12 +4458,12 @@ static enum kernel_mm_status commit_file_mapping(
             discard_prepared_file_source(record,prepared);
             return status_from_vma(vma_status);
         }
-        if (unmap_space_range(record,plan.start,plan.end)) __builtin_trap();
+        if (unmap_vma_space_range(record,plan.start,plan.end)) __builtin_trap();
         status=populate_object_mapping(record,*file,file_offset,&plan,object);
         if (status) {
             /* Replacement reserved enough VMA capacity for removal as well.
              * A failed MAP_FIXED leaves a hole, never an unpopulated object VMA. */
-            if (unmap_space_range(record,plan.start,plan.end)) __builtin_trap();
+            if (unmap_vma_space_range(record,plan.start,plan.end)) __builtin_trap();
             edit.kind=KERNEL_VMA_EDIT_REMOVE;
         }
         if (kernel_vma_set_commit_edit(record->vmas,&edit)) __builtin_trap();
@@ -4218,7 +4495,7 @@ static enum kernel_mm_status commit_file_mapping(
                 kernel_heap_release(record->vma_heap, registration);
             return status_from_vma(vma_status);
         }
-        status = unmap_space_range(record, plan.start, plan.end);
+        status = unmap_vma_space_range(record, plan.start, plan.end);
         if (status != KERNEL_MM_STATUS_OK ||
             kernel_vma_set_commit_edit(record->vmas, &edit) !=
                 KERNEL_VMA_STATUS_OK) {
@@ -4275,7 +4552,7 @@ static enum kernel_mm_status mm_munmap_impl(
     if (vma_status != KERNEL_VMA_STATUS_OK) {
         return status_from_vma(vma_status);
     }
-    status = unmap_space_range(record, address, end);
+    status = unmap_vma_space_range(record, address, end);
     if (status != KERNEL_MM_STATUS_OK) {
         return status;
     }
@@ -4472,7 +4749,7 @@ enum kernel_mm_status kernel_mm_shmat(
         }
         return status;
     }
-    status = unmap_space_range(record, start, end);
+    status = unmap_vma_space_range(record, start, end);
     if (status != KERNEL_MM_STATUS_OK) {
         if (shared_entry != 0) {
             kernel_memory_object_release(&shared_entry->object);
@@ -4743,7 +5020,7 @@ static enum kernel_mm_status mm_brk_impl(
     if (vma_status != KERNEL_VMA_STATUS_OK) {
         return status_from_vma(vma_status);
     }
-    status = unmap_space_range(record, new_page_end, old_page_end);
+    status = unmap_vma_space_range(record, new_page_end, old_page_end);
     if (status != KERNEL_MM_STATUS_OK) {
         return status;
     }
@@ -5392,7 +5669,7 @@ static enum kernel_mm_status mmap_hugetlb(struct kernel_mm *mm,
     if (flags&KERNEL_MM_MAP_FIXED) {
         struct kernel_vma_edit edit;
         status=status_from_vma(kernel_vma_set_prepare_replace(record->vmas,start,end,&v,&edit));
-        if (!status) status=unmap_space_range(record,start,end);
+        if (!status) status=unmap_vma_space_range(record,start,end);
         if (!status) status=status_from_vma(kernel_vma_set_commit_edit(record->vmas,&edit));
     } else status=status_from_vma(kernel_vma_set_insert(record->vmas,&v));
     if (status) {
@@ -5789,7 +6066,7 @@ enum kernel_mm_status kernel_mm_munmap(struct kernel_mm *mm, uint64_t address, u
         return status_from_vma(vma_status);
     }
 
-    status = unmap_space_range(record, address, end);
+    status = unmap_vma_space_range(record, address, end);
     mm_operation_unclaim_range(&operation);
     return status;
 #endif
@@ -6100,7 +6377,7 @@ static void move_remap_leaves(struct kernel_mm_record *record,
     }
     /* 新旧VA不连续；先确认所有CPU都不再借用旧翻译，再回收源空表。 */
     finish_tlb_change(record, &batch, targets, 0, UINT64_MAX, executable);
-    if (unmap_space_range(record, from, from + length)) __builtin_trap();
+    if (unmap_vma_space_range(record, from, from + length)) __builtin_trap();
 }
 
 int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
@@ -6234,6 +6511,9 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
             return -KERNEL_ENOMEM;
         replacement.backing_owner = attachment;
     }
+    /* Without EVENT_REMAP a moved destination starts with no registration. */
+    if (new_address != old_address && kernel_vma_userfault(&replacement))
+        kernel_vma_clear_userfault(&replacement);
     struct kernel_vma_remap edit;
     enum kernel_vma_status prepared = preserve ?
         kernel_vma_set_prepare_duplicate(record->vmas, old_address, old_address + old_size,
@@ -6869,7 +7149,8 @@ static __attribute__((noinline)) int memory_fault_view_changed(struct kernel_mm_
         kernel_vma_set_lookup(record->vmas, address, &latest) ||
         latest.kind != original->kind || latest.start != original->start ||
         latest.end != original->end || latest.permissions != original->permissions ||
-        latest.role != original->role || latest.fault_policy != original->fault_policy;
+        latest.role != original->role || latest.fault_policy != original->fault_policy ||
+        latest.backing_owner != original->backing_owner;
 }
 
 /* With a continuous MM read gate, VMA writers that can change this anonymous
@@ -6967,6 +7248,49 @@ static void release_unused_anonymous_neighbours(struct physical_page_allocator *
     window->mask = 0;
 }
 #endif
+
+static __attribute__((noinline)) enum kernel_mm_status wait_for_userfault(
+    struct mm_operation *operation, uint64_t address, uint32_t access,
+    const struct fault_vma *view)
+{
+    struct kernel_mm_record *record = operation->record;
+    /* A delegated fault can wait indefinitely. Only an actor that can
+     * release all of its MM qualifications and source pins may enroll. */
+    struct kernel_task *task = kernel_task_current();
+    if (!task || task->proc_exiting || operation->guard.previous ||
+        kernel_io_context_current()->user_pins) return KERNEL_MM_STATUS_BUS_FAULT;
+
+    struct kernel_userfault_ctx *ctx = kernel_vma_userfault(&view->vma);
+    struct kernel_userfault_wait wait = {0};
+    int error;
+    {
+        KERNEL_LOCK_SCOPE(vmas);
+        if (operation->shared) kernel_rwlock_read(&record->vma_lock, &vmas);
+        {
+            KERNEL_RAW_READ_SCOPE(raw, &record->metadata);
+            struct kernel_mm_leaf leaf;
+            if (memory_fault_view_changed(record, address, view) ||
+                arch_mmu_user_leaf_snapshot(&record->space, address, &leaf) !=
+                    ARCH_MMU_STATUS_NOT_MAPPED)
+                return KERNEL_MM_STATUS_CONFLICT;
+        }
+        /* A manager's PTE publication and registration changes take the
+         * exclusive MM gate. The VMA reader also excludes shared-gate edits. */
+        error = kernel_userfault_prepare(ctx, address, access, operation->fault_origin, &wait);
+    }
+    if (error) {
+        if (error == -KERNEL_EAGAIN) return KERNEL_MM_STATUS_CONFLICT;
+        return error == -KERNEL_ENOMEM ? KERNEL_MM_STATUS_NO_MEMORY : KERNEL_MM_STATUS_BUS_FAULT;
+    }
+    /* The prepared token already owns the caller's scheduler wait slot.
+     * Release qualifications without draining unrelated blocking OFD work. */
+    mm_operation_release(operation);
+    enum kernel_wait_wake_reason reason = kernel_userfault_wait(ctx, &wait);
+    if (reason == KERNEL_WAIT_SIGNALLED)
+        return operation->fault_origin == KERNEL_USERFAULT_TRAP ?
+            KERNEL_MM_STATUS_OK : KERNEL_MM_STATUS_BUS_FAULT;
+    return KERNEL_MM_STATUS_CONFLICT;
+}
 
 static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_operation *operation,
     uint64_t address, uint32_t access, const struct fault_vma *view, int force)
@@ -7071,6 +7395,10 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
                 return KERNEL_MM_STATUS_PAGE_ACCESS;
             }
         } else if (status == KERNEL_MM_STATUS_NOT_MAPPED) {
+            if (__builtin_expect(vma->flags & KERNEL_VMA_USERFAULT_MISSING, 0)) {
+                kernel_raw_lock_release(&guard);
+                return wait_for_userfault(operation, address, access, view);
+            }
             if (!shared && !elf && vma->role != KERNEL_VMA_ROLE_VDSO &&
                 vma->role != KERNEL_VMA_ROLE_VVAR &&
                 vma->fault_policy != KERNEL_VMA_FAULT_DEMAND_ZERO) return status;
@@ -7315,6 +7643,99 @@ memory_tables_changed:
     if (cookie) physical_page_release(allocator, old);
     return status;
 }
+static int userfault_fill_vma(struct kernel_userfault_ctx *ctx,
+    uint64_t start, uint64_t end, struct kernel_vma *vma)
+{
+    if (!kernel_mm_pagemap_live(&ctx->target)) return -KERNEL_ESRCH;
+    if (kernel_vma_set_lookup(ctx->target.record->vmas, start, vma) ||
+        kernel_vma_userfault(vma) != ctx || end > vma->end) return -KERNEL_ENOENT;
+    return 0;
+}
+
+int kernel_mm_userfault_check_fill(struct kernel_userfault_ctx *ctx, uint64_t start, uint64_t end,
+    uint64_t *generation)
+{
+    struct kernel_mm_record *record = ctx->target.record;
+    KERNEL_LOCK_SCOPE(gate);
+    kernel_rwlock_read(&record->operations, &gate);
+    KERNEL_LOCK_SCOPE(vmas);
+    kernel_rwlock_read(&record->vma_lock, &vmas);
+    struct kernel_vma vma;
+    int error = userfault_fill_vma(ctx, start, end, &vma);
+    if (!error) *generation = kernel_vma_set_generation(record->vmas);
+    kernel_lock_release(&vmas);
+    mm_gate_release(record, &gate);
+    return error;
+}
+
+/* Source bytes already belong to the new physical page. Holding the
+ * exclusive gate from VMA lookup through translation sync prevents remap and
+ * unregister from publishing between validation and installation. */
+int kernel_mm_userfault_fill(struct kernel_userfault_ctx *ctx, uint64_t address, uint64_t end,
+    uint64_t generation, uint64_t physical)
+{
+    struct kernel_mm_record *record = ctx->target.record;
+    struct kernel_mm_leaf_preparation prepared = KERNEL_MM_LEAF_PREPARATION_INIT;
+    struct kernel_mm_retirement batch;
+    batch.count = batch.nonleaf = batch.compound = 0;
+    struct physical_page_allocator *allocator = ctx->target.allocator;
+    KERNEL_LOCK_SCOPE(gate);
+    kernel_rwlock_write(&record->operations, &gate);
+    struct kernel_vma vma;
+    int error = userfault_fill_vma(ctx, address, end, &vma);
+    if (error == -KERNEL_ESRCH) return error;
+    if (error) goto out;
+    /* UFFDIO_COPY acquires the source bytes without the target gate. A
+     * replacement may have re-registered this address in the meantime. */
+    if (kernel_vma_set_generation(record->vmas) != generation) {
+        error = -KERNEL_EAGAIN;
+        goto out;
+    }
+
+    uint32_t targets;
+    unsigned missing;
+    {
+        struct kernel_mm_leaf leaf;
+        KERNEL_RAW_READ_SCOPE(raw, &record->metadata);
+        enum arch_mmu_status state = arch_mmu_user_leaf_probe(&record->space, address, &leaf, &missing);
+        if (state != ARCH_MMU_STATUS_NOT_MAPPED) {
+            error = state == ARCH_MMU_STATUS_OK ? -KERNEL_EEXIST : -KERNEL_EFAULT;
+            goto out;
+        }
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        if (!(missing & (1U << i))) continue;
+        if (physical_page_allocate_order_nosleep(allocator, 0, &prepared.tables[i])) {
+            error = -KERNEL_ENOMEM;
+            goto out;
+        }
+        void *table;
+        if (physical_page_map_owned(allocator, prepared.tables[i], &table)) __builtin_trap();
+        clear_page(table);
+    }
+    int executable = !!(vma.permissions & KERNEL_MM_EXECUTE);
+    {
+        KERNEL_RAW_WRITE_SCOPE(raw, &record->metadata);
+        enum arch_mmu_status state = arch_mmu_user_map_prepared_page(&record->space, address,
+            physical, backend_permissions_from_mm(vma.permissions), 0, &prepared);
+        if (state != ARCH_MMU_STATUS_OK) __builtin_trap();
+        if (!(vma.flags & KERNEL_VMA_ANON_HISTORY) &&
+            !kernel_vma_set_mark_anonymous(record->vmas, address, generation, &vma))
+            __builtin_trap();
+        targets = note_fault_change_locked(record, &batch, 0, executable);
+    }
+    finish_fault_change(record, &batch, targets, missing ? 0 : address,
+        missing ? UINT64_MAX : BOAROS_PAGE_SIZE, 0, executable);
+    error = 0;
+out:
+    mm_gate_release(record, &gate);
+    for (unsigned i = 0; i < 2; i++) {
+        if (prepared.tables[i] != KERNEL_MM_NO_PAGE &&
+            physical_page_release(allocator, prepared.tables[i])) __builtin_trap();
+    }
+    return error;
+}
+
 static void fault_retry(struct kernel_mm_record *record, uint64_t address)
 {
 #if BOAROS_COST_DIAGNOSTICS
@@ -7557,7 +7978,8 @@ static enum kernel_mm_status dispatch_fault(struct mm_operation *operation, uint
 }
 
 static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
-    uint64_t address, uint32_t access, int force,struct kernel_mm_user_pin *pin)
+    uint64_t address, uint32_t access, int force, struct kernel_mm_user_pin *pin,
+    enum kernel_userfault_origin origin)
 {
     COST_SCOPE(fault_cost, MM_FAULT_TICKS);
     if (!mm || !access || (access & (access - 1)) || (access & ~KERNEL_VMA_ALL_PERMISSIONS))
@@ -7566,7 +7988,9 @@ static enum kernel_mm_status resolve_user_fault(struct kernel_mm *mm,
         return KERNEL_MM_STATUS_NOT_MAPPED;
     int shared = BOAROS_MAX_CPUS > 1 && !force;
     for (;;) {
-        struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {.shared = shared,.fault_pin=pin};
+        struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {
+            .shared = shared, .fault_pin = pin, .fault_origin = origin,
+        };
         shared = BOAROS_MAX_CPUS > 1 && !force;
         enum kernel_mm_status status = mm_operation_begin(mm, &operation);
         if (status) return status;
@@ -7648,7 +8072,7 @@ int kernel_mm_remote_transfer(struct kernel_mm *mm, uint64_t address,
         enum kernel_mm_status status;
         for (;;) {
             if (force) {
-                status=resolve_user_fault(mm,current,access,1,NULL);
+                status=resolve_user_fault(mm,current,access,1,NULL,KERNEL_USERFAULT_INTERNAL);
                 if (status) break;
                 status=mm_operation_begin(mm,&operation);
                 if (status) break;
@@ -7662,7 +8086,7 @@ int kernel_mm_remote_transfer(struct kernel_mm *mm, uint64_t address,
             mm_operation_end(&operation);
             if (status!=KERNEL_MM_STATUS_ACCESS && status!=KERNEL_MM_STATUS_NOT_MAPPED &&
                 status!=KERNEL_MM_STATUS_CONFLICT) break;
-            status=resolve_user_fault(mm,current,access,force,NULL);
+            status=resolve_user_fault(mm,current,access,force,NULL,KERNEL_USERFAULT_INTERNAL);
             if (status) break;
         }
         if (status) return status==KERNEL_MM_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EFAULT;
@@ -7880,10 +8304,12 @@ static struct kernel_task *fault_actor(struct kernel_mm *mm)
     return task;
 }
 static enum kernel_mm_status resolve_fault_accounted(struct kernel_mm *mm,
-    uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin, struct kernel_task *task)
+    uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin, struct kernel_task *task,
+    enum kernel_userfault_origin origin)
 {
     uint64_t block_reads = task ? kernel_task_read_bytes(task) : 0U;
-    enum kernel_mm_status status = resolve_user_fault(mm,address,access,0,pin);
+    if (!task) origin = KERNEL_USERFAULT_INTERNAL;
+    enum kernel_mm_status status = resolve_user_fault(mm,address,access,0,pin,origin);
     if (status == KERNEL_MM_STATUS_OK && task)
         kernel_task_account_fault(task,
             kernel_task_read_bytes(task) != block_reads);
@@ -7891,11 +8317,11 @@ static enum kernel_mm_status resolve_fault_accounted(struct kernel_mm *mm,
 }
 
 enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,uint64_t address,uint32_t access)
-{ return resolve_fault_accounted(mm,address,access,NULL,fault_actor(mm)); }
+{ return resolve_fault_accounted(mm,address,access,NULL,fault_actor(mm),KERNEL_USERFAULT_COPY); }
 
 enum kernel_mm_status kernel_mm_resolve_owned_user_fault(struct kernel_mm *mm,
     struct kernel_task *task,uint64_t address,uint32_t access)
-{ return resolve_fault_accounted(mm,address,access,NULL,task); }
+{ return resolve_fault_accounted(mm,address,access,NULL,task,KERNEL_USERFAULT_TRAP); }
 
 enum kernel_mm_status kernel_mm_resolve_user_pin(struct kernel_mm *mm,uint64_t address,
     uint32_t access,struct kernel_mm_user_pin *pin)
@@ -7903,7 +8329,7 @@ enum kernel_mm_status kernel_mm_resolve_user_pin(struct kernel_mm *mm,uint64_t a
     if (!pin) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     if (pin->registration) __builtin_trap();
     for (;;) {
-        enum kernel_mm_status status=resolve_fault_accounted(mm,address,access,pin,fault_actor(mm));
+        enum kernel_mm_status status=resolve_fault_accounted(mm,address,access,pin,fault_actor(mm),KERNEL_USERFAULT_COPY);
         if (status || pin->registration) return status;
         status=kernel_mm_pin_user_page(mm,address,access,pin);
         if (status!=KERNEL_MM_STATUS_NOT_MAPPED && status!=KERNEL_MM_STATUS_ACCESS) return status;

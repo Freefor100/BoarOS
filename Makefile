@@ -332,7 +332,7 @@ COMMON_C_SOURCES := \
 	kernel/bpf/btf.c kernel/bpf/trace.c kernel/bpf/info.c \
 	kernel/elf_image.c \
 	kernel/exec_image.c \
-	mm/hugetlb.c mm/mm.c \
+	mm/hugetlb.c mm/mm.c mm/userfaultfd.c \
 	mm/uaccess.c \
 	drivers/serial/ns16550.c \
 	drivers/virtio/block.c \

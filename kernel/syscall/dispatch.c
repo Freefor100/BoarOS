@@ -343,6 +343,9 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     } else if (request->number == 262U || request->number == 263U) {
         if (syscall_handle_fanotify(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 282U) {
+        if (syscall_handle_userfaultfd(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_EVENTFD2) {
         if (syscall_handle_eventfd(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
