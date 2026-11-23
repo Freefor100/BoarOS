@@ -1,5 +1,5 @@
 #!/bin/sh
-# 仅显式解释两份原文本脚本；保留原程序、参数、遍历和判分标记。
+# 发布盘上的 run-static.sh 和 run-dynamic.sh 缺少 shebang。
 set -e
 [ "$#" = 2 ] || exit 125
 static=$(grep -c '^[[:space:]]*\./run-static\.sh[[:space:]]*$' "$1" || :)

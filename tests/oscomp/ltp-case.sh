@@ -28,13 +28,12 @@ while IFS="$tab" read -r helper source reason <&3; do
     case "$helper" in ''|'#'*) continue ;; esac
     if [ "$name" = "$helper" ]; then
         echo "BOAROS-CASE SKIP command=$file reason=$reason source=$source" >&2
-        # 保留原 FAIL 行的非零状态；没有 Summary/TPASS，不会获得通过分。
         exit 125
     fi
 done
 exec 3<&- || exit 125
 if [ "$name" = df01.sh ]; then
-    # 原脚本使用 GNU stat、df 的选项。工具目录只进入该测例的环境。
+    # df01.sh 需要 GNU stat 和 df 的选项。
     PATH=/boaros-tools:$PATH
     export PATH
     if [ "${BOAROS_EVAL_ARCH:-}" = loongarch ]; then

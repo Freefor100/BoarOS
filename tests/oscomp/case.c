@@ -1,4 +1,4 @@
-/* 单项监督持有直接子进程和自己的测试进程组；不扫描或按名称终止任务。 */
+/* 单项监督器管理直接子进程和本次测例的进程组。 */
 #ifdef CASE_HOST
 #define _GNU_SOURCE
 #include <errno.h>
@@ -151,7 +151,7 @@ static int run(int argc, char **argv, char **envp, int interpret)
         for (;;) {}
     }
     call(NR_CLOSE, ready[0], 0, 0, 0, 0, 0);
-    /* 子进程继承隔离组但不是组长，仍可原样测试 setsid。监督者先退出该组。 */
+    /* 子进程是隔离组的普通成员，可以调用 setsid。监督者先回到原进程组。 */
     int setup_failed = call(NR_SETPGID, 0, original_group, 0, 0, 0, 0) < 0;
     if (!setup_failed) {
         char token = 1;
@@ -178,7 +178,7 @@ static int run(int argc, char **argv, char **envp, int interpret)
             if (time >= start) deadline_elapsed = time - start;
             message("BOAROS-CASE TIMEOUT seconds="); number(limit);
             message(" command="); message(argv[3]); message("\n");
-            /* wait 尚未回收 PID；即使子进程此刻退出，也不能误杀复用者。 */
+            /* wait4 回收前，直接子进程的 PID 仍指向本次测例。 */
             stop_group(group, child, clock_failed ? 9 : 15);
             grace = time + 2000;
         }
@@ -189,12 +189,11 @@ static int run(int argc, char **argv, char **envp, int interpret)
         long delay[2] = {0, 20000000};
         call(NR_SLEEP, (long)delay, 0, 0, 0, 0, 0);
     }
-    /* 回收直接 child 后不再使用其 PID；监督者仍保护隔离组的身份。 */
+    /* 直接子进程已回收，此处向测试进程组发送清理信号。 */
     if (!setup_failed) stop_group(group, 0, 9);
     if (setup_failed) return 125;
     if (expired) {
         message("BOAROS-CASE TIMEOUT-END wait_status="); number(status);
-        /* 只保留数值诊断；child 已回收，不能再按其 PID 发信号或保活。 */
         message(" child_pid="); number(child);
         message(" test_pgid="); number(group);
         message(" deadline_elapsed_ms=");

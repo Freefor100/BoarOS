@@ -22,7 +22,7 @@ $BB mount -t proc proc /proc
 $BB mount -t sysfs sysfs /sys
 $BB mount -t tmpfs -o mode=1777 tmpfs /dev/shm
 $BB chmod 1777 /tmp
-# 发布镜像将此脚本存成 0644；补执行权限，不改测例内容或判断。
+# 发布镜像中的 run-all.sh 权限为 0644，直接执行需要补上执行位。
 $BB chmod +x /glibc/basic/run-all.sh /musl/basic/run-all.sh
 export HOME=/ TERM=vt100
 # BOAROS_LOCAL_DISKS
@@ -53,7 +53,7 @@ for group in $groups; do
             cd /$libc
             export PATH=/bin:/$libc:/$libc/ltp/testcases/bin:.
             export LD_LIBRARY_PATH=/$libc/lib
-            # 按运行时环境统一接入Linux接口，不识别程序名称或组别。
+            # LoongArch 的 musl 通过 linux-sched.so 使用内核调度接口。
             if [ "$libc" = musl ] && [ -n "${BOAROS_LINUX_SCHED_PRELOAD:-}" ]; then
                 export LD_PRELOAD=$BOAROS_LINUX_SCHED_PRELOAD
             else
@@ -70,7 +70,6 @@ for group in $groups; do
                 # LTP 的 test.sh 必须先于 libc 根目录的同名 Lua 驱动脚本。
                 export PATH=/bin:$LTPROOT/testcases/bin:/$libc:.
                 export BOAROS_CASE_SHELL=/$libc/busybox
-                # 仅在临时副本中接入逐项监督，原循环、参数、标记和判分行均保留。
                 if ! $BB sh /tmp/boaros-ltp-hook.sh ./ltp_testcode.sh /tmp/boaros-ltp-$libc.sh; then
                     result=125
                 else
@@ -86,7 +85,7 @@ for group in $groups; do
                     result=$?
                 fi
             elif [ "$group" = iozone ]; then
-                # RR时间片是全局参数；结束本组前恢复，策略只由子进程树继承。
+                # RR 时间片是系统参数，本组结束时恢复原值。
                 rr_path=/proc/sys/kernel/sched_rr_timeslice_ms
                 old_rr_ms=$($BB cat "$rr_path") || exit 125
                 trap 'printf "%s\n" "$old_rr_ms" > "$rr_path" || exit 125' EXIT

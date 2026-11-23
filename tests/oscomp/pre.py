@@ -161,7 +161,7 @@ print(json.dumps(result))'''
 def budget_evidence(observed, budget_seconds, clock_ticks_per_second):
     if observed is None: return None
     if clock_ticks_per_second <= 0: raise ValueError('invalid process clock resolution')
-    # start_ticks向下取整，先扣除一个tick的不确定性，不能额外要求再活一秒。
+    # start_ticks 向下取整，运行时间下界扣除一个时钟滴答。
     lower_bound = observed['elapsed_seconds'] - 1 / clock_ticks_per_second
     return {**observed, 'budget_observed': bool(observed.get('budget_observed')) or
             lower_bound >= budget_seconds, 'elapsed_lower_bound_seconds': lower_bound}
@@ -197,7 +197,7 @@ def observe_lifecycle(directory):
         target = directory / 'lifecycle.json'; temporary = target.with_suffix('.tmp')
         temporary.write_text(json.dumps(record, indent=2) + '\n'); temporary.replace(target)
     try:
-        # 只观察本次隔离提交的容器，名称本身不能证明owner。
+        # 用镜像引用和提交目录挂载核验本次评测容器。
         for attempt in range(30):
             inspected = subprocess.run(['docker', 'container', 'inspect', name], capture_output=True,
                                        text=True, timeout=5)
@@ -237,7 +237,7 @@ def collect_results(directory, report):
         ticks = lifecycle.get('clock_ticks_per_second')
         clock_source = 'owned-container-probe'
         if ticks is None:
-            # 旧采样未保存USER_HZ；从同一固定镜像的sysconf恢复单位，原记录不改写。
+            # 旧采样的进程记账时间单位从原容器镜像的 sysconf 获取。
             ticks = int(subprocess.check_output(['docker', 'run', '--rm', '--network', 'none',
                 '--entrypoint', 'python3', report['container']['reference'], '-c',
                 "import os;print(os.sysconf('SC_CLK_TCK'))"], text=True))
@@ -391,7 +391,7 @@ def main():
             try: observer.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 observer.terminate(); observer.wait(timeout=5)
-        # 容器默认root只写本次隔离目录；归还宿主owner以便既有清理流程处理。
+        # 将容器生成的文件交还给宿主调用者清理。
         if reference and any(path.exists() for path in (directory / 'submit', directory / 'hooks', directory / 'testdata')):
             subprocess.run(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'chown',
                 '-v', str(directory) + ':/owned-run', reference, '-R', str(os.getuid()) + ':' + str(os.getgid()),
