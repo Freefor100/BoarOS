@@ -82,10 +82,16 @@ struct key_call {
 };
 
 static const char *const key_type_names[] = {"keyring", "user", "logon"};
-/* The service mutex serializes publication, reference retirement and graph
- * mutations. Allocations inside it cannot enter reclaim. User copies stay
- * outside, and serial-number lookup is independent of graph size. */
+/* The service mutex serializes publication, reference retirement, graph
+ * mutations and quota limits. Allocations inside it cannot enter reclaim.
+ * User copies stay outside, and serial-number lookup is independent of graph size. */
 static struct kernel_mutex keys_lock;
+static unsigned key_quota_limits[KERNEL_KEY_QUOTA_COUNT] = {
+    [KERNEL_KEY_QUOTA_MAXKEYS] = 200U,
+    [KERNEL_KEY_QUOTA_MAXBYTES] = 20000U,
+    [KERNEL_KEY_QUOTA_ROOT_MAXKEYS] = 1000000U,
+    [KERNEL_KEY_QUOTA_ROOT_MAXBYTES] = 25000000U,
+};
 static struct kernel_raw_lock init_lock = {
     .rank=KERNEL_RAW_RANK_OBJECT, .initialized=KERNEL_RAW_INITIALIZED,
 };
@@ -105,6 +111,22 @@ static void lock_keys(struct kernel_lock_guard *guard)
         }
     }
     kernel_mutex_lock(&keys_lock, guard);
+}
+
+unsigned kernel_keys_quota_get(enum kernel_key_quota quota)
+{
+    KERNEL_LOCK_SCOPE(guard);
+    lock_keys(&guard);
+    return key_quota_limits[quota];
+}
+
+int kernel_keys_quota_set(enum kernel_key_quota quota, unsigned limit)
+{
+    if (!limit || limit > INT32_MAX) return -KERNEL_EINVAL;
+    KERNEL_LOCK_SCOPE(guard);
+    lock_keys(&guard);
+    key_quota_limits[quota] = limit;
+    return 0;
 }
 
 static struct kernel_avl_node *find_first(struct kernel_avl_node *node, uint64_t key)
@@ -160,8 +182,10 @@ static void uid_put(struct key_uid *account)
 
 static int quota_check(const struct key_uid *account, size_t added, unsigned count)
 {
-    unsigned max_keys = account->uid.key ? 200U : 1000000U;
-    size_t max_bytes = account->uid.key ? 20000U : 25000000U;
+    unsigned max_keys = key_quota_limits[account->uid.key ? KERNEL_KEY_QUOTA_MAXKEYS :
+        KERNEL_KEY_QUOTA_ROOT_MAXKEYS];
+    size_t max_bytes = key_quota_limits[account->uid.key ? KERNEL_KEY_QUOTA_MAXBYTES :
+        KERNEL_KEY_QUOTA_ROOT_MAXBYTES];
     if ((count && account->count >= max_keys) || added > max_bytes ||
         account->bytes > max_bytes - added)
         return -KERNEL_EDQUOT;
