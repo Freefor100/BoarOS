@@ -5,6 +5,7 @@
 
 struct kernel_heap;
 struct kernel_vma_set;
+struct kernel_userfault_ctx;
 struct kernel_vma;
 struct kernel_shm_attachment;
 #define KERNEL_VMA_ALL_PERMISSIONS UINT32_C(7)
@@ -26,7 +27,8 @@ void kernel_vma_set_clear_locks(struct kernel_vma_set *);
 #define KERNEL_VMA_ANON_HISTORY 128U /* established private backing (including anonymous read faults); survives DONTNEED */
 #define KERNEL_VMA_ANON_SOURCE 256U /* lazy ELF zero-fill, not file-backed */
 #define KERNEL_VMA_AIO_RING 512U
-#define KERNEL_VMA_ALL_FLAGS 1023U
+#define KERNEL_VMA_USERFAULT_MISSING 1024U
+#define KERNEL_VMA_ALL_FLAGS 2047U
 /* The VMA writer is held. Revalidate the fault snapshot and mark private backing. */
 /* Caller excludes edits and serializes concurrent history marks. This changes
  * fork provenance only and leaves the mapping generation unchanged. */
@@ -98,7 +100,7 @@ struct kernel_vma {
     enum kernel_vma_fault_policy fault_policy;
     uint32_t flags;
     void *backing;
-    /* Source owner for file/ELF/object mappings, attachment for SysV mappings. */
+    /* Backing source, SysV attachment, or userfaultfd registration for anonymous VMAs. */
     void *backing_owner;
     /* Optional byte count for sealable file mappings or shared object views.
      * The backing file description keeps the counter alive. */
@@ -122,6 +124,16 @@ static inline int kernel_vma_grows_down(const struct kernel_vma *vma)
  * logical VMA set.  Architecture MM code may then commit page-table state and
  * finish the edit without another allocation.
  */
+static inline struct kernel_userfault_ctx *kernel_vma_userfault(const struct kernel_vma *vma)
+{
+    return vma->flags & KERNEL_VMA_USERFAULT_MISSING ? vma->backing_owner : 0;
+}
+
+int kernel_vma_set_userfault(struct kernel_vma_set *, uint64_t start, uint64_t end,
+    struct kernel_userfault_ctx *, int enable);
+void kernel_vma_clear_userfault(struct kernel_vma *);
+void kernel_vma_set_clear_userfault(struct kernel_vma_set *, struct kernel_userfault_ctx *);
+
 struct kernel_vma_edit {
     const struct kernel_vma_set *set;
     uint64_t generation;

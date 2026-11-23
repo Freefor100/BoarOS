@@ -1135,6 +1135,8 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
                 prefix = "anon_inode:inotify";
             else if (file_kind == KERNEL_OPEN_FILE_KIND_FANOTIFY)
                 prefix = "anon_inode:[fanotify]";
+            else if (file_kind == KERNEL_OPEN_FILE_KIND_USERFAULTFD)
+                prefix = "anon_inode:[userfaultfd]";
             else if (file_kind == KERNEL_OPEN_FILE_KIND_EVENTFD)
                 prefix = "anon_inode:[eventfd]";
             else if (file_kind == KERNEL_OPEN_FILE_KIND_TIMERFD)

@@ -1,6 +1,8 @@
 #include <kernel/cost.h>
 #include <kernel/heap.h>
+#include <kernel/errno.h>
 #include <kernel/page.h>
+#include <kernel/mm.h>
 #include <kernel/rlimit.h>
 #include <kernel/task.h>
 #include <kernel/vma.h>
@@ -142,7 +144,11 @@ static int vma_valid(const struct kernel_vma *vma)
     if ((vma->maximum_permissions & ~KERNEL_VMA_ALL_PERMISSIONS) ||
         (vma->permissions & KERNEL_VMA_ALL_PERMISSIONS & ~vma->maximum_permissions))
         return 0;
-    if (vma->backing_owner && vma->kind != KERNEL_VMA_KIND_FILE_PRIVATE &&
+    if ((vma->flags & KERNEL_VMA_USERFAULT_MISSING) &&
+        (vma->kind != KERNEL_VMA_KIND_ANONYMOUS || !vma->backing_owner))
+        return 0;
+    if (vma->backing_owner && !kernel_vma_userfault(vma) &&
+        vma->kind != KERNEL_VMA_KIND_FILE_PRIVATE &&
         vma->kind != KERNEL_VMA_KIND_FILE_SHARED && vma->kind != KERNEL_VMA_KIND_ELF_PRIVATE &&
         vma->kind != KERNEL_VMA_KIND_OBJECT_SHARED && !kernel_vma_shm_attachment(vma))
         return 0;
@@ -575,6 +581,7 @@ enum kernel_vma_status kernel_vma_set_fork(
             struct kernel_vma *entry = &working->entries[working->count];
             *entry = source->entries[index];
             entry->flags &= ~KERNEL_VMA_LOCK_MASK;
+            if (kernel_vma_userfault(entry)) kernel_vma_clear_userfault(entry);
             if (entry->flags & KERNEL_VMA_WIPEONFORK) entry->flags &= ~KERNEL_VMA_ANON_HISTORY;
             struct kernel_shm_attachment *attachment = kernel_vma_shm_attachment(entry);
             if (attachment) kernel_shm_attachment_open(attachment);
@@ -1069,6 +1076,65 @@ enum kernel_vma_status kernel_vma_set_prepare_flags(struct kernel_vma_set *set,
     *edit = (struct kernel_vma_edit){ .set = set, .generation = set->generation,
         .start = start, .end = end, .kind = KERNEL_VMA_EDIT_FLAGS, .flags = flags, .flags_mask = mask };
     return KERNEL_VMA_STATUS_OK;
+}
+
+void kernel_vma_clear_userfault(struct kernel_vma *vma)
+{
+    vma->flags &= ~KERNEL_VMA_USERFAULT_MISSING;
+    vma->backing_owner = NULL;
+}
+
+void kernel_vma_set_clear_userfault(struct kernel_vma_set *set,
+    struct kernel_userfault_ctx *ctx)
+{
+    int changed = 0;
+    for (uint32_t i = 0; i < set->count; i++) {
+        struct kernel_vma *vma = &set->entries[i];
+        struct kernel_userfault_ctx *owner = kernel_vma_userfault(vma);
+        if (owner && (!ctx || owner == ctx)) {
+            kernel_vma_clear_userfault(vma);
+            changed = 1;
+        }
+    }
+    if (changed) {
+        merge_all(set);
+        if (!++set->generation) __builtin_trap();
+    }
+}
+
+int kernel_vma_set_userfault(struct kernel_vma_set *set, uint64_t start, uint64_t end,
+    struct kernel_userfault_ctx *ctx, int enable)
+{
+    uint32_t first = first_overlap(set, start), last = lower_bound(set, end);
+    if (first == last) return -KERNEL_EINVAL;
+    int changed = 0;
+    for (uint32_t i = first; i < last; i++) {
+        struct kernel_vma *vma = &set->entries[i];
+        if (vma->kind != KERNEL_VMA_KIND_ANONYMOUS ||
+            vma->fault_policy != KERNEL_VMA_FAULT_DEMAND_ZERO ||
+            vma->role == KERNEL_VMA_ROLE_VDSO || vma->role == KERNEL_VMA_ROLE_VVAR ||
+            kernel_vma_grows_down(vma))
+            return -KERNEL_EINVAL;
+        if (enable && !(vma->maximum_permissions & KERNEL_MM_WRITE)) return -KERNEL_EPERM;
+        struct kernel_userfault_ctx *owner = kernel_vma_userfault(vma);
+        if (owner && owner != ctx) return enable ? -KERNEL_EBUSY : -KERNEL_EINVAL;
+        if (enable ? owner == NULL : owner != NULL) changed = 1;
+    }
+    if (!changed) return 0;
+    if (reserve_edit_capacity(set, start, end, 0)) return -KERNEL_ENOMEM;
+    if (split_at(set, start) || split_at(set, end)) __builtin_trap();
+    first = first_overlap(set, start);
+    last = lower_bound(set, end);
+    for (uint32_t i = first; i < last; i++) {
+        struct kernel_vma *vma = &set->entries[i];
+        if (enable) {
+            vma->flags |= KERNEL_VMA_USERFAULT_MISSING;
+            vma->backing_owner = ctx;
+        } else kernel_vma_clear_userfault(vma);
+    }
+    merge_window(set, first ? first - 1 : 0, last < set->count ? last + 1 : last);
+    if (!++set->generation) __builtin_trap();
+    return 0;
 }
 
 static enum kernel_vma_status remove_range(struct kernel_vma_set *set,
