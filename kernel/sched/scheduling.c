@@ -5,6 +5,7 @@
 #include <kernel/tty_task.h>
 #include <arch/timer.h>
 #include <kernel/errno.h>
+#include <kernel/irq.h>
 #include <kernel/time.h>
 #include <kernel/tick.h>
 
@@ -1737,6 +1738,31 @@ static int nice_reduction_allowed(struct kernel_task *target,int nice)
 /* Effective priority alone changes index membership. The PI updater owns
  * removal and RT head/tail placement; saved nice changes neither an RT FIFO
  * position nor a READY fair node's virtual-runtime key. */
+uint64_t kernel_task_timerslack_get(const struct kernel_task *task)
+{
+    return __atomic_load_n(&task->timer_slack_ns, __ATOMIC_RELAXED);
+}
+
+void kernel_task_timerslack_set_locked(struct kernel_task *task, uint64_t ns)
+{
+    int policy = task->scheduling.policy;
+    if (policy == KERNEL_SCHED_FIFO || policy == KERNEL_SCHED_RR)
+        ns = 0;
+    else if (!ns)
+        ns = task->default_timer_slack_ns;
+    __atomic_store_n(&task->timer_slack_ns, ns, __ATOMIC_RELAXED);
+}
+
+void kernel_task_timerslack_set(struct kernel_task *task, uint64_t ns)
+{
+#if BOAROS_MAX_CPUS > 1
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+#else
+    KERNEL_IRQ_SCOPE(guard);
+#endif
+    kernel_task_timerslack_set_locked(task, ns);
+}
+
 static void sched_commit_locked(struct kernel_task *task,const struct kernel_sched_policy *updated)
 {
     int parameters_changed=task->scheduling.policy!=updated->policy || task->scheduling.nice!=updated->nice ||
@@ -1758,6 +1784,8 @@ static void sched_commit_locked(struct kernel_task *task,const struct kernel_sch
     }
     if(weight_changed)task->scheduling.fair_remainder=0;
     task->scheduling.policy=updated->policy;
+    if (parameters_changed)
+        kernel_task_timerslack_set_locked(task, kernel_task_timerslack_get(task));
     if (weight_changed && task->ready_node.queued && !task->ready_node.priority) {
         struct kernel_sched_runqueue *queue=
 #if BOAROS_MAX_CPUS > 1

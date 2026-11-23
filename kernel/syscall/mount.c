@@ -15,6 +15,7 @@
 #include <kernel/heap.h>
 #include <kernel/mm.h>
 #include <kernel/procfs.h>
+#include <kernel/process_acct.h>
 #include <kernel/devpts.h>
 #include <kernel/tmpfs.h>
 #include <kernel/loop.h>
@@ -168,6 +169,7 @@ static __attribute__((noinline)) int unmount_filesystem(struct kernel_mm *mm,
                         const struct kernel_syscall_request *request)
 {
     KERNEL_FS_PATHS(fs_paths, fs);
+    KERNEL_LOCK_SCOPE(accounting);
     KERNEL_LOCK_SCOPE(topology);
     enum { MNT_FORCE_FLAG = 1U, UMOUNT_NOFOLLOW_FLAG = 8U };
     unsigned flags=(uint32_t)request->arguments[1];
@@ -188,6 +190,7 @@ static __attribute__((noinline)) int unmount_filesystem(struct kernel_mm *mm,
              fs_paths.root, target, !(flags & UMOUNT_NOFOLLOW_FLAG), &root);
     if (result) goto Finish;
     if(!kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_ADMIN)) {result=-KERNEL_EPERM;goto Finish;}
+    kernel_process_acct_lock(&accounting);
     kernel_vfs_mount_topology_lock(&topology);
     if (!kernel_vfs_mount_contains(kernel_fs_context_mount_root(fs),root)) {
         result=-KERNEL_EINVAL;goto Finish;

@@ -399,7 +399,7 @@ COMMON_C_SOURCES := \
 	kernel/sched/core.c kernel/sched/cgroup.c \
 	kernel/sched/policy.c \
 	kernel/sched/runqueue.c \
-	kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/cpu_clock.c \
+	kernel/sched/scheduling.c kernel/sched/accounting.c kernel/sched/process_acct.c kernel/sched/cpu_clock.c \
 	kernel/sched/posix_timer.c \
 	kernel/sched/lifetime.c \
 	kernel/sched/identity.c \
@@ -436,6 +436,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/time.c \
 	kernel/syscall/membarrier.c \
 	kernel/syscall/aio.c \
+	kernel/syscall/keys.c \
 	kernel/syscall/uts.c \
 	kernel/syscall/event.c \
 	kernel/credentials.c \

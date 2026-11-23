@@ -3,6 +3,7 @@
 #include <kernel/tmpfs.h>
 #include <kernel/pidfd.h>
 #include "open_file_internal.h"
+#include "lease.h"
 #include "fanotify_internal.h"
 #include <kernel/namespace.h>
 #include <kernel/procfs.h>
@@ -403,7 +404,11 @@ int kernel_files_open_fanotify_event(struct kernel_files *files, struct kernel_v
 
     if (flags & 04000000U) flags |= 010000U; /* __O_SYNC implies O_DSYNC. */
     file->open_flags = flags & ~02000000U;
-    return flags & 3U ? kernel_vfs_file_acquire_write(&file->file) : 0;
+    if (flags&3U) {
+        error=kernel_vfs_file_acquire_write(&file->file);
+        if (error) return error;
+    }
+    return kernel_vfs_lease_open(&file->file,flags&3U,flags&KERNEL_FILES_O_NONBLOCK);
 }
 
 static enum kernel_open_file_status create_open_file(
@@ -1082,6 +1087,7 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
     KERNEL_SERVICE_SCOPE_IF(service, !local);
     if (!local) kernel_assert_service_context();
     if (first) {
+        kernel_vfs_lease_release(&file->file);
         kernel_open_file_async_close(file);
         if (file->notify_opened)
             kernel_vfs_notify_close(&file->file,(__atomic_load_n(&file->open_flags,__ATOMIC_RELAXED)&3U) ?
@@ -1315,7 +1321,9 @@ int kernel_open_file_noatime_allowed(const struct kernel_open_file_description *
 void kernel_open_file_set_status_flags(struct kernel_open_file_description *file, uint32_t flags)
 {
     if (!open_file_live(file)) __builtin_trap();
-    const uint32_t mask=00002000U | 00004000U | 00020000U | KERNEL_FILES_O_DIRECT | 01000000U;
+    /* Regular-file O_ASYNC is published and cleared by the lease owner. */
+    const uint32_t mask=00002000U | 00004000U | KERNEL_FILES_O_DIRECT | 01000000U |
+        (file->kind == KERNEL_OPEN_FILE_KIND_REGULAR ? 0U : KERNEL_FILES_O_ASYNC);
     uint32_t old=__atomic_load_n(&file->open_flags, __ATOMIC_RELAXED);
     while (!__atomic_compare_exchange_n(&file->open_flags, &old,
         (old & ~mask) | (flags & mask), 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}

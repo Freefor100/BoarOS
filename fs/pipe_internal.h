@@ -62,6 +62,8 @@ struct kernel_pipe {
 #define KERNEL_PIPE_ATOMIC_WRITE UINT64_C(4096)
 
 /* 调用者持有端点/OFD引用；resize可等待已有用户复制资格。 */
+uint32_t kernel_pipe_max_size(void);
+int kernel_pipe_set_max_size(uint64_t size);
 int64_t kernel_pipe_capacity(struct kernel_pipe *,int command,uint64_t argument);
 
 enum kernel_pipe_status {

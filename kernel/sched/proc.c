@@ -106,6 +106,22 @@ int kernel_proc_comm(kernel_pid_t pid, uint64_t identity, int thread,
     return 0;
 }
 
+int kernel_proc_timerslack(kernel_pid_t pid, uint64_t identity,
+                           uint64_t *value, int writing)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_task *task = process_find_identity(pid, KERNEL_PID_TGID);
+    struct kernel_pid *id = task ? process_identity(task, KERNEL_PID_TGID) : 0;
+    if (!id || id->generation != identity || !task->accounted || task->retirement)
+        return -KERNEL_ESRCH;
+    if (task != kernel_task_current() &&
+        !kernel_credentials_capable(kernel_credentials_current(), KERNEL_CAP_SYS_NICE))
+        return -KERNEL_EPERM;
+    if (writing) kernel_task_timerslack_set_locked(task, *value);
+    else *value = kernel_task_timerslack_get(task);
+    return 0;
+}
+
 /* Identity and MM publication/release share wait_domain. The mask accessors
  * are nonblocking atomics; no task or MM pointer survives this scope. */
 int kernel_proc_coredump_filter(kernel_pid_t pid, uint64_t identity, int thread,

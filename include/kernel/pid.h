@@ -92,6 +92,7 @@ struct kernel_pid_registry {
     struct kernel_pid_registry *shutdown_next;
     struct kernel_heap *heap; /* Non-NULL only for scheduler-owned heap storage. */
     uint64_t namespace_id;
+    struct kernel_process_acct *accounting; /* Owned by the accounting control lock. */
     struct kernel_pid *child_reaper; /* Weak: the TGID role owns the identity. */
 };
 #define KERNEL_PID_NAMESPACE_MAX_DEPTH 32U

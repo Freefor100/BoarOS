@@ -24,9 +24,30 @@
 #include <string.h>
 
 #define PIPE_META(name, pipe) KERNEL_RAW_SCOPE(name, &(pipe)->metadata_lock)
-#define PIPE_MAX_UNPRIVILEGED_BYTES UINT32_C(1048576)
+static uint32_t pipe_max_size=UINT32_C(1048576);
 #define PIPE_USER_PAGES_SOFT UINT64_C(16384)
 #define PIPE_USER_PAGES_HARD UINT64_C(0)
+
+static uint32_t pipe_round_size(uint64_t size)
+{
+    if (size>(UINT32_C(1)<<31)) return 0;
+    uint32_t rounded=BOAROS_PAGE_SIZE;
+    while (rounded<size) rounded<<=1;
+    return rounded;
+}
+
+uint32_t kernel_pipe_max_size(void)
+{
+    return __atomic_load_n(&pipe_max_size,__ATOMIC_RELAXED);
+}
+
+int kernel_pipe_set_max_size(uint64_t size)
+{
+    uint32_t rounded=pipe_round_size(size);
+    if (!rounded) return -KERNEL_EINVAL;
+    __atomic_store_n(&pipe_max_size,rounded,__ATOMIC_RELAXED);
+    return 0;
+}
 
 static int pipe_unprivileged(const struct kernel_credentials *cred)
 {
@@ -154,9 +175,10 @@ enum kernel_pipe_status kernel_pipe_create(
     pipe->gid = cred->fsgid;
     pipe->buffers=pipe->inline_buffers;
     pipe->ring_size=KERNEL_PIPE_INLINE_SLOTS;
-    if ((uint64_t)pipe->ring_size*BOAROS_PAGE_SIZE>PIPE_MAX_UNPRIVILEGED_BYTES &&
+    uint32_t max_size=kernel_pipe_max_size();
+    if ((uint64_t)pipe->ring_size*BOAROS_PAGE_SIZE>max_size &&
         !kernel_credentials_capable(cred,KERNEL_CAP_SYS_RESOURCE))
-        pipe->ring_size=PIPE_MAX_UNPRIVILEGED_BYTES/BOAROS_PAGE_SIZE;
+        pipe->ring_size=max_size/BOAROS_PAGE_SIZE;
     { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
       pipe->account=kernel_uid_account_get_locked(cred->account); }
     uint64_t pages=kernel_uid_account_pipe_pages(pipe->account,0,pipe->ring_size);
@@ -223,12 +245,10 @@ int64_t kernel_pipe_capacity(struct kernel_pipe *pipe,int command,uint64_t argum
     }
     if (command!=1031) return -KERNEL_EINVAL;
     /* Linux在64位目标上也只消费unsigned int参数。 */
-    uint32_t size=(uint32_t)argument;
-    if (size>(UINT32_C(1)<<31)) return -KERNEL_EINVAL;
-    uint32_t rounded=BOAROS_PAGE_SIZE;
-    while (rounded<size) rounded<<=1;
+    uint32_t rounded=pipe_round_size((uint32_t)argument);
+    if (!rounded) return -KERNEL_EINVAL;
     uint32_t nr=rounded/BOAROS_PAGE_SIZE;
-    if (rounded>PIPE_MAX_UNPRIVILEGED_BYTES &&
+    if (rounded>kernel_pipe_max_size() &&
         !kernel_credentials_capable(kernel_credentials_current(),KERNEL_CAP_SYS_RESOURCE)) {
         /* 此快照可直接拒绝越限扩容；通过者仍在复制资格内复核容量。 */
         PIPE_META(guard,pipe);
@@ -252,7 +272,7 @@ int64_t kernel_pipe_capacity(struct kernel_pipe *pipe,int command,uint64_t argum
         uint32_t old=pipe->ring_size;
         const struct kernel_credentials *cred=kernel_credentials_current();
         do {
-            if (nr>old && rounded>PIPE_MAX_UNPRIVILEGED_BYTES &&
+            if (nr>old && rounded>kernel_pipe_max_size() &&
                 !kernel_credentials_capable(cred,KERNEL_CAP_SYS_RESOURCE)) {
                 result=-KERNEL_EPERM;break;
             }

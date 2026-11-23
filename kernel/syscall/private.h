@@ -1,6 +1,8 @@
 #ifndef BOAROS_KERNEL_SYSCALL_PRIVATE_H
 #define BOAROS_KERNEL_SYSCALL_PRIVATE_H
 #include <kernel/syscall.h>
+enum kernel_syscall_status syscall_handle_keys(struct kernel_task *,
+    const struct kernel_syscall_request *, struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_personality(struct kernel_task *,const struct kernel_syscall_request *,struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_legacy_rlimit(struct kernel_task *,const struct kernel_syscall_request *,struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_process_vm(struct kernel_task *,const struct kernel_syscall_request *,struct kernel_syscall_result *);

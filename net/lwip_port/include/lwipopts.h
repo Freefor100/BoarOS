@@ -110,7 +110,7 @@
 #define TCP_SND_BUF (BOAROS_LWIP_WINDOW_MSS * TCP_MSS)
 /* Only connections routed over lo may use the larger segment and window. */
 #define BOAROS_LWIP_LOOPBACK_MSS 8192U
-#define BOAROS_LWIP_LOOPBACK_WINDOW 32768U
+#define BOAROS_LWIP_LOOPBACK_WINDOW 49152U
 
 #define LWIP_STATS 1
 #if BOAROS_COST_DIAGNOSTICS || defined(BOAROS_LWIP_SHARED_MEMORY)

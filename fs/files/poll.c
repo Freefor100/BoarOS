@@ -261,13 +261,16 @@ static int core_poll_run(
             if (pinned[i]) kernel_wait_node_init(&nodes[i],task);
     }
 
+    uint64_t effective = 0;
+    if (!ready_count && !error && !immediate && target_monotonic_ns)
+        effective = kernel_time_select_deadline(task, target_monotonic_ns);
     while (!ready_count && !error && !immediate) {
         /* 查询、绑定、复查共用短IRQ范围；不在已准备的token内等待其他锁。 */
         uintptr_t saved_intr = arch_interrupt_save();
         struct kernel_wait_token token;
         enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
-        enum kernel_scheduler_status prepared=target_monotonic_ns ?
-            kernel_wait_prepare_monotonic(0,target_monotonic_ns,1,&token) :
+        enum kernel_scheduler_status prepared=effective ?
+            kernel_wait_prepare_monotonic(0,effective,1,&token) :
             kernel_wait_prepare(0,0,1,&token);
         if (prepared != KERNEL_SCHEDULER_STATUS_OK) {
             error = -KERNEL_EIO;

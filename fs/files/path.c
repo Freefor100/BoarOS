@@ -1,6 +1,7 @@
 #include "../vfs_notify.h"
 #include <kernel/scheduler.h>
 #include "../open_file_internal.h"
+#include "../lease.h"
 #include "../pipe_internal.h"
 #include "../vfs_internal.h"
 #include "../char_device_internal.h"
@@ -276,28 +277,20 @@ static enum kernel_files_status finish_open(struct kernel_files *files,
         uint64_t access_mode = flags & LINUX_O_ACCMODE;
 
         int generated = kernel_vfs_file_generated(&description->file);
-        if (!generated &&
-            (access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR ||
-             (flags & LINUX_O_TRUNC) != 0U)) {
-            int lease_result = kernel_vfs_file_acquire_write(&description->file);
-            if (lease_result != 0) {
-                KERNEL_FILES_NOTE(files, open_failures, 1);
-                kernel_files_queue_description(files, description);
-                (void)kernel_files_drain_file_cleanup(files);
-                *linux_result = lease_result;
-                return KERNEL_FILES_STATUS_OK;
-            }
-        }
-        if (!generated && !created && (flags & LINUX_O_TRUNC) != 0U) {
-            int trunc_result = kernel_vfs_ftruncate(&description->file, 0U);
-
-            if (trunc_result != 0) {
-                KERNEL_FILES_NOTE(files, open_failures, 1);
-                kernel_files_queue_description(files, description);
-                (void)kernel_files_drain_file_cleanup(files);
-                *linux_result = trunc_result;
-                return KERNEL_FILES_STATUS_OK;
-            }
+        int write=access_mode==LINUX_O_WRONLY || access_mode==LINUX_O_RDWR;
+        int error=0;
+        if (!generated && write)
+            error=kernel_vfs_file_acquire_write(&description->file);
+        if (!error && !generated)
+            error=kernel_vfs_lease_open(&description->file,(int)access_mode,flags&LINUX_O_NONBLOCK);
+        if (!error && !generated && !created && (flags&LINUX_O_TRUNC))
+            error=kernel_vfs_open_truncate(&description->file);
+        if (error) {
+            KERNEL_FILES_NOTE(files,open_failures,1);
+            kernel_files_queue_description(files,description);
+            (void)kernel_files_drain_file_cleanup(files);
+            *linux_result=error;
+            return KERNEL_FILES_STATUS_OK;
         }
         description->kind = generated
             ? KERNEL_OPEN_FILE_KIND_GENERATED : KERNEL_OPEN_FILE_KIND_REGULAR;

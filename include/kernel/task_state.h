@@ -201,6 +201,7 @@ struct kernel_task {
     uint32_t resource_flags;
     struct kernel_task_usage usage;
     uint64_t proc_start_ticks;
+    uint64_t timer_slack_ns, default_timer_slack_ns;
     char comm[16];
     struct kernel_wait_queue child_exit_queue;
     struct kernel_wait_queue vfork_done_queue;

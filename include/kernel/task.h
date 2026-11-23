@@ -128,6 +128,12 @@ enum kernel_task_status kernel_task_ppid(
     const struct kernel_task *task,
     kernel_pid_t *ppid);
 
+#define KERNEL_DEFAULT_TIMER_SLACK_NS UINT64_C(50000)
+/* Policy changes and explicit writes serialize in the scheduler wait domain. */
+uint64_t kernel_task_timerslack_get(const struct kernel_task *);
+void kernel_task_timerslack_set(struct kernel_task *, uint64_t nanoseconds);
+void kernel_task_timerslack_set_locked(struct kernel_task *, uint64_t nanoseconds);
+
 /* The returned MM is borrowed for the duration of the current task call. */
 enum kernel_task_status kernel_task_mm_borrow(
     const struct kernel_task *task,

@@ -1,6 +1,8 @@
 #include "../fs/cgroup_internal.h"
 #include <kernel/hugetlb.h>
 #include <kernel/bpf.h>
+#include <kernel/keys.h>
+#include <kernel/process_acct.h>
 #include <kernel/reboot.h>
 #include <kernel/console.h>
 #include <arch/loongarch/smp.h>
@@ -144,6 +146,7 @@ static int release_root(void)
         la_virt_puts(" rng-timeouts=");la_virt_hex(root.rng.device.timeouts);
         la_virt_puts(" block-irqs=");la_virt_hex(block_irqs);la_virt_puts("\n");
     }
+    kernel_process_acct_shutdown();
     int error=kernel_vfs_disk_cleanup_pending();
     if(error) return error;
     if(root.mount.private_data) {
@@ -156,6 +159,7 @@ static int release_root(void)
     int ipc_final=kernel_ipc_initial_shutdown();if(ipc_final)return ipc_final;
     int bpf_final=kernel_bpf_shutdown(&root.heap);if(bpf_final)return bpf_final;
     int cgroup_final=kernel_cgroup_shutdown(&root.heap);if(cgroup_final)return cgroup_final;
+    int keys_final=kernel_keys_shutdown(&root.heap);if(keys_final)return keys_final;
     if((root.cache.state==KERNEL_PAGE_CACHE_LIVE || root.cache.state==KERNEL_PAGE_CACHE_CLEANUP) &&
        kernel_page_cache_destroy(&root.cache)!=KERNEL_PAGE_CACHE_STATUS_OK) return -KERNEL_EIO;
     while(root.count) {

@@ -461,7 +461,9 @@ static enum kernel_syscall_status syscall_wait_clock(struct kernel_task *caller,
     struct kernel_syscall_result *decoded)
 {
     enum kernel_wait_wake_reason reason;
-    if (sleep_clock(domain, deadline, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+    uint64_t effective = kernel_clock_is_alarm(clock) ? deadline :
+        kernel_time_slack_deadline(domain, deadline, kernel_task_timerslack_get(caller));
+    if (sleep_clock(domain, effective, &reason) != KERNEL_SCHEDULER_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;

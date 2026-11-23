@@ -42,6 +42,11 @@ struct kernel_resource_limits {
     /* One object per thread group. These histories outlive the leader and
      * are copied into neither a fork child nor a replacement exec image. */
     struct kernel_task_usage dead_usage, child_usage;
+    uint64_t acct_start_ns, acct_memory_kib;
+    uint32_t acct_leader_status;
+    uint32_t acct_last_uid, acct_last_gid;
+    char acct_last_comm[16];
+    unsigned acct_last_nonleader, acct_finalized;
 };
 /* A task owns one reference; clone threads share, fork takes a value copy. */
 struct kernel_resource_limits *kernel_resource_limits_create(struct kernel_heap *,

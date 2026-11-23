@@ -2,6 +2,7 @@
 #include <arch/timer.h>
 #include <kernel/time.h>
 #include <kernel/timex.h>
+#include <kernel/task_state.h>
 #include <kernel/errno.h>
 #include <kernel/tick.h>
 #include <kernel/vdso.h>
@@ -37,6 +38,43 @@ static int64_t time_maxerror = TIME_ERROR_LIMIT, time_esterror = TIME_ERROR_LIMI
 static uint64_t time_error_second, time_reference_second;
 /* Full signed 64-bit adjtime microseconds, including a sub-us residual. */
 static int64_t time_slew_us, time_slew_fraction;
+
+/* Round up to a shared power-of-two boundary while staying in range.
+ * Expired (including immediate) timeouts and tight waits bypass rounding. */
+static uint64_t time_round_timeout(uint64_t deadline, uint64_t slack_ns)
+{
+    slack_ns |= slack_ns >> 1U;
+    slack_ns |= slack_ns >> 2U;
+    slack_ns |= slack_ns >> 4U;
+    slack_ns |= slack_ns >> 8U;
+    slack_ns |= slack_ns >> 16U;
+    slack_ns |= slack_ns >> 32U;
+    uint64_t mask = slack_ns >> 1U;
+    uint64_t delay = (0U - deadline) & mask;
+    return delay > (uint64_t)INT64_MAX - deadline ? INT64_MAX : deadline + delay;
+}
+
+uint64_t kernel_time_slack_deadline(enum kernel_time_domain domain, uint64_t deadline,
+                                   uint64_t slack_ns)
+{
+    if (slack_ns < 2 || deadline >= INT64_MAX || deadline <= kernel_time_domain_now(domain))
+        return deadline;
+    return time_round_timeout(deadline, slack_ns);
+}
+
+uint64_t kernel_time_select_deadline(const struct kernel_task *task, uint64_t deadline)
+{
+    if (!deadline || deadline >= INT64_MAX) return deadline;
+    uint64_t slack = __atomic_load_n(&task->timer_slack_ns, __ATOMIC_RELAXED);
+    if (!slack) return deadline;
+    uint64_t now = kernel_time_monotonic_ns();
+    if (deadline <= now) return deadline;
+    uint64_t priority = __atomic_load_n(&task->scheduling.execution_priority, __ATOMIC_RELAXED);
+    uint64_t estimated = (deadline - now) / ((int32_t)(priority >> 32) > 0 ? 200U : 1000U);
+    if (estimated > UINT64_C(100000000)) estimated = UINT64_C(100000000);
+    if (estimated > slack) slack = estimated;
+    return time_round_timeout(deadline, slack);
+}
 
 static void store_epoch(struct kernel_clock_epoch *to,const struct kernel_clock_epoch *from)
 {

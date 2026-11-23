@@ -7,6 +7,7 @@
 struct kernel_heap;
 struct kernel_task;
 struct kernel_exec_security;
+struct kernel_key;
 
 #define KERNEL_CAP_LAST_CAP 40U
 #define KERNEL_CAP_VALID_MASK ((UINT64_C(1) << 41) - 1)
@@ -20,10 +21,10 @@ enum kernel_capability {
     KERNEL_CAP_NET_RAW=13, KERNEL_CAP_IPC_LOCK=14, KERNEL_CAP_IPC_OWNER=15,
     KERNEL_CAP_SYS_MODULE=16, KERNEL_CAP_SYS_RAWIO=17,
     KERNEL_CAP_SYS_CHROOT=18, KERNEL_CAP_SYS_PTRACE=19,
-    KERNEL_CAP_SYS_ADMIN=21, KERNEL_CAP_SYS_BOOT=22, KERNEL_CAP_SYS_NICE=23,
+    KERNEL_CAP_SYS_PACCT=20, KERNEL_CAP_SYS_ADMIN=21, KERNEL_CAP_SYS_BOOT=22, KERNEL_CAP_SYS_NICE=23,
     KERNEL_CAP_SYS_RESOURCE=24, KERNEL_CAP_SYS_TIME=25,
     KERNEL_CAP_SYS_TTY_CONFIG=26, KERNEL_CAP_MKNOD=27,
-    KERNEL_CAP_SETFCAP=31, KERNEL_CAP_MAC_OVERRIDE=32,
+    KERNEL_CAP_LEASE=28, KERNEL_CAP_SETFCAP=31, KERNEL_CAP_MAC_OVERRIDE=32,
     KERNEL_CAP_SYSLOG=34, KERNEL_CAP_WAKE_ALARM=35,
     KERNEL_CAP_PERFMON=38, KERNEL_CAP_BPF=39, KERNEL_CAP_CHECKPOINT_RESTORE=40,
 };
@@ -60,6 +61,8 @@ struct kernel_credentials {
     uint64_t effective,permitted,inheritable,bounding,ambient;
     uint32_t securebits;
     struct kernel_uid_account *account;
+    struct kernel_key *thread_keyring, *process_keyring, *session_keyring;
+    uint8_t request_key_default;
 };
 
 const struct kernel_credentials *kernel_credentials_initial(void);
