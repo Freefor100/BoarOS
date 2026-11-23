@@ -42,4 +42,11 @@ if [ "$name" = df01.sh ]; then
         exec "$runner" -i "$limit" /boaros-tools/dash "$file"
     fi
 fi
+if [ "$name" = keyctl02 ]; then
+    # 上游用这两项判断是否要给实时内核的线程回收留出额外时间。
+    KCONFIG_PATH="${TMPDIR:-/tmp}/boaros-keyctl02-kconfig"
+    printf '%s\n' '# CONFIG_PREEMPT_RT is not set' \
+        '# CONFIG_PREEMPT_RT_FULL is not set' > "$KCONFIG_PATH" || exit 125
+    export KCONFIG_PATH
+fi
 exec "$runner" "$limit" "$shell" "$file"

@@ -178,6 +178,27 @@ class OfficialFlowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertEqual(result.stdout, 'real-result\n')
 
+    def test_keyctl02_config_is_scoped_to_that_case(self):
+        root = Path(self.temp.name)
+        env = dict(os.environ, TMPDIR=str(root))
+        env.pop('KCONFIG_PATH', None)
+        base = ['sh', str(HERE / 'ltp-case.sh'), str(self.binary),
+                str(HERE / 'ltp-skips.tsv'), '3', '/bin/sh']
+        for name, expected in (
+                ('keyctl02', '# CONFIG_PREEMPT_RT is not set\n'
+                             '# CONFIG_PREEMPT_RT_FULL is not set\n'),
+                ('keyctl02-other', 'config unset\n')):
+            with self.subTest(name=name):
+                program = root / name
+                program.write_text('#!/bin/sh\n[ "$#" = 0 ] || exit 125\n'
+                                   'if [ -n "${KCONFIG_PATH:-}" ]; then cat "$KCONFIG_PATH"; '
+                                   'else echo "config unset"; fi\nexit 7\n')
+                program.chmod(0o755)
+                result = subprocess.run(base + [str(program)], env=env, text=True,
+                                        capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 7, result.stderr)
+                self.assertEqual(result.stdout, expected)
+
     def test_published_input_skips_are_limited_to_exact_names(self):
         names = ('float_bessel', 'float_exp_log', 'float_iperb', 'float_power',
                  'float_trigo', 'io_setup01', 'io_setup02')

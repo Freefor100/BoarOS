@@ -104,6 +104,7 @@ LoongArch 手动启动改为 `--arch loongarch` 与独立输出目录，QEMU 使
   1. **进程组隔离与信号范围**。监督器以自身的进程标识符（Process ID，PID）建立测试进程组。子进程通过 `fork` 继承该组，在管道上等到监督器回到原进程组后才执行测例。因此，测试进程组标识符（Process Group ID，PGID）等于监督器的 PID，而直接子进程可以用 `setsid()` 建立自己的会话。超时时，监督器向原测试进程组发送信号，并单独向尚未回收的直接子进程发送同一信号。自行离开测试组的其他后代超出本次监督范围，由首个用户进程退出时的系统清理处理。
   2. **轮询、超时与测量口径**。监督器用 `wait4(child, &status, WNOHANG, NULL)` 检查直接子进程是否已经退出。未检测到退出时，`nanosleep` 请求休眠 **20 毫秒**。这是轮询间隔，实际发现退出还受监督器何时恢复运行影响。`BOAROS-CASE START` 到 `END` 的 `elapsed_ms` 是监督器按单调时钟测得的经过时间，包含启动、发现退出和清理的时间。默认单项限时为 **120 秒**（`BOAROS_LTP_CASE_TIMEOUT`）。监督器发现超时时先发送 `SIGTERM`，**2 秒**宽限后如果直接子进程仍未退出，再发送 `SIGKILL`。回收直接子进程后，监督器也会向原测试组发送 `SIGKILL` 以清理该组的残留进程。超时返回 **124**，准备或计时错误返回 **125**。
   3. **跳过表过滤**：通过共享 [ltp-skips.tsv](../../tests/oscomp/ltp-skips.tsv) 跳过无参直接调用缺少外部控制器/输入的辅助程序以及按时间预算排除的单项，输出跳过原因并返回 125（逐项依据见 [OSComp 测例与环境问题](../learning/oscomp-test-issues.md)）；诊断时另可通过 `--diagnostic-exclude` 显式记录 `EXCLUDE`。脚本语法兼容 LoongArch BusyBox `hush` 的实际子集。
+  4. **单项配置**。[`ltp-case.sh`](../../tests/oscomp/ltp-case.sh) 仅在启动原版 `keyctl02` 时生成两行配置，用 `KCONFIG_PATH` 指定文件，告知测例 `CONFIG_PREEMPT_RT` 与 `CONFIG_PREEMPT_RT_FULL` 均未启用。变量随该次测例进程退出，其他测例沿用各自的环境。
 
 ---
 
