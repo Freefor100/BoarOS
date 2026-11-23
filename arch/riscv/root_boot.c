@@ -687,6 +687,7 @@ enum riscv_root_boot_status riscv_root_boot_finish(
         *available_pages=physical_page_available(root->heap.page_allocator);
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
+    physical_page_drain_faults(root->heap.page_allocator);
     kernel_heap_get_statistics(&root->heap, heap_statistics);
     *available_pages = physical_page_available(root->heap.page_allocator);
     if (heap_statistics->live_allocations != 0U ||
