@@ -8,6 +8,7 @@
 #include <ext4_block_group.h>
 #include <kernel/time.h>
 #include <kernel/credentials.h>
+#include <kernel/posix_acl.h>
 #include <stdlib.h>
 
 static unsigned stat_lookup_watch,stat_lookup_reads,stat_lookup_opens,stat_lookup_io_locks,stat_lookup_allocations;
@@ -16,12 +17,17 @@ static unsigned directory_inode_reads,directory_inode_reject;
 static unsigned directory_name_lookups,directory_name_error;
 static unsigned borrowed_path_watch,borrowed_path_state_locks;
 static _Thread_local unsigned inode_geometry_watch,inode_geometry_reads,inode_geometry_fail;
+static _Thread_local unsigned attribute_watch,attribute_reads,attribute_writes;
 static uint64_t inode_geometry_block;
 static struct ext4_blockdev *inode_geometry_device;
 int __real_ext4_block_get_range(struct ext4_blockdev *,struct ext4_block *,uint64_t,uint32_t,uint32_t,enum ext4_block_access);
 int __wrap_ext4_block_get_range(struct ext4_blockdev *device,struct ext4_block *block,
     uint64_t lba,uint32_t offset,uint32_t length,enum ext4_block_access access)
 {
+    if (attribute_watch) {
+        if (access==EXT4_BLOCK_READ) attribute_reads++;
+        else attribute_writes++;
+    }
     if (inode_geometry_watch && device==inode_geometry_device && lba==inode_geometry_block) {
         inode_geometry_reads++;
         if (inode_geometry_fail) return EIO;
@@ -172,7 +178,7 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
     stat_lookup_watch=0;
     printf("directory reuse: inode reads=%u opens=%u inode I/O locks=%u\n",stat_lookup_reads,stat_lookup_opens,stat_lookup_io_locks);
     assert(!stat_lookup_opens && !stat_lookup_reads);
-    assert(stat_lookup_io_locks==32);
+    assert(!stat_lookup_io_locks);
     printf("path query zeroed allocations=%u\n",stat_lookup_allocations);
     assert(!stat_lookup_allocations);
     struct kernel_credentials *lower=kernel_credentials_clone(instance->heap,kernel_credentials_current());
@@ -183,6 +189,21 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
     struct kernel_vfs_path *held=NULL;
     assert(!kernel_vfs_path_resolve(root,root,"reuse-parent/child",1,&held));
     assert(!kernel_vfs_path_set_mode(held,0711));
+    previous=kernel_credentials_override(lower);
+    assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after));
+    stat_lookup_watch=1;stat_lookup_reads=0;
+    for (unsigned i=0;i<16;i++)
+        assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after));
+    stat_lookup_watch=0;
+    assert(!stat_lookup_reads && "repeated permission checks should reuse absent access ACLs");
+    assert(kernel_credentials_override(previous)==lower);
+    struct {uint32_t version; struct kernel_acl_entry entries[5];} acl={2,{
+        {1,7,UINT32_MAX},{2,0,70001},{4,1,UINT32_MAX},{16,1,UINT32_MAX},{32,1,UINT32_MAX}}};
+    assert(!kernel_vfs_path_xattr(held,KERNEL_XATTR_SET,KERNEL_ACL_ACCESS,&acl,sizeof(acl),0));
+    previous=kernel_credentials_override(lower);
+    assert(kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after)==-KERNEL_EACCES);
+    assert(kernel_credentials_override(previous)==lower);
+    assert(!kernel_vfs_path_xattr(held,KERNEL_XATTR_REMOVE,KERNEL_ACL_ACCESS,NULL,0,0));
     previous=kernel_credentials_override(lower);
     assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after));
     assert(kernel_credentials_override(previous)==lower);kernel_credentials_put(lower);
@@ -201,6 +222,19 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
     assert(!kernel_vfs_unlink_at(root,root,"reuse-renamed/child",1));
     assert(!kernel_vfs_unlink_at(root,root,"reuse-renamed",1));
     puts("PASS directory reuse: stable lookup, current mode, rename, pressure, detached identity and final reclamation");
+}
+
+static void attribute_read_qualification_case(struct kernel_vfs_path *root)
+{
+    ext4_file *file=lwext4_node_file(root->file.private_data);
+    size_t size;
+    attribute_watch=1;
+    assert(ext4_file_getxattr(file,"user.not-present",16,NULL,0,&size)==ENODATA);
+    assert(!ext4_file_listxattr(file,NULL,0,&size,false));
+    attribute_watch=0;
+    printf("xattr metadata: reader acquisitions=%u writer acquisitions=%u\n",attribute_reads,attribute_writes);
+    assert(attribute_reads>=2 && !attribute_writes);
+    puts("PASS xattr reads retain inode block verification");
 }
 static void lookup_attributes_case(struct kernel_vfs_path *root)
 {
@@ -319,11 +353,20 @@ static void lookup_directory_mapping_case(struct kernel_vfs_path *root)
         assert(kernel_vfs_stat_at(dir,root,"second-missing",1,&stat)==-KERNEL_ENOENT);
     }
     assert(directory_name_lookups==5 && "positive lookups should keep recent miss history");
+    for (unsigned i=0;i<32;i++) {
+        assert(!kernel_vfs_stat_at(dir,root,"config.rs",1,&stat));
+        assert(!kernel_vfs_stat_at(dir,root,"builder.rs",1,&stat));
+    }
+    assert(directory_name_lookups==5 && "metadata-only lookups should reuse exact positive names");
     directory_name_error=1;
     assert(kernel_vfs_stat_at(dir,root,"first-missin",1,&stat)==-KERNEL_EIO);
     assert(kernel_vfs_stat_at(dir,root,"first-missin",1,&stat)==-KERNEL_EIO);
     assert(directory_name_lookups==7);
     directory_name_error=0;
+    struct kernel_vfs_instance *instance=dir->file.mount->private_data;
+    instance->ops->reclaim_clean(instance);
+    assert(!kernel_vfs_stat_at(dir,root,"config.rs",1,&stat));
+    assert(directory_name_lookups==8 && "reclaim must drop the cached positive name");
     assert(!kernel_vfs_mknod_at(dir,root,"first-missing",KERNEL_VFS_S_IFREG|0600,0,0));
     assert(!kernel_vfs_stat_at(dir,root,"first-missing",1,&stat));
     uint64_t created=stat.ino;
@@ -332,13 +375,17 @@ static void lookup_directory_mapping_case(struct kernel_vfs_path *root)
     assert(kernel_vfs_stat_at(dir,root,"second-missing",1,&stat)==-KERNEL_ENOENT);
     assert(!kernel_vfs_link_at(source,dir,root,"second-missing"));
     assert(!kernel_vfs_stat_at(dir,root,"second-missing",1,&stat) && stat.ino==created);
+    for (unsigned i=0;i<2;i++)
+        assert(!kernel_vfs_stat_at(dir,root,"second-missing",1,&stat) && stat.ino==created);
     assert(kernel_vfs_stat_at(dir,root,"rename-missing",1,&stat)==-KERNEL_ENOENT);
     assert(!kernel_vfs_rename_at(dir,dir,root,"second-missing","rename-missing",0));
+    assert(kernel_vfs_stat_at(dir,root,"second-missing",1,&stat)==-KERNEL_ENOENT);
     assert(!kernel_vfs_stat_at(dir,root,"rename-missing",1,&stat) && stat.ino==created);
     assert(!kernel_vfs_path_release(&source));
     assert(!kernel_vfs_unlink_at(dir,root,"first-missing",0));
     assert(!kernel_vfs_unlink_at(dir,root,"rename-missing",0));
     assert(!kernel_vfs_unlink_at(dir,root,"config.rs",0));
+    assert(kernel_vfs_stat_at(dir,root,"config.rs",1,&stat)==-KERNEL_ENOENT);
     assert(!kernel_vfs_unlink_at(dir,root,"builder.rs",0));
 
     /* Fresh names are absent from the positive VFS index after mknod. Grow
@@ -829,6 +876,7 @@ int main(int argc,char **argv)
     }
     struct kernel_vfs_path *root=NULL,*directories[65]={0};
     assert(!kernel_vfs_path_root(&mount,&heap,&root));
+    attribute_read_qualification_case(root);
     if (getenv("EXT4_NAMESPACE_REUSE_ONLY")) {
         directory_reuse_case(root);removed_directory_qualification(root);lookup_attributes_case(root);inode_attribute_lifecycle(adapter,root);
         rename_order_case(adapter,root);rename_order_directory_case(adapter,root);

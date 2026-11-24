@@ -7202,7 +7202,7 @@ int ext4_file_getxattr(ext4_file *file,const char *name,size_t length,void *valu
     struct ext4_mountpoint *mp=file->mp;
     EXT4_MP_LOCK(mp);
     struct ext4_inode_ref ref;
-    result=ext4_fs_get_inode_ref(&mp->fs,file->inode,&ref);
+    result=ext4_fs_get_inode_ref_read(&mp->fs,file->inode,&ref);
     if (!result) {
         result=ext4_xattr_get(&ref,index,suffix,count,value,capacity,size);
         result=ext4_result(result,ext4_fs_put_inode_ref(&ref));
@@ -7218,7 +7218,7 @@ int ext4_file_listxattr(ext4_file *file,char *output,size_t capacity,size_t *siz
     *size=0;
     EXT4_MP_LOCK(mp);
     struct ext4_inode_ref ref;
-    int result=ext4_fs_get_inode_ref(&mp->fs,file->inode,&ref);
+    int result=ext4_fs_get_inode_ref_read(&mp->fs,file->inode,&ref);
     if (!result) {
         size_t length=0;
         result=ext4_xattr_list(&ref,NULL,&length);

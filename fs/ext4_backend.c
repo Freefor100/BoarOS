@@ -386,6 +386,120 @@ static bool vfs_realtime(struct ext4_timestamp *now)
 #else
 #define TIMESTAMP_SCOPE(name, adapter) KERNEL_IRQ_SCOPE(name); (void)(adapter)
 #endif
+
+enum { EXT4_NAME_CHUNKS=128, EXT4_NAME_SETS=64, EXT4_NAME_WAYS=4, EXT4_NAME_EPOCHS=256 };
+struct ext4_cached_name {
+    uint64_t epoch;
+    uint32_t parent, inode, hash;
+    uint8_t length;
+    char name[43];
+};
+union ext4_name_chunk {
+    struct ext4_cached_name sets[EXT4_NAME_SETS][EXT4_NAME_WAYS];
+    union ext4_name_chunk *next;
+};
+struct ext4_name_cache {
+    uint64_t epochs[EXT4_NAME_EPOCHS];
+    unsigned chunks, victim;
+    union ext4_name_chunk *table[EXT4_NAME_CHUNKS];
+};
+_Static_assert(sizeof(union ext4_name_chunk)==16384,"ext4 name cache allocation unit");
+
+static void ext4_name_cache_init(struct lwext4_mount_adapter *adapter)
+{
+    struct kernel_heap *heap=adapter->instance.heap;
+    uint64_t budget=physical_page_total(heap->page_allocator)*BOAROS_PAGE_SIZE/256U;
+    unsigned chunks=1;
+    if (budget<sizeof(union ext4_name_chunk)) return;
+    while (chunks<EXT4_NAME_CHUNKS && 2U*chunks*sizeof(union ext4_name_chunk)<=budget) chunks*=2U;
+    struct ext4_name_cache *cache=NULL;
+    if (!kernel_heap_allocate_zeroed_nosleep(heap,1,sizeof(*cache),(void **)&cache)) {
+        cache->chunks=chunks;
+        adapter->name_cache=cache;
+    }
+}
+
+static void ext4_name_cache_reclaim(struct lwext4_mount_adapter *adapter)
+{
+    struct ext4_name_cache *cache=adapter->name_cache;
+    if (!cache) return;
+    union ext4_name_chunk *discard=NULL;
+    {
+        TIMESTAMP_SCOPE(guard,adapter);
+        for (unsigned i=0;i<cache->chunks;i++) {
+            union ext4_name_chunk *chunk=cache->table[i];
+            if (!chunk) continue;
+            cache->table[i]=NULL;
+            chunk->next=discard;
+            discard=chunk;
+        }
+    }
+    while (discard) {
+        union ext4_name_chunk *next=discard->next;
+        kernel_heap_release(adapter->instance.heap,discard);
+        discard=next;
+    }
+}
+
+static uint32_t ext4_name_hash(uint32_t parent,const char *name,size_t length)
+{
+    uint32_t hash=UINT32_C(2166136261)^parent;
+    for (size_t i=0;i<length;i++) hash=(hash^(uint8_t)name[i])*UINT32_C(16777619);
+    return hash^(hash>>16);
+}
+
+static uint64_t ext4_name_epoch(const struct ext4_name_cache *cache,uint32_t parent)
+{ return __atomic_load_n(&cache->epochs[parent%EXT4_NAME_EPOCHS],__ATOMIC_ACQUIRE); }
+
+static bool ext4_name_matches(const struct ext4_cached_name *entry,uint32_t parent,
+    uint64_t epoch,uint32_t hash,const char *name,size_t length)
+{
+    return entry->hash==hash && entry->parent==parent && entry->epoch==epoch &&
+        entry->length==length && !memcmp(entry->name,name,length);
+}
+
+static uint32_t ext4_name_cached(const struct ext4_name_cache *cache,uint32_t parent,
+    uint64_t epoch,uint32_t hash,const char *name,size_t length)
+{
+    union ext4_name_chunk *chunk=cache->table[hash&(cache->chunks-1U)];
+    if (!chunk) return 0;
+    const struct ext4_cached_name *set=chunk->sets[(hash>>7)%EXT4_NAME_SETS];
+    for (unsigned i=0;i<EXT4_NAME_WAYS;i++)
+        if (ext4_name_matches(&set[i],parent,epoch,hash,name,length)) return set[i].inode;
+    return 0;
+}
+
+static void ext4_name_remember(struct lwext4_mount_adapter *adapter,uint32_t parent,
+    uint64_t epoch,uint32_t hash,const char *name,size_t length,uint32_t inode)
+{
+    struct ext4_name_cache *cache=adapter->name_cache;
+    union ext4_name_chunk **slot=&cache->table[hash&(cache->chunks-1U)],*candidate=NULL;
+    for (;;) {
+        {
+            TIMESTAMP_SCOPE(guard,adapter);
+            if (epoch!=ext4_name_epoch(cache,parent)) break;
+            if (!*slot && candidate) { *slot=candidate;candidate=NULL; }
+            if (*slot) {
+                struct ext4_cached_name *set=(*slot)->sets[(hash>>7)%EXT4_NAME_SETS];
+                struct ext4_cached_name *entry=NULL;
+                for (unsigned i=0;i<EXT4_NAME_WAYS;i++) {
+                    if (ext4_name_matches(&set[i],parent,epoch,hash,name,length)) { entry=&set[i];break; }
+                    if (!entry && (!set[i].inode || set[i].epoch!=ext4_name_epoch(cache,set[i].parent)))
+                        entry=&set[i];
+                }
+                if (!entry) entry=&set[cache->victim++%EXT4_NAME_WAYS];
+                entry->epoch=epoch;entry->parent=parent;entry->inode=inode;entry->hash=hash;
+                entry->length=(uint8_t)length;
+                memcpy(entry->name,name,length);
+                break;
+            }
+        }
+        if (kernel_heap_allocate_zeroed_nosleep(adapter->instance.heap,1,sizeof(*candidate),(void **)&candidate))
+            return;
+    }
+    if (candidate) kernel_heap_release(adapter->instance.heap,candidate);
+}
+
 static int time_compare(struct ext4_timestamp a, struct ext4_timestamp b)
 {
     if (a.seconds != b.seconds) return a.seconds < b.seconds ? -1 : 1;
@@ -546,7 +660,17 @@ static struct lwext4_staged_inode *stage_inode(struct lwext4_mount_adapter *adap
     return record;
 }
 static void inode_changed(void *context,uint32_t inode)
-{ (void)stage_inode(context,NULL,inode); }
+{
+    struct lwext4_mount_adapter *adapter=context;
+    struct ext4_name_cache *cache=adapter->name_cache;
+    if (cache) {
+        /* Directory edits call the observer before changing name records.
+         * The directory writer stays held until transaction completion. */
+        if (__atomic_fetch_add(&cache->epochs[inode%EXT4_NAME_EPOCHS],1,__ATOMIC_RELEASE)==UINT64_MAX)
+            __builtin_trap();
+    }
+    (void)stage_inode(context,NULL,inode);
+}
 
 static int track_nested_file(void *context, ext4_file *file)
 {
@@ -1019,6 +1143,8 @@ static int release_mount_storage(struct kernel_vfs_mount *mount)
         kernel_heap_release(heap, adapter->physical_buffer);
         adapter->physical_buffer = 0;
     }
+    ext4_name_cache_reclaim(adapter);
+    if (adapter->name_cache) kernel_heap_release(heap,adapter->name_cache);
     boaros_lwext4_lock_fini(&adapter->backend_lock);
     if (adapter->heap_bound) {
         boaros_lwext4_heap_unbind(heap);
@@ -1824,6 +1950,7 @@ static int mount_ext_filesystem(struct kernel_vfs_mount *mount,
     }
 
     adapter->superblock = superblock;
+    ext4_name_cache_init(adapter);
     adapter->instance.writeback_block_size = ext4_sb_get_block_size(superblock);
     mount->read_only=adapter->instance.read_only;
     mount->state = VFS_MOUNT_STATE_LIVE;
@@ -2637,10 +2764,26 @@ static int ext4_backend_permission(struct kernel_vfs_node *node,const struct ker
 {
     if (cred->fsuid==node->uid || !(node->mode & 0070U))
         return kernel_vfs_dac_permission(node->mode,node->uid,node->gid,access,cred);
+    struct lwext4_node *live=(struct lwext4_node *)node;
+    struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
+    bool accepted=!ext4_current_operation(adapter->device.fs);
+    bool absent=false;
+    uint64_t epoch=0;
+    if (accepted) {
+        TIMESTAMP_SCOPE(guard,adapter);
+        epoch=live->metadata_epoch+1U;
+        absent=epoch && live->access_acl_absent_epoch==epoch;
+    }
+    if (absent) return kernel_vfs_dac_permission(node->mode,node->uid,node->gid,access,cred);
     void *acl=NULL;size_t length=0;
     int result=ext4_acl_read(node,KERNEL_ACL_ACCESS,&acl,&length);
-    if (result==-KERNEL_ENODATA)
+    if (result==-KERNEL_ENODATA) {
+        if (accepted) {
+            TIMESTAMP_SCOPE(guard,adapter);
+            if (live->metadata_epoch+1U==epoch) live->access_acl_absent_epoch=epoch;
+        }
         return kernel_vfs_dac_permission(node->mode,node->uid,node->gid,access,cred);
+    }
     if (result) return result;
     result=kernel_acl_dac_permission(acl,length,node->mode,node->uid,node->gid,cred,access);
     kernel_heap_release(node->instance->heap,acl);
@@ -3314,7 +3457,10 @@ static int ext4_backend_lookup(struct kernel_vfs_node *parent,
     if (error) return error;
     ext4_file *directory=lwext4_node_file(parent);
     struct lwext4_node *live=(struct lwext4_node *)parent;
-    uint32_t result_inode;
+    struct ext4_name_cache *names=adapter->name_cache;
+    uint32_t result_inode,hash=0;
+    uint64_t name_epoch=0;
+    bool remember=false;
     if (ext4_current_operation(adapter->device.fs)) {
         error=lwext4_error(ext4_file_lookup_child(directory,name,length,&result_inode,mode,NULL,NULL,NULL));
     } else {
@@ -3324,8 +3470,15 @@ static int ext4_backend_lookup(struct kernel_vfs_node *parent,
         bool ready;
         struct lwext4_directory_mapping *mapping;
         bool cacheable=!mode && length && length<=sizeof(mapping->misses[0].name);
+        remember=names && !mode && length && length<=sizeof(((struct ext4_cached_name *)0)->name);
+        if (remember) hash=ext4_name_hash(directory->inode,name,length);
         {
             TIMESTAMP_SCOPE(guard,adapter);
+            if (remember) {
+                name_epoch=ext4_name_epoch(names,directory->inode);
+                uint32_t hit=ext4_name_cached(names,directory->inode,name_epoch,hash,name,length);
+                if (hit) { *inode=hit;return 0; }
+            }
             epoch=live->metadata_epoch;
             mapping=live->directory_mapping;
             ready=mapping && mapping->epoch==epoch;
@@ -3403,6 +3556,7 @@ static int ext4_backend_lookup(struct kernel_vfs_node *parent,
         if (result_inode == EXT4_ROOT_INO ||
             (result_inode >= first && result_inode <= ext4_get32(sb, inodes_count))) {
             *inode = result_inode;
+            if (remember) ext4_name_remember(adapter,directory->inode,name_epoch,hash,name,length,result_inode);
             return 0;
         }
         error = -KERNEL_EUCLEAN;
@@ -3505,7 +3659,11 @@ static int ext4_backend_close_node(struct kernel_vfs_node *node)
 static int ext4_backend_writeback_allowed(struct kernel_vfs_instance *instance)
 { (void)instance; return !boaros_lwext4_allocation_active(); }
 static void ext4_backend_reclaim_clean(struct kernel_vfs_instance *instance)
-{ (void)ext4_bcache_reclaim(lwext4_instance(instance)->device.bc); }
+{
+    struct lwext4_mount_adapter *adapter=lwext4_instance(instance);
+    ext4_name_cache_reclaim(adapter);
+    (void)ext4_bcache_reclaim(adapter->device.bc);
+}
 static int ext4_backend_writeback_reclaim(struct kernel_vfs_instance *instance, int memory_pressure)
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
