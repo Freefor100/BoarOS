@@ -296,6 +296,12 @@ enum riscv_sv39_status riscv_sv39_user_leaf_probe_slot(const struct riscv_sv39_u
     uint64_t, struct kernel_mm_leaf *, unsigned *missing_tables, uint64_t **slot);
 enum riscv_sv39_status riscv_sv39_user_empty_window(const struct riscv_sv39_user_space *,
     uint64_t, unsigned, unsigned *);
+/* A continuously held MM writer keeps the returned base table and empty
+ * slots stable. A missing base table returns a NULL slot. */
+enum riscv_sv39_status riscv_sv39_user_empty_window_slot(const struct riscv_sv39_user_space *,
+    uint64_t address, unsigned count, unsigned *empty, uint64_t **slot);
+void riscv_sv39_user_publish_empty_window(struct riscv_sv39_user_space *, uint64_t *slot,
+    unsigned empty, const uint64_t *physical, uint32_t permissions, int flags);
 enum riscv_sv39_status riscv_sv39_user_leaf_missing_order(struct riscv_sv39_user_space *,
     uint64_t, uint32_t, unsigned *);
 enum riscv_sv39_status riscv_sv39_user_map_prepared_order(struct riscv_sv39_user_space *,

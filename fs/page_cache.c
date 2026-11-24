@@ -2996,6 +2996,7 @@ struct prepare_space {
     uint64_t offset,accepted_end;
     size_t length,ready;
     int mapping,error,complete;
+    bool overwrite_mapped;
     struct file_write_reservation *reservation;
 };
 static void prepare_space(void *argument)
@@ -3040,6 +3041,13 @@ static void complete_space(void *argument)
 static int prepare_space_request(struct kernel_page_cache *cache,struct prepare_space *request,
     void (*execute)(void *))
 {
+    if (request->overwrite_mapped) {
+        struct kernel_vfs_instance *instance = request->node->instance;
+        if (instance->read_only) return -KERNEL_EROFS;
+        int error = instance->ops->error(instance);
+        if (!error) request->ready = request->length;
+        return error;
+    }
     /* 来源pin和页写资格在空间准备前归还；write/offset门闩保持同次写互斥。
      * CPU0后端借用这些门闩，CALLER后端直接使用当前任务的事务现场。 */
     struct kernel_io_context *context=kernel_io_context_current();
@@ -3108,12 +3116,12 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
             retried_space=retry_space;
             size_t length=BOAROS_PAGE_CACHE_WRITEBACK_PAGES*BOAROS_PAGE_SIZE-(offset&BOAROS_PAGE_MASK);
             if (length>size-*written) length=size-*written;
-            int needed=0;
-            *reservation=(struct prepare_space){.node=node,.offset=offset,.length=length,.reservation=ticket};
+            *reservation=(struct prepare_space){.node=node,.offset=offset,.length=length,
+                .overwrite_mapped=source->overwrite_mapped,.reservation=ticket};
             ticket->space_pressure=0;
             space_error=prepare_space_request(cache,reservation,prepare_space);
-            ready=reservation->ready;needed=reservation->complete;
-            *complete|=needed;
+            ready=reservation->ready;
+            *complete|=reservation->complete;
             if (!ready) {
                 if (space_error!=-KERNEL_ENOSPC || !ticket->space_pressure || retried_space)
                     return space_error;

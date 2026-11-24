@@ -748,6 +748,10 @@ static void admission_legacy(struct kernel_vfs_mount *mount,struct kernel_vfs_fi
     struct ext4_inode_ref ref; assert(!ext4_fs_get_inode_ref(adapter->device.fs,node->inode,&ref));
     ext4_inode_clear_flag(ref.inode,EXT4_INODE_FLAG_EXTENTS); memset(ref.inode->blocks,0,sizeof(ref.inode->blocks));ref.dirty=true;
     assert(!ext4_fs_put_inode_ref(&ref));
+    /* This fixture changes inode format through the raw backend. */
+    struct ext4_delalloc *mapping = &((struct lwext4_node *)node)->delalloc;
+    mapping->fresh_extent = false;
+    mapping->mapped_end = 0;
     assert(!(journal?ext4_transaction_end(adapter->mount_point):ext4_cache_flush(adapter->mount_point)));
 }
 static void admission_prefix(struct kernel_page_cache *cache,struct kernel_vfs_mount *mount,int legacy)

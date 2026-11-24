@@ -42,6 +42,6 @@ static inline void kernel_mm_retirement_release(struct physical_page_allocator *
         physical_page_release_order_batch(allocator, batch->pages, batch->orders, batch->count);
     else
         physical_page_release_batch(allocator, batch->pages, batch->count);
-    *batch = (struct kernel_mm_retirement){0};
+    batch->count = batch->nonleaf = batch->compound = 0;
 }
 #endif

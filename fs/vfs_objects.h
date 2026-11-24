@@ -236,6 +236,9 @@ struct kernel_vfs_backend {
     /* Delayed admission borrows prepared blocks until the actual copied
      * prefix is known; overlapping sources share acceptance and lifetime. */
     int (*reserve_write)(struct kernel_vfs_node *, uint64_t, size_t, size_t *, int *, struct file_write_reservation *);
+    /* Called under the inode writer. The outer write gate excludes destructive
+     * range changes until all accepted bytes have been copied. */
+    bool (*overwrite_mapped)(struct kernel_vfs_node *, uint64_t, size_t);
     void (*finish_reservation)(struct kernel_vfs_node *, struct file_write_reservation *, uint64_t start, uint64_t accepted_end);
     /* Accept while inode qualification still protects this mapping generation. */
     void (*accept_reservation)(struct kernel_vfs_node *, struct file_write_reservation *, uint64_t start, uint64_t accepted_end);
