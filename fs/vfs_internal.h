@@ -167,6 +167,7 @@ struct kernel_page_cache_dirty *kernel_vfs_node_dirty_pages(struct kernel_vfs_no
 int kernel_vfs_node_writeback_allowed(const struct kernel_vfs_node *node);
 void kernel_vfs_node_written(struct kernel_vfs_node *node, uint64_t end);
 #define KERNEL_VFS_WRITEBACK_MAX 32U
+#define KERNEL_VFS_GROWTH_WRITEBACK_MAX 128U
 /* Stable sources remain caller-owned. The backend may retain them through
  * ordered commit; source.bytes includes the entire retained allocation, not
  * just this dirty range. source_buffer/source_size describe initialized stable

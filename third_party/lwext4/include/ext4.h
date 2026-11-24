@@ -107,6 +107,8 @@ struct ext4_journal_runtime {
 	void (*request)(void *context, unsigned work);
 	int (*wait)(void *context, uint64_t sequence, enum ext4_journal_wait kind);
 	bool (*join_pending_metadata)(void *context);
+	/* Allow completed writes to private new blocks to precede publication. */
+	bool prewrite_fresh;
 };
 int ext4_journal_group_enable(const char *mount_point,
 	const struct ext4_journal_runtime *runtime, size_t memory_limit);
@@ -227,7 +229,9 @@ int ext4_file_remove_privileges(ext4_file *,uint32_t mode);
 /* Live inode owner update, set-ID/capability removal and ctime share one
  * operation transaction. UINT32_MAX preserves the corresponding ID. */
 int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid, uint32_t privilege_mode);
-/* One operation for up to EXT4_BLOCK_BATCH_MAX ordered, disjoint file ranges. Sources are
+/* File transaction sizing is independent of the device descriptor window. */
+#define EXT4_FILE_WRITEBACK_MAX 128U
+/* One operation for up to EXT4_FILE_WRITEBACK_MAX ordered, disjoint file ranges. Sources are
  * borrowed on entry; a retained owner is released after its last full block's
  * ordered commit or abort. Failed mounts retain accepted versions for readers.
  * source_buffer/source_size optionally cover complete filesystem blocks around
