@@ -6226,6 +6226,7 @@ int ext4_file_sync_metadata_prepare(ext4_file *file, bool data_only, uint64_t *t
 #if CONFIG_JOURNALING_ENABLE
     if (file->mp->fs.jbd_journal) {
         struct jbd_journal *journal = file->mp->fs.jbd_journal;
+        unsigned work = EXT4_JOURNAL_WORK_COMMIT;
         bool request = false;
         {
             EXT4_STATE_SCOPE(state, &file->mp->fs);
@@ -6246,6 +6247,7 @@ int ext4_file_sync_metadata_prepare(ext4_file *file, bool data_only, uint64_t *t
                          * paying for another metadata-only commit. */
                         uint64_t now = runtime->now_ns(runtime->context);
                         journal->sync_join_deadline_ns = now + UINT64_C(4000000);
+                        work |= EXT4_JOURNAL_WORK_JOIN_TIMES;
                     }
                 }
                 if (!join && journal->running && journal->running->sequence == sequence)
@@ -6254,7 +6256,7 @@ int ext4_file_sync_metadata_prepare(ext4_file *file, bool data_only, uint64_t *t
             } else if (!r && !journal->grouped) r = jbd_journal_sync(journal, journal->committed_id);
         }
         if (request && file->mp->journal_runtime.request)
-            file->mp->journal_runtime.request(file->mp->journal_runtime.context, EXT4_JOURNAL_WORK_COMMIT);
+            file->mp->journal_runtime.request(file->mp->journal_runtime.context, work);
         EXT4_MP_UNLOCK(file->mp);
         return r;
     }

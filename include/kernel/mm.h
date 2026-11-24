@@ -133,6 +133,13 @@ unsigned kernel_mm_try_pin_user_read_batch(const struct kernel_mm *, uint64_t fi
     unsigned count, struct kernel_mm_user_pin *);
 void kernel_mm_unpin_user_read_batch(struct kernel_mm_user_pin *, unsigned count);
 
+#if defined(__riscv) && BOAROS_MAX_CPUS == 1
+#define KERNEL_MM_COPY_READY_PAGES 8U
+/* Resident writable base pages, excluding shared file-write aliases. */
+unsigned kernel_mm_copy_to_ready_user_pages(struct kernel_mm *, uint64_t first,
+    const void *const *source, unsigned count);
+#endif
+
 /* Caller retains an independently acquired MM owner through faults and copy.
  * force is debugger access through VM_MAY*: readonly private stores resolve
  * COW without changing VMA/PTE permissions. Errors retain the true prefix. */

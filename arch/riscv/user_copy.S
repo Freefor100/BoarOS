@@ -206,6 +206,40 @@ riscv_uaccess_fixups_start:
     copy riscv_copy_to_user,1
     copy riscv_copy_from_user,0
 
+#if BOAROS_MAX_CPUS == 1
+    .section .text.riscv_copy_page,"ax",@progbits
+    .balign 4
+    .globl riscv_copy_page
+    .type riscv_copy_page,@function
+riscv_copy_page:
+    lui a2,1
+    add a2,a2,a0
+.Lcopy_page:
+    /* Read the entire cache line before storing it, even when the source
+     * and destination evict each other's translation. */
+    ld t0,0(a1)
+    ld t1,8(a1)
+    ld t2,16(a1)
+    ld t3,24(a1)
+    ld t4,32(a1)
+    ld a3,40(a1)
+    ld a4,48(a1)
+    ld a5,56(a1)
+    sd t0,0(a0)
+    sd t1,8(a0)
+    sd t2,16(a0)
+    sd t3,24(a0)
+    sd t4,32(a0)
+    sd a3,40(a0)
+    sd a4,48(a0)
+    sd a5,56(a0)
+    addi a0,a0,64
+    addi a1,a1,64
+    bne a0,a2,.Lcopy_page
+    ret
+    .size riscv_copy_page,.-riscv_copy_page
+#endif
+
     .section .text.riscv_copy_string_from_user,"ax",@progbits
     .balign 4
     .globl riscv_copy_string_from_user

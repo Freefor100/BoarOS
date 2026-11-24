@@ -480,6 +480,43 @@ static enum kernel_files_status direct_read(struct kernel_files *files,struct ke
     return 0;
 }
 
+#if defined(__riscv) && BOAROS_MAX_CPUS == 1
+static unsigned copy_cached_pages(struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor,
+    const struct kernel_page_cache_read_page *pages, size_t count, uint64_t bytes, int *miss)
+{
+    if (cursor->count!=1 || cursor->index || cursor->offset>=cursor->iov->length) return 0;
+    uint64_t address=cursor->iov->base+cursor->offset;
+    if (address&BOAROS_PAGE_MASK) return 0;
+    uint64_t available=cursor->iov->length-cursor->offset;
+    if (bytes>available) bytes=available;
+    if (count>bytes/BOAROS_PAGE_SIZE) count=bytes/BOAROS_PAGE_SIZE;
+    unsigned done=0;
+    while (count-done>1) {
+        const void *source[KERNEL_MM_COPY_READY_PAGES];
+        unsigned window=count-done;
+        if (window>KERNEL_MM_COPY_READY_PAGES) window=KERNEL_MM_COPY_READY_PAGES;
+        unsigned prepared=0;
+        while (prepared<window) {
+            const struct kernel_page_cache_read_page *page=&pages[done+prepared];
+            if (page->status || page->valid_bytes!=BOAROS_PAGE_SIZE) break;
+            source[prepared++]=kernel_page_cache_read_data(page);
+        }
+        if (prepared<2) break;
+        unsigned copied=kernel_mm_copy_to_ready_user_pages(mm,address,source,prepared);
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+        for (unsigned i=0;i<copied && !*miss;i++) *miss=pages[done+i].cache_miss;
+#else
+        (void)miss;
+#endif
+        done+=copied;
+        address+=(uint64_t)copied*BOAROS_PAGE_SIZE;
+        if (copied<window) break;
+    }
+    cursor->offset+=(uint64_t)done*BOAROS_PAGE_SIZE;
+    return done;
+}
+#endif
+
 /* 缓存批次只覆盖剩余需求；复制前已经结束存储锁，整个批次的成功页都有独立引用。 */
 static enum kernel_files_status disk_read(
     struct kernel_files *files, struct kernel_mm *mm,
@@ -520,7 +557,18 @@ static enum kernel_files_status disk_read(
             break;
         }
         struct kernel_uaccess_write_cursor user_copy={0};
-        for (size_t i = 0; i < count; i++) {
+        unsigned ready=0;
+#if defined(__riscv) && BOAROS_MAX_CPUS == 1
+        if (!start && count>1) {
+            ready=copy_cached_pages(mm,cursor,pages,count,remaining,&cache_miss);
+            size_t copied=(size_t)ready*BOAROS_PAGE_SIZE;
+            total+=copied;
+            position+=copied;
+            chunks+=ready;
+            if (advance) description->offset=position;
+        }
+#endif
+        for (size_t i = ready; i < count; i++) {
             struct kernel_page_cache_read_page *part = &pages[i];
             chunks++;
             if (part->status == KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE ||

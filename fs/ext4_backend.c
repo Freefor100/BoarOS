@@ -231,7 +231,7 @@ static int journal_publish_locked(struct lwext4_mount_adapter *adapter)
         }
         if (reclaimed || failed) {
             wake_commit = !adapter->journal_requested;
-            adapter->journal_requested = 1;
+            adapter->journal_requested |= EXT4_JOURNAL_WORK_COMMIT;
         }
     }
     journal_wake(&adapter->journal_progress);
@@ -255,21 +255,20 @@ static void backend_unlock(void *lock)
     if (changed) complete_sync_waiters(adapter);
 }
 
-static void journal_request_flags(struct lwext4_mount_adapter *adapter,
-    int commit, int checkpoint, int force)
+static void journal_request_flags(struct lwext4_mount_adapter *adapter, unsigned work)
 {
     int wake_commit = 0, wake_checkpoint = 0;
     {
         KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
-        if (commit) {
+        if (work & EXT4_JOURNAL_WORK_COMMIT) {
             wake_commit = !adapter->journal_requested;
-            adapter->journal_requested = 1;
+            adapter->journal_requested |= work &
+                (EXT4_JOURNAL_WORK_COMMIT | EXT4_JOURNAL_WORK_JOIN_TIMES);
         }
-        if (checkpoint) {
+        if (work & EXT4_JOURNAL_WORK_CHECKPOINT) {
             wake_checkpoint = !adapter->checkpoint_requested;
             adapter->checkpoint_requested = 1;
         }
-        if (force) adapter->journal_force = 1;
     }
     if (wake_commit) journal_wake(&adapter->journal_work);
     if (wake_checkpoint) journal_wake(&adapter->checkpoint_work);
@@ -476,7 +475,7 @@ static void time_notify(struct lwext4_mount_adapter *adapter, int notify)
     if (!notify) return;
     {
         KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
-        adapter->journal_requested = 1;
+        adapter->journal_requested |= EXT4_JOURNAL_WORK_COMMIT;
     }
     journal_wake(&adapter->journal_work);
 }
@@ -652,19 +651,23 @@ static void time_written(void *owner, unsigned fields,
 static int writeback_times(struct kernel_vfs_node *node, bool wait)
 { return ext4_file_writeback_times(lwext4_node_file(node), wait); }
 
-static int writeback_mount_times(struct lwext4_mount_adapter *adapter, bool wait)
+static int writeback_mount_times(struct lwext4_mount_adapter *adapter, bool wait,
+    bool join_atime)
 {
     size_t count;
     {
         TIMESTAMP_SCOPE(times, adapter);
         count = adapter->dirty_times_count;
     }
+    if (join_atime && count>8) count=8;
     int result = EOK;
     while (count--) {
         struct kernel_vfs_node *node;
         {
             TIMESTAMP_SCOPE(times, adapter);
             node = adapter->dirty_times ? &adapter->dirty_times->node : NULL;
+            if (join_atime && node && adapter->dirty_times->dirty_fields!=EXT4_TIME_ATIME)
+                break;
             if (node && kernel_vfs_node_acquire(node)) __builtin_trap();
         }
         if (!node) break;
@@ -674,7 +677,7 @@ static int writeback_mount_times(struct lwext4_mount_adapter *adapter, bool wait
             struct lwext4_node *current = (struct lwext4_node *)node;
             /* Newer RAM updates keep their pin without hiding other inodes
              * from this bounded flush pass. New entries join the tail. */
-            if (!result && current->dirty_previous && adapter->dirty_times == current) {
+            if (!result && adapter->dirty_times == current && current->dirty_next) {
                 time_unlink_dirty(current);
                 time_append_dirty(current);
             }
@@ -685,8 +688,9 @@ static int writeback_mount_times(struct lwext4_mount_adapter *adapter, bool wait
     }
     {
         TIMESTAMP_SCOPE(times, adapter);
-        adapter->times_deadline = adapter->dirty_times
-            ? kernel_time_monotonic_ns() + UINT64_C(100000000) : 0;
+        if (!adapter->dirty_times) adapter->times_deadline = 0;
+        else if (!join_atime)
+            adapter->times_deadline = kernel_time_monotonic_ns() + UINT64_C(100000000);
     }
     return result;
 }
@@ -1076,7 +1080,7 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
                        ? -KERNEL_EBUSY : -KERNEL_EIO;
         }
     }
-    result = writeback_mount_times(adapter, true);
+    result = writeback_mount_times(adapter, true, false);
     if (result != EOK) return lwext4_error(result);
     if (!kernel_vfs_nodes_internal_idle(&adapter->instance)) return -KERNEL_EBUSY;
     orphan_link = &adapter->orphans;
@@ -1196,8 +1200,7 @@ static bool journal_join_pending_metadata(void *context)
 
 static void journal_request(void *context, unsigned work)
 {
-    journal_request_flags(context, work & EXT4_JOURNAL_WORK_COMMIT,
-        work & EXT4_JOURNAL_WORK_CHECKPOINT, 0);
+    journal_request_flags(context, work);
 }
 
 static uint64_t journal_reached(const struct lwext4_mount_adapter *adapter, enum ext4_journal_wait kind)
@@ -1309,7 +1312,9 @@ static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait
     boaros_lwext4_state_unlock(&adapter->backend_lock);
     /* lwext4 已登记固定 seal/checkpoint target。晚到的等待者只推动
      * 这个目标，不能 force 封闭目标之后接纳的无关 running group。 */
-    journal_request_flags(adapter, 1, kind == EXT4_JOURNAL_WAIT_CHECKPOINT, 0);
+    unsigned work = EXT4_JOURNAL_WORK_COMMIT;
+    if (kind == EXT4_JOURNAL_WAIT_CHECKPOINT) work |= EXT4_JOURNAL_WORK_CHECKPOINT;
+    journal_request_flags(adapter, work);
     unsigned depth = boaros_lwext4_pause();
     if (changed) complete_sync_waiters(adapter);
     int result;
@@ -1335,9 +1340,11 @@ static void journal_worker(void *context)
     if(!journal_await_start(adapter,0))return;
     kernel_io_context_current()->background_reclaim = 1;
     for (;;) {
+        unsigned work;
         int force, stopping;
         {
             KERNEL_TASK_LOCK_SCOPE(guard, &adapter->journal_control);
+            work = adapter->journal_requested;
             force = adapter->journal_force;
             adapter->journal_force = adapter->journal_requested = 0;
             stopping = adapter->journal_stopping;
@@ -1353,7 +1360,12 @@ static void journal_worker(void *context)
         int metadata = EOK;
         uint64_t times_due = time_deadline(adapter);
         if (times_due && kernel_time_monotonic_ns() >= times_due)
-            metadata = writeback_mount_times(adapter, false);
+            metadata = writeback_mount_times(adapter, false, false);
+        else if (work & EXT4_JOURNAL_WORK_JOIN_TIMES)
+            /* Stage already-dirty timestamps during the current group's
+             * join window. Resource pressure leaves the remaining updates
+             * queued for their original deadlines. */
+            (void)writeback_mount_times(adapter, false, true);
         int result = EOK;
         struct ext4_journal_progress progress = {0};
         if (adapter->device.fs->jbd_journal) {
@@ -3386,7 +3398,7 @@ static int ext4_backend_flush(struct kernel_vfs_instance *instance)
 static int ext4_backend_sync_filesystem(struct kernel_vfs_mount *mount)
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(mount->private_data);
-    int result = writeback_mount_times(adapter, true);
+    int result = writeback_mount_times(adapter, true, false);
     /* Timestamp failures have already been published on the affected inode. */
     if (result != EOK) return lwext4_error(result);
     result = ext4_filesystem_sync_metadata(adapter->mount_point);
