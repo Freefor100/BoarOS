@@ -671,19 +671,36 @@ static inline void entry_retire(struct kernel_page_cache_entry *entry)
 #endif
 }
 
-/* Acquisition is serialized by the cache index; page references are separate. */
-static void entry_borrow(struct kernel_page_cache_entry *entry)
+static inline void entry_borrows_add(struct kernel_page_cache_record *record, size_t count)
 {
 #if BOAROS_MAX_CPUS > 1
-    if ((__atomic_fetch_add(&entry->users,1,__ATOMIC_RELAXED)&CACHE_USERS_COUNT)==CACHE_USERS_COUNT ||
-        __atomic_fetch_add(&entry->cache->record->entry_borrows,1,__ATOMIC_RELAXED)==UINT64_MAX)
+    uint64_t previous = __atomic_fetch_add(&record->entry_borrows,count,__ATOMIC_RELAXED);
+#else
+    uint64_t previous = record->entry_borrows;
+    record->entry_borrows += count;
+#endif
+    if (previous > UINT64_MAX-count) __builtin_trap();
+}
+
+/* Acquisition is serialized by the cache index; page references are separate. */
+static inline void entry_borrow_indexed(struct kernel_page_cache_entry *entry)
+{
+#if BOAROS_MAX_CPUS > 1
+    if ((__atomic_fetch_add(&entry->users,1,__ATOMIC_RELAXED)&CACHE_USERS_COUNT)==CACHE_USERS_COUNT)
         __builtin_trap();
 #else
-    if (entry->users == UINT32_MAX || entry->cache->record->entry_borrows == UINT64_MAX) __builtin_trap();
-    entry->users++; entry->cache->record->entry_borrows++;
+    if (entry->users == UINT32_MAX) __builtin_trap();
+    entry->users++;
 #endif
 }
-static void entry_return(struct kernel_page_cache_entry *entry)
+
+static void entry_borrow(struct kernel_page_cache_entry *entry)
+{
+    entry_borrow_indexed(entry);
+    entry_borrows_add(entry->cache->record, 1);
+}
+
+static int entry_return(struct kernel_page_cache_entry *entry)
 {
 #if BOAROS_MAX_CPUS > 1
     uint32_t users=__atomic_fetch_sub(&entry->users,1,__ATOMIC_ACQ_REL);
@@ -698,22 +715,18 @@ static void entry_return(struct kernel_page_cache_entry *entry)
     if (last_retired && entry->cache->record->started) {
         entry->cache->record->requested=1; cache_wake(&entry->cache->record->work);
     }
+    return last_retired;
 }
 
 #if BOAROS_MAX_CPUS > 1
-static int entry_return_live(struct kernel_page_cache_record *record,
-    struct kernel_page_cache_entry *entry)
+static int entry_return_live(struct kernel_page_cache_entry *entry)
 {
     uint32_t users=__atomic_load_n(&entry->users,__ATOMIC_RELAXED);
     while (!(users&CACHE_USERS_RETIRED)) {
         if (!users) __builtin_trap();
         if (__atomic_compare_exchange_n(&entry->users,&users,users-1,1,
-            __ATOMIC_ACQ_REL,__ATOMIC_RELAXED)) {
-            /* The entry may be freed now; its cache remains pinned by the
-             * outstanding borrow count until this release. */
-            if (!__atomic_fetch_sub(&record->entry_borrows,1,__ATOMIC_RELEASE)) __builtin_trap();
+            __ATOMIC_ACQ_REL,__ATOMIC_RELAXED))
             return 1;
-        }
     }
     return 0;
 }
@@ -2416,14 +2429,20 @@ void kernel_page_cache_put_batch(struct kernel_page_cache *cache,
     if (!cache_live(cache) || !pages || !count) return;
 #if BOAROS_MAX_CPUS > 1
     struct kernel_page_cache_record *record=cache->record;
+    size_t returned=0;
     int locked=0;
     for (size_t i=0;i<count;i++) {
         if (pages[i].status!=KERNEL_PAGE_CACHE_STATUS_OK) continue;
-        if (pages[i].entry && entry_return_live(record,pages[i].entry)) {
+        if (pages[i].entry && entry_return_live(pages[i].entry)) {
             pages[i].entry=NULL;
             pages[i].physical_address=0;
+            returned++;
         } else if (pages[i].entry || pages[i].physical_address) locked=1;
     }
+    /* Individual entries may retire after their decrement; the outstanding
+     * aggregate keeps the cache alive through the whole release batch. */
+    if (returned && __atomic_fetch_sub(&record->entry_borrows,returned,__ATOMIC_RELEASE)<returned)
+        __builtin_trap();
     if (!locked) return;
 #endif
     int clean = 0;
@@ -2433,11 +2452,7 @@ void kernel_page_cache_put_batch(struct kernel_page_cache *cache,
             if (pages[i].status == KERNEL_PAGE_CACHE_STATUS_OK) {
                 struct kernel_page_cache_entry *entry = pages[i].entry;
                 if (entry) {
-                    entry_return(entry);
-                    if (entry_retired(entry) && !entry_users(entry)) {
-                        /* truncate/hole已移除索引，只推进退休owner的释放。 */
-                        clean = 1;
-                    }
+                    clean |= entry_return(entry);
                     pages[i].entry = NULL;
                 } else if (pages[i].physical_address) {
                     physical_page_release(cache->allocator, pages[i].physical_address);
@@ -2750,11 +2765,17 @@ static int read_cached_batch(struct cache_read_batch_request *request, bool take
              * entries are stable under the index guard until it is taken. */
             if (take_physical)
                 take_read_page(cache,entry,&page->physical_address,&page->valid_bytes,valid,request->no_reuse);
-            else
-                take_read_page_borrow(cache,entry,&page->physical_address,&page->valid_bytes,&page->entry,valid,request->no_reuse);
+            else {
+                entry_borrow_indexed(entry);
+                page->entry=entry;
+                page->physical_address=entry->physical_address;
+                page->valid_bytes=valid;
+                note_read_access(cache,entry,request->no_reuse);
+            }
             page->status=KERNEL_PAGE_CACHE_STATUS_OK;
             hits++;
         }
+        if (hits && !take_physical) entry_borrows_add(cache->record,hits);
 #if BOAROS_MAX_CPUS == 1
         note_read_hits(cache,hits);
 #endif
@@ -3246,6 +3267,8 @@ PrepareTarget:
             entry_return(entry);
         }
         if (offset+count>old_size) kernel_vfs_node_written(node,offset+count);
+        if (count==ready && ticket->owner && node->instance->ops->finish_full_reservation)
+            node->instance->ops->finish_full_reservation(ticket);
         kernel_lock_release(&io);
         kernel_vfs_write_source_finish(source,&view);
         kernel_page_cache_resize_finish(&resize,old_size);
@@ -3762,7 +3785,6 @@ static int writeback_run(struct kernel_page_cache *cache,
     struct file_write_span *spans=workspace->spans;
     for (size_t first=0;first<count;) {
         memset(prepared,0,(count-first)*sizeof(*prepared));
-        memset(spans,0,(count-first)*sizeof(*spans));
         size_t ready=0,done=0;
         int result=prepare_writeback_batch(cache,entries+first,count-first,limit,background,
             prepared,&done);

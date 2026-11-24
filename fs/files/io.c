@@ -539,13 +539,16 @@ static enum kernel_files_status disk_read(
                 kernel_copy_to_user_iov_cursor(mm,cursor,&user_copy,page+start,chunk,&copied);
             /* A later user page can fault and the task may be reaped while
              * blocked. Keep the copied prefix visible to other FD owners. */
-            if (copied > chunk || (advance && kernel_open_file_advance(description,copied))) {
+            if (copied > chunk) {
                 status = KERNEL_FILES_STATUS_STATE; done = 1; break;
             }
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
             if (copied && part->cache_miss) cache_miss=1;
 #endif
             total += copied; position += copied;
+            /* The open-file owner and its offset qualification cover this
+             * call. Position is already bounded by the file and page end. */
+            if (advance) description->offset = position;
             if (access == KERNEL_UACCESS_STATUS_FAULT) {
                 error = -KERNEL_EFAULT; done = 1; break;
             }

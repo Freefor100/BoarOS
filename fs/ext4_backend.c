@@ -505,7 +505,9 @@ struct lwext4_staged_inode {
     struct jbd_journal *journal;
     struct ext4_timestamp values[3];
     uint64_t versions[3];
+    uint64_t file_size, file_position;
     unsigned fields;
+    bool restore_file;
 };
 
 static struct lwext4_staged_inode *stage_inode(struct lwext4_mount_adapter *adapter,
@@ -545,6 +547,21 @@ static struct lwext4_staged_inode *stage_inode(struct lwext4_mount_adapter *adap
 static void inode_changed(void *context,uint32_t inode)
 { (void)stage_inode(context,NULL,inode); }
 
+static int track_nested_file(void *context, ext4_file *file)
+{
+    struct kernel_vfs_node *node = file->time_owner;
+    if (file != lwext4_node_file(node))
+        return EOK;
+    struct lwext4_staged_inode *record = stage_inode(context, node, file->inode);
+    if (!record) return ENOMEM;
+    if (!record->restore_file) {
+        record->file_size = file->fsize;
+        record->file_position = file->fpos;
+        record->restore_file = true;
+    }
+    return EOK;
+}
+
 static void time_stage(void *context,void *owner,uint32_t inode,unsigned field,
     struct ext4_timestamp value)
 {
@@ -566,6 +583,13 @@ static void time_finish(void *context, void *staged_inodes, bool accepted)
         struct lwext4_staged_inode *next = record->next;
         struct lwext4_node *node = record->node;
         struct kernel_vfs_node *dirty_pin, *staged_pin = &node->node;
+        /* A nested operation can finish before its journal owner decides
+         * whether to commit. Restore the live handle with the inode on abort. */
+        if (!accepted && record->restore_file) {
+            ext4_file *file = lwext4_node_file(staged_pin);
+            file->fsize = record->file_size;
+            file->fpos = record->file_position;
+        }
         {
             TIMESTAMP_SCOPE(times, adapter);
             /* Invalidate even after abort: nonjournal failures may have an
@@ -1687,7 +1711,8 @@ static int mount_ext_filesystem(struct kernel_vfs_mount *mount,
     result = ext4_mount_setup_locks(adapter->mount_point, &adapter->locks);
     if (result != EOK) { (void)cleanup_mount(mount); return lwext4_error(result); }
     struct ext4_inode_observer observer={.context=adapter,.store=time_stage,
-        .changed=inode_changed,.finish=time_finish,.snapshot=time_snapshot,.written=time_written};
+        .changed=inode_changed,.track_file=track_nested_file,.finish=time_finish,
+        .snapshot=time_snapshot,.written=time_written};
     result = ext4_mount_setup_inode_observer(adapter->mount_point, &observer);
     if (result != EOK) { (void)cleanup_mount(mount); return lwext4_error(result); }
     result = ext4_mount_setup_clock(adapter->mount_point, vfs_realtime);
@@ -3432,6 +3457,7 @@ static void initialize_backend(void)
     ops->reserve_write = ext4_backend_reserve_write;
     ops->overwrite_mapped = ext4_backend_overwrite_mapped;
     ops->finish_reservation = ext4_backend_finish_reservation;
+    ops->finish_full_reservation = ext4_finish_full_reservation;
     ops->accept_reservation = ext4_backend_accept_reservation;
     ops->complete_write = ext4_backend_complete_write;
     ops->block_device = ext4_backend_block_device;
