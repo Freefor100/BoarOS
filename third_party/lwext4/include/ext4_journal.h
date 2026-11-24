@@ -189,6 +189,7 @@ struct jbd_journal {
 	struct jbd_memory *memory;
 	uint64_t accepted_sequence, sealed_sequence, durable_sequence, checkpoint_sequence;
 	uint64_t seal_target;
+	uint64_t sync_join_deadline_ns;
 	ext4_fsblk_t *log_map;
 	/* Each actual consumer owns one block until its synchronous I/O ends. */
 	struct jbd_image *commit_image, *checkpoint_image;

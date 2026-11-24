@@ -346,6 +346,8 @@ struct kernel_vfs_backend {
     void (*memory_written)(struct kernel_vfs_node *node, uint64_t end);
     int (*writeback)(struct kernel_vfs_node *node,
         struct file_write_span *spans, size_t count);
+    /* Synchronous data-only submission; EOPNOTSUPP leaves bytes untouched. */
+    int (*writeback_mapped)(struct kernel_vfs_node *, struct file_write_span *, size_t);
     /* Caller owns inode io_lock; positive result is the returned byte count. */
     int (*xattr)(struct kernel_vfs_node *, enum kernel_xattr_operation,
         const char *, void *, size_t, uint32_t);

@@ -233,6 +233,25 @@ int main(void)
         assert(kernel_block_flush(&device) == completion);
         assert(calls == i + 1);
     }
+    struct kernel_block_device partition = {.parent=&device,.logical_block_size=512};
+    kernel_block_note_writeback(&partition);
+    uint64_t first = kernel_block_writeback_epoch(&device);
+    assert(first != 0 && first == kernel_block_writeback_epoch(&partition));
+    unsigned before = calls;
+    completion = KERNEL_BLOCK_STATUS_IO;
+    assert(kernel_block_flush_through(&device, first) == completion);
+    assert(kernel_block_flush_through(&partition, first) == completion);
+    assert(calls == before + 2);
+    completion = KERNEL_BLOCK_STATUS_OK;
+    assert(kernel_block_flush_through(&partition, first) == completion);
+    assert(kernel_block_flush_through(&device, first) == completion);
+    assert(calls == before + 3);
+    kernel_block_note_writeback(&device);
+    uint64_t second = kernel_block_writeback_epoch(&partition);
+    assert(second > first);
+    assert(kernel_block_flush(&device) == completion);
+    assert(kernel_block_flush_through(&partition, second) == completion);
+    assert(calls == before + 4);
     puts("block flush capability and error tests passed");
     test_write_batch();
     test_read_batch();

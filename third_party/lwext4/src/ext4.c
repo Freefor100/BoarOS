@@ -1512,7 +1512,8 @@ static bool ext4_group_due(struct ext4_mountpoint *mp, bool force)
 	 * Keep the next group joinable while an older group occupies the consumer;
 	 * its fixed target is sealed as soon as that consumer becomes available. */
 	bool sync_due = journal->seal_target >= running->sequence &&
-		!journal->committing && TAILQ_EMPTY(&journal->sealed_queue);
+		!journal->committing && TAILQ_EMPTY(&journal->sealed_queue) &&
+		now >= journal->sync_join_deadline_ns;
 	return force || sync_due ||
 		(uint64_t)running->reserved_logs * journal->block_size >= 256 * 1024 ||
 		(now >= running->first_dirty_ns && now - running->first_dirty_ns >= 100000000);
@@ -1557,6 +1558,7 @@ static int ext4_group_wait(struct ext4_mountpoint *mp, uint64_t target, enum ext
 	int error = jbd_journal_error(journal);
 	if (error || reached >= target) return error;
 	if (journal->seal_target < target) journal->seal_target = target;
+	journal->sync_join_deadline_ns = 0;
 	if (kind == EXT4_JOURNAL_WAIT_CHECKPOINT && journal->checkpoint_target < target)
 		journal->checkpoint_target = target;
 	}
@@ -1967,10 +1969,15 @@ int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_pro
 		bool commit_ready = !journal->committing &&
 			(!TAILQ_EMPTY(&journal->sealed_queue) || ext4_group_due(mp, false));
 		bool checkpoint_ready = jbd_journal_checkpoint_ready(journal);
+		uint64_t deadline = running ? running->first_dirty_ns + 100000000 : 0;
+		if (running && !journal->committing && TAILQ_EMPTY(&journal->sealed_queue) &&
+		    journal->seal_target >= running->sequence && journal->sync_join_deadline_ns &&
+		    journal->sync_join_deadline_ns < deadline)
+			deadline = journal->sync_join_deadline_ns;
 		*progress = (struct ext4_journal_progress){
 			.accepted = journal->accepted_sequence, .sealed = journal->sealed_sequence,
 			.durable = journal->durable_sequence, .checkpoint = journal->checkpoint_sequence,
-			.deadline_ns = running ? running->first_dirty_ns + 100000000 : 0,
+			.deadline_ns = deadline,
 			.memory_used = jbd_memory_used(journal), .memory_peak = jbd_memory_peak(journal),
 			.ready = commit_ready || checkpoint_ready,
 			.commit_ready = commit_ready, .checkpoint_ready = checkpoint_ready,
@@ -5915,6 +5922,76 @@ static int ext4_fpwrite_batch_mode(ext4_file *file, struct file_write_span *span
 int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count)
 { return ext4_fpwrite_batch_mode(file, spans, count, false); }
 
+int ext4_fpwrite_mapped_batch(ext4_file *file, struct file_write_span *spans, unsigned count)
+{
+    struct ext4_fs *fs = &file->mp->fs;
+    struct jbd_journal *journal = fs->jbd_journal;
+    size_t block = fs->bdev->lg_bsize;
+    if (!journal || !journal->grouped || !fs->bdev->bdif->bwrite_phase ||
+        !count || count > EXT4_BLOCK_BATCH_MAX || fs->read_only)
+        return ENOTSUP;
+    for (unsigned i = 0; i < count; i++)
+        if (spans[i].offset % block || spans[i].size != block) return ENOTSUP;
+
+    struct ext4_block_write writes[EXT4_BLOCK_BATCH_MAX];
+    EXT4_MP_LOCK(file->mp);
+    int result;
+    {
+        EXT4_STATE_READ_SCOPE(state, fs);
+        result = jbd_journal_error(journal);
+        struct ext4_inode_goal probe = {.inode = file->inode};
+        struct ext4_inode_goal *goal = RB_FIND(ext4_inode_goal_tree, &fs->inode_goals, &probe);
+        if (!result && (ext4_current_operation(fs) ||
+            (goal && goal->data_sequence > journal->durable_sequence))) result = ENOTSUP;
+    }
+    if (result) goto out;
+
+    struct ext4_inode_ref ref;
+    result = ext4_fs_get_inode_ref_read(fs, file->inode, &ref);
+    if (result) goto out;
+    uint64_t end = ext4_inode_get_size(ext4_fs_super(fs), ref.inode);
+    struct ext4_inode_block_range range = {0};
+    uint64_t mapped = 0;
+    for (unsigned i = 0; i < count; i++) {
+        uint64_t offset = spans[i].offset;
+        if (offset > end || block > end - offset || offset / block > UINT32_MAX) {
+            result = ENOTSUP;
+            break;
+        }
+        if (!range.count || mapped != offset) {
+            unsigned consecutive = 1;
+            while (i + consecutive < count &&
+                spans[i + consecutive].offset == offset + consecutive * block)
+                consecutive++;
+            result = ext4_fs_get_inode_dblk_range(&ref, offset / block,
+                consecutive, false, &range);
+            if (result) break;
+            if (!range.block || range.unwritten) {
+                result = ENOTSUP;
+                break;
+            }
+        }
+        writes[i] = (struct ext4_block_write){
+            .offset = fs->bdev->part_offset + range.block * block,
+            .data = spans[i].buffer, .size = block,
+            .next = i + 1 < count ? &writes[i+1] : NULL};
+        mapped = offset + block;
+        range.block++;
+        range.count--;
+    }
+    result = ext4_result(result, ext4_fs_put_inode_ref(&ref));
+out:
+    EXT4_MP_UNLOCK(file->mp);
+    if (result) return result;
+    /* The VFS inode reader excludes truncate and hole punching through I/O.
+     * The durable data goal excludes older ordered payloads for these blocks. */
+    result = ext4_blocks_set_phase(fs->bdev, writes);
+    if (!result) {
+        for (unsigned i = 0; i < count; i++) spans[i].written = spans[i].size;
+    } else if (result == ENOTSUP) result = EIO;
+    return result;
+}
+
 /* Nonjournal synchronous storage is borrowed only until device completion.
  * Journal users need the ordered-owner completion protocol instead. */
 int ext4_fpwrite_direct(ext4_file *file, struct file_write_span *span)
@@ -6088,6 +6165,11 @@ int ext4_file_sync_metadata_prepare(ext4_file *file, bool data_only, uint64_t *t
 	if (!file || !file->mp || !file->mp->mounted || !target)
 		return EINVAL;
 	*target = 0;
+#if CONFIG_JOURNALING_ENABLE
+    struct ext4_journal_runtime *runtime = &file->mp->journal_runtime;
+    bool join = runtime->join_pending_metadata && runtime->now_ns &&
+        runtime->join_pending_metadata(runtime->context);
+#endif
 	EXT4_MP_LOCK(file->mp);
 #if CONFIG_JOURNALING_ENABLE
     if (file->mp->fs.jbd_journal) {
@@ -6102,7 +6184,20 @@ int ext4_file_sync_metadata_prepare(ext4_file *file, bool data_only, uint64_t *t
             uint64_t sequence = goal ? (data_only ? goal->data_sequence : goal->full_sequence) : 0;
             if (!r && journal->grouped && journal->durable_sequence < sequence) {
                 *target = sequence;
-                if (journal->seal_target < sequence) journal->seal_target = sequence;
+                if (journal->seal_target < sequence) {
+                    journal->seal_target = sequence;
+                    journal->sync_join_deadline_ns = 0;
+                    if (join && journal->running && journal->running->sequence == sequence &&
+                        !journal->running->ordered_count && !journal->committing &&
+                        TAILQ_EMPTY(&journal->sealed_queue)) {
+                        /* Let already-dirty inode timestamps join before
+                         * paying for another metadata-only commit. */
+                        uint64_t now = runtime->now_ns(runtime->context);
+                        journal->sync_join_deadline_ns = now + UINT64_C(4000000);
+                    }
+                }
+                if (!join && journal->running && journal->running->sequence == sequence)
+                    journal->sync_join_deadline_ns = 0;
                 request = true;
             } else if (!r && !journal->grouped) r = jbd_journal_sync(journal, journal->committed_id);
         }

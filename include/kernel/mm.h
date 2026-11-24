@@ -126,6 +126,12 @@ enum kernel_mm_status kernel_mm_pin_user_pair(const struct kernel_mm *,
     uint64_t first, uint64_t second, uint32_t access,
     struct kernel_mm_user_pin pins[2], unsigned *count);
 void kernel_mm_unpin_user_pair(struct kernel_mm_user_pin pins[2]);
+/* Lend a contiguous accessible prefix without resolving a fault or waiting
+ * for an address-space editor. The caller releases the returned prefix. */
+#define KERNEL_MM_USER_READ_BATCH 16U
+unsigned kernel_mm_try_pin_user_read_batch(const struct kernel_mm *, uint64_t first,
+    unsigned count, struct kernel_mm_user_pin *);
+void kernel_mm_unpin_user_read_batch(struct kernel_mm_user_pin *, unsigned count);
 
 /* Caller retains an independently acquired MM owner through faults and copy.
  * force is debugger access through VM_MAY*: readonly private stores resolve

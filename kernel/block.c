@@ -203,7 +203,18 @@ static void block_request_put(struct kernel_block_device **device)
     kernel_block_get_device(device); \
     struct kernel_block_device *request_owner __attribute__((cleanup(block_request_put))) = device
 
-enum kernel_block_status kernel_block_flush(struct kernel_block_device *device)
+void kernel_block_note_writeback(struct kernel_block_device *device)
+{
+    struct kernel_block_device *disk = physical(device);
+    if (!__atomic_add_fetch(&disk->writeback_epoch, 1, __ATOMIC_RELEASE))
+        __builtin_trap();
+}
+
+uint64_t kernel_block_writeback_epoch(struct kernel_block_device *device)
+{ return __atomic_load_n(&physical(device)->writeback_epoch, __ATOMIC_ACQUIRE); }
+
+enum kernel_block_status kernel_block_flush_through(struct kernel_block_device *device,
+    uint64_t target)
 {
     if (device == 0 || device->logical_block_size == 0U) {
         return KERNEL_BLOCK_STATUS_INVALID;
@@ -212,16 +223,26 @@ enum kernel_block_status kernel_block_flush(struct kernel_block_device *device)
     struct kernel_block_device *disk = physical(device);
     KERNEL_LOCK_SCOPE(io); kernel_rwlock_write(&disk->phase_barrier, &io);
     KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_write(&disk->transfer_lock, &transfer);
+    if (target && __atomic_load_n(&disk->flushed_writeback_epoch, __ATOMIC_RELAXED) >= target)
+        return KERNEL_BLOCK_STATUS_OK;
+    uint64_t completed = kernel_block_writeback_epoch(disk);
+    enum kernel_block_status result;
     if (disk->flush != 0) {
         /* FLUSH covers the whole underlying queue, regardless of its caller. */
         uint64_t started = block_io_begin(disk);
-        enum kernel_block_status result = disk->flush(disk->context);
+        result = disk->flush(disk->context);
         block_io_end(disk, BLOCK_IO_FLUSH, started, 0);
-        return result;
+    } else {
+        result = disk->cache_mode == KERNEL_BLOCK_CACHE_WRITETHROUGH
+            ? KERNEL_BLOCK_STATUS_OK : KERNEL_BLOCK_STATUS_UNSUPPORTED;
     }
-    return disk->cache_mode == KERNEL_BLOCK_CACHE_WRITETHROUGH
-               ? KERNEL_BLOCK_STATUS_OK : KERNEL_BLOCK_STATUS_UNSUPPORTED;
+    if (result == KERNEL_BLOCK_STATUS_OK)
+        __atomic_store_n(&disk->flushed_writeback_epoch, completed, __ATOMIC_RELEASE);
+    return result;
 }
+
+enum kernel_block_status kernel_block_flush(struct kernel_block_device *device)
+{ return kernel_block_flush_through(device, 0); }
 
 enum kernel_block_status kernel_block_read_at(
     struct kernel_block_device *device,

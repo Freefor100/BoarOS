@@ -1479,17 +1479,17 @@ test-fat32-user-riscv: $(KERNEL_RV) $(FAT32_USER_RV)
 .PHONY: test-block-host
 test-block-host:
 	mkdir -p build/host
-	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_flush.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-flush
+	cc -DBOAROS_PAGE_SHIFT=12 -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_flush.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-flush
 	build/host/block-flush
-	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_registry.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-registry
+	cc -DBOAROS_PAGE_SHIFT=12 -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_registry.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-registry
 	build/host/block-registry
-	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_window.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-window
+	cc -DBOAROS_PAGE_SHIFT=12 -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_window.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-window
 	build/host/block-window
-	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_partitions.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-partitions
+	cc -DBOAROS_PAGE_SHIFT=12 -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_partitions.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-partitions
 	build/host/block-partitions
-	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_MAX_CPUS=2 -idirafter include tests/host/block_partitions.c kernel/block.c tests/host/block_runtime.c tests/host/sync/notifications.c -pthread -Itests/host/block_model -o build/host/block-partitions-smp
+	cc -DBOAROS_PAGE_SHIFT=12 -std=c11 -Wall -Wextra -Werror -DBOAROS_MAX_CPUS=2 -idirafter include tests/host/block_partitions.c kernel/block.c tests/host/block_runtime.c tests/host/sync/notifications.c -pthread -Itests/host/block_model -o build/host/block-partitions-smp
 	build/host/block-partitions-smp
-	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_fault_test.c tests/host/block_fault.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-fault
+	cc -DBOAROS_PAGE_SHIFT=12 -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_fault_test.c tests/host/block_fault.c kernel/block.c tests/host/block_runtime.c -pthread -Itests/host/block_model -o build/host/block-fault
 	build/host/block-fault
 
 .PHONY: test-record-lock-host
