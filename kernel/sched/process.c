@@ -24,6 +24,7 @@
 #include <kernel/futex.h>
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
+#include <kernel/random.h>
 #include <kernel/mm.h>
 #include <kernel/vfs.h>
 #include <kernel/msg.h>
@@ -52,6 +53,7 @@
 #include <kernel/seccomp.h>
 #include "ptrace_internal.h"
 #include <kernel/remote_memory.h>
+#include <kernel/io_uring.h>
 
 #define LINUX_WNOHANG UINT32_C(0x00000001)
 #define LINUX_WUNTRACED UINT32_C(0x00000002)
@@ -1953,6 +1955,7 @@ static int cleanup_task_io_requests(struct kernel_task *thread)
         kernel_fanotify_read_abort(read);
     }
     if (thread->io_buffer) kernel_task_io_buffer_release(thread->io_buffer);
+    if (thread->io_uring_call && kernel_io_uring_abort(thread)) return -KERNEL_EIO;
     return 0;
 }
 
@@ -2452,6 +2455,7 @@ void kernel_task_io_buffer_release(struct kernel_task_io_buffer *buffer)
         *buffer = (struct kernel_task_io_buffer){0};
         return;
     }
+    if (buffer->wipe_bytes) kernel_random_erase(buffer->data,buffer->wipe_bytes);
     if (buffer->task) {
         if (buffer->task->io_buffer != buffer) __builtin_trap();
         if (buffer->retained_scratch &&

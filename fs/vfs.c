@@ -4490,7 +4490,7 @@ static int memory_write_source(struct kernel_vfs_node *node,uint64_t offset,
         kernel_lock_release(&io);
         if (!kernel_vfs_write_source_prepare(source,count,&view)) {
             kernel_memory_object_finish_page(node->memory,index,address,0);
-            return 0;
+            return source->staging_error;
         }
         count=view.size;
         kernel_vfs_node_lock(node,&io,1);
@@ -4506,6 +4506,30 @@ static int memory_write_source(struct kernel_vfs_node *node,uint64_t offset,
     }
     return 0;
 }
+
+#if defined(__riscv) || defined(__loongarch__)
+int kernel_vfs_write_source_prepare_secret(struct kernel_vfs_write_source *source,uint64_t address,
+    struct kernel_vfs_write_view *view)
+{
+    if (source->direct || !kernel_mm_local_secret_address(source->mm,address)) return 0;
+    if (kernel_task_io_buffer_acquire(&view->staging,source->mm->allocator)) {
+        source->staging_error = -KERNEL_ENOMEM;
+        return 0;
+    }
+    /* The buffered write imports just its admitted fragment. The task
+     * buffer owner also erases it if forced exit interrupts the operation. */
+    view->staging.wipe_bytes = (uint32_t)view->first;
+    size_t imported = 0;
+    source->access = kernel_copy_from_user(source->mm,view->staging.data,address,view->first,&imported);
+    if (!imported) {
+        kernel_task_io_buffer_release(&view->staging);
+        return 0;
+    }
+    view->size = view->first = imported;
+    source->data = view->staging.data;
+    return 1;
+}
+#endif
 
 int kernel_vfs_check_write_limit(struct kernel_vfs_size_limit *limit,
     uint64_t offset, size_t *size)
@@ -4628,6 +4652,23 @@ static int direct_write_source(struct kernel_vfs_file *file,uint64_t offset,
     struct kernel_vfs_node *node=file->private_data;
     size_t alignment=kernel_vfs_direct_alignment(file);
     if (!alignment || offset%alignment || size%alignment) return -KERNEL_EINVAL;
+    if (source->pinned) {
+        if (source->cached_offset % alignment || BOAROS_PAGE_SIZE % alignment)
+            return -KERNEL_EINVAL;
+        while (*written < size) {
+            size_t bytes = BOAROS_PAGE_SIZE - source->cached_offset;
+            if (bytes > size - *written) bytes = size - *written;
+            size_t done = 0;
+            int error = direct_transfer(file, offset + *written,
+                (unsigned char *)source->pinned->page + source->cached_offset,
+                bytes, 1, &done, source->operation);
+            *written += done;
+            if (error || done != bytes) return error;
+            source->pinned++;
+            source->cached_offset = 0;
+        }
+        return 0;
+    }
     /* Kernel/pipe/loop owners already lend stable bytes through synchronous
      * completion. Only faultable user mappings need the bounded staging copy. */
     if (!source->mm)
@@ -4874,6 +4915,24 @@ int kernel_vfs_write_user(struct kernel_vfs_file *file,struct kernel_mm *mm,
     uint64_t offset,int append,struct kernel_vfs_size_limit *limit,
     struct kernel_vfs_user_write_result *result)
 { return kernel_vfs_write_user_mode(file,mm,iov,iov_count,count,offset,append,0,limit,result); }
+
+int kernel_vfs_write_long_pins(struct kernel_vfs_file *file, const struct kernel_mm_long_pin *pins,
+    size_t first, size_t count, uint64_t position, int append, int direct,
+    struct kernel_vfs_size_limit *limit, struct kernel_vfs_user_write_result *result)
+{
+    *result = (struct kernel_vfs_user_write_result){.end_offset=position};
+    KERNEL_LOCK_SCOPE(operation);
+    kernel_vfs_file_write_lock(file, &operation);
+    if ((file->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) return -KERNEL_EINVAL;
+    VFS_TEMPORARY_WRITER(writer, file);
+    struct kernel_vfs_write_source source = {
+        .pinned=pins, .cached_offset=first, .user_payload=1, .direct=direct, .operation=&operation,
+    };
+    int error = vfs_write_source_locked(file, position, append ? &position : NULL,
+        &source, count, limit, &result->written);
+    result->end_offset = position + result->written;
+    return error;
+}
 
 static int ftruncate_borrowing(struct kernel_vfs_file *,uint64_t,
     const struct kernel_lock_guard *,struct kernel_vfs_size_limit *);

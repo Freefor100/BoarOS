@@ -1,4 +1,5 @@
 #include <kernel/cpu_config.h>
+#include <arch/loongarch/boot_map.h>
 #include <arch/loongarch/smp_boot.h>
 #if BOAROS_MAX_CPUS > 1
     .section .text.boot, "ax", @progbits
@@ -15,10 +16,14 @@ la_secondary_entry:
     csrwr $t0, 0
     csrwr $zero, 2
     csrwr $zero, 4
+    bl la_bootstrap_mmu
     la.abs $t0, .Lsecondary_high
     jr $t0
 .Lsecondary_high:
+    csrwr $zero, 0x180
+    csrwr $zero, 0x181
     csrwr $zero, 0x182
+    csrwr $zero, 0x183
     /* Firmware consumes MBUF0 as entry; MBUF1 keeps this target's owner. */
     li.w $t0, 0x1028
     iocsrrd.d $a0, $t0

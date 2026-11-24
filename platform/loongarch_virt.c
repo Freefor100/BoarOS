@@ -10,7 +10,14 @@
 #include <arch/loongarch/smp.h>
 
 /* QEMU v11.1.0 virt.h: ns16550 and ACPI GED, accessed uncached. */
-static volatile unsigned char *const uart = (void *)(LA_UNCACHED_BASE + 0x1fe001e0);
+static volatile unsigned char *uart = (void *)(LA_BOOT_UNCACHED_BASE + 0x1fe001e0);
+static uint64_t mmio_base = LA_BOOT_UNCACHED_BASE;
+
+void la_virt_use_kernel_mapping(void)
+{
+    uart = (void *)(LA_UNCACHED_BASE + 0x1fe001e0);
+    mmio_base = LA_UNCACHED_BASE;
+}
 static int emergency;
 void kernel_console_putc(char c)
 {
@@ -50,13 +57,13 @@ void la_virt_halt(void)
 }
 void la_virt_shutdown(void)
 {
-    *(volatile unsigned char *)(LA_UNCACHED_BASE + 0x100e001c) = 0x34;
+    *(volatile unsigned char *)(uintptr_t)(mmio_base + 0x100e001c) = 0x34;
     la_virt_halt();
 }
 void la_virt_restart(void)
 {
     /* ACPI GED regs + RESET, as defined by the fixed QEMU virt platform. */
-    *(volatile unsigned char *)(LA_UNCACHED_BASE + 0x100e001e) = 0x42;
+    *(volatile unsigned char *)(uintptr_t)(mmio_base + 0x100e001e) = 0x42;
     la_virt_halt();
 }
 void la_virt_fatal(const char *message)
@@ -66,7 +73,7 @@ void *la_virt_page_access(uint64_t address)
 int la_virt_physical_address(const void *pointer, uint64_t *address)
 {
     uint64_t v = (uintptr_t)pointer;
-    if (!address || v < LA_DIRECT_BASE || v - LA_DIRECT_BASE >= (UINT64_C(1) << 48)) return 0;
+    if (!address || v < LA_DIRECT_BASE || v - LA_DIRECT_BASE >= LA_DIRECT_SIZE) return 0;
     *address = v - LA_DIRECT_BASE; return 1;
 }
 struct efi_header { uint64_t signature; uint32_t revision, size, crc, reserved; };
@@ -77,23 +84,26 @@ struct efi_table {
     uint64_t count, tables;
 };
 struct efi_config { uint32_t guid[4]; uint64_t address; };
+static const void *boot_page_access(uint64_t address)
+{ return (const void *)(uintptr_t)(LA_BOOT_CACHED_BASE + address); }
+
 int la_virt_boot_memory(uint64_t systab, uint64_t kernel_start, uint64_t kernel_end,
                         struct boot_memory_layout *layout)
 {
     if (systab > 0x100000 - sizeof(struct efi_table)) return 0;
-    const struct efi_table *table = la_virt_page_access(systab);
+    const struct efi_table *table = boot_page_access(systab);
     if (table->header.signature != UINT64_C(0x5453595320494249) || table->count > 16 ||
         table->tables > 0x100000 - table->count*sizeof(struct efi_config)) return 0;
-    const struct efi_config *config = la_virt_page_access(table->tables);
+    const struct efi_config *config = boot_page_access(table->tables);
     uint64_t fdt = 0;
     for (uint64_t i = 0; i < table->count; i++)
         if (config[i].guid[0] == 0xb1b621d5 && config[i].guid[1] == 0x41a5f19c &&
             config[i].guid[2] == 0x15d90b83 && config[i].guid[3] == 0xe0aa692c) fdt = config[i].address;
     struct dtb_boot_info info;
-    if (!fdt || fdt >= 0x10000000 || dtb_read_boot_info(la_virt_page_access(fdt), &info) != DTB_STATUS_OK)
+    if (!fdt || fdt >= 0x10000000 || dtb_read_boot_info(boot_page_access(fdt), &info) != DTB_STATUS_OK)
         return 0;
 #if BOAROS_MAX_CPUS > 1
-    la_smp_discover(la_virt_page_access(fdt));
+    la_smp_discover(boot_page_access(fdt));
 #endif
     *layout = (struct boot_memory_layout){0};
     struct dtb_memory_range reservations[DTB_MAX_RESERVED_RANGES + 3];

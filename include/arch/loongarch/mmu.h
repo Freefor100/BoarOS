@@ -268,8 +268,13 @@ void arch_mmu_sync_instructions(void);
 void arch_mmu_flush_address(uint64_t);
 void la_mmu_flush_range(uint64_t address, uint64_t size);
 int arch_mmu_kernel_window_active(void);
+int arch_mmu_secret_page_supported(void);
+enum arch_mmu_status arch_mmu_secret_page_protect(struct physical_page_allocator *, uint64_t);
+enum arch_mmu_status arch_mmu_secret_page_restore(struct physical_page_allocator *, uint64_t);
 enum arch_mmu_status arch_mmu_kernel_window_map(struct physical_page_allocator *, uint64_t, uint64_t);
 enum arch_mmu_status arch_mmu_kernel_window_unmap(struct physical_page_allocator *, uint64_t);
 void la_mmu_initialize(void);
+enum arch_mmu_status la_mmu_direct_map_initialize(
+    struct physical_page_allocator *, const struct boot_memory_layout *);
 enum arch_mmu_status la_mmu_kernel_window_initialize(struct physical_page_allocator *);
 #endif

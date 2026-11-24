@@ -310,6 +310,7 @@ struct kernel_task {
     struct kernel_namespace *uts_namespace, *ipc_namespace;
     struct kernel_ptrace_state *ptrace;
     struct kernel_remote_memory_request *remote_memory_request;
+    struct kernel_io_uring_call *io_uring_call;
     uint32_t parent_death_signal;
     uint32_t child_subreaper;
     struct kernel_task *parent_death_next;

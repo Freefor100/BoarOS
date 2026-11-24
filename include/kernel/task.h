@@ -33,6 +33,7 @@ struct kernel_task_io_buffer {
         struct {
             uint64_t physical_address;
             void *data;
+            uint32_t wipe_bytes;
             uint8_t retained_scratch;
         };
         struct {
@@ -55,6 +56,9 @@ struct kernel_task *kernel_task_current(void);
 /* Root-relative TID lookup includes unreaped process zombies and keeps one
  * storage borrow; completed nonleaders await cleanup without staying visible. */
 struct kernel_task *kernel_task_find_by_tid(kernel_pid_t tid);
+/* Stable task-storage identity. A borrow does not keep user resources live. */
+void kernel_task_storage_get(struct kernel_task *);
+void kernel_task_storage_put(struct kernel_task *);
 /* Same storage ownership, with an explicit user namespace observer. */
 struct kernel_task *kernel_task_find_user_tid(struct kernel_task *,kernel_pid_t tid);
 /* 当前执行owner覆盖读取；内核任务没有用户信号/重启上下文。 */

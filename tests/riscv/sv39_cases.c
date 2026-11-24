@@ -1,4 +1,5 @@
 #include <arch/riscv/sv39.h>
+#include <arch/riscv/memory_layout.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -1007,6 +1008,76 @@ int run_sv39_huge_tests(void)
     return 0;
 }
 
+static uint64_t direct_load_fault(uint64_t address)
+{
+    uint64_t saved, temporary, cause;
+    __asm__ volatile(
+        "csrr %[saved], stvec\n\t"
+        "la %[temporary], 1f\n\t"
+        "csrw stvec, %[temporary]\n\t"
+        "li %[cause], 0\n\t"
+        "ld zero, 0(%[address])\n\t"
+        "j 2f\n\t"
+        ".balign 4\n"
+        "1: csrr %[cause], scause\n\t"
+        "la %[temporary], 2f\n\t"
+        "csrw sepc, %[temporary]\n\t"
+        "sret\n"
+        "2: csrw stvec, %[saved]"
+        : [saved] "=&r"(saved), [temporary] "=&r"(temporary),
+          [cause] "=&r"(cause)
+        : [address] "r"(address)
+        : "memory");
+    return cause;
+}
+
+int run_sv39_secret_direct_map_tests(void)
+{
+    const uint64_t region = UINT64_C(0x86800000);
+    const uint64_t target = region + BOAROS_PAGE_SIZE;
+    const uint64_t neighbour = target + BOAROS_PAGE_SIZE;
+    const uint64_t base = RISCV_DIRECT_MAP_BASE;
+    const uint32_t read_write = RISCV_SV39_READ | RISCV_SV39_WRITE;
+    struct physical_page_allocator allocator;
+    const struct boot_memory_layout layout = {
+        .usable_count = 1,
+        .usable = {{ .base = (uintptr_t)user_space_page_pool,
+                     .size = sizeof(user_space_page_pool) }},
+    };
+    struct riscv_sv39_page_table kernel = {0};
+    const uint64_t old_satp = riscv_sv39_current_satp();
+    if (init_test_page_allocator(&allocator, &layout) ||
+        riscv_sv39_page_table_init(&kernel, &allocator) ||
+        riscv_sv39_map_range(&kernel, 0x80000000, 0x80000000, 0x8000000,
+                             read_write | RISCV_SV39_EXECUTE) ||
+        riscv_sv39_map_range(&kernel, base + region, region,
+                             RISCV_SV39_PAGE_SIZE_2M, read_write) ||
+        riscv_sv39_activate(&kernel) ||
+        riscv_sv39_secret_direct_map_enable(&kernel) ||
+        !riscv_sv39_secret_page_supported())
+        return 170;
+
+    volatile uint64_t *target_alias = (void *)(uintptr_t)(base + target);
+    volatile uint64_t *neighbour_alias = (void *)(uintptr_t)(base + neighbour);
+    *target_alias = 0x1234;
+    *neighbour_alias = 0x5678;
+    if (riscv_sv39_secret_page_protect(&allocator, target) ||
+        direct_load_fault(base + target) != 13 || *neighbour_alias != 0x5678)
+        return 171;
+    uint64_t available = physical_page_available(&allocator);
+    if (riscv_sv39_secret_page_protect(&allocator, neighbour) ||
+        direct_load_fault(base + neighbour) != 13 ||
+        physical_page_available(&allocator) != available)
+        return 172;
+    if (riscv_sv39_secret_page_restore(&allocator, target) || *target_alias != 0x1234 ||
+        direct_load_fault(base + neighbour) != 13 ||
+        riscv_sv39_secret_page_restore(&allocator, neighbour) || *neighbour_alias != 0x5678 ||
+        physical_page_available(&allocator) != available + 1 ||
+        riscv_sv39_switch_satp(old_satp))
+        return 173;
+    return 0;
+}
+
 int run_sv39_tests(void)
 {
     int huge_result=run_sv39_huge_tests();
@@ -1274,5 +1345,7 @@ int run_sv39_tests(void)
         return result;
     }
 
-    return test_model_and_boundaries();
+    result = test_model_and_boundaries();
+    if (result != 0) return result;
+    return run_sv39_secret_direct_map_tests();
 }

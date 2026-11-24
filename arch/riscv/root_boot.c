@@ -26,7 +26,10 @@
 #include <kernel/sem.h>
 #include <kernel/msg.h>
 #include <kernel/mqueue.h>
+#include <kernel/nvme.h>
+#include <kernel/igb.h>
 #include <kernel/errno.h>
+#include <platform/riscv_pci.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -45,12 +48,25 @@ int riscv_root_boot_start_network(struct riscv_root_boot *root,
         if(error)return error;
         break;
     }
+    if (!root->net_device.configured && info->qemu_virt_pci) {
+        int error = kernel_igb_open_optional(&root->igb, riscv_virt_pci_host(), &root->heap,
+            root->heap.page_allocator, info->timebase_frequency);
+        if (error) return error;
+        if (root->igb)
+            return kernel_network_igb_start(&root->network, &root->heap, root->igb,
+                info->timebase_frequency);
+    }
     return kernel_network_start(&root->network,&root->heap,
         root->net_device.configured ? &root->net_device : 0,info->timebase_frequency);
 }
 static int stop_network(struct riscv_root_boot *root)
 {
     int error=kernel_network_stop(&root->network);
+    if (!error && root->igb) {
+        error = kernel_igb_rx_stop(root->igb);
+        if (!error) error = kernel_igb_rx_destroy(root->igb);
+        if (!error) root->igb = NULL;
+    }
     return error ? error : virtio_net_stop(&root->net_device);
 }
 
@@ -234,6 +250,7 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
                 root->cleanup_device_owned = 0U;
             }
         }
+        if (kernel_nvme_bus_stop()) cleanup_failed = 1;
     }
     if (riscv_uart_tty_stop(&root->uart)) cleanup_failed = 1;
     if (root->heap.page_allocator && kernel_bpf_shutdown(&root->heap)) cleanup_failed = 1;
@@ -351,6 +368,12 @@ enum riscv_root_boot_status riscv_root_boot_start_with_irq(
     }
     if (root->device_count == 0U) {
         return RISCV_ROOT_BOOT_STATUS_NO_DEVICE;
+    }
+    if (info->qemu_virt_pci &&
+        kernel_nvme_bus_start(riscv_virt_pci_host(), &root->heap, allocator,
+            info->timebase_frequency)) {
+        failure = RISCV_ROOT_BOOT_STATUS_DEVICE;
+        goto fail;
     }
 
     if (kernel_page_cache_init(&root->page_cache,
@@ -667,7 +690,8 @@ enum riscv_root_boot_status riscv_root_boot_finish(
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
     error = (int)destroy_devices(root);
-    if (error != RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
+    if (error == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) error = kernel_nvme_bus_stop();
+    if (error) {
         root->finish_failure = RISCV_ROOT_FINISH_DEVICE;
         root->finish_error = error;
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;

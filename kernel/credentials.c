@@ -74,7 +74,7 @@ struct kernel_uid_account *kernel_uid_account_put_locked(struct kernel_uid_accou
     if(!a->heap)return 0;
     if(!a->references)__builtin_trap();
     if(--a->references)return 0;
-    if (!a->heap || a->pending || a->processes || a->shm_locked_pages ||
+    if (!a->heap || a->pending || a->processes || a->shm_locked_pages || a->pinned_io_pages ||
         a->mqueue_bytes || a->pipe_pages || a->inotify_groups || a->inotify_marks ||
         a->fanotify_groups || a->fanotify_marks) __builtin_trap();
     struct kernel_uid_account **p=&accounts[a->uid%ACCOUNT_BUCKETS];
@@ -125,6 +125,24 @@ void kernel_uid_account_mqueue_uncharge(struct kernel_uid_account *account,uint6
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         if(!account || account->mqueue_bytes<bytes)__builtin_trap();
         account->mqueue_bytes-=bytes;account=kernel_uid_account_put_locked(account);
+    }
+    kernel_uid_account_release(account);
+}
+int kernel_uid_account_pin_charge(struct kernel_uid_account *account,uint64_t pages,uint64_t limit)
+{
+    KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+    if (pages > limit || account->pinned_io_pages > limit - pages) return -KERNEL_ENOMEM;
+    account->pinned_io_pages += pages;
+    kernel_uid_account_get_locked(account);
+    return 0;
+}
+void kernel_uid_account_pin_uncharge(struct kernel_uid_account *account,uint64_t pages)
+{
+    {
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        if (account->pinned_io_pages < pages) __builtin_trap();
+        account->pinned_io_pages -= pages;
+        account = kernel_uid_account_put_locked(account);
     }
     kernel_uid_account_release(account);
 }

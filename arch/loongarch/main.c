@@ -32,6 +32,8 @@ void la_kernel_main(uint64_t systab)
     enum physical_page_status status = physical_page_allocator_init(&allocator, &layout);
     la_virt_puts("allocator init="); la_virt_hex(status); la_virt_puts(" ranges="); la_virt_hex(layout.usable_count); la_virt_puts("\n");
     if (status != PHYSICAL_PAGE_STATUS_OK) la_virt_fatal("allocator init");
+    if (la_mmu_direct_map_initialize(&allocator, &layout) != ARCH_MMU_STATUS_OK)
+        la_virt_fatal("paged physical map");
     status = physical_page_allocator_bind_access(&allocator, la_virt_page_access);
     if (status != PHYSICAL_PAGE_STATUS_OK) la_virt_fatal("allocator access");
     status = physical_page_allocator_finalize(&allocator);

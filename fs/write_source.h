@@ -5,6 +5,7 @@
 #include "../mm/uaccess_internal.h"
 #include <kernel/cost.h>
 #include <kernel/page_cache.h>
+#include <kernel/task.h>
 #include <string.h>
 
 struct kernel_page_cache;
@@ -17,11 +18,12 @@ struct kernel_vfs_write_source {
     struct kernel_uaccess_iov_cursor user;
     enum kernel_uaccess_status access;
     size_t chunks;
-    int direct, user_payload;
+    int direct, user_payload, staging_error;
     bool overwrite_mapped;
     const struct kernel_lock_guard *operation;
     const struct kernel_page_cache_read_page *cached;
     size_t cached_offset;
+    const struct kernel_mm_long_pin *pinned;
 };
 
 static inline size_t kernel_vfs_write_source_span(
@@ -71,7 +73,15 @@ struct kernel_vfs_write_view {
     uint64_t pages[2];
     size_t size,first;
     unsigned count;
+#if defined(__riscv) || defined(__loongarch__)
+    struct kernel_task_io_buffer staging;
+#endif
 };
+
+#if defined(__riscv) || defined(__loongarch__)
+int kernel_vfs_write_source_prepare_secret(struct kernel_vfs_write_source *,uint64_t address,
+    struct kernel_vfs_write_view *);
+#endif
 
 static inline int kernel_vfs_write_source_prepare(struct kernel_vfs_write_source *source,
     size_t limit,struct kernel_vfs_write_view *view)
@@ -90,14 +100,26 @@ static inline int kernel_vfs_write_source_prepare(struct kernel_vfs_write_source
     if (part && (next&~BOAROS_PAGE_MASK)!=view->pages[0]) {
         source->access=kernel_uaccess_pin_user_pair(source->mm,address,next,KERNEL_MM_READ,
             view->pins,&view->count);
-        if (source->access) return 0;
+        if (source->access) {
+#if defined(__riscv) || defined(__loongarch__)
+            if (source->access==KERNEL_UACCESS_STATUS_FAULT)
+                return kernel_vfs_write_source_prepare_secret(source,address,view);
+#endif
+            return 0;
+        }
         kernel_vfs_write_source_use_pin(source,&view->pins[0]);
         if (view->count==1) return 1;
         view->pages[1]=next&~BOAROS_PAGE_MASK;
         view->size+=part;cursor.offset+=part;
     } else {
         source->access=kernel_uaccess_pin_user_page(source->mm,address,KERNEL_MM_READ,&view->pins[0]);
-        if (source->access) return 0;
+        if (source->access) {
+#if defined(__riscv) || defined(__loongarch__)
+            if (source->access==KERNEL_UACCESS_STATUS_FAULT)
+                return kernel_vfs_write_source_prepare_secret(source,address,view);
+#endif
+            return 0;
+        }
         kernel_vfs_write_source_use_pin(source,&view->pins[0]);
         view->count=1;
     }
@@ -133,6 +155,31 @@ static inline void kernel_vfs_write_source_copy_view(struct kernel_vfs_write_sou
         kernel_vfs_write_source_copy_cached(source,destination,view->size);
         return;
     }
+    if (source->pinned) {
+        unsigned char *output = destination;
+        size_t remaining = view->size;
+        while (remaining) {
+            size_t n = BOAROS_PAGE_SIZE - source->cached_offset;
+            if (n > remaining) n = remaining;
+            memmove(output, (const unsigned char *)source->pinned->page + source->cached_offset, n);
+            output += n;
+            remaining -= n;
+            source->cached_offset += n;
+            if (source->cached_offset == BOAROS_PAGE_SIZE) {
+                source->pinned++;
+                source->cached_offset = 0;
+            }
+        }
+        return;
+    }
+#if defined(__riscv) || defined(__loongarch__)
+    if (view->staging.allocator) {
+        memcpy(destination,source->data,view->size);
+        COST_ADD(CACHE_COPY,view->size);
+        kernel_vfs_write_source_advance(source,view->size);
+        return;
+    }
+#endif
     kernel_vfs_write_source_copy(source,destination,view->first);
     kernel_vfs_write_source_advance(source,view->first);
     for (size_t copied=view->first;copied<view->size;) {
@@ -153,6 +200,9 @@ static inline void kernel_vfs_write_source_finish(struct kernel_vfs_write_source
 {
     if (view->count==2) kernel_mm_unpin_user_pair(view->pins);
     else if (view->count) kernel_mm_unpin_user_page(view->pins);
+#if defined(__riscv) || defined(__loongarch__)
+    if (view->staging.allocator) kernel_task_io_buffer_release(&view->staging);
+#endif
     view->count=0;
     if (source->mm) source->data=NULL;
 }

@@ -55,7 +55,7 @@ enum kernel_scheduler_status arch_process_prepare_clone(struct kernel_task *chil
 }
 int arch_direct_map_va_to_pa(uint64_t value, uint64_t size, uint64_t *address)
 {
-    if (!size || value < LA_DIRECT_BASE || value-LA_DIRECT_BASE >= (UINT64_C(1)<<48) ||
-        size > (UINT64_C(1)<<48)-(value-LA_DIRECT_BASE) || !address) return 1;
+    if (!size || value < LA_DIRECT_BASE || value-LA_DIRECT_BASE >= LA_DIRECT_SIZE ||
+        size > LA_DIRECT_SIZE-(value-LA_DIRECT_BASE) || !address) return 1;
     *address=value-LA_DIRECT_BASE; return 0;
 }

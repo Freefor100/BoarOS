@@ -366,6 +366,14 @@ enum kernel_files_status kernel_files_fstatfs(
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     struct kernel_open_file_description *file = kernel_files_hold_fd(files, fd, &pin_guard);
     if (!file) { *linux_result = -KERNEL_EBADF; return KERNEL_FILES_STATUS_OK; }
+    if (file->kind == KERNEL_OPEN_FILE_KIND_SECRETMEM) {
+        const struct kernel_linux_statfs stat = {
+            .f_type = 0x5345434d,
+            .f_bsize = BOAROS_PAGE_SIZE, .f_frsize = BOAROS_PAGE_SIZE,
+            .f_namelen = 255,
+        };
+        return output_statfs(mm, user_buffer, &stat, linux_result);
+    }
     if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && !file->file.mount) {
         const struct kernel_linux_statfs stat = {
             .f_type = 0x50495045, /* PIPEFS_MAGIC */
@@ -394,9 +402,10 @@ enum kernel_files_status kernel_files_fstatfs(
 
 /* Input values are imported before resolving the target, as in Linux. The
  * owned inode/FD then covers allocation, backend access and output faults. */
-enum kernel_files_status kernel_files_xattr(struct kernel_files *files,
+enum kernel_files_status kernel_files_xattr_owned(struct kernel_files *files,
     const struct kernel_fs_context *fs,struct kernel_mm *mm,
-    const struct kernel_files_xattr_request *request,int64_t *linux_result)
+    const struct kernel_files_xattr_request *request,
+    struct kernel_open_file_description *description,int64_t *linux_result)
 {
     if (!kernel_files_is_live(files) || !mm || !request || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
@@ -404,7 +413,6 @@ enum kernel_files_status kernel_files_xattr(struct kernel_files *files,
     if (op>KERNEL_XATTR_REMOVE) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     int result=0;size_t length=0,size=0,copied=0;char name[KERNEL_XATTR_NAME_MAX+1];void *value=NULL;
     KERNEL_FILES_PIN_SCOPE(pin);KERNEL_FILES_PATH_SCOPE(path);
-    struct kernel_open_file_description *description=NULL;
     if (op==KERNEL_XATTR_SET && (request->flags & ~3U)) {result=-KERNEL_EINVAL;goto Done;}
     if (op!=KERNEL_XATTR_LIST) {
         enum kernel_uaccess_status access=kernel_copy_string_from_user(mm,name,request->name,sizeof(name),&length);
@@ -428,7 +436,7 @@ enum kernel_files_status kernel_files_xattr(struct kernel_files *files,
         }
     }
     if (request->by_fd) {
-        description=kernel_files_hold_fd(files,request->fd,&pin);
+        if (!description) description=kernel_files_hold_fd(files,request->fd,&pin);
         if (!description || kernel_open_file_kind(description)==KERNEL_OPEN_FILE_KIND_PATH) {result=-KERNEL_EBADF;goto Done;}
     } else {
         enum kernel_files_status status=copy_metadata_path(files,fs,mm,KERNEL_FS_AT_FDCWD,
@@ -460,4 +468,12 @@ Done:
     return KERNEL_FILES_STATUS_OK;
 State:
     kernel_files_release_allocation(files,value);return KERNEL_FILES_STATUS_STATE;
+}
+
+
+enum kernel_files_status kernel_files_xattr(struct kernel_files *files,
+    const struct kernel_fs_context *fs, struct kernel_mm *mm,
+    const struct kernel_files_xattr_request *request, int64_t *linux_result)
+{
+    return kernel_files_xattr_owned(files, fs, mm, request, NULL, linux_result);
 }

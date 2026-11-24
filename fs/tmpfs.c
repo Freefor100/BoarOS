@@ -2,6 +2,7 @@
 #include "vfs_notify.h"
 #include "char_device_internal.h"
 #include <kernel/block.h>
+#include <kernel/nvme.h>
 #include <kernel/tmpfs.h>
 #include <kernel/credentials.h>
 #include <kernel/posix_acl.h>
@@ -1067,6 +1068,13 @@ int kernel_tmpfs_create(struct kernel_heap *heap,uint64_t flags,const char *opti
 /* The hidden, writable view owns the instance until boot teardown. User mounts
  * clone only the view, including when the last user mount was unmounted. */
 static struct kernel_vfs_path *devtmpfs_root;
+extern __attribute__((weak)) int kernel_nvme_visit_command_nodes(
+    int (*)(void *, const char *, uint64_t), void *);
+
+static int devtmpfs_nvme_node(void *root, const char *name, uint64_t rdev)
+{
+    return kernel_vfs_mknod_at(root, root, name, KERNEL_VFS_S_IFCHR | 0600, rdev, 0);
+}
 
 int kernel_devtmpfs_is_mount(const struct kernel_vfs_mount *mount)
 {
@@ -1183,6 +1191,8 @@ static int devtmpfs_initialize(struct kernel_heap *heap)
             KERNEL_VFS_S_IFCHR | characters[i].mode, characters[i].number, 0);
         if (error) break;
     }
+    if (!error && kernel_nvme_visit_command_nodes)
+        error = kernel_nvme_visit_command_nodes(devtmpfs_nvme_node, devtmpfs_root);
     if (!error) {
         kernel_block_set_devnode_publisher(devtmpfs_block_nodes);
         struct kernel_block_device **devices = NULL;

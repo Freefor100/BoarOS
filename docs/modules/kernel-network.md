@@ -10,7 +10,8 @@ BoarOS 的网络子系统基于 `lwIP`（`STABLE-2_2_1_RELEASE`，`NO_SYS=1`）�
 | :--- | :--- |
 | `kernel/syscall/socket.c`、`fs/files/socket.c` | 套接字系统调用参数导入、文件描述符安装与失败回滚 |
 | `net/socket.c`、`net/socket_state.h` | 统一套接字端点、收发队列与额度管理、多核 TCP 归属核调度、回环快路径、`AF_UNIX` 与 `AF_NETLINK` |
-| `net/ethernet.c` | 以太网帧收发接入、VirtIO 网卡收包轮询、串行纯 ACK 合并与 IPv4 组播/UDP 快速接收 |
+| `net/ethernet.c` | 以太网帧收发接入、VirtIO 和 Intel 82576 的协议栈接入、串行纯 ACK 合并与 IPv4 组播/UDP 快速接收 |
+| `drivers/net/igb.c` | Intel 82576 原生收发描述符、完成通知、硬件队列停用与目的地址分流 |
 | `net/packet_ring.c`、`net/rtnetlink.h` | `AF_PACKET` 第三版共享内存接收环（`TPACKET_V3`）与 `rtnetlink` 接口/地址/路由查询 |
 | `net/lwip_port/`、`third_party/lwip/` | lwIP 内核移植层（内存池预算、直连路由快照、IPv4 分片重组所有权与 `TIME_WAIT` 回收钩子） |
 
@@ -25,6 +26,14 @@ BoarOS 的网络子系统基于 `lwIP`（`STABLE-2_2_1_RELEASE`，`NO_SYS=1`）�
 | **`AF_NETLINK`** | 只读 `NETLINK_ROUTE` 查询（`RTM_GETLINK`、`RTM_GETADDR`、`RTM_GETROUTE`）及 POSIX 消息队列异步线程通知（`mq_notify(SIGEV_THREAD)`） |
 
 ---
+
+### Intel 82576 队列与接收缓冲区
+
+QEMU 的 `igb` 设备在未挂接 VirtIO 网卡时接入 `eth0`。接收描述符分别携带报头和载荷的直接内存访问（Direct Memory Access，DMA）地址。驱动批量把描述符提交给网卡。设备回写完成标志后，`net/ethernet.c` 持有两段缓冲区并构造一条 lwIP 报文链。协议栈归还最后一个引用时，接收缓冲区才能进入下一批描述符。发送侧先在短保护内预留队列槽，再把报文复制到该槽的 DMA 缓冲区，最后发布描述符。设备回写完成后才可重用发送槽。
+
+第二个接收队列由虚拟机设备队列（Virtual Machine Device Queues，VMDq）按独立的以太网硬件地址分流。用户可以使用普通网卡配置接口为 `eth1` 分配 IPv4 地址。该接口默认无 IPv4 地址，接收队列由实际的缓冲区提供者启用。主地址、广播和组播流量继续进入 `eth0`。发往次接口 IP 的地址解析协议（Address Resolution Protocol，ARP）报文在内核处理，次接口载荷队列无需接收广播缓冲区。QEMU 的 82576 接收端缩放（Receive Side Scaling，RSS）使用带冲突的散列桶，设备模型也缺少按 TCP 四元组选择目标队列的入口。独立地址是该设备上将用户内存提供给网卡前的隔离条件。
+
+在独立队列上，网卡可把具备完整内核报头的 IPv4 TCP 载荷直接写入提供者提交的页面。单独一段缓冲区中的其他报文在协议解析前转入内核缓冲区。关闭队列先停止硬件，再归还队列尚未完成的缓冲区。已交给协议栈的缓存仍由其实际引用持有，停用失败时保留设备可能仍在使用的页面。
 
 ## 二、协议栈资源预算与内存管理
 

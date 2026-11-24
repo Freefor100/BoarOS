@@ -103,6 +103,15 @@ enum riscv_sv39_status riscv_sv39_map_range(
 enum riscv_sv39_status riscv_sv39_activate(
     struct riscv_sv39_page_table *table);
 
+/* Bind only the final runtime table, after low boot aliases are gone. */
+enum riscv_sv39_status riscv_sv39_secret_direct_map_enable(
+    const struct riscv_sv39_page_table *);
+int riscv_sv39_secret_page_supported(void);
+enum riscv_sv39_status riscv_sv39_secret_page_protect(
+    struct physical_page_allocator *, uint64_t);
+enum riscv_sv39_status riscv_sv39_secret_page_restore(
+    struct physical_page_allocator *, uint64_t);
+
 /*
  * Kernel stack window: reserve the empty subtree while the table is
  * BUILDING so every later user root copy inherits it, then insert and

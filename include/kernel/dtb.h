@@ -49,6 +49,7 @@ struct dtb_boot_info {
     struct dtb_memory_range virtio_mmio[DTB_MAX_VIRTIO_MMIO_RANGES];
     uint8_t rng_seed[DTB_RNG_SEED_SIZE];
     uint32_t rng_seed_size;
+    uint8_t qemu_virt_pci;
 };
 
 struct dtb_uart_info {

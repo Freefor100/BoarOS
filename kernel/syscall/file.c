@@ -130,7 +130,7 @@ enum kernel_syscall_status syscall_handle_chown(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
-static int copy_open_how(struct kernel_mm *mm,uint64_t user,uint64_t size,
+int syscall_copy_open_how(struct kernel_mm *mm,uint64_t user,uint64_t size,
                          uint64_t how[3])
 {
     if (size < 3U * sizeof(*how)) return -KERNEL_EINVAL;
@@ -197,7 +197,7 @@ enum kernel_syscall_status syscall_handle_openat(
     enum kernel_files_status status=KERNEL_FILES_STATUS_OK;
     if (strict) {
         uint64_t how[3];
-        linux_result=copy_open_how(mm,request->arguments[2],request->arguments[3],how);
+        linux_result=syscall_copy_open_how(mm,request->arguments[2],request->arguments[3],how);
         if (!linux_result) status=kernel_files_openat2(files,fs,mm,(int32_t)request->arguments[0],
             request->arguments[1],how[0],how[1],how[2],&linux_result);
     } else status=kernel_files_openat(files,fs,mm,(int64_t)request->arguments[0],

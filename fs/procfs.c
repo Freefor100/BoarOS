@@ -1199,6 +1199,10 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
                 prefix = "anon_inode:[fanotify]";
             else if (file_kind == KERNEL_OPEN_FILE_KIND_USERFAULTFD)
                 prefix = "anon_inode:[userfaultfd]";
+            else if (file_kind == KERNEL_OPEN_FILE_KIND_IO_URING)
+                prefix = "anon_inode:[io_uring]";
+            else if (file_kind == KERNEL_OPEN_FILE_KIND_SECRETMEM)
+                prefix = "/secretmem (deleted)";
             else if (file_kind == KERNEL_OPEN_FILE_KIND_EVENTFD)
                 prefix = "anon_inode:[eventfd]";
             else if (file_kind == KERNEL_OPEN_FILE_KIND_TIMERFD)
@@ -2056,6 +2060,14 @@ static int proc_maps_snapshot(struct kernel_vfs_node *node,
         if(row->file && kernel_open_file_kind(row->file)==KERNEL_OPEN_FILE_KIND_BPF){
             error=kernel_open_file_pseudo_stat(row->file,&stat);if(error)goto Finish;
             name=kernel_bpf_fd_name(row->file);if(!name){error=-KERNEL_EIO;goto Finish;}
+        } else if (row->file && kernel_open_file_kind(row->file) == KERNEL_OPEN_FILE_KIND_SECRETMEM) {
+            error = kernel_open_file_pseudo_stat(row->file, &stat);
+            if (error) goto Finish;
+            name = "/secretmem (deleted)";
+        } else if (row->file && kernel_open_file_kind(row->file) == KERNEL_OPEN_FILE_KIND_IO_URING) {
+            error = kernel_open_file_pseudo_stat(row->file, &stat);
+            if (error) goto Finish;
+            name = "anon_inode:[io_uring]";
         }else if (row->file) {
             const struct kernel_vfs_file *file = kernel_open_file_vfs_borrow(row->file);
             struct kernel_vfs_path *path = kernel_open_file_path(row->file);

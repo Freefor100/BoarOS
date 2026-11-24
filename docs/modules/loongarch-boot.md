@@ -8,7 +8,7 @@ BoarOS 完整支持龙芯 **LoongArch 64（LA464 处理器模型）** 架构，�
 
 | 源码路径 | 核心职责 |
 | :--- | :--- |
-| `arch/loongarch/boot.S`、`main.c`、`linker.ld` | 直接映射窗口配置、开启分页跳转高半区、引导初始化与根盘启动 |
+| `arch/loongarch/boot.S`、`main.c`、`linker.ld` | 物理入口、引导页表、高半区切换与根盘启动 |
 | `arch/loongarch/mmu.c`、`tlb_refill.S` | 16 KiB 三级页表、32 MiB 原生大页、硬件辅助 `LDDIR`/`LDPTE` 软件 TLB 重填 |
 | `arch/loongarch/smp.c`、`secondary.S` | 片上 IOCSR 邮箱从核唤醒、IPI 事件分发与跨核 `INVTLB` 同步协议 |
 | `arch/loongarch/trap.c`、`trap_entry.S`、`context.c`、`fpu.c` | 陷入与中断分发、上下文切换、浮点与 LSX/LASX 向量扩展现场切换 |
@@ -16,15 +16,17 @@ BoarOS 完整支持龙芯 **LoongArch 64（LA464 处理器模型）** 架构，�
 
 ---
 
-## 二、早期引导与直接映射窗口（DMW）
+## 二、早期引导与内核物理内存映射
 
-LoongArch 64 架构提供硬件**直接映射配置窗口（Direct Mapping Window，DMW）**，无需建立传统恒等页表即可在开启分页后直接将高地址映射到物理内存。`arch/loongarch/boot.S` 与 `secondary.S` 在启动早期按三步完成虚拟地址空间切换：
+LoongArch 64 从物理入口开始执行，使用硬件直接映射窗口（Direct Mapping Window，DMW）过渡。`arch/loongarch/boot.S` 通过临时缓存和非缓存窗口清除静态内存、读取引导信息和准备高半区目录。
 
-1. **配置永久直接映射窗口**：
-   - `CSR.DMW0`（`0x180`）设为 `0x9000000000000011`（`LA_DIRECT_BASE`，可缓存一致访存 `MAT=1`），供内核直接访问物理内存；
-   - `CSR.DMW1`（`0x181`）设为 `0x8000000000000001`（`LA_UNCACHED_BASE`，强序非缓存 `MAT=0`），供内核访问外设寄存器与 PCI 配置空间。
-2. **临时过渡窗口与开启分页**：将 `CSR.DMW2`（`0x182`）临时设为 `0x11` 覆盖当前低物理地址取指区间，随后写 `CSR.CRMD`（`0x0`）开启分页模式（`PG=1`）。
-3. **跳转高半区并清除过渡窗口**：跳转至高半区标签 `.Lmapped`（从核为 `.Lsecondary_high`）后立即清零 `CSR.DMW2`，正式进入常规高半区内核运行态。
+1. 主核在共享高半区页表中建立一条 32 MiB 启动映射，配置 `CSR.PGDH` 与物理重填入口，再从页表映射中的内核地址调用 `la_kernel_main()`。
+2. `la_mmu_direct_map_initialize()` 依据引导内存范围建立缓存物理内存映射，并为设备寄存器和 PCI 地址窗建立分离的非缓存映射。物理内存使用 `LA_DIRECT_BASE = 0xffff900000000000`，设备地址使用 `LA_UNCACHED_BASE = 0xffffa00000000000`。普通完整范围优先用 32 MiB 大页。
+3. 主核改用页表映射中的串口和电源寄存器，关闭所有硬件直接映射窗口，并清除地址转换缓存。各任务共用同一个高半区根。切换进程页表或批量撤销用户映射时仅清除非全局项，保留全局的普通内存与设备地址转换。
+
+`memfd_secret` 首次装页时，在内核页表中撤除相应物理页的直接映射。首次触及大页时只拆分这一条 32 MiB 映射，锁外准备末级表，发布后等待各在线核完成地址转换失效。后续同一区间的操作直接编辑 16 KiB 叶项。最后一个秘密页归还时恢复原大页映射，确认各在线核已经失效再释放拆分表。秘密内存对象清零并归还各数据页。
+
+当系统调用以调用进程中的秘密映射作为输入或输出缓冲区时，`kernel_mm_copy_local_secret()` 核对当前页表和访问权限，在页表读保护内通过原用户虚拟地址复制一个短片段。撤销映射需要取得同一页表的写保护。复制过程沿用原用户页表。远程内存读写和要求借用物理页的接口仍拒绝秘密页。
 
 ---
 
@@ -33,7 +35,7 @@ LoongArch 64 架构提供硬件**直接映射配置窗口（Direct Mapping Windo
 ### 3.1 页表几何与 32 MiB 原生大页
 
 与 RISC-V Sv39 的 4 KiB 硬件页表遍历不同，BoarOS 在 LoongArch 64 上采用 **16 KiB 基页**（`BOAROS_PAGE_SHIFT = 14`），每张页表恰好容纳 `2,048` 项 8 字节页表项（每级索引 11 位），构建经典的三级页表（索引位偏移 `14 / 25 / 36`，分别编程至 `CSR.PWCL` 与 `CSR.PWCH`）：
-- **用户页表根**存于 `CSR.PGDL`（`0x19`），**内核栈高半区页表根**存于 `CSR.PGDH`（`0x1a`）；
+- **用户页表根**存于 `CSR.PGDL`（`0x19`），**内核的高半区页表根**存于 `CSR.PGDH`（`0x1a`），供普通物理内存、设备和任务内核栈映射共用；
 - **32 MiB 原生大页**：直接由中间目录级（PMD）大叶表示（`ARCH_MMU_HUGE_ORDER = 11`，页表项置 `PTE_HUGE = 1 << 6`），单条 32 MiB PMD 恰好覆盖龙芯硬件一对 16 MiB `EntryLo` 表项；
 - **软件权限编码**：`arch/loongarch/mmu.c` 使用 `PTE_VALID`（`1`）、`PTE_DIRTY`（`2`）、`PTE_PRESENT`（`1<<7`）、`PTE_WRITE`（`1<<8`）、`PTE_COW`（`1<<9`）、`PTE_NONE`（`1<<10`）、`PTE_NR`（`1<<61`）与 `PTE_NX`（`1<<62`），`PROT_NONE` 保留 `PTE_PRESENT | PTE_NONE`（清除 `PTE_VALID`）而不丢弃物理页所有权与 CoW 标记。
 
@@ -68,14 +70,14 @@ flowchart LR
 
 LoongArch 不依赖外部固件启核，而是通过片上 **IOCSR 邮箱与核间中断寄存器**直接引导从核：
 1. CPU0 将从核上下文虚拟指针写入目标核 `MBUF1`，将 `la_secondary_entry` 物理入口地址写入 `MBUF0`（经 IOCSR `0x1048` 邮寄），再向 `0x1040` 发送唤醒 IPI；
-2. 从核启动后完成 DMW 窗口与高半区切换，从 `MBUF1`（`0x1028`）取回栈指针 `$sp` 与任务指针 `$tp`，配置异常入口与 `CSR.PGDH`，使能本地 IPI 与恒频定时器；
+2. 从核以临时直接窗口进入，加载共享 `CSR.PGDH`，跳到页表映射后关闭所有硬件直接映射窗口。随后从 `MBUF1`（`0x1028`）取回栈指针 `$sp` 与任务指针 `$tp`，配置异常入口，使能本地 IPI 与恒频定时器；
 3. 与 CPU0 完成 `LA_IPI_HANDSHAKE` 握手并观察到首次本地时钟中断后，正式发布 `KERNEL_CPU_ONLINE` 加入多核调度。
 
 ### 5.2 无死锁的跨核 `INVTLB` 同步协议
 
 在 LoongArch 上，解除映射或降权时由 `la_smp_sync_user()` / `la_smp_sync_kernel()` 驱动跨核 TLB 失效确认：
 - 发起核将本次失效请求 `(generation, address, size, instructions, targets, pending)` 写入自己的每核槽 `fences[self]`，向目标核的 `incoming_fences[target].sources` 置位并发送 `LA_IPI_TLB`；
-- 目标核在 IPI 处理中根据范围执行精确页失效（`invtlb 0x5`）或全量失效（`invtlb 0x0`），涉及可执行页时追加 `ibar 0` 指令屏障，核对代次后清除 `pending` 对应位；
+- 目标核在 IPI 中按地址范围执行失效。用户单页使用 `invtlb 0x5`，用户大范围使用 `invtlb 0x3`。内核单页使用包含全局项的 `invtlb 0x6`，内核大范围使用 `invtlb 0x0`。涉及可执行页时追加 `ibar 0` 指令屏障，核对代次后清除 `pending` 对应位；
 - **防互等死锁机制**：发起核在自旋等待全部 `pending` 位清零期间，持续主动调用 `consume(0)` 消费发给自己的远端 TLB 失效请求，确保即使两颗核同时在关中断上下文发起跨核刷页，也能各自推进而绝不互等死锁。
 
 ---

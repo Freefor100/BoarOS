@@ -211,8 +211,17 @@ enum kernel_uaccess_status kernel_uaccess_write_cursor_copy(
         if (!cursor->pin.registration || cursor->pin.mm != mm ||
             cursor->virtual_page != virtual_page) {
             kernel_uaccess_write_cursor_finish(cursor);
-            status = kernel_uaccess_pin_user_page(mm, current,
-                                                 KERNEL_MM_WRITE, &cursor->pin);
+            status = kernel_uaccess_pin_user_page(mm,current,KERNEL_MM_WRITE,&cursor->pin);
+#if defined(__loongarch__)
+            if (status == KERNEL_UACCESS_STATUS_FAULT) {
+                size_t done;
+                status = access_status(kernel_mm_copy_local_secret(mm,current,(void *)(source+copied),
+                    chunk,SECRET_COPY_OUT,&done));
+                copied += done;
+                COST_ADD(COPY_TO_USER,done);
+                if (!status) continue;
+            }
+#endif
             if (status != KERNEL_UACCESS_STATUS_OK) {
                 *bytes_copied = copied;
                 return status;
@@ -248,6 +257,10 @@ static __attribute__((noinline)) enum kernel_uaccess_status copy_to_user_pair(
     *copied=0;
     enum kernel_uaccess_status access=kernel_uaccess_pin_user_pair(mm,destination,
         destination+first,KERNEL_MM_WRITE,pins,&count);
+#if defined(__loongarch__)
+    if (access==KERNEL_UACCESS_STATUS_FAULT)
+        return copy_to_user_cursor(mm,destination,source,size,copied);
+#endif
     if (access) return access;
     copy_to_pinned_page((unsigned char *)pins[0].page+(destination&BOAROS_PAGE_MASK),source,first);
     if (count==2) {
@@ -317,10 +330,17 @@ enum kernel_uaccess_status kernel_copy_from_user(
         if (chunk > size - copied) {
             chunk = size - copied;
         }
-        status = kernel_uaccess_pin_user_page(mm,
-                                   current,
-                                   KERNEL_MM_READ,
-                                   &pin);
+        status = kernel_uaccess_pin_user_page(mm,current,KERNEL_MM_READ,&pin);
+#if defined(__loongarch__)
+        if (status == KERNEL_UACCESS_STATUS_FAULT) {
+            size_t done;
+            status = access_status(kernel_mm_copy_local_secret(mm,current,destination+copied,
+                chunk,SECRET_COPY_IN,&done));
+            copied += done;
+            COST_ADD(COPY_FROM_USER,done); COST_IO_ADD(3,done);
+            if (!status) continue;
+        }
+#endif
         if (status != KERNEL_UACCESS_STATUS_OK) {
             *bytes_copied = copied;
             return status;
@@ -415,10 +435,20 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
         if ((uint64_t)chunk > ARCH_MMU_USER_LIMIT - current) {
             chunk = (size_t)(ARCH_MMU_USER_LIMIT - current);
         }
-        status = kernel_uaccess_pin_user_page(mm,
-                                   current,
-                                   KERNEL_MM_READ,
-                                   &pin);
+        status = kernel_uaccess_pin_user_page(mm,current,KERNEL_MM_READ,&pin);
+#if defined(__loongarch__)
+        if (status == KERNEL_UACCESS_STATUS_FAULT) {
+            size_t done;
+            status = access_status(kernel_mm_copy_local_secret(mm,current,kernel_destination+copied,
+                chunk,SECRET_COPY_STRING,&done));
+            copied += done;
+            if (!status) {
+                if (done == chunk) continue;
+                *string_length = copied;
+                return KERNEL_UACCESS_STATUS_OK;
+            }
+        }
+#endif
         if (status != KERNEL_UACCESS_STATUS_OK) {
             *string_length = copied;
             return status;

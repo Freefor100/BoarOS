@@ -123,8 +123,13 @@ static void merge_all(struct kernel_vma_set *set);
 void kernel_vma_set_clear_locks(struct kernel_vma_set *set)
 {
     if (!set_valid(set)) __builtin_trap();
-    for (uint32_t i = 0; i < set->count; i++) set->entries[i].flags &= ~KERNEL_VMA_LOCK_MASK;
-    set->usage.locked = 0;
+    uint64_t locked = 0;
+    for (uint32_t i = 0; i < set->count; i++) {
+        struct kernel_vma *vma = &set->entries[i];
+        if (!(vma->flags & KERNEL_VMA_SECRET)) vma->flags &= ~KERNEL_VMA_LOCK_MASK;
+        else if (vma->flags & KERNEL_VMA_LOCKED) locked += vma->end - vma->start;
+    }
+    set->usage.locked = locked;
     merge_all(set);
     set->generation++;
 }

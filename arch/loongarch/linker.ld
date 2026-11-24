@@ -1,10 +1,13 @@
 OUTPUT_ARCH(loongarch)
-ENTRY(_start)
+ENTRY(__firmware_entry)
 PHDRS { text PT_LOAD FLAGS(5); rodata PT_LOAD FLAGS(4); data PT_LOAD FLAGS(6); }
 SECTIONS {
- . = 0x9000000000200000;
+ /* Match LA_DIRECT_BASE in boot_map.h. QEMU's ELF boot enters by PA. */
+ KERNEL_VIRTUAL_BASE = 0xffff900000000000;
+ . = KERNEL_VIRTUAL_BASE + 0x200000;
  __kernel_start = .;
- .text : AT(ADDR(.text) - 0x9000000000000000) {
+ __firmware_entry = _start - KERNEL_VIRTUAL_BASE;
+ .text : AT(ADDR(.text) - KERNEL_VIRTUAL_BASE) {
    KEEP(*(.text.boot))
    /* Keep the syscall entry and accounting code together, before filesystem
     * or driver text growth can move individual parts of this path. */
@@ -15,9 +18,9 @@ SECTIONS {
    *(.text .text.*)
    . = ALIGN(0x4000);
  } :text
- .rodata : AT(ADDR(.rodata) - 0x9000000000000000) { *(.rodata .rodata.*) . = ALIGN(0x4000); } :rodata
- .data : AT(ADDR(.data) - 0x9000000000000000) { *(.data .data.*) . = ALIGN(0x4000); } :data
- .bss (NOLOAD) : AT(ADDR(.bss) - 0x9000000000000000) {
+ .rodata : AT(ADDR(.rodata) - KERNEL_VIRTUAL_BASE) { *(.rodata .rodata.*) . = ALIGN(0x4000); } :rodata
+ .data : AT(ADDR(.data) - KERNEL_VIRTUAL_BASE) { *(.data .data.*) . = ALIGN(0x4000); } :data
+ .bss (NOLOAD) : AT(ADDR(.bss) - KERNEL_VIRTUAL_BASE) {
    __bss_start = .;
    /* 与RV相同：CPU本地状态、共享锁和调度器前缀集中在现有BSS首页。 */
    *(.bss.scheduler.cpu) . = ALIGN(64);
@@ -28,5 +31,6 @@ SECTIONS {
    __boot_stack_top = .; __bss_end = .;
  } :data
  . = ALIGN(0x4000); __kernel_end = .;
+ ASSERT(__kernel_end - KERNEL_VIRTUAL_BASE <= 0x02000000, "kernel outgrows LA bootstrap mapping")
  /DISCARD/ : { *(.comment) *(.eh_frame .eh_frame.*) *(.note .note.*) }
 }

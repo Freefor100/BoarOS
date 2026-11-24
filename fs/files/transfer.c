@@ -1000,99 +1000,175 @@ static int offset_capable(const struct kernel_open_file_description *file)
         file->block || (file->device && file->device->positioned);
 }
 
-enum kernel_files_status kernel_files_splice(struct kernel_files *files,struct kernel_mm *mm,
-    int64_t in_fd,uint64_t user_in,int64_t out_fd,uint64_t user_out,uint64_t count,uint32_t flags,int64_t *result)
+static enum kernel_files_status splice_owned(struct kernel_files *files,
+    struct kernel_open_file_description **input_owner, int64_t *in, int positioned_in,
+    struct kernel_open_file_description **output_owner, int64_t *out, int positioned_out,
+    uint64_t count, uint32_t flags, int64_t *result)
 {
-    if(!kernel_files_is_live(files) || !mm || !result)return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    *result=0;
-    if(!count)return KERNEL_FILES_STATUS_OK;
-    if(flags&~SPLICE_ALL){*result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;}
-    struct kernel_open_file_description *input=NULL,*output=NULL;
-    enum kernel_files_status status=kernel_files_pin(files,in_fd,&input,result);
-    if(status || *result)goto done;
-    status=kernel_files_pin(files,out_fd,&output,result);if(status || *result)goto done;
-    int inp=input->kind==KERNEL_OPEN_FILE_KIND_PIPE,outp=output->kind==KERNEL_OPEN_FILE_KIND_PIPE;
-    if((inp && user_in) || (outp && user_out)){*result=-KERNEL_ESPIPE;goto done;}
-    int64_t in=0,out=0;
-    *result=copy_offset_in(mm,user_out,&out);if(*result)goto done;
-    *result=copy_offset_in(mm,user_in,&in);if(*result)goto done;
-    if(!kernel_open_file_readable(input) || !kernel_files_description_writable(output)){*result=-KERNEL_EBADF;goto done;}
-    if((!inp && !outp) || (inp && outp && input->pipe==output->pipe)){*result=-KERNEL_EINVAL;goto done;}
-    if((user_in && !offset_capable(input)) || (user_out && !offset_capable(output))){*result=-KERNEL_EINVAL;goto done;}
-    if(inp && !outp && (kernel_open_file_flags(output)&KERNEL_FILES_O_APPEND)){*result=-KERNEL_EINVAL;goto done;}
-    {
-        KERNEL_SERVICE_SCOPE_IF(service,
-            (!inp && (input->kind==KERNEL_OPEN_FILE_KIND_GENERATED || input->device ||
-                (input->kind==KERNEL_OPEN_FILE_KIND_REGULAR && kernel_vfs_file_metadata_requires_cpu0(&input->file)))) ||
-            (!outp && (output->device || (output->kind==KERNEL_OPEN_FILE_KIND_REGULAR && kernel_vfs_file_metadata_requires_cpu0(&output->file)))));
-        struct kernel_open_file_description *file=inp?output:input;
-        KERNEL_LOCK_SCOPE(position_owner);
-        if(!inp || !outp) {
-            if(offset_capable(file))kernel_mutex_lock(&file->offset_lock,&position_owner);
-            if(inp) {if(!user_out)out=(int64_t)file->offset;*result=signed_transfer_range((uint64_t)out,count);}
-            else {if(!user_in)in=(int64_t)file->offset;*result=signed_transfer_range((uint64_t)in,count);}
-            if(position_owner.lock)kernel_lock_release(&position_owner);
-            if(*result)goto transfer_done;
-        }
-        unsigned broken=0;uint64_t accepted=0;
-        if(inp && outp) {
-            *result=kernel_pipe_link(input->pipe,output->pipe,count,!!((flags&SPLICE_NONBLOCK) ||
-                ((kernel_open_file_flags(input)|kernel_open_file_flags(output))&KERNEL_FILES_O_NONBLOCK)),1,&broken);
-        } else if(outp) {
-            uint64_t position=(uint64_t)in;
-            if (input->file.notify_access_perm) {
-                *result = kernel_vfs_fanotify_permission(&input->file, VFS_NOTIFY_ACCESS_PERM, NULL);
-                if (*result) goto transfer_done;
-            }
-            *result=file_into_pipe(&input,output,&position,count,flags,!user_in,0,&broken);
-            in=(int64_t)position;
-        } else {
-            uint64_t position=(uint64_t)out;
-            *result=pipe_into_file(input,&output,&position,count,flags,!user_out,&accepted);
-            out=(int64_t)position;
-        }
-        if(kernel_files_pipe_result(*result,broken))status=KERNEL_FILES_STATUS_STATE;
-        if(*result>0 || accepted) {
-            int64_t completed=*result>0?*result:(int64_t)accepted;
-            kernel_vfs_notify_file(&input->file,VFS_NOTIFY_ACCESS);kernel_vfs_notify_file(&output->file,VFS_NOTIFY_MODIFY);
-            KERNEL_FILES_NOTE(files,bytes_read,(uint64_t)completed);
-            KERNEL_FILES_NOTE(files,bytes_written,(uint64_t)completed);
-        }
-        if(position_owner.lock)kernel_lock_release(&position_owner);
-        /* Output faults preserve already consumed pipe bytes and accepted data. */
-        if(*result>=0) {
-            int error=copy_offset_out(mm,user_out,out);
-            if(!error)error=copy_offset_out(mm,user_in,in);
-            if(error)*result=error;
-        }
-transfer_done:;
+    struct kernel_open_file_description *input = *input_owner, *output = *output_owner;
+    int inp = input->kind == KERNEL_OPEN_FILE_KIND_PIPE;
+    int outp = output->kind == KERNEL_OPEN_FILE_KIND_PIPE;
+    if ((inp && positioned_in) || (outp && positioned_out)) {
+        *result = -KERNEL_ESPIPE;
+        return KERNEL_FILES_STATUS_OK;
     }
-done:
-    if(output)status=kernel_files_release_io(files,&output,status);
-    if(input)status=kernel_files_release_io(files,&input,status);
+    if (!kernel_open_file_readable(input) || !kernel_files_description_writable(output)) {
+        *result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if ((!inp && !outp) || (inp && outp && input->pipe == output->pipe) ||
+        (positioned_in && !offset_capable(input)) || (positioned_out && !offset_capable(output)) ||
+        (inp && !outp && (kernel_open_file_flags(output) & KERNEL_FILES_O_APPEND))) {
+        *result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+
+    KERNEL_SERVICE_SCOPE_IF(service,
+        (!inp && (input->kind == KERNEL_OPEN_FILE_KIND_GENERATED || input->device ||
+            (input->kind == KERNEL_OPEN_FILE_KIND_REGULAR && kernel_vfs_file_metadata_requires_cpu0(&input->file)))) ||
+        (!outp && (output->device || (output->kind == KERNEL_OPEN_FILE_KIND_REGULAR &&
+            kernel_vfs_file_metadata_requires_cpu0(&output->file)))));
+    if (!inp || !outp) {
+        struct kernel_open_file_description *file = inp ? output : input;
+        KERNEL_LOCK_SCOPE(position_owner);
+        if (offset_capable(file)) kernel_mutex_lock(&file->offset_lock, &position_owner);
+        if (inp) {
+            if (!positioned_out) *out = (int64_t)file->offset;
+            *result = signed_transfer_range((uint64_t)*out, count);
+        } else {
+            if (!positioned_in) *in = (int64_t)file->offset;
+            *result = signed_transfer_range((uint64_t)*in, count);
+        }
+        if (*result) return KERNEL_FILES_STATUS_OK;
+    }
+
+    unsigned broken = 0;
+    uint64_t accepted = 0;
+    if (inp && outp) {
+        *result = kernel_pipe_link(input->pipe, output->pipe, count, !!((flags & SPLICE_NONBLOCK) ||
+            ((kernel_open_file_flags(input) | kernel_open_file_flags(output)) & KERNEL_FILES_O_NONBLOCK)),
+            1, &broken);
+    } else if (outp) {
+        uint64_t position = (uint64_t)*in;
+        if (input->file.notify_access_perm) {
+            *result = kernel_vfs_fanotify_permission(&input->file, VFS_NOTIFY_ACCESS_PERM, NULL);
+            if (*result) return KERNEL_FILES_STATUS_OK;
+        }
+        *result = file_into_pipe(input_owner, output, &position, count, flags, !positioned_in, 0, &broken);
+        *in = (int64_t)position;
+    } else {
+        uint64_t position = (uint64_t)*out;
+        *result = pipe_into_file(input, output_owner, &position, count, flags, !positioned_out, &accepted);
+        *out = (int64_t)position;
+    }
+    enum kernel_files_status status = kernel_files_pipe_result(*result, broken);
+    if (*result > 0 || accepted) {
+        uint64_t completed = *result > 0 ? (uint64_t)*result : accepted;
+        kernel_vfs_notify_file(&input->file, VFS_NOTIFY_ACCESS);
+        kernel_vfs_notify_file(&output->file, VFS_NOTIFY_MODIFY);
+        KERNEL_FILES_NOTE(files, bytes_read, completed);
+        KERNEL_FILES_NOTE(files, bytes_written, completed);
+    }
     return status;
 }
-enum kernel_files_status kernel_files_tee(struct kernel_files *files,int64_t in_fd,int64_t out_fd,
-    uint64_t count,uint32_t flags,int64_t *result)
+
+enum kernel_files_status kernel_files_splice(struct kernel_files *files, struct kernel_mm *mm,
+    int64_t in_fd, uint64_t user_in, int64_t out_fd, uint64_t user_out, uint64_t count,
+    uint32_t flags, int64_t *result)
 {
-    *result=0;
-    if(flags&~SPLICE_ALL){*result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;}
-    if(!count)return KERNEL_FILES_STATUS_OK;
-    KERNEL_FILES_PIN_SCOPE(a);KERNEL_FILES_PIN_SCOPE(b);
-    struct kernel_open_file_description *in=kernel_files_hold_fd(files,in_fd,&a);
-    if(!in){*result=-KERNEL_EBADF;return KERNEL_FILES_STATUS_OK;}
-    struct kernel_open_file_description *out=kernel_files_hold_fd(files,out_fd,&b);
-    if(!out || !kernel_open_file_readable(in) || !kernel_files_description_writable(out)){*result=-KERNEL_EBADF;return KERNEL_FILES_STATUS_OK;}
-    if(in->kind!=KERNEL_OPEN_FILE_KIND_PIPE || out->kind!=KERNEL_OPEN_FILE_KIND_PIPE || in->pipe==out->pipe){*result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;}
-    unsigned broken=0;
-    *result=kernel_pipe_link(in->pipe,out->pipe,count,!!((flags&SPLICE_NONBLOCK) ||
-        ((kernel_open_file_flags(in)|kernel_open_file_flags(out))&KERNEL_FILES_O_NONBLOCK)),0,&broken);
-    if(kernel_files_pipe_result(*result,broken))return KERNEL_FILES_STATUS_STATE;
-    if(*result>0){
-        kernel_vfs_notify_file(&in->file,VFS_NOTIFY_ACCESS);kernel_vfs_notify_file(&out->file,VFS_NOTIFY_MODIFY);
+    if (!kernel_files_is_live(files) || !mm || !result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    *result = 0;
+    if (!count) return KERNEL_FILES_STATUS_OK;
+    if (flags & ~SPLICE_ALL) {
+        *result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    struct kernel_open_file_description *input = NULL, *output = NULL;
+    enum kernel_files_status status = kernel_files_pin(files, in_fd, &input, result);
+    if (status || *result) goto done;
+    status = kernel_files_pin(files, out_fd, &output, result);
+    if (status || *result) goto done;
+    if ((input->kind == KERNEL_OPEN_FILE_KIND_PIPE && user_in) ||
+        (output->kind == KERNEL_OPEN_FILE_KIND_PIPE && user_out)) {
+        *result = -KERNEL_ESPIPE;
+        goto done;
+    }
+    int64_t in = 0, out = 0;
+    *result = copy_offset_in(mm, user_out, &out);
+    if (!*result) *result = copy_offset_in(mm, user_in, &in);
+    if (*result) goto done;
+    status = splice_owned(files, &input, &in, user_in != 0, &output, &out,
+        user_out != 0, count, flags, result);
+    /* Output faults preserve already consumed pipe bytes and accepted data. */
+    if (!status && *result >= 0) {
+        int error = copy_offset_out(mm, user_out, out);
+        if (!error) error = copy_offset_out(mm, user_in, in);
+        if (error) *result = error;
+    }
+done:
+    if (output) status = kernel_files_release_io(files, &output, status);
+    if (input) status = kernel_files_release_io(files, &input, status);
+    return status;
+}
+
+static enum kernel_files_status tee_owned(struct kernel_open_file_description *in,
+    struct kernel_open_file_description *out, uint64_t count, uint32_t flags, int64_t *result)
+{
+    if (!kernel_open_file_readable(in) || !kernel_files_description_writable(out)) {
+        *result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (in->kind != KERNEL_OPEN_FILE_KIND_PIPE || out->kind != KERNEL_OPEN_FILE_KIND_PIPE ||
+        in->pipe == out->pipe) {
+        *result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    unsigned broken = 0;
+    *result = kernel_pipe_link(in->pipe, out->pipe, count, !!((flags & SPLICE_NONBLOCK) ||
+        ((kernel_open_file_flags(in) | kernel_open_file_flags(out)) & KERNEL_FILES_O_NONBLOCK)), 0, &broken);
+    if (kernel_files_pipe_result(*result, broken)) return KERNEL_FILES_STATUS_STATE;
+    if (*result > 0) {
+        kernel_vfs_notify_file(&in->file, VFS_NOTIFY_ACCESS);
+        kernel_vfs_notify_file(&out->file, VFS_NOTIFY_MODIFY);
     }
     return KERNEL_FILES_STATUS_OK;
 }
+
+enum kernel_files_status kernel_files_tee(struct kernel_files *files, int64_t in_fd, int64_t out_fd,
+    uint64_t count, uint32_t flags, int64_t *result)
+{
+    *result = 0;
+    if (flags & ~SPLICE_ALL) {
+        *result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (!count) return KERNEL_FILES_STATUS_OK;
+    KERNEL_FILES_PIN_SCOPE(a);
+    KERNEL_FILES_PIN_SCOPE(b);
+    struct kernel_open_file_description *in = kernel_files_hold_fd(files, in_fd, &a);
+    if (!in) {
+        *result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    struct kernel_open_file_description *out = kernel_files_hold_fd(files, out_fd, &b);
+    if (!out) {
+        *result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    return tee_owned(in, out, count, flags, result);
+}
+
+int64_t kernel_files_uring_splice(struct kernel_files *files, int is_tee,
+    struct kernel_open_file_description **input, int64_t in,
+    struct kernel_open_file_description **output, int64_t out, uint64_t count, uint32_t flags)
+{
+    int64_t result = 0;
+    if (!count) return 0;
+    enum kernel_files_status status = is_tee ? tee_owned(*input, *output, count, flags, &result) :
+        splice_owned(files, input, &in, in != -1, output, &out, out != -1, count, flags, &result);
+    return status == KERNEL_FILES_STATUS_OK ? result : -KERNEL_EIO;
+}
+
 enum kernel_files_status kernel_files_vmsplice(struct kernel_files *files,struct kernel_mm *mm,
     int64_t fd,uint64_t user_iov,uint64_t count,uint32_t flags,int64_t *result)
 {

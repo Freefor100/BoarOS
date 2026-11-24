@@ -1,4 +1,5 @@
 #include <kernel/dtb.h>
+#include <platform/riscv_pci.h>
 #include <string.h>
 
 #include <stddef.h>
@@ -248,6 +249,7 @@ struct dtb_discovery_node {
     uint8_t reg_seen;
     uint8_t compatible_seen;
     uint8_t compatible_virtio_mmio;
+    uint8_t compatible_pci_ecam;
     uint8_t status_seen;
 };
 
@@ -415,7 +417,8 @@ static enum dtb_status finish_discovery_node(
     uint64_t size;
     uint32_t bus_index;
 
-    if (!node->compatible_virtio_mmio || !node->enabled) {
+    if ((!node->compatible_virtio_mmio && !node->compatible_pci_ecam) ||
+        !node->enabled) {
         return DTB_STATUS_OK;
     }
     if (depth < 2U || !node->reg_seen || node->reg == 0) {
@@ -456,7 +459,13 @@ static enum dtb_status finish_discovery_node(
         bus_index--;
     }
 
-    return insert_virtio_mmio(info, address, size);
+    if (node->compatible_virtio_mmio)
+        return insert_virtio_mmio(info, address, size);
+    /* These apertures and legacy interrupt swizzles are QEMU virt board
+     * wiring. Other ECAM hosts require their individual device-tree setup. */
+    if (address == RISCV_VIRT_PCI_ECAM_BASE && size == RISCV_VIRT_PCI_ECAM_SIZE)
+        info->qemu_virt_pci = 1;
+    return DTB_STATUS_OK;
 }
 
 static enum dtb_status discover_virtio_mmio(
@@ -524,6 +533,7 @@ static enum dtb_status discover_virtio_mmio(
             node.reg_seen = 0U;
             node.compatible_seen = 0U;
             node.compatible_virtio_mmio = 0U;
+            node.compatible_pci_ecam = 0U;
             node.status_seen = 0U;
             nodes[depth] = node;
             depth++;
@@ -617,6 +627,9 @@ static enum dtb_status discover_virtio_mmio(
                 }
                 node->compatible_seen = 1U;
                 node->compatible_virtio_mmio = (uint8_t)compatible;
+                if (!string_list_contains(value, length, "pci-host-ecam-generic", &compatible))
+                    return DTB_STATUS_INVALID;
+                node->compatible_pci_ecam = (uint8_t)compatible;
             } else if (bytes_equal_string(name, name_length, "status")) {
                 int available;
 

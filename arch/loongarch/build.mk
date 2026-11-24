@@ -57,7 +57,7 @@ LA_CFLAGS := $(LA_FLAGS) -std=gnu11 -O2 -g3 -gdwarf-4 -gstrict-dwarf -ffreestand
 LA_C_SOURCES := $(COMMON_C_SOURCES) \
     arch/loongarch/main.c arch/loongarch/smp.c arch/loongarch/mmu.c arch/loongarch/context.c arch/loongarch/ptrace.c \
     arch/loongarch/timer.c arch/loongarch/trap.c arch/loongarch/signal.c arch/loongarch/fpu.c platform/loongarch_virt.c \
-    platform/loongarch_pci.c platform/loongarch_root.c platform/loongarch_rtc.c drivers/virtio/pci_block.c drivers/virtio/pci.c drivers/virtio/pci_rng.c drivers/virtio/pci_net.c kernel/pci.c
+    platform/loongarch_pci.c platform/loongarch_root.c platform/loongarch_rtc.c drivers/virtio/pci_block.c drivers/virtio/pci.c drivers/virtio/pci_rng.c drivers/virtio/pci_net.c
 LA_ASM_SOURCES := arch/loongarch/boot.S arch/loongarch/secondary.S arch/loongarch/context_switch.S \
     arch/loongarch/tlb_refill.S arch/loongarch/trap_entry.S arch/loongarch/signal_trampoline.S arch/loongarch/fpu_state.S
 LA_OBJECTS = $(patsubst %.c,$(LA_BUILD)/%.o,$(LA_C_SOURCES)) $(patsubst %.S,$(LA_BUILD)/%.o,$(LA_ASM_SOURCES))
