@@ -315,6 +315,9 @@ struct kernel_vfs_backend {
         uint64_t offset, int append);
     int (*stat)(const struct kernel_vfs_file *file,
         struct kernel_vfs_stat *stat);
+    /* Metadata-only lookup of a regular entry in a namespace-qualified directory. */
+    int (*stat_inode)(struct kernel_vfs_mount *, struct kernel_vfs_node *parent,
+        uint64_t inode, struct kernel_vfs_node *live, struct kernel_vfs_stat *);
     int (*mkdir)(struct kernel_vfs_mount *mount,
         uint64_t parent_inode, const char *path,
         uint32_t mode, uint32_t umask);

@@ -172,6 +172,8 @@ struct ext4_buf {
 	struct ext4_block_payload *current_payload;
 };
 
+enum { EXT4_BCACHE_RECENT = 16 };
+
 /**@brief   Block cache descriptor*/
 struct ext4_bcache {
 	/* Index, LRU, references and load publication; no allocation/I/O inside. */
@@ -198,6 +200,8 @@ struct ext4_bcache {
 
 	/**@brief   A tree holding all bufs*/
 	RB_HEAD(ext4_buf_lba, ext4_buf) lba_root;
+	/* Recently found tree members, protected by metadata without extra loans. */
+	struct ext4_buf *recent[EXT4_BCACHE_RECENT];
 
 	/**@brief   Unreferenced buffers in idle age order. */
 	struct ext4_buf *lru_head, *lru_tail;

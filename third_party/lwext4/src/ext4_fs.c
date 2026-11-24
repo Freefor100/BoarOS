@@ -734,7 +734,9 @@ static int ext4_fs_get_block_group_ref_mode(struct ext4_fs *fs, uint32_t bgid,
 	struct metadata_check check;
 	bool cached=metadata_cached(ref->block.payload,bgid,offset,size,false,&check);
 
-	if (!cached && !ext4_fs_verify_bg_csum(ext4_fs_super(fs), bgid, bg)) {
+	if (cached)
+		return EOK;
+	if (!ext4_fs_verify_bg_csum(ext4_fs_super(fs), bgid, bg)) {
 		ext4_dbg(DEBUG_FS,
 			 DBG_WARN "Block group descriptor checksum failed."
 			 "Block group index: %" PRIu32"\n",
@@ -1059,10 +1061,13 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 	ref->index = index + 1;
 	ref->fs = fs;
 	ref->dirty = false;
+	if (!initialized)
+		return EOK;
 	struct metadata_check check;
-	bool cached=metadata_cached(ref->block.payload,ref->index,offset_in_block,inode_size,true,&check);
+	if (metadata_cached(ref->block.payload,ref->index,offset_in_block,inode_size,true,&check))
+		return EOK;
 
-	if (initialized && !cached && !ext4_fs_verify_inode_csum(ref)) {
+	if (!ext4_fs_verify_inode_csum(ref)) {
 		ext4_dbg(DEBUG_FS,
 			DBG_WARN "Inode checksum failed."
 			"Inode: %" PRIu32"\n",
@@ -1070,7 +1075,7 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 		ext4_block_set(fs->bdev, &ref->block);
 		return EUCLEAN;
 	}
-	if (initialized) metadata_checked(ref->block.payload,&check);
+	metadata_checked(ref->block.payload,&check);
 
 	return EOK;
 }

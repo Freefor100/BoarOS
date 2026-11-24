@@ -696,6 +696,20 @@ int kernel_vfs_mount_view_acquire_locked(struct kernel_vfs_mount *mount)
 static struct kernel_vfs_path *find_location(struct kernel_vfs_mount *,struct kernel_vfs_dentry *);
 static int dentry_acquire(struct kernel_vfs_dentry *);
 static void dentry_release(struct kernel_vfs_dentry **);
+static void release_node_pin(struct kernel_vfs_node **);
+
+struct vfs_walk_stat {
+    struct kernel_vfs_stat *stat;
+    struct kernel_vfs_statx_extra *extra;
+};
+
+static void statx_mount_info(struct kernel_vfs_mount *mount,
+    struct kernel_vfs_stat *stat,struct kernel_vfs_statx_extra *extra)
+{
+    if (mount) extra->mount_id=extra->request&KERNEL_VFS_STATX_MNT_ID_UNIQUE ?
+        kernel_vfs_unique_mount_id(mount->id) : mount->id;
+    stat->attributes_mask|=KERNEL_VFS_STATX_ATTR_MOUNT_ROOT;
+}
 
 struct vfs_path_walk {
     const struct kernel_vfs_path *start, *root;
@@ -707,6 +721,7 @@ struct vfs_path_walk {
     struct kernel_service_scope service;
     struct kernel_vfs_node *directory;
     struct kernel_vfs_path **pathless_link;
+    const struct vfs_walk_stat *stat;
     unsigned final_write, resolve;
     uint64_t topology_generation;
 };
@@ -2999,7 +3014,7 @@ static bool lookup_walk_child(struct vfs_path_walk *walk,struct kernel_vfs_path 
 
 static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
     const char *name,size_t name_length,struct kernel_vfs_path **owner,int search,
-    struct vfs_path_walk *walk,bool parsed,bool cross_mount)
+    struct vfs_path_walk *walk,bool parsed,bool cross_mount,const struct vfs_walk_stat *query)
 {
     if (!parent || !parent->references || !name || !name_length || !owner || *owner) return -KERNEL_EINVAL;
     if (name_length>255U) return -KERNEL_ENAMETOOLONG;
@@ -3078,6 +3093,8 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
         }
     }
     uint64_t inode;uint32_t mode=0;
+    struct kernel_vfs_node *stat_node=NULL;
+    bool stat_leaf=false;
     /* Owned names retain real positive objects. A backend that initializes
      * the inode itself needs no speculative child mode read before opening. */
     char canonical[256];
@@ -3098,10 +3115,31 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
             entry=find_path(instance,parent->dentry,name,name_length);
             if (entry && kernel_vfs_file_inode(&entry->file)!=inode) {retired=detach_path(entry);entry=NULL;}
             if (entry && dentry_acquire(entry)) __builtin_trap();
+            /* A published mountpoint retains its dentry. An unrepresented
+             * name can complete a metadata query without a new path owner. */
+            stat_leaf=!entry && query && instance->ops->stat_inode &&
+                !__atomic_load_n(&mount->paths_closing,__ATOMIC_ACQUIRE);
+            if (stat_leaf) {
+                stat_node=kernel_vfs_node_find(instance,inode);
+                if (stat_node && kernel_vfs_node_acquire(stat_node)) {
+                    stat_leaf=false;
+                    stat_node=NULL;
+                }
+            }
         }
         if (retired) dentry_release(&retired);
     }
     if (!entry) {
+        if (stat_leaf) {
+            result=instance->ops->stat_inode(mount,parent->file.private_data,inode,stat_node,query->stat);
+            release_node_pin(&stat_node);
+            if (result!=-KERNEL_ENOTSUP) {
+                if (!result && query->extra) statx_mount_info(mount,query->stat,query->extra);
+                if (!result && __atomic_load_n(&mount->expiry_mark,__ATOMIC_RELAXED))
+                    __atomic_store_n(&mount->expiry_mark,0U,__ATOMIC_RELAXED);
+                return result;
+            }
+        }
         enum kernel_heap_status allocation=kernel_heap_allocate_zeroed(instance->heap,1,sizeof(*entry)+name_length+1,(void **)&entry);
         if (allocation) return allocation==KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
         entry->heap=instance->heap;entry->references=1;entry->parent=parent->dentry;
@@ -3123,14 +3161,14 @@ Enter:
 }
 
 static int path_lookup_locked(struct kernel_vfs_path *parent,const char *name,size_t length,struct kernel_vfs_path **owner)
-{ return path_lookup_locked_mode(parent,name,length,owner,1,NULL,false,true); }
+{ return path_lookup_locked_mode(parent,name,length,owner,1,NULL,false,true,NULL); }
 int kernel_vfs_path_lookup_object(struct kernel_vfs_path *parent,const char *name,size_t length,struct kernel_vfs_path **owner)
 {
     KERNEL_SERVICE_SCOPE_IF(service,parent && kernel_vfs_namespace_requires_cpu0(parent->file.mount));
     if (!parent || !parent->file.mount || !parent->file.mount->private_data) return -KERNEL_EINVAL;
     KERNEL_LOCK_SCOPE(guard);namespace_node_lock(parent->file.private_data,&guard,0);
     if (((struct kernel_vfs_instance *)parent->file.mount->private_data)->quiescing) return -KERNEL_EIO;
-    return path_lookup_locked_mode(parent,name,length,owner,0,NULL,false,true);
+    return path_lookup_locked_mode(parent,name,length,owner,0,NULL,false,true,NULL);
 }
 
 int kernel_vfs_path_lookup_layer(struct kernel_vfs_path *parent,const char *name,size_t length,
@@ -3140,7 +3178,7 @@ int kernel_vfs_path_lookup_layer(struct kernel_vfs_path *parent,const char *name
     KERNEL_LOCK_SCOPE(guard);
     namespace_node_lock(parent->file.private_data,&guard,0);
     if (((struct kernel_vfs_instance *)parent->file.mount->private_data)->quiescing) return -KERNEL_EIO;
-    return path_lookup_locked_mode(parent,name,length,owner,1,NULL,false,false);
+    return path_lookup_locked_mode(parent,name,length,owner,1,NULL,false,false,NULL);
 }
 
 int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
@@ -3282,7 +3320,7 @@ static int resolve_object(struct kernel_vfs_path *start,
             /* The original C string has already been split at slashes.
              * A length-delimited symlink target can contain invalid bytes. */
             result=path_lookup_locked_mode(current,pending+begin,component_length,&next,1,walk,
-                                           pending==path,true);
+                                           pending==path,true,suffix ? NULL : walk->stat);
             walk->component=NULL;
         }
         if (result == -KERNEL_ENOENT && allow_missing_final &&
@@ -3296,7 +3334,7 @@ static int resolve_object(struct kernel_vfs_path *start,
             result = 0;
             goto Finish;
         }
-        if (result != 0) goto Finish;
+        if (result != 0 || !next) goto Finish;
         if (next->file.mount!=current->file.mount) {
             if (suffix && (next->file.mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR &&
                 !(trailing_only && follow_trailing_final==VFS_TRAILING_PRESERVE)) {
@@ -3439,11 +3477,11 @@ static int path_resolve(struct kernel_vfs_path *start,
                             const char *path, int follow_final,
                             struct kernel_vfs_path **owner,
                             struct kernel_vfs_path **pathless_link,
-                            struct kernel_vfs_path *terminal)
+                            struct kernel_vfs_path *terminal,const struct vfs_walk_stat *query)
 {
     if (!path || !start || !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
     VFS_PATH_WALK(walk,start,root);
-    walk.pathless_link=pathless_link;walk.terminal=terminal;
+    walk.pathless_link=pathless_link;walk.terminal=terminal;walk.stat=query;
     return resolve_object(start, root, path, strlen(path), follow_final, 0, 0, VFS_TRAILING_FOLLOW,
                           owner, 0, &walk);
 }
@@ -3452,7 +3490,7 @@ int kernel_vfs_path_resolve(struct kernel_vfs_path *start,
                             struct kernel_vfs_path *root,
                             const char *path, int follow_final,
                             struct kernel_vfs_path **owner)
-{ return path_resolve(start,root,path,follow_final,owner,NULL,NULL); }
+{ return path_resolve(start,root,path,follow_final,owner,NULL,NULL,NULL); }
 
 static int location_key_compare(const struct kernel_vfs_dentry *entry,const struct kernel_vfs_path *path)
 { return ((uintptr_t)entry>(uintptr_t)path->dentry)-((uintptr_t)entry<(uintptr_t)path->dentry); }
@@ -4640,9 +4678,7 @@ void kernel_vfs_statx_extra(const struct kernel_vfs_file *file, const struct ker
     if (!path && file) path = file->path;
     if (path) file = &path->file;
     struct kernel_vfs_mount *mount = file ? file->mount : NULL;
-    if (mount) extra->mount_id = extra->request & KERNEL_VFS_STATX_MNT_ID_UNIQUE ?
-        kernel_vfs_unique_mount_id(mount->id) : mount->id;
-    stat->attributes_mask |= KERNEL_VFS_STATX_ATTR_MOUNT_ROOT;
+    statx_mount_info(mount,stat,extra);
     if (kernel_vfs_path_is_mount_root(path))
         stat->attributes |= KERNEL_VFS_STATX_ATTR_MOUNT_ROOT;
     if (file && (extra->request & KERNEL_VFS_STATX_DIOALIGN))
@@ -5466,7 +5502,10 @@ static int stat_at_resolved(struct kernel_vfs_path *start,
 {
     struct kernel_vfs_path *resolved __attribute__((cleanup(release_path_pin))) = 0;
     struct kernel_vfs_path *link __attribute__((cleanup(release_path_pin))) = 0;
-    int result=path_resolve(start,root,path,follow_final,&resolved,&link,terminal);
+    struct vfs_walk_stat query={stat,extra};
+    bool needs_path=target || (extra && (extra->request&KERNEL_VFS_STATX_DIOALIGN));
+    int result=path_resolve(start,root,path,follow_final,&resolved,&link,terminal,
+        needs_path ? NULL : &query);
     if (!result && resolved) {
         result = kernel_vfs_path_stat(resolved, stat);
         if (!result && extra) kernel_vfs_statx_extra(NULL, resolved, stat, extra);
@@ -5747,7 +5786,7 @@ int kernel_vfs_unlink_at(struct kernel_vfs_path *start,
     /* Keep basename lookup and removal in one namespace operation; a racing
      * rename must not redirect unlink to the object's new name. */
     if (!directory) walk.component = &leaf;
-    result = path_lookup_locked_mode(parent, name, strlen(name), &path, 1, &walk, false, true);
+    result = path_lookup_locked_mode(parent, name, strlen(name), &path, 1, &walk, false, true, NULL);
     walk.component = NULL;
     if (result) goto Finish;
     if (directory && namespace_is_parallel(parent->file.mount->private_data) &&
@@ -5915,7 +5954,7 @@ int kernel_vfs_readlink_at(struct kernel_vfs_path *start,
     struct kernel_vfs_path terminal = {0};
     struct kernel_vfs_path *resolved = 0;
     if (!buffer || !bytes_read || !size) return -KERNEL_EINVAL;
-    int result = path_resolve(start, root, path, 0, &resolved, NULL, &terminal);
+    int result = path_resolve(start, root, path, 0, &resolved, NULL, &terminal, NULL);
     if (!result) {
         result = kernel_vfs_path_readlink(resolved, buffer, size, bytes_read);
         (void)kernel_vfs_path_release(&resolved);
