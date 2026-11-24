@@ -700,22 +700,38 @@ static void entry_borrow(struct kernel_page_cache_entry *entry)
     entry_borrows_add(entry->cache->record, 1);
 }
 
-static int entry_return(struct kernel_page_cache_entry *entry)
+static inline int entry_return_locked(struct kernel_page_cache_entry *entry)
 {
 #if BOAROS_MAX_CPUS > 1
     uint32_t users=__atomic_fetch_sub(&entry->users,1,__ATOMIC_ACQ_REL);
-    if (!(users&CACHE_USERS_COUNT) ||
-        !__atomic_fetch_sub(&entry->cache->record->entry_borrows,1,__ATOMIC_RELEASE)) __builtin_trap();
+    if (!(users&CACHE_USERS_COUNT)) __builtin_trap();
     int last_retired=users==(CACHE_USERS_RETIRED|1U);
 #else
-    if (!entry->users || !entry->cache->record->entry_borrows) __builtin_trap();
-    entry->users--; entry->cache->record->entry_borrows--;
+    if (!entry->users) __builtin_trap();
+    entry->users--;
     int last_retired=!entry->users && entry->retired;
 #endif
     if (last_retired && entry->cache->record->started) {
         entry->cache->record->requested=1; cache_wake(&entry->cache->record->work);
     }
     return last_retired;
+}
+
+static inline void entry_borrows_sub(struct kernel_page_cache_record *record, size_t count)
+{
+#if BOAROS_MAX_CPUS > 1
+    if (__atomic_fetch_sub(&record->entry_borrows,count,__ATOMIC_RELEASE)<count) __builtin_trap();
+#else
+    if (record->entry_borrows < count) __builtin_trap();
+    record->entry_borrows -= count;
+#endif
+}
+
+static int entry_return(struct kernel_page_cache_entry *entry)
+{
+    int retired = entry_return_locked(entry);
+    entry_borrows_sub(entry->cache->record, 1);
+    return retired;
 }
 
 #if BOAROS_MAX_CPUS > 1
@@ -923,7 +939,26 @@ static void publish_cache_page_state(struct kernel_page_cache_entry *entry)
         entry->dirty_end!=0,entry->writeback);
 }
 
-static void dirty_mark(struct kernel_page_cache_entry *entry, size_t begin, size_t end)
+static inline void dirty_charge(struct kernel_page_cache_record *record,
+    const struct kernel_vfs_node *node, unsigned pages)
+{
+    size_t bytes = (size_t)pages * BOAROS_PAGE_SIZE;
+    kernel_task_account_write(bytes);
+    struct kernel_writeback_domain *domain = node->instance->writeback.domain;
+    if (domain) domain_charge(&domain->dirty_bytes, bytes, 1);
+    if (record->group) __atomic_fetch_add(&record->group->dirty, pages, __ATOMIC_RELAXED);
+}
+
+static inline void dirty_notify_forced(struct kernel_page_cache_record *record)
+{
+    if (record->started && !record->stopping && record->force_writeback) {
+        record->requested=1;
+        cache_wake(&record->work);
+    }
+}
+
+static inline bool dirty_mark_entry(struct kernel_page_cache_entry *entry,
+    size_t begin, size_t end, bool account)
 {
     if (begin>=end || end>BOAROS_PAGE_SIZE) __builtin_trap();
     struct kernel_page_cache_record *r=entry->cache->record;
@@ -935,10 +970,7 @@ static void dirty_mark(struct kernel_page_cache_entry *entry, size_t begin, size
             if (r->started && !r->stopping) cache_wake(&r->work);
         }
 #endif
-        kernel_task_account_write(BOAROS_PAGE_SIZE);
-        struct kernel_writeback_domain *domain=entry->node->instance->writeback.domain;
-        if (domain) domain_charge(&domain->dirty_bytes,BOAROS_PAGE_SIZE,1);
-        if (entry->cache->record->group) __atomic_fetch_add(&entry->cache->record->group->dirty,1,__ATOMIC_RELAXED);
+        if (account) dirty_charge(r, entry->node, 1);
         struct kernel_page_cache_dirty *dirty=kernel_vfs_node_dirty_pages(entry->node);
         if (entry->dirty_indexed) __builtin_trap();
         if (!dirty->count) {
@@ -958,9 +990,12 @@ static void dirty_mark(struct kernel_page_cache_entry *entry, size_t begin, size
     if (block) entry->dirty_blocks|=dirty_block_range(block,begin,end);
 #endif
     entry->generation++;
-    if (r->started && !r->stopping && r->force_writeback) {
-        r->requested=1;cache_wake(&r->work);
-    }
+    if (account) dirty_notify_forced(r);
+    return first_dirty;
+}
+static void dirty_mark(struct kernel_page_cache_entry *entry, size_t begin, size_t end)
+{
+    dirty_mark_entry(entry, begin, end, true);
 }
 static void dirty_clear(struct kernel_page_cache_entry *entry)
 {
@@ -2441,8 +2476,7 @@ void kernel_page_cache_put_batch(struct kernel_page_cache *cache,
     }
     /* Individual entries may retire after their decrement; the outstanding
      * aggregate keeps the cache alive through the whole release batch. */
-    if (returned && __atomic_fetch_sub(&record->entry_borrows,returned,__ATOMIC_RELEASE)<returned)
-        __builtin_trap();
+    if (returned) entry_borrows_sub(record, returned);
     if (!locked) return;
 #endif
     int clean = 0;
@@ -3115,12 +3149,118 @@ void kernel_page_cache_finish_mapping_write(struct kernel_page_cache *cache,stru
 }
 
 #if BOAROS_USER_SMP
-struct cached_overwrite_workspace {
+struct cached_write_workspace {
     struct kernel_mm_user_pin pins[KERNEL_MM_USER_READ_BATCH];
-    struct kernel_page_cache_write_borrow writers[KERNEL_MM_USER_READ_BATCH];
+    union {
+        struct kernel_page_cache_write_borrow writers[KERNEL_MM_USER_READ_BATCH];
+        struct kernel_page_cache_entry *append[KERNEL_MM_USER_READ_BATCH];
+    };
 };
-_Static_assert(sizeof(struct cached_overwrite_workspace) <= BOAROS_PAGE_SIZE,
-    "overwrite descriptors fit in the task I/O page");
+_Static_assert(sizeof(struct cached_write_workspace) <= BOAROS_PAGE_SIZE,
+    "write descriptors fit in the task I/O page");
+
+static unsigned cached_user_batch(const struct kernel_vfs_write_source *source,
+    uint64_t offset, size_t limit, uint64_t *address)
+{
+    if (!source->mm || source->user.count != 1 || source->user.index ||
+        (offset & BOAROS_PAGE_MASK))
+        return 0;
+    const struct kernel_uaccess_iovec *iov = source->user.iov;
+    *address = iov->base + source->user.offset;
+    if ((*address & BOAROS_PAGE_MASK) || source->user.offset >= iov->length)
+        return 0;
+    uint64_t available = iov->length - source->user.offset;
+    if (limit > available) limit = available;
+    size_t pages = limit / BOAROS_PAGE_SIZE;
+    return pages > KERNEL_MM_USER_READ_BATCH ? KERNEL_MM_USER_READ_BATCH : (unsigned)pages;
+}
+
+/* The VFS write-operation owner fixes the append position. The candidates
+ * remain private through allocation, user access and the final index check. */
+static __attribute__((noinline)) size_t copy_cached_append_batch(
+    struct kernel_page_cache *cache, struct kernel_vfs_node *node, uint64_t offset,
+    struct kernel_vfs_write_source *source, size_t limit,
+    struct file_write_reservation *ticket)
+{
+    uint64_t address;
+    unsigned count = cached_user_batch(source, offset, limit, &address);
+    if (count < 2) return 0;
+    struct kernel_task_io_buffer scratch = {0};
+    if (kernel_task_io_buffer_acquire(&scratch, cache->allocator)) return 0;
+    struct cached_write_workspace *work = scratch.data;
+    uint64_t pages[KERNEL_MM_USER_READ_BATCH];
+    uint64_t first = offset >> BOAROS_PAGE_SHIFT;
+    unsigned owned = physical_page_allocate_batch(cache->allocator, pages, count);
+    unsigned built = 0;
+    for (; built < owned; built++) {
+        struct kernel_page_cache_entry *entry;
+        if (allocate_entry_header(cache, node, first + built, &entry)) break;
+        entry->physical_address = pages[built];
+        entry->page_references_owned = 1;
+        if (physical_page_map_owned(cache->allocator, pages[built], (void **)&entry->data))
+            __builtin_trap();
+        work->append[built] = entry;
+    }
+    physical_page_release_batch(cache->allocator, pages + built, owned - built);
+    memset(work->pins, 0, built * sizeof(work->pins[0]));
+    unsigned pinned = built ?
+        kernel_mm_try_pin_user_read_batch(source->mm, address, built, work->pins) : 0;
+    struct kernel_vfs_write_source copy = *source;
+    for (unsigned i = 0; i < pinned; i++) {
+        copy.data = work->pins[i].page;
+        kernel_vfs_write_source_copy(&copy, work->append[i]->data, BOAROS_PAGE_SIZE);
+        kernel_vfs_write_source_advance(&copy, BOAROS_PAGE_SIZE);
+    }
+    kernel_mm_unpin_user_read_batch(work->pins, pinned);
+    unsigned published = 0;
+    if (pinned) {
+        KERNEL_LOCK_SCOPE(io);
+        kernel_vfs_node_lock(node, &io, 1);
+        if (kernel_vfs_node_size(node) == offset) {
+            {
+                CACHE_SCOPE(guard, cache);
+                {
+                    CACHE_INDEX_SCOPE(index, node);
+#if BOAROS_MAX_CPUS > 1
+                    if (!node->cache_index_closed)
+#endif
+                    {
+                        struct kernel_page_cache_entry *next = index_at_or_after(node, first);
+                        for (; published < pinned; published++) {
+                            if (next && next->page_index == first + published) break;
+                            struct kernel_page_cache_entry *entry = work->append[published];
+                            prepare_entry_publication(entry, KERNEL_PAGE_CACHE_STATUS_OK);
+                            if (RB_INSERT(kernel_page_cache_tree, &node->cache_pages, entry))
+                                __builtin_trap();
+                        }
+                    }
+                }
+                for (unsigned i = 0; i < published; i++) {
+                    account_entry_publication(cache, work->append[i]);
+                    dirty_mark_entry(work->append[i], 0, BOAROS_PAGE_SIZE, false);
+                }
+                if (published) {
+                    dirty_charge(cache->record, node, published);
+                    dirty_notify_forced(cache->record);
+                }
+            }
+            if (published) {
+                size_t length = (size_t)published * BOAROS_PAGE_SIZE;
+                kernel_vfs_node_written(node, offset + length);
+                if (length == limit && ticket->owner && node->instance->ops->finish_full_reservation)
+                    node->instance->ops->finish_full_reservation(ticket);
+            }
+        }
+    }
+    for (unsigned i = published; i < built; i++)
+        (void)abandon_entry(cache, work->append[i], KERNEL_PAGE_CACHE_STATUS_OK);
+    kernel_task_io_buffer_release(&scratch);
+    size_t bytes = (size_t)published * BOAROS_PAGE_SIZE;
+    if (published) source->data = NULL;
+    source->user.offset += bytes;
+    source->chunks += published;
+    return bytes;
+}
 
 /* A resident, page-aligned overwrite can keep its inode writer across the
  * copy. Source faults and closed destination entries fall back at the first
@@ -3129,24 +3269,16 @@ static __attribute__((noinline)) size_t copy_cached_overwrite_batch(
     struct kernel_page_cache *cache, struct kernel_vfs_node *node, uint64_t offset,
     struct kernel_vfs_write_source *source, size_t limit)
 {
-    if (!source->mm || source->user.count != 1 || (offset & BOAROS_PAGE_MASK))
-        return 0;
-    const struct kernel_uaccess_iovec *iov = source->user.iov;
-    uint64_t address = iov->base + source->user.offset;
-    if ((address & BOAROS_PAGE_MASK) || source->user.offset >= iov->length)
-        return 0;
-    uint64_t available = iov->length - source->user.offset;
-    if (limit > available) limit = available;
     uint64_t eof = kernel_vfs_node_size(node);
     if (offset >= eof) return 0;
     if (limit > eof - offset) limit = eof - offset;
-    unsigned count = limit / BOAROS_PAGE_SIZE;
+    uint64_t address;
+    unsigned count = cached_user_batch(source, offset, limit, &address);
     if (count < 2) return 0;
-    if (count > KERNEL_MM_USER_READ_BATCH) count = KERNEL_MM_USER_READ_BATCH;
 
     struct kernel_task_io_buffer scratch = {0};
     if (kernel_task_io_buffer_acquire(&scratch, cache->allocator)) return 0;
-    struct cached_overwrite_workspace *work = scratch.data;
+    struct cached_write_workspace *work = scratch.data;
     memset(work->pins, 0, count * sizeof(work->pins[0]));
     struct kernel_mm_user_pin *pins = work->pins;
     count = kernel_mm_try_pin_user_read_batch(source->mm, address, count, pins);
@@ -3183,12 +3315,16 @@ static __attribute__((noinline)) size_t copy_cached_overwrite_batch(
         kernel_mm_unpin_user_read_batch(pins, count);
         if (used) {
             CACHE_SCOPE(guard, cache);
+            unsigned newly_dirty = 0;
             for (unsigned i = used; i > 0; i--) {
                 struct kernel_page_cache_entry *entry = writers[i-1].entry;
-                dirty_mark(entry, 0, BOAROS_PAGE_SIZE);
+                newly_dirty += dirty_mark_entry(entry, 0, BOAROS_PAGE_SIZE, false);
                 writer_end_locked(&writers[i-1]);
-                entry_return(entry);
+                entry_return_locked(entry);
             }
+            entry_borrows_sub(cache->record, used);
+            if (newly_dirty) dirty_charge(cache->record, node, newly_dirty);
+            dirty_notify_forced(cache->record);
         }
     }
     kernel_task_io_buffer_release(&scratch);
@@ -3207,7 +3343,8 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
     struct kernel_vfs_write_view view={0};
     struct file_write_reservation *ticket=reservation->reservation;
 #if BOAROS_USER_SMP
-    int batch_overwrite = kernel_cpu_get_boot_count() > 1;
+    bool batch_write = true;
+    bool batch_overwrite = kernel_cpu_get_boot_count() > 1;
 #endif
     while (*written<size) {
         if (!ready) {
@@ -3235,8 +3372,12 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
             }
         }
 #if BOAROS_USER_SMP
-        if (batch_overwrite && !ticket->owner && ready >= 2 * BOAROS_PAGE_SIZE) {
-            size_t copied = copy_cached_overwrite_batch(cache, node, offset, source, ready);
+        if (batch_write && ready >= 2 * BOAROS_PAGE_SIZE) {
+            size_t copied = 0;
+            if (offset == kernel_vfs_node_size(node))
+                copied = copy_cached_append_batch(cache, node, offset, source, ready, ticket);
+            else if (batch_overwrite && !ticket->owner)
+                copied = copy_cached_overwrite_batch(cache, node, offset, source, ready);
             if (copied) {
                 offset += copied;
                 *written += copied;
@@ -3244,7 +3385,7 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
                 retried_space = 0;
                 continue;
             }
-            batch_overwrite = 0;
+            batch_write = 0;
         }
 #endif
         size_t start=offset&BOAROS_PAGE_MASK;

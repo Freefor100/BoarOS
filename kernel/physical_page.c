@@ -1676,14 +1676,10 @@ static __attribute__((noinline)) uint32_t physical_page_release_owner(struct phy
     return order;
 }
 
-static inline __attribute__((always_inline)) void physical_page_release_buddy(
+static inline __attribute__((always_inline)) void physical_page_release_at_root(
     struct physical_page_allocator *a, uint64_t address, uint32_t order,
-    unsigned references, struct page_work *work)
+    unsigned references, const struct physical_page_root *root, struct page_work *work)
 {
-    if (address & BOAROS_PAGE_MASK)
-        physical_page_release_fatal(a, address, order, "unaligned-address", address);
-    const struct physical_page_root *root = root_for_address(a, address, work);
-    if (!root) physical_page_release_fatal(a,address,order,"address-range",address);
     uint32_t page = root->first_page_index + (uint32_t)((address - root->address) >> BOAROS_PAGE_SHIFT);
     if (!order) {
         struct physical_page_metadata *metadata = &a->metadata[page];
@@ -1706,6 +1702,17 @@ static inline __attribute__((always_inline)) void physical_page_release_buddy(
         }
     }
     (void)physical_page_release_owner(a,address,order,root,page,work,0);
+}
+
+static inline __attribute__((always_inline)) void physical_page_release_buddy(
+    struct physical_page_allocator *a, uint64_t address, uint32_t order,
+    unsigned references, struct page_work *work)
+{
+    if (address & BOAROS_PAGE_MASK)
+        physical_page_release_fatal(a, address, order, "unaligned-address", address);
+    const struct physical_page_root *root = root_for_address(a, address, work);
+    if (!root) physical_page_release_fatal(a,address,order,"address-range",address);
+    physical_page_release_at_root(a, address, order, references, root, work);
 }
 
 #if BOAROS_MAX_CPUS == 1
@@ -1872,8 +1879,19 @@ void physical_page_release_batch(struct physical_page_allocator *a,
         physical_page_release_buddy(a, addresses[0], 0U, 2, &work);
         return;
     }
-    for (unsigned i = 0; i < count; i++)
-        physical_page_release_buddy(a, addresses[i], 0U, 1, &work);
+    const struct physical_page_root *root = NULL;
+    uint64_t length = 0;
+    for (unsigned i = 0; i < count; i++) {
+        uint64_t address = addresses[i];
+        if (address & BOAROS_PAGE_MASK)
+            physical_page_release_fatal(a, address, 0, "unaligned-address", address);
+        if (!root || address - root->address >= length) {
+            root = root_for_address(a, address, &work);
+            if (!root) physical_page_release_fatal(a, address, 0, "address-range", address);
+            length = order_page_count(root->order) << BOAROS_PAGE_SHIFT;
+        }
+        physical_page_release_at_root(a, address, 0, 1, root, &work);
+    }
 }
 
 void physical_page_release_order_batch(struct physical_page_allocator *a,
