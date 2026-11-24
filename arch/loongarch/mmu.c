@@ -676,6 +676,25 @@ enum arch_mmu_status arch_mmu_user_move_leaf(struct arch_mmu_user_space *s,
     __atomic_store_n(target, entry, __ATOMIC_RELEASE);
     return ARCH_MMU_STATUS_OK;
 }
+
+uint64_t arch_mmu_user_thp_base_entry(uint64_t physical,const struct kernel_mm_leaf *leaf)
+{
+    return encode(physical,leaf->permissions&7U,leaf->cow ? KERNEL_MM_LEAF_COW : 0);
+}
+
+void arch_mmu_user_thp_install_split(struct arch_mmu_user_space *s,
+    const struct kernel_mm_leaf *leaf,uint64_t table_address)
+{
+    uint64_t *slot;
+    uint32_t order;
+    if (walk_leaf(s,leaf->virtual_address,&slot,&order) || order!=HUGE_ORDER ||
+        !(*slot&PTE_NONE) || (*slot&PTE_ADDRESS)!=leaf->physical_address)
+        __builtin_trap();
+    __atomic_store_n(slot,table_address,__ATOMIC_RELEASE);
+    s->table_pages++;
+    if (leaf->permissions) { s->protected_pages-=1U<<order;s->leaf_pages+=1U<<order; }
+    resident_peak(s);
+}
 enum arch_mmu_status arch_mmu_user_cow_snapshot(struct arch_mmu_user_space *s,
     uint64_t v, uint64_t *cookie, uint64_t *physical)
 {

@@ -70,6 +70,21 @@ enum kernel_syscall_status syscall_handle_prctl(
         } else decoded->value = (int64_t)kernel_task_timerslack_get(caller);
         return KERNEL_SYSCALL_STATUS_OK;
     }
+    if (option==41U || option==42U) { /* PR_SET_THP_DISABLE / PR_GET_THP_DISABLE */
+        decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+        uint64_t disable=request->arguments[1],flags=request->arguments[2];
+        if (request->arguments[3] || request->arguments[4] ||
+            (option==42U ? disable || flags : (flags&~UINT64_C(2)) || (!disable && flags))) {
+            decoded->value=-KERNEL_EINVAL;
+            return KERNEL_SYSCALL_STATUS_OK;
+        }
+        struct kernel_mm *mm;
+        if (kernel_task_mm_borrow_mutable(caller,&mm)!=KERNEL_TASK_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        if (option==41U) kernel_mm_thp_disable_set(mm,disable ? 1U|(unsigned)flags : 0U);
+        decoded->value=option==42U ? kernel_mm_thp_disable_get(mm) : 0;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
     if (option != 1U && option != 2U && option != 15U && option != 16U &&
         option != 36U && option != 37U)
         return syscall_handle_prctl_credentials(caller, request, decoded);

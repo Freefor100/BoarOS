@@ -94,12 +94,20 @@ flowchart LR
 - **挂载容量与全局余量一起结算。** `size` 限制同一文件系统实例中已预留和已分配的大页总数。`min_size` 在挂载时从全局大页池留出保底额度。两个选项接受字节数或挂载时持久大页池容量的百分比，结果向下取整至大页。映射失败退回本次预留，实页一直占用额度到最后一个物理引用归还。随后先补回该实例的保底，再归还全局。绑定挂载和延迟卸载后仍存活的映射继续使用原实例的额度。`statfs()` 可查询设置了上限的实例剩余容量。
 - **`mremap()` 搬移页表项和原预留。** 源、目标地址按原生大页对齐，长度向上取整。内核先为目标准备页表，再搬移已驻留的大页项并保留原后备偏移。目标准备失败时源范围仍保有数据，Linux 规定已撤销的固定目标及已裁掉的源尾部不恢复。私有映射分段改变地址顺序后，按仍存活的后备区间保留预留。允许缩小和固定目标搬移，扩大范围或使用 `MREMAP_DONTUNMAP` 返回 `EINVAL`。
 
+## 六、私有匿名映射的透明大页
+
+透明大页（Transparent Huge Pages，THP）服务于普通私有匿名映射。应用通过 `MADV_HUGEPAGE` 建议使用。在可覆盖整张大页的对齐区间内，首次写缺页尝试直接分配连续内存并发布一条硬件大页页表项。连续块或页表准备不足时，缺页处理退回基本页。RISC-V 使用 2 MiB，LoongArch 使用 32 MiB。透明大页从普通物理页分配器取得内存，`/proc/meminfo` 的 `AnonHugePages` 和 `/proc/kpageflags` 的 `KPF_THP` 反映实际分配。
+
+- **建议与显式合并。** `MADV_NOHUGEPAGE` 阻止后续建立透明大页。`MADV_COLLAPSE` 尝试将驻留的基本页合并到连续大页中。它在撤销旧地址转换前完成新物理块和页表的准备，等待其他核确认旧权限失效后复制内容。原范围中的空页在新大页中填零。`prctl(PR_SET_THP_DISABLE)` 和 `prctl(PR_GET_THP_DISABLE)` 在地址空间层控制策略，`fork()` 继承，`execve()` 保留。`PR_THP_DISABLE_EXCEPT_ADVISED` 允许应用显式请求大页。
+- **拆页与写时复制。** 部分 `mprotect()`、`munmap()` 或 `MADV_DONTNEED` 在更改基本页前拆开大页映射。独占物理大页分批转换成独立基本页，无需复制数据。派生进程或管道仍引用原物理块时，拆页先准备独立基本页。准备不足时原映射继续有效。派生后独占的大页可直接恢复写权限。普通匿名映射的 `mremap()` 在需要搬移时拆开透明大页，继续使用基本页的搬移规则。
+
 <details>
 <summary>展开查看：当前范围边界与定向验证入口</summary>
 
 ### 当前实现边界
 
-- 每个物理页分配器维护一个原生尺寸的大页池。多尺寸池、透明大页（Transparent Huge Pages，THP）以及直接从大页文件装载可执行与可链接格式（Executable and Linkable Format，ELF）映像待补。
+- 每个物理页分配器维护一个原生尺寸的大页池。多尺寸池以及直接从大页文件装载可执行与可链接格式（Executable and Linkable Format，ELF）映像待补。
+- 透明大页的第一阶段由应用建议或显式合并触发。后台自动合并、普通文件与共享内存的透明大页、系统级策略配置和透明大页零页待补。
 - 共享 `futex` 等待在阻塞期间持有大页映射对象引用，直至等待退出；System V `SHM_HUGETLB` 的段、附加句柄与 VMA 共同维系后备对象寿命（详见 [SysV 共享内存](sysv-shm.md)）。
 
 ### 定向验证入口
@@ -107,6 +115,6 @@ flowchart LR
 - **宿主大页池、预留配额与双基页模型**：`make test-hugetlb-host`、`make test-mm-huge-host`
 - **双架构硬件大叶测试**：`make test-huge-riscv`、`tests/loongarch/mmu.c`
 - **用户态端到端对照（RV64 / LA64）**：`tests/userland/hugetlb.py`（覆盖私有/共享匿名大页、缺页、CoW、边界拒绝、管道页借用、SysV 附加与 `SIGBUS`）
-- **文件后备与生命周期**。`tests/userland/api8.py --program huge_files` 验证命名文件和大页 memfd 的共享后备、写时复制、预留失败、封印、截短、打洞和延迟卸载。
+- **文件后备、搬移与透明大页**。`tests/userland/api8.py --program huge_files` 验证挂载额度、固定地址搬移、封印、截短、打洞、延迟卸载，以及透明大页的建立、复制与局部修改。`tests/host/mm-hugetlb.sh` 注入目标页表或高阶物理分配失败，核对源映射和基本页回退。
 
 </details>

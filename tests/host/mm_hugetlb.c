@@ -1,8 +1,10 @@
 /* 数字物理地址0的owner与空候选必须可区分；映射回独立宿主pool。 */
 #include <kernel/mm_backend.h>
 #include <kernel/heap.h>
+#include <kernel/errno.h>
 #include <kernel/vma.h>
 #include <kernel/hugetlb.h>
+#include <kernel/rlimit.h>
 #include <kernel/uaccess.h>
 #include <assert.h>
 #include <stdio.h>
@@ -40,6 +42,25 @@ static void put(struct kernel_mm *m,uint64_t a,unsigned char b)
 static unsigned char get(struct kernel_mm *m,uint64_t a)
 { unsigned char b=0;size_t n=0;assert(!kernel_copy_from_user(m,&b,a,1,&n)&&n==1);return b; }
 static unsigned stale_registration;
+static unsigned reject_base, reject_thp, reject_split_table;
+static uint64_t data_limit=UINT64_MAX;
+void kernel_task_current_memory_limits(struct kernel_memory_limits *out)
+{ *out=(struct kernel_memory_limits){.address_space=UINT64_MAX,.data_soft=data_limit,.data_hard=UINT64_MAX}; }
+enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *,uint64_t *);
+enum physical_page_status __real_physical_page_allocate_order_nosleep(
+    struct physical_page_allocator *,uint32_t,uint64_t *);
+enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *allocator,uint64_t *address)
+{
+    if (reject_base) { reject_base--;return PHYSICAL_PAGE_STATUS_EMPTY; }
+    return __real_physical_page_allocate(allocator,address);
+}
+enum physical_page_status __wrap_physical_page_allocate_order_nosleep(
+    struct physical_page_allocator *allocator,uint32_t order,uint64_t *address)
+{
+    if (order==9 && reject_thp) { reject_thp--;return PHYSICAL_PAGE_STATUS_EMPTY; }
+    if (!order && reject_split_table) { reject_split_table--;return PHYSICAL_PAGE_STATUS_EMPTY; }
+    return __real_physical_page_allocate_order_nosleep(allocator,order,address);
+}
 enum kernel_hugetlb_status __real_kernel_hugetlb_mapping_register(struct kernel_hugetlb_mapping *,uint64_t);
 enum kernel_hugetlb_status __wrap_kernel_hugetlb_mapping_register(struct kernel_hugetlb_mapping *m,uint64_t epoch)
 {
@@ -112,8 +133,46 @@ int main(void)
  assert(kernel_mm_mmap_hugetlb(&parent,HUGE,HUGE,3,KERNEL_MM_MAP_FIXED,0,0,&a)==KERNEL_MM_STATUS_NO_MEMORY);
  assert(!kernel_mm_mmap_hugetlb(&parent,HUGE,HUGE,3,KERNEL_MM_MAP_FIXED,0,1,&a));
  n=0;assert(kernel_copy_from_user(&parent,&b,HUGE,1,&n));
+ assert(!kernel_mm_munmap(&parent,HUGE,HUGE));
+ assert(!kernel_hstate_resize(h,1));
+ assert(!kernel_mm_mmap_hugetlb(&parent,HUGE,HUGE,3,KERNEL_MM_MAP_FIXED,0,0,&a));
+ put(&parent,HUGE+33,47);
+ uint64_t other=UINT64_C(2)<<30,destination;
+ assert(!kernel_mm_mmap_anonymous(&parent,other,HUGE,3,KERNEL_MM_MAP_FIXED,&destination));
+ put(&parent,other,22);
+ reject_base=1;
+ assert(kernel_mm_mremap(&parent,HUGE,HUGE,HUGE,3,other,&destination)==-KERNEL_ENOMEM);
+ assert(!reject_base && get(&parent,HUGE+33)==47);
+ struct kernel_vma vma;
+ assert(kernel_mm_vma_lookup(&parent,other,&vma)==KERNEL_MM_STATUS_NOT_MAPPED);
+ assert(!kernel_mm_mremap(&parent,HUGE,HUGE,HUGE,3,other,&destination));
+ assert(destination==other && get(&parent,other+33)==47);
+ assert(!kernel_mm_munmap(&parent,other,HUGE) && !kernel_hstate_resize(h,0));
+
+ assert(!kernel_mm_mmap_anonymous(&parent,HUGE,HUGE,3,KERNEL_MM_MAP_FIXED,&a));
+ assert(!kernel_mm_madvise(&parent,HUGE,HUGE,KERNEL_MM_ADVICE_HUGEPAGE));
+ reject_thp=1;put(&parent,HUGE,57);
+ assert(!reject_thp && !physical_page_thp_pages(&pages));
+ reject_thp=1;
+ assert(kernel_mm_madvise(&parent,HUGE,HUGE,KERNEL_MM_ADVICE_COLLAPSE)==-KERNEL_ENOMEM);
+ assert(!reject_thp && get(&parent,HUGE)==57 && !physical_page_thp_pages(&pages));
+ assert(!kernel_mm_madvise(&parent,HUGE,HUGE,KERNEL_MM_ADVICE_COLLAPSE));
+ assert(get(&parent,HUGE)==57 && physical_page_thp_pages(&pages)==512);
+ reject_split_table=1;
+ assert(kernel_mm_mmap_anonymous(&parent,HUGE+4096,4096,3,KERNEL_MM_MAP_FIXED,&a)==KERNEL_MM_STATUS_NO_MEMORY);
+ assert(!reject_split_table && get(&parent,HUGE)==57 && physical_page_thp_pages(&pages)==512);
+ assert(!kernel_mm_mprotect(&parent,HUGE,HUGE,KERNEL_MM_READ));
+ assert(!kernel_mm_madvise(&parent,HUGE+HUGE/2,HUGE/2,KERNEL_MM_ADVICE_DONTDUMP));
+ data_limit=HUGE/2;
+ assert(kernel_mm_mprotect(&parent,HUGE,HUGE,3)==KERNEL_MM_STATUS_NO_MEMORY);
+ struct kernel_mm_mapping mapping;
+ assert(!kernel_mm_lookup(&parent,HUGE,&mapping) && (mapping.permissions&KERNEL_MM_WRITE));
+ assert(!kernel_mm_lookup(&parent,HUGE+HUGE/2,&mapping) && !(mapping.permissions&KERNEL_MM_WRITE));
+ data_limit=UINT64_MAX;
+ assert(!kernel_mm_munmap(&parent,HUGE+4096,4096));
+ assert(get(&parent,HUGE)==57 && !physical_page_thp_pages(&pages));
  assert(!kernel_mm_release(&parent));
  kernel_hstate_snapshot(h,&snap);assert(snap.free==0&&!snap.reserved&&!snap.maps);
  kernel_hstate_put(h);assert(!kernel_hstate_shutdown(&pages));assert(!kernel_hstate_shutdown(&pages));assert(!physical_page_allocator_audit(&pages));
- puts("hugetlb MM private/shared fault fork and reservation recovery passed");
+ puts("hugetlb MM fork, move rollback and transparent huge page fallback, collapse and split passed");
 }

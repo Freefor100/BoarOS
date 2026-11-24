@@ -1,13 +1,16 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
@@ -228,6 +231,94 @@ static void check_huge_remap(void)
     CHECK(counter("HugePages_Free:")==4 && counter("HugePages_Rsvd:")==0);
 }
 
+static uint64_t page_flags(const unsigned char *address,size_t page)
+{
+    int fd=open("/proc/self/pagemap",O_RDONLY);
+    uint64_t entry;
+    CHECK(fd>=0 && pread(fd,&entry,8,((uintptr_t)address/page)*8)==8 && !close(fd));
+    CHECK(entry>>63);
+    uint64_t frame=entry&((UINT64_C(1)<<55)-1);
+    CHECK(frame);
+    fd=open("/proc/kpageflags",O_RDONLY);
+    CHECK(fd>=0 && pread(fd,&entry,8,frame*8)==8 && !close(fd));
+    return entry;
+}
+
+struct thp_reader {
+    const volatile unsigned char *address;
+    unsigned stage;
+};
+
+static void *check_thp_remote_reader(void *context)
+{
+    struct thp_reader *reader=context;
+    cpu_set_t cpu;
+    CPU_ZERO(&cpu);
+    CPU_SET(1,&cpu);
+    CHECK(!sched_setaffinity(0,sizeof(cpu),&cpu));
+    CHECK(*reader->address==88);
+    __atomic_store_n(&reader->stage,1,__ATOMIC_RELEASE);
+    while (__atomic_load_n(&reader->stage,__ATOMIC_ACQUIRE)==1) (void)*reader->address;
+    CHECK(*reader->address==0);
+    return NULL;
+}
+
+static void check_transparent_hugepages(void)
+{
+    const uint64_t thp=UINT64_C(1)<<22;
+    const size_t page=(size_t)sysconf(_SC_PAGESIZE);
+    unsigned char *window=mmap(NULL,2*huge,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    CHECK(window!=MAP_FAILED);
+    unsigned char *address=(unsigned char *)(((size_t)window+huge-1)&-huge);
+    CHECK(mmap(address,huge,PROT_READ|PROT_WRITE,MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS,-1,0)==address);
+    CHECK(!madvise(address,huge,MADV_HUGEPAGE));
+    address[page]=88;
+    CHECK(page_flags(address,page)&thp);
+    CHECK(page_flags(address+page,page)&thp);
+    CHECK(counter("AnonHugePages:")>=huge/1024);
+    CHECK(!counter("HugePages_Rsvd:") && counter("HugePages_Free:")==4);
+    pid_t child=fork();
+    CHECK(child>=0);
+    if (!child) {
+        CHECK(address[page]==88);
+        address[page]=77;
+        CHECK(address[page]==77);
+        _exit(0);
+    }
+    int status;
+    CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
+    CHECK(address[page]==88);
+    CHECK(!mprotect(address+page,page,PROT_READ));
+    CHECK(address[page]==88);
+    CHECK(!mprotect(address+page,page,PROT_READ|PROT_WRITE));
+    CHECK(!madvise(address,huge,25)); /* MADV_COLLAPSE */
+    CHECK(address[page]==88 && (page_flags(address+page,page)&thp));
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    CHECK(!sched_getaffinity(0,sizeof(cpus),&cpus));
+    if (CPU_ISSET(0,&cpus) && CPU_ISSET(1,&cpus)) {
+        struct thp_reader reader={.address=address+page};
+        pthread_t thread;
+        cpu_set_t first;
+        CPU_ZERO(&first);
+        CPU_SET(0,&first);
+        CHECK(!sched_setaffinity(0,sizeof(first),&first));
+        CHECK(!pthread_create(&thread,NULL,check_thp_remote_reader,&reader));
+        while (!__atomic_load_n(&reader.stage,__ATOMIC_ACQUIRE)) sched_yield();
+        CHECK(!madvise(address+page,page,MADV_DONTNEED));
+        __atomic_store_n(&reader.stage,2,__ATOMIC_RELEASE);
+        CHECK(!pthread_join(thread,NULL) && !sched_setaffinity(0,sizeof(cpus),&cpus));
+    } else CHECK(!madvise(address+page,page,MADV_DONTNEED));
+    CHECK(address[page]==0);
+    CHECK(!prctl(PR_SET_THP_DISABLE,1,0,0,0));
+    CHECK(prctl(PR_GET_THP_DISABLE,0,0,0,0)==1);
+    ERROR(madvise(address,huge,25),EINVAL);
+    CHECK(!prctl(PR_SET_THP_DISABLE,0,0,0,0));
+    CHECK(!madvise(address,huge,MADV_NOHUGEPAGE));
+    ERROR(madvise(address,huge,25),EINVAL);
+    CHECK(!munmap(window,2*huge));
+}
+
 static void check_memfd(void)
 {
     struct statfs fs;
@@ -261,6 +352,7 @@ int main(void)
     check_mount_context();
     check_mount_quota();
     check_huge_remap();
+    check_transparent_hugepages();
     pool(0);
     puts("HUGE FILES PASS");
     return 0;

@@ -29,7 +29,10 @@ void kernel_vma_set_clear_locks(struct kernel_vma_set *);
 #define KERNEL_VMA_AIO_RING 512U
 #define KERNEL_VMA_USERFAULT_MISSING 1024U
 #define KERNEL_VMA_SECRET 2048U
-#define KERNEL_VMA_ALL_FLAGS 4095U
+#define KERNEL_VMA_THP_ADVISE 4096U
+#define KERNEL_VMA_THP_DENY 8192U
+#define KERNEL_VMA_THP_TRACKED 16384U
+#define KERNEL_VMA_ALL_FLAGS 32767U
 /* The VMA writer is held. Revalidate the fault snapshot and mark private backing. */
 /* Caller excludes edits and serializes concurrent history marks. This changes
  * fork provenance only and leaves the mapping generation unchanged. */

@@ -2266,7 +2266,10 @@ static int capture_destination(struct kernel_aio_direct *direct,struct kernel_mm
     if (status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ACCESS)
         status=kernel_mm_resolve_user_pin(mm,address,KERNEL_MM_WRITE,&pin);
     if (status) return 0;
-    int captured=!pin.cache_write.entry;
+    /* A later partial edit can demote an anonymous THP and move the
+     * unchanged destination bytes to base pages. Use normal user copying. */
+    int captured=!pin.cache_write.entry &&
+        (!pin.order || !physical_page_is_thp(mm->allocator,pin.owner_address));
     if (captured) {
         if (physical_page_acquire_order(mm->allocator,pin.owner_address,pin.order)) __builtin_trap();
         direct->spans[direct->pages++]=(struct aio_destination_page){

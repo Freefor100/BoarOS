@@ -2629,6 +2629,8 @@ static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
             memory.writeback, 0, 0, 0};
         for (unsigned i = 0; i < sizeof(bytes) / sizeof(bytes[0]); i++)
             used += append_kib(data + used, names[i], bytes[i]);
+        used+=append_kib(data+used,"AnonHugePages:  ",
+            physical_page_thp_pages(heap->page_allocator)*BOAROS_PAGE_SIZE);
         struct kernel_hstate_snapshot huge;
         int error=proc_huge_snapshot(heap->page_allocator,&huge);
         if (error) { kernel_heap_release(heap,data); return error; }

@@ -73,6 +73,7 @@ struct physical_page_allocator {
     /* Optional anonymous-page reclaim, installed when MADV_FREE first has work. */
     uint64_t (*lazy_reclaim)(struct physical_page_allocator *, uint64_t, uint64_t *);
     uint64_t shared_anon_pages;
+    uint64_t transparent_huge_pages;
     uint64_t (*buffer_bytes)(void *);
     void *buffer_context;
     uint64_t total_pages;
@@ -163,6 +164,13 @@ enum physical_page_status physical_page_allocate_order_nosleep(
  * failure; success must be released page-by-page, not with release_order. */
 enum physical_page_status physical_page_allocate_contiguous(
     struct physical_page_allocator *allocator, uint32_t order, uint64_t *address);
+/* A transparent anonymous compound allocation can become independent base
+ * owners after the caller drains pins and withdraws its huge translation. */
+void physical_page_mark_thp(struct physical_page_allocator *, uint64_t address);
+void physical_page_split_thp(struct physical_page_allocator *, uint64_t address, uint32_t order);
+/* The caller's reference pins the allocation shape. */
+int physical_page_is_thp(const struct physical_page_allocator *, uint64_t head);
+uint64_t physical_page_thp_pages(const struct physical_page_allocator *);
 
 enum physical_page_status physical_page_release(
     struct physical_page_allocator *allocator,

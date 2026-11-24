@@ -111,6 +111,9 @@ enum arch_mmu_status arch_mmu_user_prepare_move(
     struct arch_mmu_user_space *, uint64_t, uint32_t, struct kernel_mm_leaf_preparation *);
 enum arch_mmu_status arch_mmu_user_move_leaf(
     struct arch_mmu_user_space *, uint64_t from, uint64_t to, uint32_t order);
+uint64_t arch_mmu_user_thp_base_entry(uint64_t, const struct kernel_mm_leaf *);
+void arch_mmu_user_thp_install_split(struct arch_mmu_user_space *,
+    const struct kernel_mm_leaf *, uint64_t table);
 enum arch_mmu_status arch_mmu_user_map_prepared_page(
     struct arch_mmu_user_space *, uint64_t, uint64_t, uint32_t, int cow,
     struct kernel_mm_leaf_preparation *);

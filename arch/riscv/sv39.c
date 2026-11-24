@@ -1869,6 +1869,26 @@ enum riscv_sv39_status riscv_sv39_user_move_leaf(struct riscv_sv39_user_space *s
     __atomic_store_n(target, entry, __ATOMIC_RELEASE);
     return RISCV_SV39_STATUS_OK;
 }
+
+uint64_t riscv_sv39_user_thp_base_entry(uint64_t physical,const struct kernel_mm_leaf *leaf)
+{
+    return encode_user_entry(physical,leaf->permissions&~RISCV_SV39_USER,
+        leaf->cow ? KERNEL_MM_LEAF_COW : 0);
+}
+
+void riscv_sv39_user_thp_install_split(struct riscv_sv39_user_space *s,
+    const struct kernel_mm_leaf *leaf,uint64_t table)
+{
+    uint64_t *slot;
+    uint32_t order;
+    if (resolve_leaf_order(s,leaf->virtual_address,&slot,&order,NULL) || order!=9 ||
+        !valid_protected_entry(*slot) || entry_address(*slot)!=leaf->physical_address)
+        __builtin_trap();
+    __atomic_store_n(slot,table_entry(table),__ATOMIC_RELEASE);
+    s->table_pages++;
+    if (leaf->permissions) { s->protected_pages-=1U<<order;s->leaf_pages+=1U<<order; }
+    resident_peak(s);
+}
 /* The caller keeps MM metadata stable through inspecting or replacing this
  * leaf. Return that actual slot so commit does not repeat the same walk. */
 static enum riscv_sv39_status resolve_cow_leaf(struct riscv_sv39_user_space *s,
