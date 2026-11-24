@@ -186,6 +186,7 @@ struct ext4_inode_observer {
     void (*store)(void *context, void *owner, uint32_t inode, unsigned field,
                   struct ext4_timestamp value);
     void (*changed)(void *context, uint32_t inode);
+    int (*track_file)(void *context, ext4_file *file);
     void (*finish)(void *context, void *staged_inodes, bool accepted);
     unsigned (*snapshot)(void *owner, struct ext4_timestamp times[3]);
     void (*written)(void *owner, unsigned fields,
@@ -580,6 +581,7 @@ int ext4_file_complete_write(ext4_file *file);
 int ext4_file_reserve_write(ext4_file *, uint64_t, size_t, size_t *, struct file_write_reservation *);
 bool ext4_file_overwrite_mapped(const ext4_file *, uint64_t offset, size_t length);
 void ext4_file_accept_reservation(ext4_file *, struct file_write_reservation *, uint64_t start, uint64_t accepted_end);
+void ext4_finish_full_reservation(struct file_write_reservation *);
 /* Finishing holds the adapter inode I/O writer, excluding concurrent mapping
  * acceptance, truncation and writeback of the same reservation tree. */
 void ext4_file_finish_reservation(ext4_file *, struct file_write_reservation *, uint64_t start, uint64_t accepted_end);

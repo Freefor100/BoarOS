@@ -2091,6 +2091,15 @@ static bool ext4_file_rolled_back(ext4_file *file, int result)
 	       ext4_operation_aborted(&file->mp->fs);
 }
 
+static int ext4_track_nested_file(ext4_file *file)
+{
+    const struct ext4_inode_observer *observer = &file->mp->inode_observer;
+    if (!file->time_owner || !observer->track_file || !file->mp->fs.jbd_journal ||
+        !ext4_operation_depth(&file->mp->fs))
+        return EOK;
+    return observer->track_file(observer->context, file);
+}
+
 static int ext4_file_data_finish(ext4_file *file, int result)
 {
     if (!result) result = ext4_operation_record_inode(&file->mp->fs, file->inode, true);
@@ -4359,7 +4368,8 @@ int ext4_ftruncate(ext4_file *f, uint64_t size, uint32_t privilege_mode)
 	EXT4_MP_LOCK(f->mp);
 
 Retry:
-	r = ext4_prepare_growth(f, size);
+	r = ext4_track_nested_file(f);
+	if (r == EOK) r = ext4_prepare_growth(f, size);
 	if (r == EOK) r = ext4_trans_start(f->mp);
 	if (r != EOK) {
 		EXT4_MP_UNLOCK(f->mp);
@@ -4611,6 +4621,20 @@ void ext4_file_accept_reservation(ext4_file *file,struct file_write_reservation 
         change->committed=true;
     }
 }
+void ext4_finish_full_reservation(struct file_write_reservation *ticket)
+{
+    if (ticket->next) return;
+    struct ext4_delalloc_chunk *chunk = ticket->owner;
+    uint64_t accepted = chunk->accepted | (ticket->mask & chunk->mask);
+    /* The inode writer holds this chunk stable. Keep final retirement and
+     * unused-space return in the ordinary completion path. */
+    if (chunk->borrowers == 1 && (!chunk->mask || (chunk->mask & ~accepted)))
+        return;
+    chunk->accepted = accepted;
+    chunk->borrowers--;
+    ticket->owner = NULL;
+}
+
 void ext4_file_finish_reservation(ext4_file *file,struct file_write_reservation *ticket,uint64_t start,uint64_t accepted_end)
 {
     struct ext4_fs *fs=&file->mp->fs;
@@ -4814,7 +4838,8 @@ int ext4_fallocate(ext4_file *file, unsigned mode, uint64_t offset,
 Retry:
     end = offset + length;
     *changed = false;
-    int r = ext4_prepare_growth(file, end);
+    int r = ext4_track_nested_file(file);
+    if (r == EOK) r = ext4_prepare_growth(file, end);
     if (r == EOK) r = ext4_trans_start(file->mp);
     if (r != EOK) { EXT4_MP_UNLOCK(file->mp); return r; }
     uint64_t saved_size = file->fsize;
@@ -5622,7 +5647,8 @@ static int ext4_direct_write_flush(struct ext4_inode_ref *ref, ext4_file *file,
     return r;
 }
 
-static int ext4_write_spans(ext4_file *file, struct file_write_span *spans, unsigned count, bool synchronous)
+static int ext4_write_spans(ext4_file *file, ext4_file *owner,
+    struct file_write_span *spans, unsigned count, bool synchronous)
 {
 	if (!file || !file->mp || count > EXT4_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
 	for (unsigned i = 0; i < count; i++) spans[i].written = 0;
@@ -5670,7 +5696,8 @@ static int ext4_write_spans(ext4_file *file, struct file_write_span *spans, unsi
 	if (!blocks) return EOK;
 	struct jbd_journal *journal = file->mp->fs.jbd_journal;
 	bool outer = !ext4_operation_depth(&file->mp->fs);
-	int r;
+	int r = outer ? EOK : ext4_track_nested_file(owner);
+	if (r) return r;
 Retry:
 	r = ext4_prepare_growth(file, write_end);
 	if (!r && journal && journal->grouped && outer) {
@@ -5856,7 +5883,7 @@ int ext4_fwrite(ext4_file *file, const void *buffer, size_t size, size_t *writte
 	if (!file || !file->mp) return EINVAL;
 	EXT4_MP_LOCK(file->mp);
 	struct file_write_span span = {.offset=file->fpos, .buffer=buffer, .size=size};
-	int r = ext4_write_spans(file, &span, 1, false);
+	int r = ext4_write_spans(file, file, &span, 1, false);
 	if (written) *written = span.written;
 	EXT4_MP_UNLOCK(file->mp);
 	return r;
@@ -5873,7 +5900,7 @@ static int ext4_fpwrite_batch_mode(ext4_file *file, struct file_write_span *span
         local = *file;
         initial_size = file->fsize;
     }
-    int r = ext4_write_spans(&local, spans, count, synchronous);
+    int r = ext4_write_spans(&local, file, spans, count, synchronous);
     ext4_file_drain_reservations(file);
     {
         EXT4_STATE_SCOPE(state, &file->mp->fs);

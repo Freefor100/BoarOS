@@ -465,6 +465,7 @@ static void reserved_abort_reuse(struct kernel_page_cache *cache,struct kernel_v
         assert(!ext4_fpwrite(file,4*block,&value,1,&done) && done==1);
     }
     assert(ext4_transaction_abort(adapter->mount_point,ECANCELED)==(reserved?reserved:ECANCELED));
+    assert(ext4_fsize(file)==length);
     kernel_lock_release(&io);
     assert(!kernel_vfs_close(&victim) && !kernel_vfs_open(mount,"/abort-reuse",&victim));
     expect_bytes(&victim,expected,length); free(expected);

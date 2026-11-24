@@ -242,6 +242,9 @@ struct kernel_vfs_backend {
     void (*finish_reservation)(struct kernel_vfs_node *, struct file_write_reservation *, uint64_t start, uint64_t accepted_end);
     /* Accept while inode qualification still protects this mapping generation. */
     void (*accept_reservation)(struct kernel_vfs_node *, struct file_write_reservation *, uint64_t start, uint64_t accepted_end);
+    /* Called under the inode writer after all bytes were published. Only
+     * in-line, nonblocking completion; leave other tickets to the caller. */
+    void (*finish_full_reservation)(struct file_write_reservation *);
 
     struct kernel_block_device *(*block_device)(struct kernel_vfs_instance *instance);
     int (*close_node)(struct kernel_vfs_node *node);
