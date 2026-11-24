@@ -24,6 +24,9 @@
 #include <kernel/vfs.h>
 #include <kernel/tmpfs.h>
 #include <arch/elf.h>
+#if defined(__riscv) && BOAROS_MAX_CPUS == 1
+#include <arch/riscv/uaccess.h>
+#endif
 #include "../fs/vfs_internal.h"
 #include "userfaultfd_internal.h"
 
@@ -2868,7 +2871,7 @@ unsigned kernel_mm_try_pin_user_read_batch(const struct kernel_mm *mm, uint64_t 
     uint64_t pages[KERNEL_MM_USER_READ_BATCH];
     unsigned ready = 0;
 #if defined(__riscv) && BOAROS_MAX_CPUS == 1
-    count=riscv_sv39_user_readable_pages(&record->space,first,count,pages);
+    count=riscv_sv39_user_accessible_pages(&record->space,first,count,KERNEL_MM_READ,pages);
     for (;ready<count;ready++)
         if (physical_page_map_owned(mm->allocator,pages[ready],&pins[ready].page)) break;
 #else
@@ -2892,6 +2895,49 @@ unsigned kernel_mm_try_pin_user_read_batch(const struct kernel_mm *mm, uint64_t 
             KERNEL_MM_READ, &pins[i]);
     return ready;
 }
+
+#if defined(__riscv) && BOAROS_MAX_CPUS == 1
+unsigned kernel_mm_copy_to_ready_user_pages(struct kernel_mm *mm, uint64_t first,
+    const void *const *source, unsigned count)
+{
+    if (!count) return 0;
+    if (count>KERNEL_MM_COPY_READY_PAGES) __builtin_trap();
+    struct kernel_mm_record *record;
+    if (mm->state!=KERNEL_MM_LIVE || resolve_record(mm,&record)) return 0;
+    uint64_t physical[KERNEL_MM_COPY_READY_PAGES];
+    void *destination[KERNEL_MM_COPY_READY_PAGES];
+
+    /* Preventing task switches on one CPU keeps verified mappings live.
+     * Release the metadata lock before moving data. */
+    kernel_preempt_disable();
+    unsigned ready=0;
+    {
+        KERNEL_RAW_READ_SCOPE(guard,&record->metadata);
+        if (!pin_admission_closed(record)) {
+            count=riscv_sv39_user_accessible_pages(&record->space,first,count,KERNEL_MM_WRITE,physical);
+            for (;ready<count;ready++) {
+                uint64_t v=first+(uint64_t)ready*BOAROS_PAGE_SIZE;
+                struct mm_file_alias_resident *resident=file_alias_resident(find_file_resident(record,v));
+                if (resident && kernel_page_cache_alias_active(&resident->alias)) break;
+                if (physical_page_map_owned(mm->allocator,physical[ready],&destination[ready])) break;
+            }
+        }
+    }
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_tag tag=kernel_cost_capture();
+    uint64_t start=kernel_cost_clock();
+#endif
+    for (unsigned i=0;i<ready;i++)
+        if (destination[i]!=source[i]) riscv_copy_page(destination[i],source[i]);
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_add_tag(tag,COST_UACCESS_COPY_TICKS,kernel_cost_clock()-start);
+    kernel_cost_add_tag(tag,COST_UACCESS_COPY_BYTES,ready*BOAROS_PAGE_SIZE);
+#endif
+    kernel_preempt_enable();
+    COST_ADD(COPY_TO_USER,ready*BOAROS_PAGE_SIZE);
+    return ready;
+}
+#endif
 
 static inline void unpin_user_pages(struct kernel_mm_user_pin *pins,unsigned count)
 {

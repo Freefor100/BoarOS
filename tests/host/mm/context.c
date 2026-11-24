@@ -36,6 +36,9 @@ _Thread_local uint64_t mm_test_context;
 _Thread_local int mm_test_wrong_owner;
 static _Thread_local struct kernel_cpu cpu;
 static _Thread_local struct kernel_io_context io, other_io;
+/* Hosted actors run on pthread stacks, outside the guest's stack cache. */
+__attribute__((weak)) unsigned kernel_stack_cache_reclaim(struct physical_page_allocator *allocator)
+{ (void)allocator; return 0; }
 struct mm_test_actor { struct kernel_task task; unsigned dispatched; };
 static _Thread_local struct mm_test_actor actor;
 static _Thread_local unsigned actor_id;

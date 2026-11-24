@@ -100,6 +100,7 @@ enum ext4_journal_wait {
 enum ext4_journal_work {
 	EXT4_JOURNAL_WORK_COMMIT = 1,
 	EXT4_JOURNAL_WORK_CHECKPOINT = 2,
+	EXT4_JOURNAL_WORK_JOIN_TIMES = 4,
 };
 struct ext4_journal_runtime {
 	void *context;
