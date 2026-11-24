@@ -1777,6 +1777,8 @@ static int mount_ext_filesystem(struct kernel_vfs_mount *mount,
         return lwext4_error(result);
     }
     adapter->mounted = 1U;
+    result = kernel_page_cache_enable_shadows(page_cache);
+    if (result) { (void)cleanup_mount(mount); return result; }
     /* Keep the filesystem's metadata working set instead of the embedded
      * library's eight-block default. Storage is still allocated on misses;
      * pressure can reclaim idle clean blocks independently of journal owners.
@@ -2540,13 +2542,15 @@ static int time_access_needed(const struct lwext4_node *node, struct ext4_timest
         now.seconds>=__atomic_load_n(&node->relatime_due,__ATOMIC_RELAXED);
 }
 
-static void ext4_backend_accessed_mode(struct kernel_vfs_file *file,bool relatime_expired)
+static void ext4_backend_accessed_mode(struct kernel_vfs_file *file,
+    bool relatime_expired, bool nowait)
 {
     if (!file || file->state != VFS_FILE_STATE_LIVE || !file->private_data) return;
     struct kernel_vfs_node *base = file->private_data;
     struct lwext4_mount_adapter *adapter = lwext4_instance(base->instance);
     if (base->instance->read_only || mount_error(adapter)) return;
     if ((base->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
+        if (nowait) return;
         KERNEL_LOCK_SCOPE(mutation);
         if (!file->write_lease) kernel_vfs_mutation_lock(file->mount, &mutation);
         if (kernel_vfs_file_atime_enabled(file)) {
@@ -2570,7 +2574,13 @@ static void ext4_backend_accessed_mode(struct kernel_vfs_file *file,bool relatim
     /* Suppressed relatime reads do not mutate the mount. Recheck after taking
      * remount qualification: another reader may already have published atime. */
     KERNEL_LOCK_SCOPE(mutation);
-    if (!file->write_lease) kernel_vfs_mutation_lock(file->mount, &mutation);
+    if (!file->write_lease) {
+        if (nowait) {
+            struct kernel_rwlock *reconfiguration = &base->instance->reconfiguration;
+            if (!kernel_lock_held(reconfiguration, 0) &&
+                !kernel_rwlock_try_read(reconfiguration, &mutation)) return;
+        } else kernel_vfs_mutation_lock(file->mount, &mutation);
+    }
     if (!kernel_vfs_file_atime_enabled(file) || mount_error(adapter) ||
         !ext4_file_read_clock(lwext4_node_file(base), &now)) return;
     int notify = 0;
@@ -2583,10 +2593,13 @@ static void ext4_backend_accessed_mode(struct kernel_vfs_file *file,bool relatim
 }
 
 static void ext4_backend_accessed(struct kernel_vfs_file *file)
-{ ext4_backend_accessed_mode(file,false); }
+{ ext4_backend_accessed_mode(file,false,false); }
+
+static void ext4_backend_accessed_nowait(struct kernel_vfs_file *file)
+{ ext4_backend_accessed_mode(file,false,true); }
 
 static void ext4_backend_accessed_after_relatime(struct kernel_vfs_file *file)
-{ ext4_backend_accessed_mode(file,true); }
+{ ext4_backend_accessed_mode(file,true,false); }
 
 static int ext4_backend_exec_metadata(struct kernel_vfs_node *node,struct kernel_vfs_exec_metadata *out)
 {
@@ -3638,6 +3651,8 @@ static void initialize_backend(void)
     ops->create = ext4_backend_create;
     ops->tmpfile = ext4_backend_tmpfile;
     ops->accessed = ext4_backend_accessed;
+    ops->accessed_nowait = ext4_backend_accessed_nowait;
+    ops->forget_cache_shadows = kernel_page_cache_forget_node;
     ops->accessed_after_relatime = ext4_backend_accessed_after_relatime;
     ops->modified = ext4_backend_modified;
     ops->stat = ext4_backend_stat;

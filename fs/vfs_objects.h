@@ -102,6 +102,7 @@ struct kernel_vfs_node {
     uint8_t unlinked;
     uint8_t tmpfile_linkable; /* Only a never-published, non-exclusive tmpfile may gain its first name. */
     uint8_t retired;
+    uint32_t cache_shadow_count; /* Protected by the page-cache metadata lock. */
     uint8_t generated_control, control_write_prefix;
 #if BOAROS_COST_DIAGNOSTICS
     uint8_t generated_diagnostic;
@@ -305,6 +306,9 @@ struct kernel_vfs_backend {
     int (*link_tmpfile)(struct kernel_vfs_instance *, uint64_t inode, uint64_t parent, const char *name);
     /* The backend takes mutation qualification only when it publishes atime. */
     void (*accessed)(struct kernel_vfs_file *file);
+    /* Also advertises cached NOWAIT reads and cache statistics for regular files. */
+    void (*accessed_nowait)(struct kernel_vfs_file *file);
+    void (*forget_cache_shadows)(struct kernel_page_cache *, struct kernel_vfs_node *);
     /* A directory scan observed expired relatime. Recheck before publishing. */
     void (*accessed_after_relatime)(struct kernel_vfs_file *file);
     int (*modified)(struct kernel_vfs_file *file,

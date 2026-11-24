@@ -1,4 +1,6 @@
 #include <kernel/aio.h>
+#include <kernel/block.h>
+#include <kernel/accounting.h>
 #include "mount_context.h"
 #include "lease.h"
 #include "pipe_internal.h"
@@ -85,6 +87,8 @@
 #define PROC_KEYS_INODE UINT64_C(38)
 #define PROC_KEY_QUOTA_FIRST_INODE UINT64_C(39)
 #define PROC_SHM_LIMIT_FIRST_INODE (PROC_KEY_QUOTA_FIRST_INODE + KERNEL_KEY_QUOTA_COUNT)
+#define PROC_STAT_INODE (PROC_SHM_LIMIT_FIRST_INODE + KERNEL_SHM_LIMIT_COUNT)
+#define PROC_DISKSTATS_INODE (PROC_STAT_INODE + 1U)
 
 static const char *const proc_key_quota_names[KERNEL_KEY_QUOTA_COUNT] = {
     [KERNEL_KEY_QUOTA_MAXKEYS] = "maxkeys",
@@ -122,6 +126,7 @@ static const struct proc_root_entry {
     {"kpageflags", PROC_KPAGEFLAGS_INODE, 8},
     {"filesystems", PROC_FILESYSTEMS_INODE, 8},
     {"cpuinfo", PROC_CPUINFO_INODE, 8},
+    {"stat", PROC_STAT_INODE, 8}, {"diskstats", PROC_DISKSTATS_INODE, 8},
 #if BOAROS_COST_DIAGNOSTICS
     {"boaros_cost", PROC_COST_INODE, 8}, {"boaros_cost_control", PROC_COST_CONTROL_INODE, 8},
     {"boaros_net_stats", PROC_NETWORK_STATS_INODE, 8}, {"boaros_mem_stats", PROC_MEMORY_STATS_INODE, 8},
@@ -623,6 +628,16 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
         *mode = KERNEL_VFS_S_IFREG | 0444U;
         return 0;
     }
+    if (length == 4U && !memcmp(name, "stat", length)) {
+        *inode = PROC_STAT_INODE;
+        *mode = KERNEL_VFS_S_IFREG | 0444U;
+        return 0;
+    }
+    if (length == 9U && !memcmp(name, "diskstats", length)) {
+        *inode = PROC_DISKSTATS_INODE;
+        *mode = KERNEL_VFS_S_IFREG | 0444U;
+        return 0;
+    }
     if (length==11U && !memcmp(name,"filesystems",length)) {
         *inode=PROC_FILESYSTEMS_INODE;
         *mode=KERNEL_VFS_S_IFREG|0444U;
@@ -682,6 +697,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
     struct kernel_vfs_node *node = 0;
     (void)path;
     if ((inode != PROC_ROOT_INODE && inode != PROC_MEMINFO_INODE && inode != PROC_CPUINFO_INODE &&
+         inode != PROC_STAT_INODE && inode != PROC_DISKSTATS_INODE &&
          inode != PROC_KPAGEFLAGS_INODE &&
          inode != PROC_DROP_CACHES_INODE && inode != PROC_CACHE_PRESSURE_INODE && inode != PROC_FILESYSTEMS_INODE &&
          inode != PROC_UPTIME_INODE && inode != PROC_SELF_INODE && inode != PROC_THREAD_SELF_INODE &&
@@ -738,6 +754,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
          (mode & KERNEL_VFS_S_IFMT) !=
             (proc_kind_mode(proc_inode_kind(inode)) & KERNEL_VFS_S_IFMT)) ||
         ((inode == PROC_MEMINFO_INODE || inode == PROC_CPUINFO_INODE ||
+          inode == PROC_STAT_INODE || inode == PROC_DISKSTATS_INODE ||
           inode == PROC_KPAGEFLAGS_INODE || inode == PROC_UPTIME_INODE ||
           inode == PROC_DROP_CACHES_INODE || inode == PROC_CACHE_PRESSURE_INODE || inode == PROC_FILESYSTEMS_INODE ||
           inode == PROC_AIO_NR_INODE || inode == PROC_AIO_MAX_NR_INODE ||
@@ -2495,6 +2512,132 @@ static int proc_cpuinfo_snapshot(struct kernel_heap *heap, char **buffer, size_t
     return 0;
 }
 
+static size_t proc_cpu_stat_row(char *text, const struct kernel_cpu_statistics *cpu, int index)
+{
+    memcpy(text, "cpu", 3);
+    size_t used = 3;
+    if (index >= 0) used += decimal(text + used, (unsigned)index);
+    else text[used++] = ' ';
+    /* BoarOS tracks time spent running idle tasks and IRQ handlers directly.
+     * I/O-wait time, softirq, steal, guest and guest_nice have no time provider. */
+    const uint64_t ticks[] = {
+        cpu->ticks[KERNEL_CPU_TIME_USER], cpu->ticks[KERNEL_CPU_TIME_NICE],
+        cpu->ticks[KERNEL_CPU_TIME_SYSTEM], cpu->ticks[KERNEL_CPU_TIME_IDLE],
+        0, cpu->ticks[KERNEL_CPU_TIME_IRQ], 0, 0, 0, 0,
+    };
+    for (unsigned i = 0; i < sizeof(ticks) / sizeof(ticks[0]); i++) {
+        text[used++] = ' ';
+        /* Linux USER_HZ is 100 on both BoarOS architectures. */
+        used += decimal(text + used, kernel_time_ticks_to_ns(ticks[i]) / UINT64_C(10000000));
+    }
+    text[used++] = '\n';
+    return used;
+}
+
+static int proc_system_stat_snapshot(struct kernel_heap *heap, char **buffer, size_t *length)
+{
+    enum { ROW_BYTES = 3 + 20 + 10 * 21 + 1, SUMMARY_BYTES = 256 };
+    struct kernel_cpu_statistics records[BOAROS_MAX_CPUS];
+    struct kernel_cpu_statistics total = {0};
+    unsigned online = kernel_cpu_statistics_snapshot(records);
+    for (unsigned i = 0; i < BOAROS_MAX_CPUS; i++) {
+        if (!(online & (1U << i))) continue;
+        for (unsigned t = 0; t < KERNEL_CPU_TIME_COUNT; t++)
+            total.ticks[t] += records[i].ticks[t];
+        total.interrupts += records[i].interrupts;
+        total.switches += records[i].switches;
+        total.tasks += records[i].tasks;
+    }
+    uint64_t runnable, blocked;
+    kernel_scheduler_task_statistics(&runnable, &blocked);
+    char *data;
+    if (kernel_heap_allocate(heap, (BOAROS_MAX_CPUS + 1U) * ROW_BYTES + SUMMARY_BYTES,
+            (void **)&data)) return -KERNEL_ENOMEM;
+    size_t used = proc_cpu_stat_row(data, &total, -1);
+    for (unsigned i = 0; i < BOAROS_MAX_CPUS; i++)
+        if (online & (1U << i))
+            used += proc_cpu_stat_row(data + used, &records[i], (int)i);
+
+    /* The interrupt total includes local and external interrupts. There is no
+     * global Linux IRQ-number table or separate software-interrupt subsystem. */
+    used += append_number_line(data + used, "intr ", total.interrupts, "\n");
+    used += append_number_line(data + used, "ctxt ", total.switches, "\n");
+    used += append_number_line(data + used, "btime ",
+        kernel_time_boot_realtime_offset() / UINT64_C(1000000000), "\n");
+    used += append_number_line(data + used, "processes ", total.tasks, "\n");
+    used += append_number_line(data + used, "procs_running ", runnable, "\n");
+    used += append_number_line(data + used, "procs_blocked ", blocked, "\n");
+    static const char softirq[] = "softirq 0 0 0 0 0 0 0 0 0 0 0\n";
+    memcpy(data + used, softirq, sizeof(softirq));
+    *buffer = data;
+    *length = used + sizeof(softirq) - 1U;
+    return 0;
+}
+
+static size_t proc_diskstats_row(char *text, const struct kernel_block_device *device)
+{
+    char name[32];
+    uint64_t number = device->device_number;
+    if (!kernel_block_device_name(number, name)) return 0;
+
+    struct kernel_block_usage usage;
+    uint64_t fields[KERNEL_BLOCK_STAT_FIELDS];
+    kernel_block_usage_snapshot(device, &usage);
+    kernel_block_stat_values(&usage, fields);
+
+    uint64_t major = (number >> 8U) & UINT64_C(0xfff);
+    uint64_t minor = (number & UINT64_C(0xff)) | ((number >> 12U) & UINT64_C(0xfff00));
+    size_t used = decimal(text, major);
+    text[used++] = ' ';
+    used += decimal(text + used, minor);
+    text[used++] = ' ';
+    size_t name_bytes = strlen(name);
+    memcpy(text + used, name, name_bytes);
+    used += name_bytes;
+    for (unsigned i = 0; i < KERNEL_BLOCK_STAT_FIELDS; i++) {
+        text[used++] = ' ';
+        used += decimal(text + used, fields[i]);
+    }
+    text[used++] = '\n';
+    return used;
+}
+
+static int proc_diskstats_snapshot(struct kernel_heap *heap, char **buffer, size_t *length)
+{
+    /* A successful enumeration pins each registration and its immutable
+     * number/generation. No registry protection is held when sampling or formatting. */
+    struct kernel_block_device **devices = NULL;
+    size_t count, capacity = 0;
+    int error;
+    while ((error = kernel_block_snapshot(devices, capacity, &count)) == -KERNEL_ENOSPC) {
+        if (devices) kernel_heap_release(heap, devices);
+        if (kernel_heap_allocate_zeroed(heap, count, sizeof(*devices), (void **)&devices))
+            return -KERNEL_ENOMEM;
+        capacity = count;
+    }
+    if (error) {
+        if (devices) kernel_heap_release(heap, devices);
+        return error;
+    }
+
+    enum { ROW_BYTES = 2 * 21 + 32 + KERNEL_BLOCK_STAT_FIELDS * 21 + 1 };
+    size_t used = 0;
+    char *data;
+    if (count > (SIZE_MAX - 1U) / ROW_BYTES ||
+        kernel_heap_allocate(heap, count * ROW_BYTES + 1U, (void **)&data)) {
+        error = -KERNEL_ENOMEM;
+    } else {
+        for (size_t i = 0; i < count; i++)
+            used += proc_diskstats_row(data + used, devices[i]);
+        data[used] = 0;
+        *buffer = data;
+        *length = used;
+    }
+    for (size_t i = 0; i < count; i++) kernel_block_put(devices[i]);
+    if (devices) kernel_heap_release(heap, devices);
+    return error;
+}
+
 static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
                          struct kernel_namespace *ipc_namespace,struct kernel_pid_registry *ipc_pid_view,char **buffer, size_t *length)
 {
@@ -2521,6 +2664,10 @@ static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
 
     if (node->inode == PROC_NET_ROUTE_INODE)
         return proc_route_snapshot(heap, buffer, length);
+    if (node->inode == PROC_STAT_INODE)
+        return proc_system_stat_snapshot(heap, buffer, length);
+    if (node->inode == PROC_DISKSTATS_INODE)
+        return proc_diskstats_snapshot(heap, buffer, length);
     if (node->inode == PROC_CPUINFO_INODE)
         return proc_cpuinfo_snapshot(heap, buffer, length);
     if(node->inode>=(UINT64_C(1)<<30U) && proc_inode_kind(node->inode)==PROC_PID_FDINFO_KIND)

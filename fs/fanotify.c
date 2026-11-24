@@ -1013,7 +1013,8 @@ static bool watch_access(struct fan_key *keys, unsigned count, unsigned parents,
 }
 
 static int check_permission(const struct kernel_vfs_file *file, const struct kernel_vfs_path *path,
-                            struct kernel_vfs_node *parent, uint32_t event, uint8_t *track_access)
+                            struct kernel_vfs_node *parent, uint32_t event, uint8_t *track_access,
+                            bool nowait)
 {
     struct kernel_vfs_node *node = file->private_data;
     struct kernel_vfs_instance *instance = node->instance;
@@ -1043,7 +1044,8 @@ static int check_permission(const struct kernel_vfs_file *file, const struct ker
                 event, priority, &mask, &fsid, &matched);
             if (!group) break;
             if (mask) {
-                result = request_permission(group, path, fan_sender(&senders, group), mask & ~FAN_ONDIR);
+                result = nowait ? -KERNEL_EAGAIN :
+                    request_permission(group, path, fan_sender(&senders, group), mask & ~FAN_ONDIR);
             }
             group_put(group);
             if (result) break;

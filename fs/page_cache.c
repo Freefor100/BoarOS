@@ -161,6 +161,17 @@ struct readahead_job {
 };
 #endif
 
+enum { CACHE_SHADOW_LIMIT = 1024, CACHE_SHADOW_BUCKETS = 256 };
+struct cache_shadow {
+    struct kernel_vfs_node *node;
+    uint64_t index, generation;
+    uint16_t next, previous; /* Slot zero is the end of a bucket chain. */
+};
+struct cache_shadow_table {
+    struct cache_shadow slots[CACHE_SHADOW_LIMIT];
+    uint16_t buckets[CACHE_SHADOW_BUCKETS];
+    uint16_t cursor;
+};
 struct kernel_page_cache_record {
     struct kernel_mutex metadata;
     struct cache_request *reads_head, **reads_tail;
@@ -213,6 +224,8 @@ struct kernel_page_cache_record {
     int readahead_started;
 #endif
     struct kernel_page_cache_entry *reclaim_cursor;
+    uint64_t reclaim_generation;
+    struct cache_shadow_table *shadows;
     uint32_t mounts;
 #if BOAROS_PAGE_CACHE_DIRTY_AGE
     uint64_t dirty_deadline;
@@ -284,6 +297,104 @@ struct cache_request {
 #define CACHE_SCOPE(name, cache) \
     KERNEL_LOCK_SCOPE(name); \
     kernel_mutex_lock(&(cache)->record->metadata, &(name))
+
+static unsigned shadow_bucket(const struct kernel_vfs_node *node, uint64_t index)
+{
+    uint64_t hash = ((uintptr_t)node >> 6) ^ index;
+    return (hash * UINT64_C(0x9e3779b97f4a7c15)) >> 56;
+}
+
+/* Shadows borrow identity only. All links and keys are protected by the
+ * cache metadata lock; final VFS release clears them before freeing a node. */
+static void shadow_remove(struct cache_shadow_table *table, uint16_t slot)
+{
+    struct cache_shadow *shadow = &table->slots[slot - 1];
+    struct kernel_vfs_node *node = shadow->node;
+    if (shadow->previous)
+        table->slots[shadow->previous - 1].next = shadow->next;
+    else
+        table->buckets[shadow_bucket(node, shadow->index)] = shadow->next;
+    if (shadow->next)
+        table->slots[shadow->next - 1].previous = shadow->previous;
+    shadow->node = NULL;
+    /* This is the last use of node by a cross-inode replacement. */
+    __atomic_sub_fetch(&node->cache_shadow_count, 1, __ATOMIC_RELEASE);
+}
+
+static void shadow_refill(struct kernel_page_cache_record *record,
+    struct kernel_vfs_node *node, uint64_t index)
+{
+    if (!__atomic_load_n(&node->cache_shadow_count, __ATOMIC_RELAXED)) return;
+    struct cache_shadow_table *table = record->shadows;
+    uint16_t slot = table->buckets[shadow_bucket(node, index)];
+    for (; slot; slot = table->slots[slot - 1].next) {
+        struct cache_shadow *shadow = &table->slots[slot - 1];
+        if (shadow->node == node && shadow->index == index) {
+            shadow_remove(table, slot);
+            return;
+        }
+    }
+}
+
+static void shadow_record_reclaim(struct kernel_page_cache_record *record,
+    struct kernel_vfs_node *node, uint64_t index)
+{
+    /* Publication removes a previous shadow for this page under this lock. */
+    uint64_t generation = ++record->reclaim_generation;
+    if (!kernel_vfs_node_cache_reporting(node)) return;
+    struct cache_shadow_table *table = record->shadows;
+    uint16_t slot = table->cursor + 1;
+    table->cursor = slot % CACHE_SHADOW_LIMIT;
+    struct cache_shadow *shadow = &table->slots[slot - 1];
+    if (shadow->node) shadow_remove(table, slot);
+    unsigned bucket = shadow_bucket(node, index);
+    uint16_t next = table->buckets[bucket];
+    *shadow = (struct cache_shadow){.node = node, .index = index,
+        .generation = generation, .next = next};
+    if (next) table->slots[next - 1].previous = slot;
+    table->buckets[bucket] = slot;
+    __atomic_add_fetch(&node->cache_shadow_count, 1, __ATOMIC_RELAXED);
+}
+
+static void shadow_forget_range(struct kernel_page_cache_record *record,
+    struct kernel_vfs_node *node, uint64_t first, uint64_t last)
+{
+    if (!__atomic_load_n(&node->cache_shadow_count, __ATOMIC_RELAXED)) return;
+    struct cache_shadow_table *table = record->shadows;
+    for (uint16_t slot = 1; slot <= CACHE_SHADOW_LIMIT; slot++) {
+        struct cache_shadow *shadow = &table->slots[slot - 1];
+        if (shadow->node == node && shadow->index >= first && shadow->index <= last)
+            shadow_remove(table, slot);
+    }
+}
+
+void kernel_page_cache_forget_node(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node)
+{
+    CACHE_SCOPE(guard, cache);
+    shadow_forget_range(cache->record, node, 0, UINT64_MAX);
+}
+
+int kernel_page_cache_enable_shadows(struct kernel_page_cache *cache)
+{
+    struct kernel_page_cache_record *record = cache->record;
+    {
+        CACHE_SCOPE(guard, cache);
+        if (record->shadows) return 0;
+    }
+    struct cache_shadow_table *table = NULL;
+    if (kernel_heap_allocate_zeroed(cache->heap, 1, sizeof(*table), (void **)&table))
+        return -KERNEL_ENOMEM;
+    {
+        CACHE_SCOPE(guard, cache);
+        if (!record->shadows) {
+            record->shadows = table;
+            return 0;
+        }
+    }
+    kernel_heap_release(cache->heap, table);
+    return 0;
+}
 
 struct read_workspace {
     struct file_read_workspace backend;
@@ -1934,18 +2045,23 @@ int kernel_page_cache_resident(struct kernel_page_cache *cache,
         entry_load_status(entry) == KERNEL_PAGE_CACHE_STATUS_OK;
 }
 
-enum kernel_page_cache_status kernel_page_cache_lookup_ready(
+static __attribute__((always_inline)) inline enum kernel_page_cache_status lookup_ready(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
-    uint64_t index, uint64_t *address, size_t *valid, int no_reuse)
+    uint64_t index, uint64_t *address, size_t *valid, int no_reuse, int nowait)
 {
     struct kernel_vfs_node *node=kernel_vfs_file_node(file);
     if (!cache_live(cache) || !address || !valid || !node)
         return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
 #if BOAROS_MAX_CPUS > 1
+    (void)nowait;
     CACHE_INDEX_SCOPE(guard,node);
     if (node->cache_index_closed) return KERNEL_PAGE_CACHE_STATUS_BUSY;
 #else
-    CACHE_SCOPE(guard,cache);
+    KERNEL_LOCK_SCOPE(guard);
+    if (nowait) {
+        if (!kernel_mutex_try_lock(&cache->record->metadata, &guard))
+            return KERNEL_PAGE_CACHE_STATUS_BUSY;
+    } else kernel_mutex_lock(&cache->record->metadata, &guard);
 #endif
     if (!read_cache_open(node)) return KERNEL_PAGE_CACHE_STATUS_BUSY;
     struct kernel_page_cache_entry *entry=index_find(node,index);
@@ -1957,6 +2073,16 @@ enum kernel_page_cache_status kernel_page_cache_lookup_ready(
     note_read_hits(cache,1);
     return KERNEL_PAGE_CACHE_STATUS_OK;
 }
+
+enum kernel_page_cache_status kernel_page_cache_lookup_ready(
+    struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
+    uint64_t index, uint64_t *address, size_t *valid, int no_reuse)
+{ return lookup_ready(cache, file, index, address, valid, no_reuse, 0); }
+
+enum kernel_page_cache_status kernel_page_cache_lookup_nowait(
+    struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
+    uint64_t index, uint64_t *address, size_t *valid, int no_reuse)
+{ return lookup_ready(cache, file, index, address, valid, no_reuse, 1); }
 
 enum kernel_page_cache_status kernel_page_cache_lookup(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
@@ -2063,6 +2189,7 @@ static void prepare_entry_publication(struct kernel_page_cache_entry *entry,
 static void account_entry_publication(struct kernel_page_cache *cache,struct kernel_page_cache_entry *entry)
 {
     struct kernel_page_cache_record *r=cache->record;
+    shadow_refill(r, entry->node, entry->page_index);
     lru_insert_head(r,entry);r->statistics.insertions++;r->statistics.current_pages++;
     if (r->statistics.current_pages>r->statistics.peak_pages) r->statistics.peak_pages=r->statistics.current_pages;
 }
@@ -4846,6 +4973,7 @@ void kernel_page_cache_truncate(struct kernel_page_cache *cache,
         {
             CACHE_SCOPE(guard,cache);
             uint64_t first=(size>>BOAROS_PAGE_SHIFT)+!!(size&BOAROS_PAGE_MASK);
+            shadow_forget_range(cache->record, node, size >> BOAROS_PAGE_SHIFT, UINT64_MAX);
             struct kernel_page_cache_entry *entry=index_at_or_after(node,first);
             while (entry) {
                 struct kernel_page_cache_entry *next=RB_NEXT(kernel_page_cache_tree,&node->cache_pages,entry);
@@ -4870,6 +4998,7 @@ void kernel_page_cache_invalidate_range(struct kernel_page_cache *cache,
     uint64_t first = start >> BOAROS_PAGE_SHIFT, last = (end - 1) >> BOAROS_PAGE_SHIFT;
     {
         CACHE_SCOPE(guard,cache);
+        shadow_forget_range(cache->record, node, first, last);
         struct kernel_page_cache_entry *entry=index_at_or_after(node,first);
         while (entry && entry->page_index<=last) {
             struct kernel_page_cache_entry *next=RB_NEXT(kernel_page_cache_tree,&node->cache_pages,entry);
@@ -4976,6 +5105,8 @@ static uint64_t reclaim_clean_pages(struct kernel_page_cache *cache,uint64_t tar
                 struct kernel_page_cache_entry *entry=r->reclaim_cursor;
                 r->reclaim_cursor=entry->lru_previous;scanned++;window++;
                 if (!retire_clean_page(cache,entry,second_chance)) continue;
+                if (second_chance)
+                    shadow_record_reclaim(r, entry->node, entry->page_index);
                 entry->reclaim_next=retired;retired=entry;selected++;
             }
             if (!window) break;
@@ -5632,6 +5763,7 @@ enum kernel_page_cache_status kernel_page_cache_invalidate_node(
                     __atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)) { busy=1;break; }
             }
             if (!busy) {
+                shadow_forget_range(cache->record, node, 0, UINT64_MAX);
                 while ((entry=RB_MIN(kernel_page_cache_tree,&node->cache_pages)))
                     remove_entry(cache,entry);
             }
@@ -5660,6 +5792,47 @@ void kernel_page_cache_get_statistics(
 #if BOAROS_MAX_CPUS > 1
         statistics->hits=__atomic_load_n(&cache->record->read_hits,__ATOMIC_RELAXED);
 #endif
+    }
+}
+
+void kernel_page_cache_range_statistics(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t first, uint64_t last,
+    struct kernel_page_cache_range_statistics *stats)
+{
+    *stats = (struct kernel_page_cache_range_statistics){0};
+    if (first > last) return;
+    struct kernel_page_cache_record *record = cache->record;
+    uint64_t query_generation;
+    {
+        CACHE_SCOPE(guard, cache);
+        query_generation = record->reclaim_generation;
+    }
+    uint64_t index = first;
+    for (;;) {
+        CACHE_SCOPE(guard, cache);
+        struct kernel_page_cache_entry *entry = index_at_or_after(node, index);
+        for (unsigned scanned = 0; entry && entry->page_index <= last; ) {
+            stats->cached++;
+            stats->dirty += entry->dirty_end != 0;
+            stats->writeback += entry->writeback != 0;
+            entry = RB_NEXT(kernel_page_cache_tree, &node->cache_pages, entry);
+            if (++scanned == 64) break;
+        }
+        if (!entry || entry->page_index > last) break;
+        index = entry->page_index;
+    }
+    {
+        CACHE_SCOPE(guard, cache);
+        if (!__atomic_load_n(&node->cache_shadow_count, __ATOMIC_RELAXED)) return;
+        uint64_t capacity = record->statistics.current_pages;
+        if (!capacity) capacity = 1;
+        for (unsigned i = 0; i < CACHE_SHADOW_LIMIT; i++) {
+            const struct cache_shadow *shadow = &record->shadows->slots[i];
+            if (shadow->node != node || shadow->index < first || shadow->index > last ||
+                shadow->generation > query_generation) continue;
+            stats->evicted++;
+            stats->recently_evicted += record->reclaim_generation - shadow->generation < capacity;
+        }
     }
 }
 
@@ -5697,6 +5870,7 @@ enum kernel_page_cache_status kernel_page_cache_destroy(struct kernel_page_cache
         &cache->record->foreground_workspace,NULL,__ATOMIC_ACQUIRE);
     if (workspace) kernel_heap_release(cache->heap,workspace);
     version_pool_close(cache->record->versions);
+    if (cache->record->shadows) kernel_heap_release(cache->heap,cache->record->shadows);
     kernel_heap_release(cache->heap,cache->record);
     cache->heap=NULL;cache->allocator=NULL;cache->record=NULL;cache->state=KERNEL_PAGE_CACHE_RELEASED;
     return KERNEL_PAGE_CACHE_STATUS_OK;

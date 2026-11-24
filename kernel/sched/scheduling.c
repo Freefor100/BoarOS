@@ -1062,6 +1062,7 @@ static struct kernel_task *claim_next_locked(struct kernel_cpu *cpu,
         next->state = KERNEL_THREAD_STATE_RUNNING;
 #endif
     }
+    kernel_rseq_mark(&next->rseq);
     /* 摘队列与取得执行owner是同一发布点，旧owner由新栈交接释放。 */
 #if BOAROS_USER_SMP
     __atomic_store_n(&next->wait.on_cpu,1,__ATOMIC_RELAXED);

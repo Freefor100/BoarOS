@@ -1097,6 +1097,7 @@ enum kernel_scheduler_status arch_process_clone_current(
             return finish_clone_failure(child, -KERNEL_EFAULT, linux_result, KERNEL_SCHEDULER_STATUS_OK);
     }
 
+    if (!(flags & LINUX_CLONE_VM)) child->rseq = parent->rseq;
     if (flags & LINUX_CLONE_CHILD_SETTID) child->set_tid_address = child_tid;
     if (!thread_clone && kernel_task_controlling_tty(parent) &&
         kernel_task_tty_set(child, kernel_task_controlling_tty(parent))) __builtin_trap();
@@ -2901,6 +2902,7 @@ static void kernel_thread_finish(
 
     if (current->arch.user_mode) process_core_rendezvous(current);
     if (current->arch.user_mode) ptrace_begin_exit(current,user_wait_status(completion));
+    current->rseq = (struct kernel_rseq){0};
     process_begin_exit(current, completion);
     /* Undo is visible before publishing exit or waking a child-TID joiner. */
     if (current->arch.user_mode) kernel_sem_exit(current);

@@ -141,6 +141,8 @@ void scheduler_task_publish_locked(struct kernel_task *task)
     task->accounted = 1;
     if (scheduler.task_count == UINT64_MAX) __builtin_trap();
     scheduler.task_count++;
+    /* Publication commits the new task identity, including CLONE_THREAD. */
+    kernel_cpu_current()->statistics.tasks++;
 }
 
 void scheduler_task_unlink_locked(struct kernel_task *task)

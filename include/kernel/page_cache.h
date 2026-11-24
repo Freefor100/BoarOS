@@ -197,10 +197,24 @@ void kernel_page_cache_put_batch(
     struct kernel_page_cache *cache,
     struct kernel_page_cache_read_page *pages,
     size_t count);
+
+struct kernel_page_cache_range_statistics {
+    uint64_t cached, dirty, writeback, evicted, recently_evicted;
+};
+void kernel_page_cache_range_statistics(struct kernel_page_cache *,
+    struct kernel_vfs_node *, uint64_t first, uint64_t last,
+    struct kernel_page_cache_range_statistics *);
+int kernel_page_cache_enable_shadows(struct kernel_page_cache *);
+/* The VFS calls this before a node address can be reused. */
+void kernel_page_cache_forget_node(struct kernel_page_cache *,
+    struct kernel_vfs_node *);
 /* The successful batch entry keeps the mapped payload alive until put. */
 const void *kernel_page_cache_read_data(const struct kernel_page_cache_read_page *);
 
 /* A successful lookup also returns an owned physical-page reference. */
+enum kernel_page_cache_status kernel_page_cache_lookup_nowait(
+    struct kernel_page_cache *, const struct kernel_vfs_file *,
+    uint64_t index, uint64_t *address, size_t *valid, int no_reuse);
 /* 只借用当前已完成页；装入、resize或截断中的条目返回BUSY。 */
 int kernel_page_cache_resident(struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t index);
 /* Search a backend hole or unwritten run without loading pages. End is the

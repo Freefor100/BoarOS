@@ -31,5 +31,6 @@ void kernel_vfs_notify_file(const struct kernel_vfs_file *, uint32_t);
 void kernel_vfs_notify_open(const struct kernel_vfs_file *, struct kernel_vfs_path **, uint32_t mask);
 void kernel_vfs_notify_close(const struct kernel_vfs_file *, uint32_t, struct kernel_vfs_path **);
 int kernel_vfs_fanotify_permission(const struct kernel_vfs_file *, uint32_t, uint8_t *track_access);
+int kernel_vfs_fanotify_access_nowait(const struct kernel_vfs_file *);
 
 #endif

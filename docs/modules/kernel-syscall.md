@@ -1,6 +1,6 @@
 # Linux 系统调用统一分派与通用系统接口
 
-系统调用是用户空间程序向操作系统内核请求服务的受控入口。RISC-V 64 的 `ECALL` 使用 `a7` 传递调用号、`a0..a5` 传递参数，LoongArch 64 的 `SYSCALL` 使用 `$a7`（`regs[11]`）传递调用号。两种架构的陷入入口将请求封装为 `struct kernel_syscall_request`，交给 `kernel/syscall/` 的共享分派器处理。当前接入 **RISC-V 284 个**、**LoongArch 280 个** Linux 系统调用编号。
+系统调用是用户空间程序向操作系统内核请求服务的受控入口。RISC-V 64 的 `ECALL` 使用 `a7` 传递调用号、`a0..a5` 传递参数，LoongArch 64 的 `SYSCALL` 使用 `$a7`（`regs[11]`）传递调用号。两种架构的陷入入口将请求封装为 `struct kernel_syscall_request`，交给 `kernel/syscall/` 的共享分派器处理。当前接入 **RISC-V 286 个**、**LoongArch 282 个** Linux 系统调用编号。
 
 ---
 
@@ -13,6 +13,7 @@
 | `kernel/syscall/io_uring.c`、`kernel/syscall/io_uring_files.c` | 共享提交与完成环、资源登记及请求分派（`io_uring_setup`、`io_uring_enter`、`io_uring_register`） |
 | `kernel/syscall/aio.c` | 原生 Linux 异步输入输出（Asynchronous I/O，AIO：`io_setup` 至 `io_pgetevents`） |
 | `kernel/syscall/membarrier.c` | 跨核内存屏障同步（`membarrier(283)`） |
+| `kernel/syscall/rseq.c` | 可重启序列（Restartable Sequences，rseq）登记、提交区间检查及用户态返回处理（`rseq(293)`） |
 | `kernel/syscall/process_vm.c`、`kernel/seccomp.c` | 跨进程向量内存读写（`process_vm_readv/writev`）与 `seccomp` 系统调用过滤 |
 | `arch/riscv/hwprobe.c` | RISC-V 硬件能力探测（`riscv_hwprobe(258)`） |
 
@@ -35,7 +36,7 @@ flowchart LR
 - **高频标量快路径（编号 172～178）**：`getpid`、`getppid`、`gettid`、`getuid`、`geteuid`、`getgid`、`getegid` 这 7 个极高频无副作用查询在 `kernel_syscall_dispatch()` 中直接读取当前任务身份或不可变凭据指针返回，跳过大型主分派表路由。
 - **线程控制与用户返回**。`prctl` 经过系统调用过滤和入口追踪后直接进入线程控制分派。RISC-V 对当前线程的定时器宽限查询和设置提供简化入口，启用过滤或追踪时使用完整系统调用分派。返回用户空间时，调度器先处理退役资源和需要重新调度的任务，再从待处理位判断是否进入信号交付。同步系统调用持续计入内核执行时间，只有中断处理需要保存并恢复前一记账状态。
 - **架构解耦的动作返回机制（`enum kernel_syscall_action`）**：分派器不直接操作底层寄存器帧，而是返回明确的动作码指导架构陷入层完成收尾——包括 `RETURN`（普通写回返回值）、`RETURN_FINAL`、`EXIT` / `EXIT_GROUP`（终止线程或进程组）、`EXEC`（装载新地址空间且不推进旧程序计数器）、`CLONE` / `CLONE3`（传递完整寄存器快照构造子任务）、`WAIT4` / `WAITID`、`YIELD` 与 `SIGNAL_RETURN`。
-- **双架构共用 280 个系统调用编号**。RISC-V 另提供 `163`（`getrlimit`）、`164`（`setrlimit`）、`258`（`riscv_hwprobe`）和 `259`（`riscv_flush_icache`）。LoongArch 通过 `prlimit64` 查询和修改资源限额。
+- **双架构共用 282 个系统调用编号**。RISC-V 另提供 `163`（`getrlimit`）、`164`（`setrlimit`）、`258`（`riscv_hwprobe`）和 `259`（`riscv_flush_icache`）。LoongArch 通过 `prlimit64` 查询和修改资源限额。
 
 ---
 
@@ -66,7 +67,13 @@ flowchart LR
 - 支持命令：`GLOBAL`、`GLOBAL_EXPEDITED`、`REGISTER_GLOBAL_EXPEDITED`、`PRIVATE_EXPEDITED`（按活动地址空间筛选目标核）、`REGISTER_PRIVATE_EXPEDITED` 与 `GET_REGISTRATIONS`。
 - 多核下通过每核邮箱 `mailboxes[BOAROS_MAX_CPUS]` 发起 `rendezvous()` 同步握手，并在等待期间持续响应其他核发来的屏障请求，防止双核同时调用 `membarrier` 形成互等死锁。
 
-### 2.4 RISC-V 硬件能力探测（`riscv_hwprobe(258)`）
+### 2.4 可重启序列（`rseq(293)`）
+
+用户库可以用可重启序列访问每核数据。线程登记对齐的 32 字节用户态区域，并在进入序列前写入描述符地址。描述符给出序列起点、提交后地址与中止入口。线程切出、迁移或收到信号后，内核在返回用户态前检查原用户态指令地址。如果线程尚未越过提交边界，内核清除活动描述符并将执行位置转到应用的中止入口。递送信号时，信号帧保存修正后的地址。
+
+可执行和可链接格式（Executable and Linkable Format，ELF）的辅助向量通过 `AT_RSEQ_FEATURE_SIZE` 和 `AT_RSEQ_ALIGN` 公布经典接口布局，供 `glibc` 自动登记。共享地址空间的新线程独立登记，普通 `fork` 继承父线程的登记，成功执行 `execve` 或退出时清除登记。应用可用 `MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ` 请求同一地址空间的其他活动线程中止尚未提交的序列，也可限定目标逻辑处理器。
+
+### 2.5 RISC-V 硬件能力探测（`riscv_hwprobe(258)`）
 
 `arch/riscv/hwprobe.c` 为用户态动态库（如 `glibc` 的字符串/向量多版本函数分发 `IFUNC`）提供标准硬件特性查询：
 - 返回 OpenSBI 厂商/架构/实现标识（Key `0`～`2`）、基础指令集 `IMA`（Key `3`）、扩展特性位掩码（`F/D`、`C`、`V` 向量、`Zba`/`Zbb`/`Zbs` 位操作与受 `senvcfg` 门控的 `Zicboz` 零块指令，Key `4`）、`Zicboz` 块大小 `64` 字节（Key `6`）、最高用户虚拟地址（Key `7`）与时钟频率（Key `8`）；
@@ -78,9 +85,9 @@ flowchart LR
 
 | 功能域 | 代表性系统调用 | 所属子系统文档 |
 | :--- | :--- | :--- |
-| **进程、线程与调度** | `clone` / `clone3` / `execve` / `wait4` / `waitid` / `sched_setattr` / `setpriority` / `futex` / `futex_waitv` / `ptrace` | [调度与同步](kernel-scheduler.md) · [映像替换](kernel-exec.md) · [进程跟踪](kernel-ptrace.md) |
+| **进程、线程与调度** | `clone` / `clone3` / `execve` / `wait4` / `waitid` / `sched_setattr` / `setpriority` / `futex` / `futex_waitv` / `ptrace` / `rseq` | [调度与同步](kernel-scheduler.md) · [映像替换](kernel-exec.md) · [进程跟踪](kernel-ptrace.md) |
 | **虚拟内存** | `brk` / `mmap` / `munmap` / `mprotect` / `mremap` / `mlock*` / `madvise` / `msync` / `mincore` / `process_vm_readv/writev` / `userfaultfd` / `memfd_secret` | [虚拟内存管理](kernel-mm.md) · [原生大页](hugepages.md) |
-| **文件、路径与挂载** | `openat` / `openat2` / `readv` / `writev` / `sendfile` / `splice` / `copy_file_range` / `fallocate` / `io_uring_*` / `statx` / `fsopen`～`move_mount` / `pivot_root` / `statmount` / `listmount` | [VFS 与 ext4](vfs-ext4.md) · [文件资源与 I/O](kernel-files.md) |
+| **文件、路径与挂载** | `openat` / `openat2` / `readv` / `writev` / `sendfile` / `splice` / `copy_file_range` / `fallocate` / `io_uring_*` / `statx` / `cachestat` / `fsopen`～`move_mount` / `pivot_root` / `statmount` / `listmount` | [VFS 与 ext4](vfs-ext4.md) · [文件资源与 I/O](kernel-files.md) |
 | **事件、锁与通知** | `epoll_*` / `ppoll` / `pselect6` / `pipe2` / `eventfd2` / `timerfd_*` / `signalfd4` / `inotify_*` / `fanotify_*` / `flock` / `fcntl` | [文件资源与 I/O](kernel-files.md) |
 | **网络与套接字** | `socket` / `socketpair` / `bind` / `listen` / `accept4` / `connect` / `sendmsg` / `sendmmsg` / `recvmmsg` / `setsockopt` | [多核网络协议栈](kernel-network.md) · [rtnetlink](../network-rtnetlink.md) |
 | **信号、时钟与 IPC** | `rt_sigaction` / `rt_sigprocmask` / `rt_sigreturn` / `sigaltstack` / `clock_gettime` / `clock_nanosleep` / `timer_*` / `adjtimex` / SysV & POSIX IPC | [信号](kernel-signal.md) · [时钟与定时器](kernel-time.md) |

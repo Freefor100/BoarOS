@@ -300,7 +300,7 @@ static int wait_progress(struct nvme_controller *c, struct kernel_wait_queue *qu
     if (kernel_scheduler_can_sleep() && c->irq) {
         struct kernel_wait_token token;
         enum kernel_wait_wake_reason reason;
-        if (kernel_wait_prepare(queue, until, 0, &token)) __builtin_trap();
+        if (kernel_wait_prepare(queue, until, KERNEL_WAIT_BLOCK_IO, &token)) __builtin_trap();
         kernel_irq_lock_release(guard);
         if (kernel_wait_park(&token, &reason) || kernel_wait_finish(&token)) __builtin_trap();
         kernel_irq_lock_acquire(&c->lock, guard);

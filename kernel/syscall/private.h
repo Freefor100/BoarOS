@@ -400,6 +400,10 @@ enum kernel_syscall_status syscall_handle_gettimeofday(
 
 enum kernel_syscall_status syscall_handle_membarrier(
     struct kernel_task *, const struct kernel_syscall_request *, struct kernel_syscall_result *);
+enum kernel_syscall_status syscall_handle_rseq(
+    struct kernel_task *, const struct kernel_syscall_request *, struct kernel_syscall_result *);
+enum kernel_syscall_status syscall_handle_cachestat(
+    struct kernel_task *, const struct kernel_syscall_request *, struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_adjtimex(
     struct kernel_task *, const struct kernel_syscall_request *, struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_native_aio(

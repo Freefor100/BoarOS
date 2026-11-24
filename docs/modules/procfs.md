@@ -11,6 +11,8 @@
 | 路径 | 类型 / 权限 | 核心内容与语义 |
 | :--- | :--- | :--- |
 | `/proc/cpuinfo` | 只读快照（`0444`） | 按逻辑处理器编号列出当前在线处理器。RISC-V 和 LoongArch 分别使用对应架构的字段。 |
+| `/proc/stat` | 只读快照（`0444`） | 汇总及逐核处理器时间、中断总数、上下文切换、启动时间、累计创建任务数，以及当前可运行和等待块设备输入输出的任务数。 |
+| `/proc/diskstats` | 只读快照（`0444`） | 按块设备列出已完成的读、写和缓存刷新请求，包含传输扇区数、累计耗时和在途请求数。字段顺序与 `/sys/block/*/stat` 一致。 |
 | `/proc/meminfo`、`/proc/uptime` | 只读快照（`0444`） | 物理内存快照（KiB：`MemTotal/Free/Available/Buffers/Cached/Shmem/Dirty/Writeback` 等）与系统运行/空闲时长 |
 | `/proc/filesystems`、`/proc/mounts` | 只读快照 / 符号链接 | 已注册文件系统类型表（非块设备带 `nodev`）；`/proc/mounts` 指向 `self/mounts` |
 | `/proc/self`、`/proc/thread-self` | 动态符号链接 | 每次解析动态返回调用者的 `<TGID>` 或 `<TGID>/task/<TID>`（在当前挂载的 PID 命名空间不可见时返回 `-ENOENT`） |
@@ -61,6 +63,10 @@ flowchart LR
 
 `cpuinfo` 依据已上线的处理器记录生成快照，枚举范围与读取线程的处理器亲和性无关。RISC-V 的 `hart` 为硬件线程编号，`isa` 列出各在线硬件线程共同支持且内核已探测的指令集架构（Instruction Set Architecture，ISA）扩展，`hart isa` 列出当前记录的扩展。`mmu` 显示 Sv39 分页模式，固件能提供厂商、架构和实现编号时才输出对应字段。LoongArch 输出逻辑编号、硬件编号 `global_id` 和指令集架构 `loongarch64`。
 
+`/proc/stat` 从每个在线处理器的执行记账取得用户态、正 nice 值的用户态、内核态、空闲和硬件中断处理时间，再转换为每秒 100 个用户节拍。处理器时间同时计入当前尚未切换的执行片段。设备等待任务数取实际阻塞在块请求完成路径上的任务。输入输出等待时间、软件中断、虚拟机被抢占和客体执行时间目前输出零。中断行提供总数。
+
+`/proc/diskstats` 先从块层登记表取得设备引用，释放登记表保护后采样各设备计数并格式化。读写扇区数以 512 字节为单位，耗时以毫秒为单位。合并请求和丢弃请求的字段当前为零。块层与 `sysfs` 共用字段转换。
+
 ---
 
 ## 四、进程观测、对象链接与逐页查询
@@ -108,5 +114,6 @@ python3 -B tests/diff-abi/harness.py --kernel kernel-rv --program build/diff-abi
 ```
 
 - 相关源码与专项测试：`tests/diff-abi/proc.c`、`tests/diff-abi/rt_controls.c`、`tests/diff-abi/sched_stat.c`、`tests/host/proc_sysvipc.c`、`tests/workloads/ipc/proc_sysvipc.c`、`tests/riscv/sched-bandwidth.sh`；控制文件设计分析见 [proc 控制文件](../learning/proc-controls.md)。
+- `python3 -B tests/userland/api8.py --program proc_system_stats` 核对在线核、处理器时间、线程创建与切换、根设备读写扇区数。
 
 </details>

@@ -152,6 +152,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 #endif
 #if BOAROS_MAX_CPUS > 1
     if (frame->scause == (RISCV_SCAUSE_INTERRUPT | 1U)) {
+        kernel_cpu_interrupt_handled();
         riscv_smp_handle_ipi();
         return;
     }
@@ -168,6 +169,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         struct kernel_cost_tag cost_timer_tag = kernel_cost_capture();
         uint64_t cost_timer_start = kernel_cost_clock();
 #endif
+        kernel_cpu_interrupt_handled();
         uint64_t elapsed_ticks;
         enum riscv_timer_status status =
             riscv_timer_handle_interrupt(&elapsed_ticks);
@@ -443,27 +445,31 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 
 void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
 {
-    if(!(frame->sstatus&RISCV_SSTATUS_SPP) &&
-       __atomic_load_n(&kernel_task_current()->ptrace,__ATOMIC_ACQUIRE))
-        kernel_ptrace_user_return(kernel_task_current(),frame);
-#if BOAROS_USER_SMP
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) {
-        do {
+        if (__atomic_load_n(&kernel_task_current()->ptrace, __ATOMIC_ACQUIRE))
+            kernel_ptrace_user_return(kernel_task_current(), frame);
+        for (;;) {
             if (kernel_task_prepare_user_return()) {
                 riscv_signal_prepare_user_return(frame);
+#if BOAROS_USER_SMP
                 if (kernel_scheduler_user_service_active())
                     kernel_scheduler_leave_user_service();
-            }
-            if(kernel_task_current()->ptrace)kernel_ptrace_user_return(kernel_task_current(),frame);
-        } while (kernel_scheduler_user_return_pending());
-        kernel_cpu_current()->user_returns++;
-    } else kernel_scheduler_prepare_idle_return();
-#else
-    if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) {
-        if (kernel_task_prepare_user_return()) riscv_signal_prepare_user_return(frame);
-        if (kernel_task_current()->ptrace) kernel_ptrace_user_return(kernel_task_current(), frame);
-    } else kernel_scheduler_prepare_idle_return();
 #endif
+            }
+            struct kernel_task *task = kernel_task_current();
+            if (task->ptrace) kernel_ptrace_user_return(task, frame);
+            if (__builtin_expect(task->rseq.pending, 0) &&
+                kernel_rseq_resume(task, &frame->sepc))
+                continue;
+#if BOAROS_USER_SMP
+            if (kernel_scheduler_user_return_pending()) continue;
+#endif
+            break;
+        }
+#if BOAROS_USER_SMP
+        kernel_cpu_current()->user_returns++;
+#endif
+    } else kernel_scheduler_prepare_idle_return();
 #if BOAROS_COST_DIAGNOSTICS
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) kernel_cost_user_return();
 #endif

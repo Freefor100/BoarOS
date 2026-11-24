@@ -892,6 +892,12 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     } else if (request->number == 283U) {
         if (syscall_handle_membarrier(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 293U) {
+        if (syscall_handle_rseq(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 451U) {
+        if (syscall_handle_cachestat(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == 171U || request->number == 266U) {
         if (syscall_handle_adjtimex(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

@@ -1055,6 +1055,9 @@ static void snapshot_copy_case(struct kernel_page_cache *cache,const char *path)
     snapshot_copy=(__typeof__(snapshot_copy)){.source=access_page(last),.armed=1};sync_done=0;
     pthread_t sync,reader,writer;assert(!pthread_create(&sync,NULL,sync_file,&file));wait_progress(&snapshot_copy.entered,1);
     assert(physical_page_flags_snapshot(cache->allocator,frame,&flags,1)==1 && flags==(dirty|writeback));
+    struct kernel_page_cache_range_statistics stats;
+    kernel_page_cache_range_statistics(cache,kernel_vfs_file_node(&file),0,0,&stats);
+    assert(stats.cached==1 && stats.dirty==1 && stats.writeback==1 && !stats.evicted);
     snapshot_writer=(__typeof__(snapshot_writer)){.cache=cache,.file=&file,.address=address,.alias=&alias};unsigned parked=mm_test_parked(8);
     assert(!pthread_create(&writer,NULL,snapshot_alias_writer,NULL));
     while(mm_test_parked(8)==parked)sched_yield();
@@ -3384,11 +3387,24 @@ static void indexed_reclaim(struct kernel_page_cache *cache,const char *path)
     assert(kernel_page_cache_reclaim(cache,1)==1);
     assert(kernel_page_cache_lookup(cache,&file,100,&address,&valid)==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND);
     struct kernel_vfs_node *node=kernel_vfs_file_node(&file);
+    struct kernel_page_cache_range_statistics stats;
+    kernel_page_cache_range_statistics(cache,node,0,128,&stats);
+    assert(stats.cached==127 && !stats.dirty && !stats.writeback &&
+           stats.evicted==2 && stats.recently_evicted==2);
+    assert(!kernel_page_cache_get(cache,&file,128,&address,&valid));
+    kernel_page_cache_range_statistics(cache,node,128,128,&stats);
+    assert(stats.cached==1 && !stats.evicted && !stats.recently_evicted);
+    assert(!physical_page_release(cache->allocator,address));
+    assert(kernel_page_cache_reclaim(cache,1)==1);
+    kernel_page_cache_range_statistics(cache,node,128,128,&stats);
+    assert(!stats.cached && stats.evicted==1 && stats.recently_evicted==1);
     {
         KERNEL_LOCK_SCOPE(writer);kernel_vfs_node_lock(node,&writer,1);
-        kernel_page_cache_invalidate_range(cache,node,99U*BOAROS_PAGE_SIZE,100U*BOAROS_PAGE_SIZE);
+        kernel_page_cache_invalidate_range(cache,node,99U*BOAROS_PAGE_SIZE,101U*BOAROS_PAGE_SIZE);
     }
     assert(kernel_page_cache_lookup(cache,&file,99,&address,&valid)==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND);
+    kernel_page_cache_range_statistics(cache,node,99,100,&stats);
+    assert(!stats.cached && !stats.evicted);
     assert(!physical_page_release(cache->allocator,held[99]));
     /* Touch the successor of a removed scan position before the next round. */
     assert(!kernel_page_cache_get(cache,&file,98,&address,&valid));
@@ -3396,6 +3412,25 @@ static void indexed_reclaim(struct kernel_page_cache *cache,const char *path)
     for (unsigned i=0;i<128;i++) if (i!=99 && i!=100)
         assert(!physical_page_release(cache->allocator,held[i]));
     assert(kernel_page_cache_reclaim(cache,UINT64_MAX)==126 && !node->cache_pages.rbh_root);
+    kernel_page_cache_range_statistics(cache,node,0,128,&stats);
+    assert(!stats.cached && stats.evicted==127 && stats.recently_evicted==1);
+    assert(!kernel_vfs_ftruncate(&file,0));
+    kernel_page_cache_range_statistics(cache,node,0,128,&stats);
+    assert(!stats.cached && !stats.evicted && !stats.recently_evicted);
+    assert(!kernel_vfs_ftruncate(&file,1025U*BOAROS_PAGE_SIZE));
+    for (unsigned i=0;i<1025;i++) {
+        assert(!kernel_page_cache_get(cache,&file,i,&address,&valid));
+        assert(!physical_page_release(cache->allocator,address));
+        assert(kernel_page_cache_reclaim(cache,1)==1);
+    }
+    kernel_page_cache_range_statistics(cache,node,0,1024,&stats);
+    assert(!stats.cached && stats.evicted==1024 && stats.recently_evicted==1);
+    kernel_page_cache_range_statistics(cache,node,0,0,&stats);
+    assert(!stats.evicted);
+    assert(!kernel_vfs_unlink(&mount,"/reclaim-window") && !kernel_vfs_close(&file));
+    assert(!kernel_vfs_create(&mount,"/reclaim-window",0600,&file));
+    kernel_page_cache_range_statistics(cache,kernel_vfs_file_node(&file),0,1024,&stats);
+    assert(!stats.cached && !stats.evicted);
     assert(!kernel_vfs_unlink(&mount,"/reclaim-window") && !kernel_vfs_close(&file));
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(cache) && !close(image_fd));
     puts("PASS indexed range/reclaim:128 pinned predecessors, later clean victim, removed/touched scan position and all owners returned");

@@ -12,6 +12,7 @@
 #include <kernel/futex.h>
 #include <kernel/mm.h>
 #include <kernel/pid.h>
+#include <kernel/rseq.h>
 #include <kernel/sched_policy.h>
 #include <kernel/sched_runqueue.h>
 #include <kernel/scheduler.h>
@@ -322,6 +323,7 @@ struct kernel_task {
 #endif
     struct kernel_fanotify_read *fanotify_read;
     uint64_t scheduled_ticks;
+    struct kernel_rseq rseq;
 } __attribute__((aligned(16)));
 
 #endif

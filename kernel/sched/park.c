@@ -239,7 +239,7 @@ static enum kernel_scheduler_status prepare_owner(struct kernel_wait_queue *queu
 enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *queue,
     uint64_t deadline,int interruptible,struct kernel_wait_token *token)
 {
-    if (!token || (unsigned)interruptible>KERNEL_WAIT_KILLABLE ||
+    if (!token || (unsigned)interruptible>KERNEL_WAIT_BLOCK_IO ||
         (queue && queue->initialized!=KERNEL_WAIT_QUEUE_INITIALIZED))
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     if (!kernel_wait_backend_initialized()) return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
@@ -399,7 +399,7 @@ enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *to
             if (record->convert_deadline && record->convert_deadline(
                     record->clock_deadline,&record->deadline)==KERNEL_TIME_STATUS_DEADLINE_PASSED)
                 record->deadline=1;
-            if (record->interruptible && kernel_wait_backend_signal(token->task))
+            if (kernel_wait_record_interruptible(record) && kernel_wait_backend_signal(token->task))
                 kernel_wait_notify_locked(token, KERNEL_WAIT_SIGNALLED);
             else if (record->deadline && (int64_t)(kernel_wait_backend_time() - record->deadline) >= 0)
                 kernel_wait_notify_locked(token, KERNEL_WAIT_TIMEOUT);

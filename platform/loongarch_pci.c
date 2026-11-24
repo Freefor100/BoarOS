@@ -130,6 +130,7 @@ void la_virt_irq_dispatch(void)
             uint32_t bits=iocsr_read(0x1800+group*4);
             while(bits) {
                 unsigned bit=(unsigned)__builtin_ctz(bits),source=group*32+bit;bits&=bits-1;
+                kernel_cpu_interrupt_handled();
                 /* 共享 level pin 在逐设备 ISR 之间可能一直为高；mask/unmask 重新采样 intirr。 */
                 *pic(0x20+group*4)|=1U<<bit;
                 arch_io_barrier();

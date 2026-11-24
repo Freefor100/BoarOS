@@ -163,6 +163,8 @@ enum kernel_wait_signal_mode {
     KERNEL_WAIT_UNINTERRUPTIBLE = 0,
     KERNEL_WAIT_INTERRUPTIBLE = 1,
     KERNEL_WAIT_KILLABLE = 2,
+    /* An uninterruptible wait for block-device completion or queue progress. */
+    KERNEL_WAIT_BLOCK_IO = 3,
 };
 
 #define KERNEL_WAIT_QUEUE_INITIALIZED UINT32_C(0x57414954)
