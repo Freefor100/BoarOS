@@ -996,7 +996,8 @@ void kernel_vfs_mount_initialize(struct kernel_vfs_mount *mount)
     uint64_t pages=physical_page_total(instance->heap->page_allocator);
     KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
     if (!instance->backend_mount.private_data) {
-        size_t limit=pages/256;
+        /* Keep the entry budget comparable across hardware page sizes. */
+        size_t limit=pages/(UINT64_C(1048576)/BOAROS_PAGE_SIZE);
         instance->dentry_cache_limit=limit<16 ? 16 : limit>8192 ? 8192 : limit;
         instance->backend_mount.private_data=instance;
         instance->backend_mount.id=mount->id;
