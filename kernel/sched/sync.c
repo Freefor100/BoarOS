@@ -147,7 +147,7 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
 #endif
     struct kernel_raw_guard metadata = {0};
     kernel_raw_lock_acquire(&lock->metadata, &metadata);
-    int busy = lock->writer || lock->pending_head || lock->handoff_owner || (write && lock->readers);
+    int busy = kernel_rwlock_busy_locked(lock, write);
     if (try_only && busy) {
         kernel_raw_lock_release(&metadata);
         return 0;

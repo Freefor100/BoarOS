@@ -14,6 +14,7 @@ struct kernel_block_device;
 struct kernel_async_io;
 struct kernel_namespace;
 struct kernel_mm_pagemap;
+int kernel_open_file_try_seek_regular(struct kernel_open_file_description *, uint64_t);
 enum kernel_proc_page_stream {
     KERNEL_PROC_PAGE_STREAM_NONE,
     KERNEL_PROC_PAGE_STREAM_PAGEMAP,

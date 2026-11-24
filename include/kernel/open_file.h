@@ -74,6 +74,7 @@ enum kernel_open_file_kind {
     KERNEL_OPEN_FILE_KIND_FS_CONTEXT,
     KERNEL_OPEN_FILE_KIND_FANOTIFY,
     KERNEL_OPEN_FILE_KIND_USERFAULTFD,
+    KERNEL_OPEN_FILE_KIND_COUNT,
 };
 
 /* VFS errors are returned through linux_result when status is OK. */
