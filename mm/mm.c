@@ -242,12 +242,14 @@ static inline uint64_t pin_state_read(const uint64_t *state)
     return *state;
 #endif
 }
-static inline uint32_t pin_count_add(uint64_t *count)
+static inline uint32_t pin_count_add(uint64_t *count, unsigned amount)
 {
 #if BOAROS_MAX_CPUS > 1
-    return (uint32_t)__atomic_fetch_add(count, 1U, __ATOMIC_RELAXED);
+    return (uint32_t)__atomic_fetch_add(count, amount, __ATOMIC_RELAXED);
 #else
-    return (uint32_t)(*count)++;
+    uint32_t previous = (uint32_t)*count;
+    *count += amount;
+    return previous;
 #endif
 }
 static inline uint64_t pin_count_sub(uint64_t *count,unsigned amount)
@@ -2715,6 +2717,19 @@ static inline enum kernel_mm_status lookup_user_mapping(const struct kernel_mm_r
         (access | KERNEL_MM_USER) ? KERNEL_MM_STATUS_OK : KERNEL_MM_STATUS_ACCESS;
 }
 
+static inline void link_user_pin(struct kernel_io_context *owner, const struct kernel_mm *mm,
+    struct kernel_mm_record *record, uint64_t head, uint64_t physical,
+    uint32_t order, void *pointer, uint32_t access,
+    struct kernel_mm_user_pin *pin)
+{
+    pin->mm=mm; pin->record=record; pin->owner=owner; pin->registration=pin;
+    pin->owner_next=owner->user_pins; pin->owner_previous=&owner->user_pins;
+    if (pin->owner_next) pin->owner_next->owner_previous=&pin->owner_next;
+    pin->page=pointer; pin->physical_address=physical; pin->access=access;
+    pin->owner_address=head; pin->order=order;
+    owner->user_pins = pin;
+}
+
 static __attribute__((always_inline)) inline void register_user_pin(const struct kernel_mm *mm,
     struct kernel_mm_record *record,uint64_t physical,uint32_t order,void *pointer,uint32_t access,
     struct kernel_mm_user_pin *pin)
@@ -2722,19 +2737,13 @@ static __attribute__((always_inline)) inline void register_user_pin(const struct
     uint64_t head=physical & ~(((uint64_t)BOAROS_PAGE_SIZE<<order)-1);
     if (physical_page_acquire_order(mm->allocator, head, order) != PHYSICAL_PAGE_STATUS_OK)
         __builtin_trap();
-    if (pin_count_add(&record->access_pins) == UINT32_MAX) __builtin_trap();
+    if (pin_count_add(&record->access_pins,1) == UINT32_MAX) __builtin_trap();
 #if BOAROS_COST_DIAGNOSTICS
     __atomic_fetch_add(&record->pin_acquisitions, 1U, __ATOMIC_RELAXED);
 #endif
-    if ((access & KERNEL_MM_WRITE) && pin_count_add(&record->write_pins) == UINT32_MAX)
+    if ((access & KERNEL_MM_WRITE) && pin_count_add(&record->write_pins,1) == UINT32_MAX)
         __builtin_trap();
-    struct kernel_io_context *owner = kernel_io_context_current();
-    pin->mm=mm; pin->record=record; pin->owner=owner; pin->registration=pin;
-    pin->owner_next=owner->user_pins; pin->owner_previous=&owner->user_pins;
-    if (pin->owner_next) pin->owner_next->owner_previous=&pin->owner_next;
-    pin->page=pointer; pin->physical_address=physical; pin->access=access;
-    pin->owner_address=head; pin->order=order;
-    owner->user_pins = pin;
+    link_user_pin(kernel_io_context_current(),mm,record,head,physical,order,pointer,access,pin);
 }
 
 /* PTE、resident索引与权限许可由同一短读资格固定；实际页acquire不能移出。 */
@@ -2848,6 +2857,36 @@ enum kernel_mm_status kernel_mm_pin_user_pair(const struct kernel_mm *mm,
     return pin_user_prefix(mm,first,second,access,pins,count,1);
 }
 
+unsigned kernel_mm_try_pin_user_read_batch(const struct kernel_mm *mm, uint64_t first,
+    unsigned count, struct kernel_mm_user_pin *pins)
+{
+    struct kernel_mm_record *record;
+    if (mm->state != KERNEL_MM_LIVE || resolve_record(mm, &record)) return 0;
+    if (count > KERNEL_MM_USER_READ_BATCH) __builtin_trap();
+    KERNEL_RAW_READ_SCOPE(guard, &record->metadata);
+    if (pin_admission_closed(record) == 1) return 0;
+    uint64_t pages[KERNEL_MM_USER_READ_BATCH];
+    unsigned ready = 0;
+    for (; ready < count; ready++) {
+        struct kernel_mm_mapping mapping;
+        if (lookup_user_mapping(record, first + (uint64_t)ready * BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ, &mapping) || mapping.order) break;
+        pages[ready] = mapping.physical_address & ~BOAROS_PAGE_MASK;
+        if (physical_page_map_owned(mm->allocator, pages[ready], &pins[ready].page)) break;
+    }
+    if (!ready) return 0;
+    physical_page_acquire_batch(mm->allocator, pages, ready);
+    if (pin_count_add(&record->access_pins,ready) > UINT32_MAX-ready) __builtin_trap();
+#if BOAROS_COST_DIAGNOSTICS
+    __atomic_fetch_add(&record->pin_acquisitions,ready,__ATOMIC_RELAXED);
+#endif
+    struct kernel_io_context *owner = kernel_io_context_current();
+    for (unsigned i = 0; i < ready; i++)
+        link_user_pin(owner, mm, record, pages[i], pages[i], 0, pins[i].page,
+            KERNEL_MM_READ, &pins[i]);
+    return ready;
+}
+
 static inline void unpin_user_pages(struct kernel_mm_user_pin *pins,unsigned count)
 {
     if (!pins || !pins[0].mm || pins[0].mm->state!=KERNEL_MM_LIVE || !pins[0].record)
@@ -2888,12 +2927,23 @@ static inline void unpin_user_pages(struct kernel_mm_user_pin *pins,unsigned cou
      * waits for completed access; allocator return needs no MM qualification. */
     if (count==1) {
         if (physical_page_release_order(mm->allocator,pins[0].owner_address,pins[0].order)) __builtin_trap();
-    } else {
+    } else if (count == 2) {
         const uint64_t physical[]={pins[0].owner_address,pins[1].owner_address};
         if (pins[0].order || pins[1].order) {
             const uint8_t orders[]={(uint8_t)pins[0].order,(uint8_t)pins[1].order};
             physical_page_release_order_batch(mm->allocator,physical,orders,2);
         } else physical_page_release_batch(mm->allocator,physical,2);
+    } else {
+        uint64_t physical[KERNEL_MM_USER_READ_BATCH];
+        uint8_t orders[KERNEL_MM_USER_READ_BATCH];
+        unsigned compound = 0;
+        for (unsigned i = 0; i < count; i++) {
+            physical[i] = pins[i].owner_address;
+            orders[i] = pins[i].order;
+            compound |= orders[i];
+        }
+        if (compound) physical_page_release_order_batch(mm->allocator, physical, orders, count);
+        else physical_page_release_batch(mm->allocator, physical, count);
     }
     for (unsigned i=count;i>0;) {
         struct kernel_mm_user_pin *pin=&pins[--i];
@@ -2907,6 +2957,11 @@ void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
 { unpin_user_pages(pin,1); }
 void kernel_mm_unpin_user_pair(struct kernel_mm_user_pin pins[2])
 { unpin_user_pages(pins,2); }
+void kernel_mm_unpin_user_read_batch(struct kernel_mm_user_pin *pins, unsigned count)
+{
+    if (count > KERNEL_MM_USER_READ_BATCH) __builtin_trap();
+    if (count) unpin_user_pages(pins,count);
+}
 
 enum kernel_mm_status kernel_mm_vma_enable(
     struct kernel_mm *mm,

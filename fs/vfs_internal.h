@@ -210,6 +210,7 @@ struct kernel_vfs_sync_request {
     uint64_t *observed_error;
     int result;
     uint8_t done, index_height;
+    uint64_t writeback_epoch;
 };
 void kernel_vfs_sync_complete(struct kernel_vfs_sync_request *, int result);
 int kernel_vfs_sync_borrowing(struct kernel_vfs_file *, int data_only,

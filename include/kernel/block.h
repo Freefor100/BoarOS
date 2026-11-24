@@ -112,6 +112,7 @@ struct kernel_block_device {
     struct kernel_block_device *pressure_parent;
     uint8_t virtual_backing;
     uint64_t registration_generation;
+    uint64_t writeback_epoch, flushed_writeback_epoch;
     struct kernel_block_usage usage;
 };
 
@@ -185,6 +186,10 @@ int kernel_block_claimed(struct kernel_block_device *);
 void kernel_block_usage(struct kernel_block_device *, uint32_t *references, uint32_t *opens);
 /* Whole-device capacity only; published partition extents are immutable. */
 void kernel_block_set_capacity(struct kernel_block_device *, uint64_t bytes);
+/* Register completed buffered writes and snapshot their device-wide frontier. */
+void kernel_block_note_writeback(struct kernel_block_device *);
+uint64_t kernel_block_writeback_epoch(struct kernel_block_device *);
+enum kernel_block_status kernel_block_flush_through(struct kernel_block_device *, uint64_t epoch);
 int kernel_block_set_read_only(struct kernel_block_device *, int read_only);
 int kernel_block_read_only(const struct kernel_block_device *);
 /* Task I/O and flush may execute on any CPU. Device references and the physical

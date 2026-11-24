@@ -4,8 +4,15 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <time.h>
 static _Thread_local struct kernel_io_context model_io;
 struct kernel_io_context *kernel_io_context_current(void) { return &model_io; }
+uint64_t kernel_time_monotonic_ns(void)
+{
+    struct timespec now;
+    assert(!clock_gettime(CLOCK_MONOTONIC, &now));
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + now.tv_nsec;
+}
 /* Production calls retain rank/owner nesting; pthread rwlocks implement the
  * standalone fixtures' sleeping execution model. */
 struct model_lock { struct kernel_rwlock *object; pthread_rwlock_t lock; struct model_lock *next; };

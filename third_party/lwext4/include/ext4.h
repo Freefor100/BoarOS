@@ -106,6 +106,7 @@ struct ext4_journal_runtime {
 	uint64_t (*now_ns)(void *context);
 	void (*request)(void *context, unsigned work);
 	int (*wait)(void *context, uint64_t sequence, enum ext4_journal_wait kind);
+	bool (*join_pending_metadata)(void *context);
 };
 int ext4_journal_group_enable(const char *mount_point,
 	const struct ext4_journal_runtime *runtime, size_t memory_limit);
@@ -234,6 +235,9 @@ int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid, uint32_t pr
  * offset/size advance file size and completion. An ordinary buffer (empty source)
  * is copied into a private version. */
 int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count);
+/* Called with the adapter's inode I/O qualification. ENOTSUP leaves the
+ * entire batch to transactional writeback. */
+int ext4_fpwrite_mapped_batch(ext4_file *file, struct file_write_span *spans, unsigned count);
 /* Synchronous no-journal data path; caller storage is never retained. */
 int ext4_fpwrite_direct(ext4_file *file, struct file_write_span *span);
 int ext4_fpwrite(ext4_file *file, uint64_t offset, const void *buffer, size_t size, size_t *written);

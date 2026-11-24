@@ -1184,6 +1184,16 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
 static uint64_t journal_now(void *context)
 { (void)context; return kernel_time_monotonic_ns(); }
 
+#if BOAROS_MAX_CPUS > 1
+static bool journal_join_pending_metadata(void *context)
+{
+    struct lwext4_mount_adapter *adapter = context;
+    if (kernel_cpu_get_boot_count() < 2) return false;
+    TIMESTAMP_SCOPE(times, adapter);
+    return adapter->dirty_times_count != 0;
+}
+#endif
+
 static void journal_request(void *context, unsigned work)
 {
     journal_request_flags(context, work & EXT4_JOURNAL_WORK_COMMIT,
@@ -1420,7 +1430,12 @@ static int start_journal_workers(struct kernel_vfs_mount *mount)
     if (adapter->device.fs->jbd_journal) {
         uint64_t budget = physical_page_total(adapter->instance.page_cache->allocator) * BOAROS_PAGE_SIZE / 32;
         if (budget > 16 * 1024 * 1024) budget = 16 * 1024 * 1024;
-        struct ext4_journal_runtime runtime = {adapter, journal_now, journal_request, journal_wait};
+        struct ext4_journal_runtime runtime = {
+            .context=adapter,.now_ns=journal_now,.request=journal_request,.wait=journal_wait,
+#if BOAROS_MAX_CPUS > 1
+            .join_pending_metadata=journal_join_pending_metadata
+#endif
+        };
         int result = ext4_journal_group_enable(adapter->mount_point, &runtime, budget);
         if (result != EOK) return lwext4_error(result);
     }
@@ -3036,6 +3051,19 @@ static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
     return lwext4_error(result);
 }
 
+static int ext4_backend_writeback_mapped(struct kernel_vfs_node *node,
+    struct file_write_span *spans, size_t count)
+{
+    int result = ext4_fpwrite_mapped_batch(lwext4_node_file(node), spans, count);
+    if (result != ENOTSUP) for (size_t i = 0; i < count; i++) {
+        COST_ADD(BACKEND_REQUESTED, spans[i].size);
+        COST_ADD(BACKEND_ACCEPTED, spans[i].written);
+    }
+    if (!result)
+        kernel_block_note_writeback(lwext4_instance(node->instance)->block);
+    return result == ENOTSUP ? -KERNEL_EOPNOTSUPP : lwext4_error(result);
+}
+
 static int ext4_backend_writeback(struct kernel_vfs_node *node,
     struct file_write_span *spans, size_t count)
 {
@@ -3320,6 +3348,7 @@ static void ext4_backend_sync_prepare(struct kernel_vfs_node *node, int data_onl
     struct kernel_vfs_sync_request *request)
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
+    request->writeback_epoch = kernel_block_writeback_epoch(adapter->block);
     int result = data_only ? EOK : writeback_times(node, true);
     if (result == EOK)
         result = ext4_file_sync_metadata_prepare(lwext4_node_file(node), data_only != 0,
@@ -3352,6 +3381,9 @@ static int ext4_backend_sync_filesystem(struct kernel_vfs_mount *mount)
     if (result != EOK) return lwext4_error(result);
     result = ext4_filesystem_sync_metadata(adapter->mount_point);
     if (result == EOK && !adapter->device.fs->jbd_journal) result = block_flush(&adapter->device);
+    uint64_t epoch = kernel_block_writeback_epoch(adapter->block);
+    if (result == EOK && epoch && kernel_block_flush_through(adapter->block, epoch))
+        result = EIO;
     if (result != EOK) kernel_vfs_record_mount_writeback_error(mount, lwext4_error(result));
     return lwext4_error(result);
 }
@@ -3503,6 +3535,7 @@ static void initialize_backend(void)
     ops->read_directory = ext4_backend_read_directory;
     ops->pread = ext4_backend_pread;
     ops->writeback = ext4_backend_writeback;
+    ops->writeback_mapped = ext4_backend_writeback_mapped;
     ops->direct_io = ext4_backend_direct_io;
     ops->direct_alignment = ext4_backend_direct_alignment;
     ops->seek_sparse = ext4_backend_seek_sparse;

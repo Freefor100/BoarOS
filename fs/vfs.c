@@ -6737,7 +6737,16 @@ int kernel_vfs_sync_range_borrowing(struct kernel_vfs_file *file,
             cache, vfs_sync_prepare, &call, borrowed);
         if (status) return status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     } else vfs_sync_prepare(&call);
-    return vfs_sync_wait(&request);
+    int result = vfs_sync_wait(&request);
+    if (!result && request.writeback_epoch) {
+        struct kernel_block_device *device = node->instance->ops->block_device(node->instance);
+        if (kernel_block_flush_through(device, request.writeback_epoch)) {
+            result = -KERNEL_EIO;
+            kernel_vfs_record_writeback_error(node, result);
+            result = observe_node_writeback_error(node, observed_error, result);
+        }
+    }
+    return result;
 }
 
 int kernel_vfs_sync(struct kernel_vfs_file *file, int datasync,
