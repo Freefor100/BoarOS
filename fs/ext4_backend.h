@@ -33,6 +33,7 @@ struct lwext4_mount_adapter {
     struct ext4_blockdev device;
     unsigned char *physical_buffer;
     struct ext4_sblock *superblock;
+    struct ext4_name_cache *name_cache;
     struct lwext4_orphan *orphans;
     struct lwext4_node *dirty_times, **dirty_times_tail;
     uint64_t times_deadline;
@@ -85,6 +86,7 @@ struct lwext4_node {
      * metadata mutation invalidates them under the existing timestamp lock. */
     struct kernel_vfs_stat metadata;
     uint64_t metadata_epoch, metadata_seen;
+    uint64_t access_acl_absent_epoch;
     struct lwext4_directory_mapping *directory_mapping;
     uint8_t inline_link_length;
     char inline_link[sizeof(((struct ext4_inode *)0)->blocks)];
