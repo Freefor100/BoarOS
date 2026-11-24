@@ -173,47 +173,33 @@ static int address_was_allocated(
     return 0;
 }
 
+static const struct physical_page_range *page_range_for_address(
+    const struct physical_page_allocator *allocator, uint64_t address, struct page_work *work)
+{
+    for (uint32_t index = 0; index < allocator->range_count; index++) {
+        const struct physical_page_range *range = &allocator->ranges[index];
+        page_checked(work);
+        if (address - range->base < range->end - range->base) return range;
+    }
+    return NULL;
+}
+
 static int page_lookup_work(
     const struct physical_page_allocator *allocator,
     uint64_t address,
     uint32_t *range_index,
     uint32_t *page_index, struct page_work *work)
 {
-    uint32_t index;
-
-    if ((address & BOAROS_PAGE_MASK) != 0U) {
-        return 0;
-    }
-
-    if (physical_page_allocator_is_finalized(allocator)) {
-        const struct physical_page_root *root = root_for_address(allocator, address, work);
-        if (!root) return 0;
-        if (range_index) *range_index = root->range_index;
-        if (page_index) *page_index = root->first_page_index + (uint32_t)((address-root->address)>>BOAROS_PAGE_SHIFT);
-        return 1;
-    }
-
-    for (index = 0U; index < allocator->range_count; index++) {
-        const struct physical_page_range *range = &allocator->ranges[index];
-
-        if (address >= range->base && address < range->end) {
-            uint64_t local = (address - range->base) >> BOAROS_PAGE_SHIFT;
-            uint64_t flat = (uint64_t)range->first_page_index + local;
-
-            if (flat >= allocator->total_pages || flat > UINT32_MAX) {
-                return 0;
-            }
-            if (range_index != 0) {
-                *range_index = index;
-            }
-            if (page_index != 0) {
-                *page_index = (uint32_t)flat;
-            }
-            return 1;
-        }
-    }
-
-    return 0;
+    if (address & BOAROS_PAGE_MASK) return 0;
+    /* Flat metadata is indexed by the immutable boot ranges. Only buddy
+     * tree mutations and allocation-order queries need the root directory. */
+    const struct physical_page_range *range = page_range_for_address(allocator, address, work);
+    if (!range) return 0;
+    uint64_t flat = range->first_page_index + ((address - range->base) >> BOAROS_PAGE_SHIFT);
+    if (flat >= allocator->total_pages || flat > UINT32_MAX) return 0;
+    if (range_index) *range_index = (uint32_t)(range - allocator->ranges);
+    if (page_index) *page_index = (uint32_t)flat;
+    return 1;
 }
 
 static int page_lookup(const struct physical_page_allocator *a, uint64_t address,
@@ -1916,16 +1902,6 @@ static void acquire_order_locked(struct physical_page_allocator *a,uint64_t addr
     (*references)++;page_written(work);
 }
 
-static const struct physical_page_root *batch_root(const struct physical_page_allocator *a,
-    const struct physical_page_root *root, uint64_t address, struct page_work *work)
-{
-    if (address & BOAROS_PAGE_MASK) __builtin_trap();
-    if (root && address - root->address <
-        (order_page_count(root->order) << BOAROS_PAGE_SHIFT)) return root;
-    root = root_for_address(a, address, work);
-    if (!root) __builtin_trap();
-    return root;
-}
 uint32_t physical_page_cow_borrow_order(struct physical_page_allocator *a,
     uint64_t address, uint32_t order)
 {
@@ -1967,11 +1943,15 @@ void physical_page_acquire_batch(struct physical_page_allocator *a,
     if (!addresses || count > PHYSICAL_PAGE_REFERENCE_BATCH_MAX) __builtin_trap();
     PAGE_METADATA_SCOPE(work, a);
     if (!physical_page_allocator_is_finalized(a)) __builtin_trap();
-    const struct physical_page_root *root = NULL;
+    const struct physical_page_range *range = NULL;
     for (unsigned i = 0; i < count; i++) {
         uint64_t address = addresses[i];
-        root = batch_root(a, root, address, &work);
-        uint32_t page = root->first_page_index + (uint32_t)((address-root->address)>>BOAROS_PAGE_SHIFT);
+        if (address & BOAROS_PAGE_MASK) __builtin_trap();
+        if (!range || address - range->base >= range->end - range->base)
+            range = page_range_for_address(a, address, &work);
+        if (!range) __builtin_trap();
+        uint64_t page = range->first_page_index + ((address - range->base) >> BOAROS_PAGE_SHIFT);
+        if (page >= a->total_pages) __builtin_trap();
         struct buddy_owner head = {.first=page,.order=0,.state=BUDDY_ALLOCATED};
         uint32_t *refs = &a->metadata[page].reference_count;
         if (!head_valid(a,&head,&work) || *refs == UINT32_MAX) __builtin_trap();

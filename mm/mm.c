@@ -4952,7 +4952,6 @@ static uint32_t protection_for_leaf(struct kernel_mm_record *record, uint64_t le
     return permissions;
 }
 
-#if !defined(BOAROS_ARCH_LOONGARCH)
 struct leaf_protection {
     struct kernel_mm_record *record;
     uint32_t permissions;
@@ -4964,7 +4963,6 @@ static uint32_t protection_for_batch_entry(void *context, uint64_t address)
     return backend_permissions_from_mm(
         protection_for_leaf(protection->record, address, protection->permissions));
 }
-#endif
 
 static enum kernel_mm_status protect_vma_pages(struct kernel_mm_record *record,
     const struct kernel_vma_edit *edit)
@@ -4988,33 +4986,15 @@ static enum kernel_mm_status protect_vma_pages(struct kernel_mm_record *record,
         targets=note_tlb_change_locked(record,&batch,instructions);
     } else {
         uint64_t cursor = address;
-#if !defined(BOAROS_ARCH_LOONGARCH)
         struct leaf_protection protection = {record, normalized};
-#endif
         int touched=0;
         for (;;) {
             KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-#if defined(BOAROS_ARCH_LOONGARCH)
-            uint64_t leaf;
-            enum arch_mmu_status status=arch_mmu_user_next_owned(&record->space,&cursor,end,&leaf);
-#else
-            enum arch_mmu_status status = riscv_sv39_user_protect_batch(&record->space,
+            enum arch_mmu_status status = arch_mmu_user_protect_batch(&record->space,
                 &cursor, address, end, protection_for_batch_entry, &protection);
-#endif
             if (status==ARCH_MMU_STATUS_NOT_MAPPED) break;
             if (status) __builtin_trap();
             touched=1;
-#if defined(BOAROS_ARCH_LOONGARCH)
-            uint32_t leaf_permissions=protection_for_leaf(record,leaf,normalized);
-            struct kernel_mm_leaf snapshot;
-            if (arch_mmu_user_leaf_snapshot(&record->space,leaf,&snapshot)) __builtin_trap();
-            if (snapshot.order) {
-                if (leaf<address || leaf+kernel_mm_leaf_size(&snapshot)>end ||
-                    arch_mmu_user_protect_owned_range(&record->space,leaf,leaf+kernel_mm_leaf_size(&snapshot),
-                        backend_permissions_from_mm(leaf_permissions))) __builtin_trap();
-            } else if (arch_mmu_user_protect_owned_page(&record->space, leaf,
-                    backend_permissions_from_mm(leaf_permissions))) __builtin_trap();
-#endif
         }
         if (!touched) return KERNEL_MM_STATUS_OK;
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
@@ -7025,6 +7005,7 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
     struct mm_file_resident *resident = 0;
     struct mm_file_resident *published = 0;
     void *old_bytes = 0, *copy = 0;
+    uint64_t *cow_slot = NULL;
     unsigned missing = 0;
 #if BOAROS_COST_DIAGNOSTICS
     unsigned count = 0;
@@ -7111,7 +7092,6 @@ static __attribute__((noinline)) enum kernel_mm_status mapped_file_fault(struct 
     {
         struct kernel_mm_leaf leaf;
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-        uint64_t *cow_slot = NULL;
         status = fault_lookup_leaf(record,address,force,&leaf,&missing,
             access == KERNEL_MM_WRITE ? &cow_slot : NULL);
         if (status == KERNEL_MM_STATUS_OK && shared && disk && access==KERNEL_MM_WRITE) {
@@ -7262,8 +7242,12 @@ prepare_file_tables:
             KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
             if (track_resident && !cookie && record->resident_count == record->resident_capacity)
                 backend = ARCH_MMU_STATUS_CONFLICT;
-            else if (cookie) backend = arch_mmu_user_cow_commit(&record->space,address,cookie,replacement,
-                backend_permissions_from_mm(vma->permissions),&batch);
+            else if (continuous_cow)
+                backend = arch_mmu_user_cow_replace_prepared(&record->space, cow_slot, cookie,
+                    replacement, backend_permissions_from_mm(vma->permissions), &batch);
+            else if (cookie)
+                backend = arch_mmu_user_cow_commit(&record->space, address, cookie, replacement,
+                    backend_permissions_from_mm(vma->permissions), &batch);
             else {
                 int flags = 0;
                 if (!shared && access != KERNEL_MM_WRITE)

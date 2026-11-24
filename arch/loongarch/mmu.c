@@ -30,6 +30,23 @@ static void resident_peak(struct arch_mmu_user_space *space)
 
 static void flush_all(void) { __asm__ volatile("invtlb 0, $zero, $zero" ::: "memory"); }
 void arch_mmu_flush_all(void) { flush_all(); }
+void la_mmu_flush_range(uint64_t address, uint64_t size)
+{
+    if (size == BOAROS_PAGE_SIZE) {
+        arch_mmu_flush_address(address);
+        return;
+    }
+    if (!size || size > 16 * BOAROS_PAGE_SIZE || address >= ARCH_MMU_USER_LIMIT ||
+        size > ARCH_MMU_USER_LIMIT - address) {
+        flush_all();
+        return;
+    }
+    /* A LoongArch translation covers an even/odd pair of base pages. */
+    uint64_t end = address + size;
+    for (address &= ~(2 * BOAROS_PAGE_SIZE - 1); address < end;
+         address += 2 * BOAROS_PAGE_SIZE)
+        arch_mmu_flush_address(address);
+}
 void arch_mmu_sync_user(uint32_t targets, uint64_t address, uint64_t size,
     int instructions)
 {
@@ -37,8 +54,7 @@ void arch_mmu_sync_user(uint32_t targets, uint64_t address, uint64_t size,
     la_smp_sync_user(targets,address,size,instructions);
 #else
     if (targets & ~UINT32_C(1)) la_virt_fatal("unsupported MM CPU target");
-    if (size == BOAROS_PAGE_SIZE) arch_mmu_flush_address(address);
-    else flush_all();
+    la_mmu_flush_range(address, size);
     if (instructions) arch_mmu_sync_instructions();
 #endif
 }
@@ -452,6 +468,17 @@ enum arch_mmu_status arch_mmu_user_cow_upgrade(struct arch_mmu_user_space *s,
     if (!status) s->cow_in_place++;
     return status;
 }
+enum arch_mmu_status arch_mmu_user_cow_replace_prepared(struct arch_mmu_user_space *s,
+    uint64_t *slot, uint64_t cookie, uint64_t replacement, uint32_t permissions,
+    struct kernel_mm_retirement *batch)
+{
+    if (*slot != cookie) return ARCH_MMU_STATUS_CONFLICT;
+    enum arch_mmu_status status = store_cow_leaf(s, slot, cookie, replacement, permissions, 0);
+    if (status) return status;
+    s->cow_copies++;
+    kernel_mm_retirement_add(batch, cookie & PTE_ADDRESS, 0);
+    return ARCH_MMU_STATUS_OK;
+}
 enum arch_mmu_status arch_mmu_user_cow_commit_order(struct arch_mmu_user_space *s, uint64_t v,
     uint64_t cookie, uint64_t replacement, uint32_t permissions, uint32_t order,
     struct kernel_mm_retirement *batch)
@@ -487,8 +514,8 @@ enum arch_mmu_status arch_mmu_user_cow_commit_order(struct arch_mmu_user_space *
 enum arch_mmu_status arch_mmu_user_cow_commit(struct arch_mmu_user_space *s, uint64_t v,
     uint64_t cookie, uint64_t replacement, uint32_t permissions, struct kernel_mm_retirement *batch)
 { return arch_mmu_user_cow_commit_order(s, v, cookie, replacement, permissions, 0, batch); }
-enum arch_mmu_status arch_mmu_user_next_owned(struct arch_mmu_user_space *s,
-    uint64_t *cursor, uint64_t end, uint64_t *address)
+static enum arch_mmu_status next_owned_leaf(struct arch_mmu_user_space *s,
+    uint64_t *cursor, uint64_t end, uint64_t *address, uint64_t **slot, unsigned *remaining)
 {
     if (!live(s) || !cursor || !address || *cursor > end || end > ARCH_MMU_USER_LIMIT ||
         ((*cursor | end) & BOAROS_PAGE_MASK)) return ARCH_MMU_STATUS_INVALID;
@@ -507,6 +534,7 @@ enum arch_mmu_status arch_mmu_user_next_owned(struct arch_mmu_user_space *s,
                     return ARCH_MMU_STATUS_STATE;
                 *address = ((uint64_t)r << 36) | ((uint64_t)m << 25);
                 *cursor = *address + HUGE_SIZE;
+                if (slot) { *slot = &middle[m]; *remaining = 0; }
                 return ARCH_MMU_STATUS_OK;
             }
             if (!directory_entry(middle[m])) return ARCH_MMU_STATUS_STATE;
@@ -516,12 +544,20 @@ enum arch_mmu_status arch_mmu_user_next_owned(struct arch_mmu_user_space *s,
                 if (!(leaves[l] & PTE_PRESENT) || (leaves[l] & PTE_HUGE)) return ARCH_MMU_STATUS_STATE;
                 *address = ((uint64_t)r << 36) | ((uint64_t)m << 25) | ((uint64_t)l << 14);
                 *cursor = *address + BOAROS_PAGE_SIZE;
+                if (slot) {
+                    *slot = &leaves[l];
+                    uint64_t pages = (end - *address) >> BOAROS_PAGE_SHIFT;
+                    *remaining = pages < ENTRIES - l ? pages : ENTRIES - l;
+                }
                 return ARCH_MMU_STATUS_OK;
             }
         }
     }
     *cursor = end; return ARCH_MMU_STATUS_NOT_MAPPED;
 }
+enum arch_mmu_status arch_mmu_user_next_owned(struct arch_mmu_user_space *s,
+    uint64_t *cursor, uint64_t end, uint64_t *address)
+{ return next_owned_leaf(s, cursor, end, address, NULL, NULL); }
 enum arch_mmu_status arch_mmu_user_owned_snapshot(struct arch_mmu_user_space *s,
     uint64_t v,uint64_t *physical,int *cow)
 {
@@ -602,29 +638,33 @@ static unsigned map_owned_window(struct arch_mmu_user_space *s, uint64_t address
     int cow = (flags & KERNEL_MM_LEAF_COW) != 0;
     unsigned slots = (ARCH_MMU_HUGE_SIZE - (address & (ARCH_MMU_HUGE_SIZE-1))) / BOAROS_PAGE_SIZE;
     if ((address & BOAROS_PAGE_MASK) || address < BOAROS_PAGE_SIZE ||
-        (slots < 32 && (pages >> slots)) || ((flags & KERNEL_MM_LEAF_FILE) && !cow))
+        (slots < 32 && (pages >> slots)) || (permissions & ~7U) ||
+        ((flags & KERNEL_MM_LEAF_FILE) && !cow))
         __builtin_trap();
     uint64_t *slot;
     uint32_t order;
     enum arch_mmu_status result = walk_leaf(s, address, &slot, &order);
     if (result && result != ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
     if (order || (required_slot >= 0 && slot[required_slot])) return 0;
+    uint64_t attributes = encode(0, permissions, flags);
+    uint32_t *owned = permissions ? &s->leaf_pages : &s->protected_pages;
+    uint32_t available = UINT32_MAX - *owned;
+    if (cow && available > UINT32_MAX - s->cow_pages)
+        available = UINT32_MAX - s->cow_pages;
+    /* The prepared pages must be visible before any table entry is usable. */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     unsigned installed = 0, count = 0;
     for (unsigned index = 0; pages; pages >>= 1, index++) {
         if (!(pages & 1)) continue;
         uint64_t p = *physical++;
         if (slot[index]) continue;
-        if ((p & BOAROS_PAGE_MASK) || !p || p > PTE_ADDRESS || (permissions & ~7U))
+        if ((p & BOAROS_PAGE_MASK) || !p || p > PTE_ADDRESS || count == available)
             __builtin_trap();
-        if ((permissions ? s->leaf_pages : s->protected_pages) >= UINT32_MAX-count ||
-            (cow && s->cow_pages >= UINT32_MAX-count)) __builtin_trap();
-        uint64_t entry = encode(p, permissions, flags);
-        __atomic_store_n(&slot[index], entry, __ATOMIC_RELEASE);
+        __atomic_store_n(&slot[index], p | attributes, __ATOMIC_RELAXED);
         installed |= 1U << index;
         count++;
     }
-    if (permissions) s->leaf_pages += count;
-    else s->protected_pages += count;
+    *owned += count;
     if (cow) s->cow_pages += count;
     resident_peak(s);
     return installed;
@@ -875,6 +915,18 @@ enum arch_mmu_status arch_mmu_user_unmap_owned_range(struct arch_mmu_user_space 
     if (status) return status;
     unmap_tree(s,s->root_address,2,0,start,end); return ARCH_MMU_STATUS_OK;
 }
+static enum arch_mmu_status protect_leaf(struct arch_mmu_user_space *s,
+    uint64_t *slot, uint32_t perms, unsigned order)
+{
+    uint64_t old = *slot;
+    if (!(old & PTE_PRESENT) || !!(old & PTE_HUGE) != !!order) return ARCH_MMU_STATUS_STATE;
+    uint64_t replacement = encode(old & PTE_ADDRESS, perms, pte_flags(old)) | (order ? PTE_HUGE : 0);
+    if (replacement != old) __atomic_store_n(slot, replacement, __ATOMIC_RELEASE);
+    uint32_t pages = 1U << order;
+    if ((old & PTE_NONE) && perms) { s->protected_pages -= pages; s->leaf_pages += pages; }
+    if (!(old & PTE_NONE) && !perms) { s->leaf_pages -= pages; s->protected_pages += pages; }
+    return ARCH_MMU_STATUS_OK;
+}
 enum arch_mmu_status arch_mmu_user_protect_resident_page(struct arch_mmu_user_space *s,uint64_t v,uint32_t perms)
 {
     if (!live(s) || (v&BOAROS_PAGE_MASK) || (perms&~7U)) return ARCH_MMU_STATUS_INVALID;
@@ -883,11 +935,30 @@ enum arch_mmu_status arch_mmu_user_protect_resident_page(struct arch_mmu_user_sp
     s->protect_visits++;
     if (status!=ARCH_MMU_STATUS_OK) return status;
     if (!*slot) return ARCH_MMU_STATUS_NOT_MAPPED;
-    uint64_t old=*slot;
-    if (!(old&PTE_PRESENT) || (old&PTE_HUGE)) return ARCH_MMU_STATUS_STATE;
-    __atomic_store_n(slot,encode(old&PTE_ADDRESS,perms,pte_flags(old)),__ATOMIC_RELEASE);
-    if ((old&PTE_NONE) && perms) { s->protected_pages--; s->leaf_pages++; }
-    if (!(old&PTE_NONE) && !perms) { s->leaf_pages--; s->protected_pages++; }
+    return protect_leaf(s, slot, perms, 0);
+}
+
+enum arch_mmu_status arch_mmu_user_protect_batch(struct arch_mmu_user_space *s,
+    uint64_t *cursor, uint64_t begin, uint64_t end,
+    uint32_t (*permissions)(void *, uint64_t), void *context)
+{
+    uint64_t address, *entries;
+    unsigned count;
+    enum arch_mmu_status status = next_owned_leaf(s, cursor, end, &address, &entries, &count);
+    if (status) return status;
+    if (!count) {
+        if (address < begin || *cursor > end) return ARCH_MMU_STATUS_INVALID;
+        s->protect_visits++;
+        return protect_leaf(s, entries, permissions(context, address), HUGE_ORDER);
+    }
+    if (count > 16) count = 16;
+    s->protect_visits += count;
+    for (unsigned i = 0; i < count; i++, address += BOAROS_PAGE_SIZE) {
+        if (!entries[i]) continue;
+        status = protect_leaf(s, &entries[i], permissions(context, address), 0);
+        if (status) return status;
+    }
+    *cursor = address;
     return ARCH_MMU_STATUS_OK;
 }
 enum arch_mmu_status arch_mmu_user_protect_owned_page(struct arch_mmu_user_space *s,uint64_t v,uint32_t perms)
@@ -905,11 +976,8 @@ enum arch_mmu_status arch_mmu_user_protect_owned_range(struct arch_mmu_user_spac
         uint64_t *slot; uint32_t order;
         status = walk_leaf(s, address, &slot, &order);
         if (status) return status;
-        uint64_t old = *slot; uint32_t pages = 1U << order;
-        __atomic_store_n(slot, encode(old & PTE_ADDRESS, perms, pte_flags(old)) |
-            (order ? PTE_HUGE : 0), __ATOMIC_RELEASE);
-        if ((old & PTE_NONE) && perms) { s->protected_pages -= pages; s->leaf_pages += pages; }
-        if (!(old & PTE_NONE) && !perms) { s->leaf_pages -= pages; s->protected_pages += pages; }
+        status = protect_leaf(s, slot, perms, order);
+        if (status) return status;
         s->protect_visits++;
     }
     if (status != ARCH_MMU_STATUS_NOT_MAPPED) return status;
