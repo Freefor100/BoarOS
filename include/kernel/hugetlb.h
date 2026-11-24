@@ -4,6 +4,7 @@
 struct kernel_heap;
 struct physical_page_allocator;
 struct kernel_hstate;
+struct kernel_hugetlb_subpool;
 struct kernel_hugetlb_map;
 enum kernel_hugetlb_status {
     KERNEL_HUGETLB_OK, KERNEL_HUGETLB_INVALID, KERNEL_HUGETLB_NO_MEMORY,
@@ -35,6 +36,12 @@ enum kernel_hugetlb_status kernel_hstate_destroy(struct kernel_hstate **);
  * be quiesced. Rejects live map/pin owners rather than hiding a cleanup leak. */
 enum kernel_hugetlb_status kernel_hstate_shutdown(struct physical_page_allocator *);
 void kernel_hstate_snapshot(struct kernel_hstate *, struct kernel_hstate_snapshot *);
+/* UINT64_MAX means no mount-specific ceiling. The guarantee is held until
+ * both the last mount/map reference and the last charged block are gone. */
+enum kernel_hugetlb_status kernel_hugetlb_subpool_create(struct kernel_hstate *,
+    uint64_t maximum, uint64_t minimum, struct kernel_hugetlb_subpool **);
+void kernel_hugetlb_subpool_put(struct kernel_hugetlb_subpool *);
+void kernel_hugetlb_subpool_capacity(struct kernel_hugetlb_subpool *, uint64_t *, uint64_t *);
 /* Construction reserves all slots against already held contiguous capacity,
  * unless noreserve. A private fork uses CHILD and gets no parent reservation.
  * Shared fork reuses the same object with acquire. VMA splits share a map and
@@ -49,7 +56,9 @@ struct kernel_hugetlb_reservation {
     struct kernel_hugetlb_file_slot *candidates;
 };
 enum kernel_hugetlb_status kernel_hugetlb_file_create(struct kernel_hstate *,
-    struct kernel_hugetlb_map **);
+    struct kernel_hugetlb_subpool *, struct kernel_hugetlb_map **);
+enum kernel_hugetlb_status kernel_hugetlb_file_private_create(struct kernel_hugetlb_map *,
+    uint64_t pages, int noreserve, struct kernel_hugetlb_map **);
 /* Charge capacity before mapping and publish the reservation only after it
  * succeeds. The caller excludes removal in [first, end) until finish. */
 enum kernel_hugetlb_status kernel_hugetlb_file_reserve_begin(struct kernel_hugetlb_map *,
@@ -79,6 +88,10 @@ void kernel_hugetlb_private_reset(struct kernel_hugetlb_map *, uint64_t first, u
  * Shared munmap does not delete backing slots; release its actual map owner. */
 enum kernel_hugetlb_status kernel_hugetlb_map_unmap(struct kernel_hugetlb_map *,
     uint64_t first, uint64_t end);
+/* Under the owning MM writer, mark surviving private intervals in any order,
+ * then release all omitted slots and clear the marks for the next edit. */
+void kernel_hugetlb_private_keep(struct kernel_hugetlb_map *, uint64_t first, uint64_t end);
+void kernel_hugetlb_private_prune(struct kernel_hugetlb_map *);
 /* Read-only shared-cache residency snapshot; caller holds a stable map owner.
  * Does not fault, acquire a data owner, or report private PTE residency. */
 /* Shared backing residency in base-page units; O(1), stable map owner required. */

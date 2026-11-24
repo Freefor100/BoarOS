@@ -159,6 +159,75 @@ static void check_mount_context(void)
     CHECK(!close(tree) && !close(context));
 }
 
+static void check_mount_quota(void)
+{
+    CHECK(!mkdir(point,0755));
+    ERROR(mount("hugetlbfs",point,"hugetlbfs",0,"size=25%,min_size=50%"),EINVAL);
+    CHECK(counter("HugePages_Rsvd:")==0);
+    ERROR(mount("hugetlbfs",point,"hugetlbfs",0,"min_size=125%"),ENOMEM);
+    CHECK(counter("HugePages_Rsvd:")==0);
+    CHECK(!mount("hugetlbfs",point,"hugetlbfs",0,"size=50%,min_size=25%"));
+    struct statfs fs;
+    CHECK(!statfs(point,&fs) && fs.f_blocks==2 && fs.f_bfree==2);
+    CHECK(counter("HugePages_Rsvd:")==1);
+    int fd=open(filename,O_RDWR|O_CREAT|O_EXCL,0600);
+    CHECK(fd>=0 && !ftruncate(fd,3*huge));
+    unsigned char *a=map(fd,1,PROT_READ|PROT_WRITE,0);
+    CHECK(counter("HugePages_Rsvd:")==1);
+    unsigned char *alias=map(fd,1,PROT_READ,0);
+    unsigned char *b=map(fd,0,PROT_READ|PROT_WRITE,huge);
+    CHECK(!fstatfs(fd,&fs) && fs.f_bfree==0);
+    CHECK(mmap(NULL,huge,PROT_READ|PROT_WRITE,MAP_SHARED,fd,2*huge)==MAP_FAILED && errno==ENOMEM);
+    a[0]=42;
+    CHECK(alias[0]==42 && counter("HugePages_Rsvd:")==1);
+    b[0]=43;
+    CHECK(counter("HugePages_Rsvd:")==0 && b[0]==43);
+    CHECK(!munmap(b,huge) && !fstatfs(fd,&fs) && fs.f_bfree==1);
+    CHECK(!ftruncate(fd,0) && !fstatfs(fd,&fs) && fs.f_bfree==2);
+    CHECK(counter("HugePages_Rsvd:")==1);
+    CHECK(!ftruncate(fd,huge));
+    a[0]=18;
+    CHECK(!unlink(filename) && !close(fd));
+    CHECK(!umount2(point,MNT_DETACH) && alias[0]==18);
+    CHECK(!munmap(a,huge) && !munmap(alias,huge) && !rmdir(point));
+    CHECK(counter("HugePages_Rsvd:")==0 && counter("HugePages_Free:")==4);
+}
+
+static void check_huge_remap(void)
+{
+    unsigned char *window=mmap(NULL,8*huge,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    CHECK(window!=MAP_FAILED);
+    unsigned char *to=(unsigned char *)(((size_t)window+huge-1)&-huge);
+    unsigned char *from=to+3*huge;
+    CHECK(mmap(from,2*huge,PROT_READ|PROT_WRITE,
+        MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB,-1,0)==from);
+    from[7]=11;
+    from[huge+7]=12;
+    CHECK(mremap(from,2*huge,3*huge,MREMAP_MAYMOVE)==MAP_FAILED && errno==EINVAL);
+    CHECK(mremap(from,huge,huge,MREMAP_FIXED|MREMAP_MAYMOVE,to+4096)==MAP_FAILED && errno==EINVAL);
+    CHECK(mremap(from,huge,huge,MREMAP_MAYMOVE|MREMAP_DONTUNMAP)==MAP_FAILED && errno==EINVAL);
+    CHECK(!mprotect(from+huge,huge,PROT_NONE));
+    CHECK(mremap(from+huge,huge-1,1,MREMAP_FIXED|MREMAP_MAYMOVE,to)==to);
+    CHECK(!mprotect(to,huge,PROT_READ|PROT_WRITE));
+    CHECK(to[7]==12 && from[7]==11);
+    unsigned char present;
+    ERROR(mincore(from+huge,4096,&present),ENOMEM);
+    CHECK(!munmap(from,huge) && to[7]==12 && !munmap(window,8*huge));
+    CHECK(counter("HugePages_Free:")==4 && counter("HugePages_Rsvd:")==0);
+
+    int fd=syscall(SYS_memfd_create,"move",MFD_HUGETLB);
+    CHECK(fd>=0 && !ftruncate(fd,2*huge));
+    from=mmap(NULL,2*huge,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+    CHECK(from!=MAP_FAILED);
+    from[3]=31;
+    CHECK(mremap(from,2*huge,1,0)==from && from[3]==31);
+    to=map(fd,1,PROT_READ|PROT_WRITE,huge);
+    CHECK(mremap(from,huge,huge,MREMAP_FIXED|MREMAP_MAYMOVE,to)==to && to[3]==31);
+    CHECK(!ftruncate(fd,0) && !ftruncate(fd,huge) && to[3]==0);
+    CHECK(!close(fd) && !munmap(to,huge));
+    CHECK(counter("HugePages_Free:")==4 && counter("HugePages_Rsvd:")==0);
+}
+
 static void check_memfd(void)
 {
     struct statfs fs;
@@ -190,6 +259,8 @@ int main(void)
     check_memfd();
     check_mount();
     check_mount_context();
+    check_mount_quota();
+    check_huge_remap();
     pool(0);
     puts("HUGE FILES PASS");
     return 0;

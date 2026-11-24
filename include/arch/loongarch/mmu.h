@@ -108,9 +108,9 @@ void arch_mmu_flush_all(void);
 enum arch_mmu_status arch_mmu_user_leaf_missing(
     struct arch_mmu_user_space *, uint64_t, unsigned *);
 enum arch_mmu_status arch_mmu_user_prepare_move(
-    struct arch_mmu_user_space *, uint64_t, struct kernel_mm_leaf_preparation *);
+    struct arch_mmu_user_space *, uint64_t, uint32_t, struct kernel_mm_leaf_preparation *);
 enum arch_mmu_status arch_mmu_user_move_leaf(
-    struct arch_mmu_user_space *, uint64_t from, uint64_t to);
+    struct arch_mmu_user_space *, uint64_t from, uint64_t to, uint32_t order);
 enum arch_mmu_status arch_mmu_user_map_prepared_page(
     struct arch_mmu_user_space *, uint64_t, uint64_t, uint32_t, int cow,
     struct kernel_mm_leaf_preparation *);

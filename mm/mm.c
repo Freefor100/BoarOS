@@ -1527,7 +1527,7 @@ static void drain_huge_maps(struct kernel_mm_record *record,int unused_only)
     struct mm_huge_map **link=&record->huge_maps;
     while (*link) {
         struct mm_huge_map *entry=*link;
-        uint64_t cursor=0; int used=0;
+        int used=0,private=0;
         if (unused_only && record->vmas) {
             for (uint32_t i=0;i<kernel_vma_set_count(record->vmas);i++) {
                 struct kernel_vma v;
@@ -1538,12 +1538,11 @@ static void drain_huge_maps(struct kernel_mm_record *record,int unused_only)
                 uint64_t first=v.backing_offset/ARCH_MMU_HUGE_SIZE-
                     kernel_hugetlb_map_file_index(entry->map);
                 uint64_t end=first+(v.end-v.start)/ARCH_MMU_HUGE_SIZE;
-                if (first<cursor || end>entry->pages) __builtin_trap();
-                if (kernel_hugetlb_map_unmap(entry->map,cursor,first)) __builtin_trap();
-                cursor=end;
+                kernel_hugetlb_private_keep(entry->map,first,end);
+                private=1;
             }
         }
-        if (kernel_hugetlb_map_unmap(entry->map,cursor,entry->pages)) __builtin_trap();
+        if (private) kernel_hugetlb_private_prune(entry->map);
         if (used) { link=&entry->next; continue; }
         *link=entry->next;
         kernel_hugetlb_mapping_stop(&entry->registration);
@@ -6034,6 +6033,9 @@ static enum kernel_mm_status mmap_hugetlb(struct kernel_mm *mm,
         if (shared_map) {
             entry->map=shared_map;
             kernel_hugetlb_map_acquire(entry->map);
+        } else if (file) {
+            hs=kernel_hugetlb_file_private_create(kernel_vfs_node_hugetlb(node),
+                length/ARCH_MMU_HUGE_SIZE,noreserve,&entry->map);
         } else {
             struct kernel_hstate *h = 0;
             hs=kernel_hstate_get_or_create(record->vma_heap,mm->allocator,ARCH_MMU_HUGE_ORDER,&h);
@@ -6776,7 +6778,7 @@ static enum kernel_mm_status anonymous_zero_template(struct mm_operation *operat
 /* Reserve destination tables while all source leaves retain their owner. Empty
  * published tables are reclaimed through the normal TLB retirement path on OOM. */
 static int prepare_remap_tables(struct kernel_mm_record *record,
-    uint64_t from, uint64_t length, uint64_t to)
+    uint64_t from, uint64_t length, uint64_t to, uint32_t order)
 {
     uint64_t cursor = from, address;
     for (;;) {
@@ -6786,8 +6788,8 @@ static int prepare_remap_tables(struct kernel_mm_record *record,
             enum arch_mmu_status status = arch_mmu_user_next_owned(
                 &record->space, &cursor, from + length, &address);
             if (status == ARCH_MMU_STATUS_NOT_MAPPED) return 0;
-            if (status || arch_mmu_user_leaf_missing(&record->space,
-                to + address - from, &missing)) __builtin_trap();
+            if (status || arch_mmu_user_leaf_missing_order(&record->space,
+                to+address-from,order,&missing)) __builtin_trap();
         }
         struct kernel_mm_leaf_preparation prepared = KERNEL_MM_LEAF_PREPARATION_INIT;
         int error = 0;
@@ -6800,7 +6802,7 @@ static int prepare_remap_tables(struct kernel_mm_record *record,
         }
         if (!error) {
             KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-            if (arch_mmu_user_prepare_move(&record->space, to + address - from, &prepared))
+            if (arch_mmu_user_prepare_move(&record->space,to+address-from,order,&prepared))
                 __builtin_trap();
         }
         for (unsigned i = 0; i < 2; i++) if (prepared.tables[i] != KERNEL_MM_NO_PAGE)
@@ -6813,7 +6815,7 @@ static int prepare_remap_tables(struct kernel_mm_record *record,
 }
 
 static void move_remap_leaves(struct kernel_mm_record *record,
-    uint64_t from, uint64_t length, uint64_t to, int executable)
+    uint64_t from, uint64_t length, uint64_t to, uint32_t order, int executable)
 {
     uint64_t cursor = from, address;
     for (;;) {
@@ -6821,7 +6823,7 @@ static void move_remap_leaves(struct kernel_mm_record *record,
         enum arch_mmu_status status = arch_mmu_user_next_owned(
             &record->space, &cursor, from + length, &address);
         if (status == ARCH_MMU_STATUS_NOT_MAPPED) break;
-        if (status || arch_mmu_user_move_leaf(&record->space, address, to + address - from))
+        if (status || arch_mmu_user_move_leaf(&record->space,address,to+address-from,order))
             __builtin_trap();
         struct mm_lazy_page *lazy=lazy_find(record,address);
         if (lazy) {
@@ -6884,7 +6886,36 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
     struct kernel_vma source;
     if (old_address >= ARCH_MMU_USER_LIMIT ||
         kernel_vma_set_lookup(record->vmas, old_address, &source)) return -KERNEL_EFAULT;
-    if (huge_vma(&source)) return -KERNEL_EOPNOTSUPP;
+    uint32_t order=0;
+    if (huge_vma(&source)) {
+        const uint64_t mask=ARCH_MMU_HUGE_SIZE-1;
+        if ((flags&4U) || (old_address&mask) || ((flags&2U) && (new_address&mask)) ||
+            old_length>UINT64_MAX-mask || new_length>UINT64_MAX-mask)
+            return -KERNEL_EINVAL;
+        old_size=(old_length+mask)&~mask;
+        new_size=(new_length+mask)&~mask;
+        if (new_size>old_size || old_size>ARCH_MMU_USER_LIMIT-old_address ||
+            ((flags&2U) && (new_address>ARCH_MMU_USER_LIMIT-new_size ||
+             (old_address<new_address+new_size && new_address<old_address+old_size))))
+            return -KERNEL_EINVAL;
+#if BOAROS_USER_SMP
+        if (kernel_task_has_user_context(kernel_task_current()) &&
+            !kernel_scheduler_user_service_active() &&
+            (source.role==KERNEL_VMA_ROLE_SYSV_SHM ||
+             ((flags&2U) && kernel_vma_set_has_shm(record->vmas,new_address,new_size)) ||
+             kernel_vma_set_has_shm(record->vmas,old_address+new_size,old_size-new_size))) {
+            mm_operation_end(&operation);
+            kernel_service_scope_begin(&service);
+            if (mm_operation_begin(mm,&operation)) return -KERNEL_ENOMEM;
+            struct kernel_vma current;
+            if (kernel_vma_set_lookup(record->vmas,old_address,&current) ||
+                !huge_vma(&current) || current.backing!=source.backing)
+                return -KERNEL_EAGAIN;
+            source=current;
+        }
+#endif
+        order=ARCH_MMU_HUGE_ORDER;
+    }
     if (!old_size && source.kind != KERNEL_VMA_KIND_ANON_SHARED &&
         source.kind != KERNEL_VMA_KIND_FILE_SHARED && source.kind != KERNEL_VMA_KIND_SYSV_SHM &&
         source.kind != KERNEL_VMA_KIND_OBJECT_SHARED)
@@ -6949,8 +6980,8 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
             if (vs) return -KERNEL_ENOMEM;
         }
     }
-    if ((source.role != KERNEL_VMA_ROLE_MMAP &&
-         !(preserve && source.role == KERNEL_VMA_ROLE_SYSV_SHM)) ||
+    if ((source.role!=KERNEL_VMA_ROLE_MMAP && source.role!=KERNEL_VMA_ROLE_HUGETLB_FILE &&
+         !((preserve || order) && source.role==KERNEL_VMA_ROLE_SYSV_SHM)) ||
         source.kind == KERNEL_VMA_KIND_ELF_PRIVATE) return -KERNEL_EOPNOTSUPP;
     uint64_t offset = source.kind == KERNEL_VMA_KIND_ANONYMOUS ? 0 :
         source.backing_offset + old_address - source.start;
@@ -6976,7 +7007,7 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
     replacement.backing_offset = offset;
     struct kernel_shm_attachment *attachment
         __attribute__((cleanup(kernel_shm_attachment_release))) = 0;
-    if (source.kind == KERNEL_VMA_KIND_SYSV_SHM) {
+    if (source.role==KERNEL_VMA_ROLE_SYSV_SHM) {
         struct kernel_shm_attachment *original = kernel_vma_shm_attachment(&source);
         if (kernel_shm_attachment_create(original->segment,
                 new_address, new_address + new_size, original,
@@ -6997,7 +7028,7 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
     if (old_size && new_address != old_address) {
         if (current_pins(mm)) return -KERNEL_EAGAIN;
         close_pins(&operation, 0);
-        int error = prepare_remap_tables(record, old_address, old_size, new_address);
+        int error=prepare_remap_tables(record,old_address,old_size,new_address,order);
         if (error) return error;
         /* All fallible mapping preparations have finished. Publish the move
          * against io_destroy before changing any source PTE. An admitted
@@ -7005,7 +7036,7 @@ int kernel_mm_mremap(struct kernel_mm *mm, uint64_t old_address,
         if ((source.flags & KERNEL_VMA_AIO_RING) &&
             kernel_aio_ring_move(mm,source.backing,old_address,new_address))
             return -KERNEL_EINVAL;
-        move_remap_leaves(record, old_address, old_size, new_address,
+        move_remap_leaves(record,old_address,old_size,new_address,order,
             (source.permissions & KERNEL_MM_EXECUTE) != 0);
     }
     if (kernel_vma_set_commit_remap(record->vmas, &edit)) __builtin_trap();

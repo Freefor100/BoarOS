@@ -55,6 +55,7 @@ struct tmp_mount {
     struct kernel_vfs_instance instance;
     struct tmp_inode_tree inodes;
     struct kernel_memory_budget pages;
+    struct kernel_hugetlb_subpool *huge_subpool;
     uint64_t inode_limit, inode_count, next_inode, next_cookie;
 };
 static int inode_compare(const struct tmp_inode *a, const struct tmp_inode *b)
@@ -114,7 +115,7 @@ static int regular_backing(struct tmp_mount *m, struct tmp_inode *i)
         enum kernel_hugetlb_status status=kernel_hstate_get_or_create(heap,heap->page_allocator,
             ARCH_MMU_HUGE_ORDER,&state);
         if (!status) {
-            status=kernel_hugetlb_file_create(state,&i->hugetlb);
+            status=kernel_hugetlb_file_create(state,m->huge_subpool,&i->hugetlb);
             kernel_hstate_put(state);
         }
         return status ? -KERNEL_ENOMEM : 0;
@@ -663,7 +664,10 @@ static int statfs(struct kernel_vfs_mount *mount, struct kernel_vfs_statfs *s)
 static int huge_statfs(struct kernel_vfs_mount *mount, struct kernel_vfs_statfs *s)
 {
     struct tmp_mount *m=tm(mount->private_data);
+    uint64_t blocks,available;
+    kernel_hugetlb_subpool_capacity(m->huge_subpool,&blocks,&available);
     *s=(struct kernel_vfs_statfs){.type=0x958458f6,.block_size=ARCH_MMU_HUGE_SIZE,
+        .blocks=blocks,.free_blocks=available,.available_blocks=available,
         .inodes=m->inode_limit,.free_inodes=m->inode_limit ? m->inode_limit-m->inode_count : 0,
         .fsid=m->instance.device_id,.name_length=255,.flags=m->instance.read_only ? 1 : 0};
     return 0;
@@ -962,6 +966,7 @@ static int unmount(struct kernel_vfs_mount *mount)
     struct tmp_inode *i;
     while ((i = RB_MIN(tmp_inode_tree, &m->inodes))) { i->links=0; collect_inode(m,i); }
     if(__atomic_load_n(&m->pages.used, __ATOMIC_ACQUIRE) || m->inode_count) __builtin_trap();
+    kernel_hugetlb_subpool_put(m->huge_subpool);
     struct kernel_heap *heap=m->instance.heap;
     kernel_heap_release(heap,m);
     return 0;
@@ -1185,6 +1190,10 @@ struct huge_mount_options {
     uint64_t inodes;
     uint32_t uid, gid, mode;
     bool limit_inodes;
+    struct huge_mount_limit {
+        uint64_t value;
+        bool present, percent;
+    } maximum, minimum;
 };
 
 static int parse_huge_parameter(const char *key,size_t keys,const char *value,
@@ -1213,8 +1222,17 @@ static int parse_huge_parameter(const char *key,size_t keys,const char *value,
         else parameters->gid=(uint32_t)result;
         return 0;
     }
-    if ((keys==4 && !memcmp(key,"size",4)) || (keys==8 && !memcmp(key,"min_size",8)))
-        return -KERNEL_EOPNOTSUPP;
+    struct huge_mount_limit *limit=NULL;
+    if (keys==4 && !memcmp(key,"size",4)) limit=&parameters->maximum;
+    else if (keys==8 && !memcmp(key,"min_size",8)) limit=&parameters->minimum;
+    if (limit) {
+        size_t consumed=memory_number(value,length,&result);
+        if (!consumed || result==UINT64_MAX) return -KERNEL_EINVAL;
+        bool percent=consumed<length && value[consumed]=='%' && consumed+1==length;
+        if (consumed!=length && !percent) return -KERNEL_EINVAL;
+        *limit=(struct huge_mount_limit){.value=result,.present=true,.percent=percent};
+        return 0;
+    }
     return -KERNEL_EINVAL;
 }
 
@@ -1239,6 +1257,36 @@ static int parse_huge_options(const char *options,struct huge_mount_options *par
     return parameters->limit_inodes && !parameters->inodes ? -KERNEL_ENOMEM : 0;
 }
 
+static int huge_mount_pages(struct huge_mount_limit limit,uint64_t pool_pages,uint64_t *pages)
+{
+    if (!limit.present) return 0;
+    if (limit.percent) {
+        uint64_t total;
+        if (__builtin_mul_overflow(limit.value,pool_pages,&total)) return -KERNEL_EINVAL;
+        *pages=total/100;
+    } else *pages=limit.value/ARCH_MMU_HUGE_SIZE;
+    return 0;
+}
+
+static int prepare_huge_subpool(struct tmp_mount *m,const struct huge_mount_options *options)
+{
+    if (!options->minimum.present && !options->maximum.present) return 0;
+    struct kernel_heap *heap=m->instance.heap;
+    struct kernel_hstate *state=NULL;
+    if (kernel_hstate_get_or_create(heap,heap->page_allocator,ARCH_MMU_HUGE_ORDER,&state))
+        return -KERNEL_ENOMEM;
+    struct kernel_hstate_snapshot capacity;
+    kernel_hstate_snapshot(state,&capacity);
+    uint64_t maximum=UINT64_MAX,minimum=0;
+    int error=huge_mount_pages(options->maximum,capacity.persistent,&maximum);
+    if (!error) error=huge_mount_pages(options->minimum,capacity.persistent,&minimum);
+    if (!error && minimum>maximum) error=-KERNEL_EINVAL;
+    if (!error && kernel_hugetlb_subpool_create(state,maximum,minimum,&m->huge_subpool))
+        error=-KERNEL_ENOMEM;
+    kernel_hstate_put(state);
+    return error;
+}
+
 static int ramfs_create(struct kernel_heap *heap,uint64_t flags,const char *options,
     struct kernel_vfs_mount **owner,bool huge)
 {
@@ -1252,6 +1300,7 @@ static int ramfs_create(struct kernel_heap *heap,uint64_t flags,const char *opti
     if (huge) {
         struct huge_mount_options parameters={.uid=uid,.gid=gid,.mode=0755};
         r=parse_huge_options(options,&parameters);
+        if (!r) r=prepare_huge_subpool(m,&parameters);
         uid=parameters.uid;gid=parameters.gid;mode=parameters.mode;
         m->inode_limit=parameters.inodes;
     } else {
@@ -1261,7 +1310,7 @@ static int ramfs_create(struct kernel_heap *heap,uint64_t flags,const char *opti
     }
     if(r) {dispose(m,m);return r;}
     struct tmp_inode *i=0; r=allocate(m,sizeof(*i),(void **)&i);
-    if(r) {dispose(m,m);return r;}
+    if(r) {kernel_hugetlb_subpool_put(m->huge_subpool);dispose(m,m);return r;}
     i->number=i->parent=1; i->mode=KERNEL_VFS_S_IFDIR|mode; i->links=2;
     i->uid=uid;i->gid=gid;
     i->size=2 * TMPFS_DIRENT_SIZE;
