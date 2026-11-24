@@ -55,6 +55,17 @@ static void contents(struct kernel_vfs_file *file, uint64_t at, const void *expe
     assert(n <= sizeof(actual));
     assert(!kernel_vfs_pread(file, at, actual, n, &done, NULL) && done == n && !memcmp(actual, expected, n));
 }
+static int path_handle(struct kernel_vfs_path *root, const char *name,
+    struct kernel_vfs_handle *handle)
+{
+    struct kernel_vfs_path *path = NULL;
+    assert(!kernel_vfs_path_resolve(root, root, name, 1, &path));
+    int type = kernel_vfs_handle_type(path, 0);
+    assert(type > 0 && kernel_vfs_handle_type(path, 1) == type);
+    kernel_vfs_encode_handle(path, handle);
+    assert(!kernel_vfs_path_release(&path));
+    return type;
+}
 static void *remote_contents(void *argument)
 {
     mm_test_attach(1);kernel_cpu_current()->logical_id=1;
@@ -306,6 +317,8 @@ int main(int argc, char **argv)
     assert(!kernel_vfs_mkdir(&mount, "/目录", 0777));
     assert(kernel_vfs_open(&mount,"/STALE.TXT",&same)==-KERNEL_ENOENT);
     assert(!kernel_vfs_create(&mount, "/目录/Long Unicode 文件😀.txt", 0666, &file));
+    struct kernel_vfs_handle original, moved, reuse;
+    int handle_type = path_handle(root, "/目录/Long Unicode 文件😀.txt", &original);
     unsigned char data[32768], zero[32768]={0};
     for (unsigned j=0;j<sizeof(data);j++) data[j]=(j*37U+19U)%251;
     assert(!kernel_vfs_pwrite(&file, 0, data, sizeof(data), &done) && done==sizeof(data));
@@ -314,6 +327,12 @@ int main(int argc, char **argv)
     assert(!kernel_vfs_open(&mount, "/moved name.TXT", &same));
     assert(file.private_data == same.private_data); contents(&same, 0, data, sizeof(data));
     assert(!kernel_vfs_close(&same));
+    assert(path_handle(root, "/moved name.TXT", &moved) == handle_type &&
+           !memcmp(&original, &moved, sizeof(original)));
+    struct kernel_vfs_path *decoded = NULL;
+    assert(!kernel_vfs_decode_handle(&mount, handle_type, &original, &decoded));
+    assert(kernel_vfs_path_inode(decoded) == original.inode &&
+           !kernel_vfs_path_release(&decoded));
     assert(!kernel_vfs_ftruncate(&file, 513));
     assert(!kernel_vfs_ftruncate(&file, sizeof(data)));
     contents(&file, 0, data, 513); contents(&file, 513, zero, sizeof(data)-513);
@@ -324,9 +343,15 @@ int main(int argc, char **argv)
     assert(!kernel_vfs_pwrite(&file, 0, data, 91, &done) && done==91);
     sync_file(&file); contents(&file, 0, data, 91);
     assert(!kernel_vfs_close(&file));
+    assert(!kernel_vfs_create(&mount, "/Moved Name.txt", 0666, &file) && !kernel_vfs_close(&file));
+    assert(path_handle(root, "/Moved Name.txt", &reuse) == handle_type &&
+           memcmp(&original, &reuse, sizeof(original)) &&
+           kernel_vfs_decode_handle(&mount, handle_type, &original, &decoded) == -KERNEL_ESTALE);
+    assert(!kernel_vfs_unlink(&mount, "/Moved Name.txt"));
     assert(!kernel_vfs_create(&mount, "/REUSED.BIN", 0666, &file));
     assert(!kernel_vfs_ftruncate(&file, 17001)); contents(&file, 0, zero, 17001);
     sync_file(&file); assert(!kernel_vfs_close(&file));
+    assert(path_handle(root, "/REUSED.BIN", &reuse) == handle_type);
     assert(!kernel_vfs_rmdir(&mount, "/目录"));
     names(&mount,root);
     metadata(&mount,&heap);
@@ -342,6 +367,7 @@ int main(int argc, char **argv)
     assert(!kernel_page_cache_init(&read_cache,&heap,&pages));
     assert(!kernel_vfs_mount_fat32(&mount,&block,&heap,&read_cache,1));
     assert(!kernel_vfs_path_root(&mount,&heap,&root));
+    assert(kernel_vfs_decode_handle(&mount, handle_type, &reuse, &decoded) == -KERNEL_ESTALE);
     assert(!kernel_block_set_read_only(&block,1));
     assert(kernel_vfs_remount(root,0,NULL)==-KERNEL_EACCES && kernel_vfs_mount_is_readonly(&mount));
     assert(!kernel_block_set_read_only(&block,0));

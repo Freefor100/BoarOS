@@ -1,6 +1,7 @@
 #include <ext4_operation.h>
 #include "lwext4_port.h"
 #include "ext4_backend.h"
+#include "fanotify_internal.h"
 #include "vfs_internal.h"
 #include "record_lock.h"
 
@@ -730,6 +731,34 @@ static int lwext4_error(int error)
         return -KERNEL_EIO;
     }
     return -error;
+}
+
+/* The operation already owns the mount. A corrupt child may have no published
+ * node, but its validated inode snapshot still supplies the handle identity. */
+static void report_ext4_error(struct lwext4_mount_adapter *adapter, int error,
+                              uint64_t inode, uint32_t generation)
+{
+    struct kernel_vfs_instance *instance = &adapter->instance;
+    if (!(__atomic_load_n(&instance->fanotify_interest, __ATOMIC_ACQUIRE) & VFS_NOTIFY_FS_ERROR))
+        return;
+    const struct kernel_fanotify_ops *ops =
+        __atomic_load_n(&instance->fanotify_ops, __ATOMIC_ACQUIRE);
+    if (!ops) return;
+    if (!inode) {
+        ops->filesystem_error(instance, error, NULL, 0);
+        return;
+    }
+    struct kernel_vfs_handle handle = {.inode = inode, .generation = generation};
+    memcpy(handle.filesystem, adapter->device.fs->sb.uuid, sizeof(handle.filesystem));
+    ops->filesystem_error(instance, error, &handle, KERNEL_VFS_HANDLE_EXT4);
+}
+
+static int ext4_node_io_error(struct kernel_vfs_node *node, int error)
+{
+    if (error == EIO || error == EUCLEAN)
+        report_ext4_error(lwext4_instance(node->instance), error, node->inode,
+                          ((struct lwext4_node *)node)->generation);
+    return lwext4_error(error);
 }
 
 static int block_open(struct ext4_blockdev *device)
@@ -1525,6 +1554,7 @@ static int ext4_backend_remount(struct kernel_vfs_mount *mount, int read_only)
 {
     struct lwext4_mount_adapter *adapter=mount->private_data;
     struct ext4_fs *fs=adapter->device.fs;
+    if (!read_only && adapter->forced_read_only) return -KERNEL_EROFS;
     int result=mount_error(adapter);
     if (result) return lwext4_error(result);
     /* Workers must still be able to service a sync before this exclusive
@@ -1590,6 +1620,17 @@ static int ext4_backend_remount(struct kernel_vfs_mount *mount, int read_only)
     journal_wake(&adapter->journal_work);
     journal_wake(&adapter->checkpoint_work);
     return lwext4_error(result);
+}
+
+static void ext4_backend_abort_mount(struct kernel_vfs_instance *instance)
+{
+    struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
+    /* Remount has already drained the journal and completed the transition.
+     * This instance may be unmounted but cannot resume writes. */
+    if (!adapter->forced_read_only) {
+        adapter->forced_read_only = true;
+        report_ext4_error(adapter, KERNEL_ESHUTDOWN, 0, 0);
+    }
 }
 
 static int cleanup_mount(struct kernel_vfs_mount *mount)
@@ -2116,6 +2157,22 @@ static int close_node_file(struct kernel_vfs_node *node)
 #endif
     return result;
 }
+
+static bool valid_disk_inode_type(uint32_t mode)
+{
+    switch (mode & KERNEL_VFS_S_IFMT) {
+    case KERNEL_VFS_S_IFREG:
+    case KERNEL_VFS_S_IFDIR:
+    case KERNEL_VFS_S_IFLNK:
+    case KERNEL_VFS_S_IFBLK:
+    case KERNEL_VFS_S_IFCHR:
+    case KERNEL_VFS_S_IFIFO:
+    case KERNEL_VFS_S_IFSOCK:
+        return true;
+    default:
+        return false;
+    }
+}
 static int ext4_backend_open_inode(struct kernel_vfs_mount *mount,
                         const char *path, uint64_t inode_number,
                         uint32_t inode_mode,
@@ -2161,6 +2218,7 @@ static int ext4_backend_open_inode(struct kernel_vfs_mount *mount,
                 inode_number, *generation, &initial) :
             ext4_fopen_inode(lwext4_node_file(node), adapter->mount_point, inode_number, &initial);
         if (result != EOK) {
+            if (result == EIO || result == EUCLEAN) report_ext4_error(adapter, result, 0, 0);
             kernel_heap_release(adapter->instance.heap, node);
             return lwext4_error(result);
         }
@@ -2198,6 +2256,10 @@ static int ext4_backend_open_inode(struct kernel_vfs_mount *mount,
     if (path) result=ext4_fraw_inode_fill(lwext4_node_file(node),&initial);
     node->mode=ext4_inode_get_mode(&adapter->device.fs->sb,&initial);
     ((struct lwext4_node *)node)->generation = ext4_inode_get_generation(&initial);
+    if (!result && !valid_disk_inode_type(node->mode)) {
+        report_ext4_error(adapter, EUCLEAN, node->inode, ((struct lwext4_node *)node)->generation);
+        result = EUCLEAN;
+    }
     node->uid=ext4_inode_get_uid(&initial);node->gid=ext4_inode_get_gid(&initial);
     node->attributes=ext4_inode_get_flags(&initial)&KERNEL_VFS_INODE_ATTRIBUTES;
     if (!result) {
@@ -2964,7 +3026,7 @@ static int ext4_backend_read_directory(struct kernel_vfs_file *file,
     int result = ext4_dir_iterate(&directory, &position, ext4_backend_emit, batch,
                                   batch->check_relatime ? &current : NULL);
     if (current) batch->relatime=KERNEL_VFS_DIR_RELATIME_CURRENT;
-    if (result != EOK) return lwext4_error(result);
+    if (result != EOK) return ext4_node_io_error(node, result);
     if (batch->check_relatime && !current) batch->relatime=KERNEL_VFS_DIR_RELATIME_EXPIRED;
     if (position == UINT64_MAX) {
         batch->position = directory.fsize;
@@ -3005,8 +3067,8 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
     struct file_read_span span={offset,buffer,prefix,0,0};
     result=ext4_fpread_batch(lwext4_node_file(node),&span,1,NULL,stored,NULL,EXT4_PREAD_LOCK_HELD);
     adapter->locks.unlock(adapter->locks.context);
-    if (result != EOK) return lwext4_error(result);
-    if (span.completed != prefix) return -KERNEL_EIO;
+    if (result != EOK) return ext4_node_io_error(node, result);
+    if (span.completed != prefix) return ext4_node_io_error(node, EIO);
     /* Cache-only growth has known zero holes beyond the accepted inode EOF. */
     memset((unsigned char *)buffer+prefix,0,requested-prefix);
     *bytes_read = requested;
@@ -3059,7 +3121,7 @@ static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
     adapter->locks.unlock(adapter->locks.context);
     for (size_t i = 0; i < count; i++)
         file_read_result(&progress, &spans[i], !(progress.completed & (UINT32_C(1) << i)));
-    return lwext4_error(result);
+    return result ? ext4_node_io_error(node, result) : 0;
 }
 
 static int ext4_backend_writeback_mapped(struct kernel_vfs_node *node,
@@ -3261,7 +3323,19 @@ static int ext4_backend_lookup(struct kernel_vfs_node *parent,
             if (candidate) kernel_heap_release(adapter->instance.heap,candidate);
         }
     }
-    if (!error) *inode = result_inode;
+    if (!error) {
+        const struct ext4_sblock *sb = &adapter->device.fs->sb;
+        uint32_t first = ext4_get32(sb, rev_level) ?
+            ext4_get32(sb, first_inode) : EXT4_GOOD_OLD_FIRST_INO;
+        if (result_inode == EXT4_ROOT_INO ||
+            (result_inode >= first && result_inode <= ext4_get32(sb, inodes_count))) {
+            *inode = result_inode;
+            return 0;
+        }
+        error = -KERNEL_EUCLEAN;
+    }
+    if (error == -KERNEL_EUCLEAN || error == -KERNEL_EIO)
+        report_ext4_error(adapter, -error, parent->inode, live->generation);
     return error;
 }
 static int ext4_backend_readlink(struct kernel_vfs_node *node, char *buffer, size_t size, size_t *count)
@@ -3532,6 +3606,7 @@ static void initialize_backend(void)
     ops->unmount = ext4_backend_unmount;
     ops->prepare_unmount = ext4_backend_prepare_unmount;
     ops->remount = ext4_backend_remount;
+    ops->abort_mount = ext4_backend_abort_mount;
     ops->statfs = ext4_backend_statfs;
     ops->get_flags = ext4_backend_get_flags;
     ops->set_flags = ext4_backend_set_flags;
@@ -3565,6 +3640,7 @@ static void initialize_backend(void)
     ops->direct_write_limit = ext4_backend_direct_limit;
     ext2_backend = ext4_backend;
     ext2_backend.type = "ext2";
+    ext2_backend.abort_mount = NULL;
     ext2_backend.pread_batch = ext4_backend_pread_batch;
     __atomic_store_n(&ext4_backend.pread_batch,ext4_backend_pread_batch,__ATOMIC_RELEASE);
 }

@@ -1,8 +1,10 @@
 #include <kernel/credentials.h>
 #include <kernel/errno.h>
+#include <kernel/bitops.h>
 #include <kernel/fanotify.h>
 #include <kernel/fs_context.h>
 #include <kernel/pid.h>
+#include <kernel/pidfd.h>
 #include <kernel/wait_internal.h>
 #include "char_device_internal.h"
 #include "fanotify_internal.h"
@@ -16,19 +18,24 @@
 #include <string.h>
 
 enum {
-    FAN_CLOEXEC = 1, FAN_NONBLOCK = 2, FAN_REPORT_FID = 0x200,
+    FAN_CLOEXEC = 1, FAN_NONBLOCK = 2, FAN_UNLIMITED_QUEUE = 0x10,
+    FAN_UNLIMITED_MARKS = 0x20, FAN_REPORT_FID = 0x200,
     FAN_REPORT_DIR_FID = 0x400, FAN_REPORT_NAME = 0x800, FAN_REPORT_TARGET_FID = 0x1000,
+    FAN_REPORT_PIDFD = 0x80, FAN_REPORT_TID = 0x100,
     FAN_MARK_ADD = 1, FAN_MARK_REMOVE = 2, FAN_MARK_DONT_FOLLOW = 4,
     FAN_MARK_ONLYDIR = 8, FAN_MARK_MOUNT = 0x10, FAN_MARK_IGNORED_MASK = 0x20,
     FAN_MARK_IGNORED_SURV_MODIFY = 0x40, FAN_MARK_FLUSH = 0x80,
     FAN_MARK_FILESYSTEM = 0x100, FAN_MARK_TYPE = 0x110,
     FAN_MARK_EVICTABLE = 0x200, FAN_MARK_IGNORE = 0x400,
-    FAN_Q_OVERFLOW = 0x4000, FAN_EVENT_ON_CHILD = 0x08000000,
+    FAN_Q_OVERFLOW = 0x4000, FAN_FS_ERROR = VFS_NOTIFY_FS_ERROR,
+    FAN_EVENT_ON_CHILD = 0x08000000,
     FAN_RENAME = 0x10000000, FAN_ONDIR = VFS_NOTIFY_ISDIR, FAN_NOFD = -1,
-    FAN_INFO_FID = 1, FAN_INFO_DFID_NAME = 2, FAN_INFO_DFID = 3,
+    FAN_INFO_FID = 1, FAN_INFO_DFID_NAME = 2, FAN_INFO_DFID = 3, FAN_INFO_ERROR = 5,
+    FAN_FILEID_INVALID = 0xff,
+    FAN_INFO_PIDFD = 4, FAN_NOPIDFD = -1, FAN_EPIDFD = -2,
     FAN_INFO_OLD_DFID_NAME = 10, FAN_INFO_NEW_DFID_NAME = 12,
     FAN_MAX_GROUPS = 128, FAN_MAX_MARKS = 8192, FAN_MAX_EVENTS = 16384,
-    FAN_HASH_BUCKETS = 128, FAN_MERGE_LIMIT = 128,
+    FAN_FS_ERROR_RESERVE = 32, FAN_HASH_BUCKETS = 128, FAN_MERGE_LIMIT = 128,
     LINUX_O_CLOEXEC = 02000000, LINUX_O_NONBLOCK = 04000,
     FAN_CLASS_CONTENT = 4, FAN_CLASS_PRE_CONTENT = 8,
     FAN_ALLOW = 1, FAN_DENY = 2,
@@ -43,7 +50,7 @@ enum {
 #define FAN_INODE_EVENTS (VFS_NOTIFY_ATTRIB | VFS_NOTIFY_DELETE_SELF | VFS_NOTIFY_MOVE_SELF)
 #define FAN_EVENT_FLAGS (FAN_EVENT_ON_CHILD | FAN_ONDIR)
 #define FAN_SUPPORTED_MASK (FAN_PATH_EVENTS | FAN_INODE_EVENTS | FAN_DIRENT_EVENTS | \
-                            VFS_NOTIFY_PERMISSION_EVENTS | FAN_EVENT_FLAGS)
+                            VFS_NOTIFY_PERMISSION_EVENTS | FAN_EVENT_FLAGS | FAN_FS_ERROR)
 #define FAN_KNOWN_MASK UINT64_C(0x7b17bfff)
 #define FAN_KNOWN_FLAGS 0x7fffU
 #define FAN_KNOWN_MARK_FLAGS 0x7ffU
@@ -66,8 +73,21 @@ struct fan_fid_info {
     int32_t handle_type;
     unsigned char handle[sizeof(struct kernel_vfs_handle)];
 };
+struct fan_pidfd_info {
+    uint8_t type, pad;
+    uint16_t len;
+    int32_t pidfd;
+};
+struct fan_error_info {
+    uint8_t type, pad;
+    uint16_t len;
+    int32_t error;
+    uint32_t count;
+};
 _Static_assert(sizeof(struct fan_metadata) == 24, "fanotify metadata ABI");
 _Static_assert(offsetof(struct fan_fid_info, handle) == 20, "fanotify FID ABI");
+_Static_assert(sizeof(struct fan_error_info) == 12, "fanotify filesystem error ABI");
+_Static_assert(sizeof(struct fan_pidfd_info) == 8, "fanotify PIDFD ABI");
 struct fan_record {
     struct fan_metadata metadata;
     struct fan_fid_info fid;
@@ -100,6 +120,11 @@ struct fan_event {
     uint64_t fsid;
     struct kernel_vfs_handle handle;
     uint16_t info_bytes;
+};
+
+struct fan_error_event {
+    struct fan_event event;
+    unsigned char records[sizeof(struct fan_fid_info) + sizeof(struct fan_error_info)];
 };
 
 enum fan_permission_state {
@@ -147,6 +172,8 @@ struct fan_group {
     struct fan_event *first, **tail;
     struct fan_event *merge[FAN_HASH_BUCKETS];
     struct fan_event overflow;
+    struct fan_error_event *error_reserve;
+    uint32_t error_reserve_free;
     struct fan_permissions reported;
     uint64_t last_report;
     unsigned queued;
@@ -160,6 +187,7 @@ struct kernel_fanotify_read {
     void *vectors;
     struct fan_event *event;
     struct kernel_files_fd_reservation reservation;
+    struct kernel_pidfd_prepared pidfd;
 };
 
 static struct kernel_raw_lock mark_lock = {
@@ -211,6 +239,8 @@ static uint32_t mark_interest(const struct fan_mark *mark)
 static uint32_t parent_interest(const struct fan_mark *mark)
 {
     uint32_t interest = mark_interest(mark);
+    if (mark->ignore_has_flags && (mark->ignored & FAN_EVENT_ON_CHILD))
+        interest |= mark->ignored & ~FAN_EVENT_FLAGS;
     if (mark->mask & FAN_EVENT_ON_CHILD ||
         (mark->ignore_has_flags && (mark->ignored & FAN_EVENT_ON_CHILD)))
         return interest;
@@ -260,7 +290,8 @@ static void unlink_mark(struct fan_mark *mark)
     struct kernel_vfs_instance *instance = mark->key.instance;
     if (!--instance->fanotify_marks)
         __atomic_store_n(&instance->fanotify_ops, NULL, __ATOMIC_RELEASE);
-    mark->group->account->fanotify_marks--;
+    if (!(mark->group->init_flags & FAN_UNLIMITED_MARKS))
+        mark->group->account->fanotify_marks--;
     mark->group->mark_count--;
 }
 
@@ -342,8 +373,21 @@ static void group_put(struct fan_group *group)
         KERNEL_RAW_SCOPE(guard, &mark_lock);
         group->account->fanotify_groups--;
     }
+    if (group->error_reserve) kernel_heap_release(group->heap, group->error_reserve);
     kernel_uid_account_put(group->account);
     kernel_heap_release(group->heap, group);
+}
+
+static bool return_reserved_error(struct fan_group *group, struct fan_event *event)
+{
+    const struct fan_error_event *reserve =
+        __atomic_load_n(&group->error_reserve, __ATOMIC_ACQUIRE);
+    if (!reserve) return false;
+    uintptr_t offset = (uintptr_t)event - (uintptr_t)reserve;
+    if (offset >= sizeof(*reserve) * FAN_FS_ERROR_RESERVE) return false;
+    __atomic_fetch_or(&group->error_reserve_free,
+        UINT32_C(1) << (offset / sizeof(*reserve)), __ATOMIC_RELEASE);
+    return true;
 }
 
 static void event_destroy(struct fan_group *group, struct fan_event *event)
@@ -357,7 +401,8 @@ static void event_destroy(struct fan_group *group, struct fan_event *event)
     }
     if (event->path && kernel_vfs_path_release(&event->path)) __builtin_trap();
     if (event->sender) kernel_task_identity_put(event->sender);
-    kernel_heap_release(group->heap, event);
+    if (event->mask != FAN_FS_ERROR || !return_reserved_error(group, event))
+        kernel_heap_release(group->heap, event);
 }
 
 static void unlink_queued_event(struct fan_group *group, struct fan_event **link)
@@ -403,6 +448,7 @@ static void deny_unreadable_permission(struct fan_group *group, struct fan_event
 
 static void discard_opened_event(struct kernel_fanotify_read *read)
 {
+    kernel_pidfd_cancel_prepared(&read->pidfd);
     kernel_files_cancel_reservation(&read->reservation);
     if (read->opened)
         (void)kernel_files_release_uninstalled_description(read->files, &read->opened);
@@ -453,10 +499,11 @@ static void release_group(void *object)
     group_put(group);
 }
 
-static size_t event_size(const struct fan_event *event)
+static size_t event_size(const struct fan_group *group, const struct fan_event *event)
 {
     return sizeof(struct fan_metadata) + event->info_bytes +
-        (event->handle_type ? sizeof(struct fan_fid_info) : 0);
+        (event->handle_type ? sizeof(struct fan_fid_info) : 0) +
+        (group->init_flags & FAN_REPORT_PIDFD ? sizeof(struct fan_pidfd_info) : 0);
 }
 
 struct fan_file_id {
@@ -517,7 +564,10 @@ static unsigned event_bucket(const struct fan_event *event)
 {
     uint64_t key = (uintptr_t)event->sender >> 6;
     if (event->path) key ^= ((uintptr_t)event->path->dentry >> 4) ^ (uintptr_t)event->path->file.mount;
-    else key ^= event->fsid ^ event->handle.inode ^ event->handle.generation;
+    else {
+        key ^= event->fsid;
+        if (event->mask != FAN_FS_ERROR) key ^= event->handle.inode ^ event->handle.generation;
+    }
     key ^= key >> 17;
     return (unsigned)key & (FAN_HASH_BUCKETS - 1);
 }
@@ -528,7 +578,15 @@ static bool merge_event(struct fan_group *group, const struct fan_event *event,
     unsigned remaining = FAN_MERGE_LIMIT;
     for (struct fan_event *old = group->merge[event_bucket(event)]; old && remaining;
          old = old->hash_next, remaining--) {
-        if (old->sender != event->sender || !!old->path != !!event->path ||
+        if (old->sender != event->sender) continue;
+        if (event->mask == FAN_FS_ERROR) {
+            if (old->mask != FAN_FS_ERROR || old->fsid != event->fsid) continue;
+            struct fan_error_info *error =
+                (void *)((unsigned char *)(old + 1) + old->info_bytes - sizeof(*error));
+            if (error->count != UINT32_MAX) ++error->count;
+            return true;
+        }
+        if (old->mask == FAN_FS_ERROR || !!old->path != !!event->path ||
             ((old->mask ^ event->mask) & FAN_ONDIR) ||
             old->info_bytes != event->info_bytes) continue;
         if (old->path) {
@@ -556,6 +614,21 @@ static void append_event(struct fan_group *group, struct fan_event *event,
     if (was_empty) kernel_wait_cursor_prepare(&group->ready, cursor);
 }
 
+static struct fan_event *take_reserved_error(struct fan_group *group)
+{
+    struct fan_error_event *reserve = __atomic_load_n(&group->error_reserve, __ATOMIC_ACQUIRE);
+    if (!reserve) return NULL;
+    uint32_t free = __atomic_load_n(&group->error_reserve_free, __ATOMIC_RELAXED);
+    while (free) {
+        unsigned index = kernel_first_set_u64(free);
+        uint32_t remaining = free & (free - 1U);
+        if (__atomic_compare_exchange_n(&group->error_reserve_free, &free, remaining,
+                true, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return &reserve[index].event;
+    }
+    return NULL;
+}
+
 static void queue_records(struct fan_group *group, const struct fan_event *identity,
                           const struct fan_info *info, unsigned count)
 {
@@ -564,11 +637,13 @@ static void queue_records(struct fan_group *group, const struct fan_event *ident
         if (group->closed || merge_event(group, identity, info, count)) return;
     }
 
-    struct fan_event *candidate = NULL;
-    if (!kernel_heap_allocate_nosleep(group->heap, sizeof(*candidate) + identity->info_bytes,
-                                      (void **)&candidate)) {
+    struct fan_event *candidate = identity->mask == FAN_FS_ERROR ? take_reserved_error(group) : NULL;
+    if (candidate || !kernel_heap_allocate_nosleep(group->heap, sizeof(*candidate) + identity->info_bytes,
+                                                  (void **)&candidate)) {
         *candidate = *identity;
         if (count) encode_info(candidate, info, count);
+        else if (identity->mask == FAN_FS_ERROR)
+            memcpy(candidate + 1, identity + 1, identity->info_bytes);
         if (candidate->sender) kernel_task_identity_retain(candidate->sender);
         if (identity->path) {
             candidate->path = NULL;
@@ -582,7 +657,8 @@ static void queue_records(struct fan_group *group, const struct fan_event *ident
     {
         KERNEL_RAW_SCOPE(guard, &group->queue_lock);
         if (!group->closed && !merge_event(group, identity, info, count)) {
-            if (candidate && group->queued < FAN_MAX_EVENTS) {
+            if (candidate && (group->queued < FAN_MAX_EVENTS ||
+                (group->init_flags & FAN_UNLIMITED_QUEUE))) {
                 struct fan_event **slot = &group->merge[event_bucket(candidate)];
                 candidate->hash_next = *slot;
                 candidate->hash_previous = slot;
@@ -638,6 +714,8 @@ static struct fan_group *select_group(struct fan_key *keys, unsigned count,
             if (!mark || mark->group != group ||
                 (keys[i].node && mark->key.node && keys[i].node != mark->key.node)) continue;
             bool parent = !!(parent_keys & (1U << i));
+            if (parent && !(mark->mask & FAN_EVENT_ON_CHILD) &&
+                !(mark->ignore_has_flags && (mark->ignored & FAN_EVENT_ON_CHILD))) continue;
             if ((event & VFS_NOTIFY_MODIFY) && !mark->survive_modify && mark->ignored) {
                 uint32_t old = mark_interest(mark), old_parent = parent_interest(mark);
                 mark->ignored = 0;
@@ -669,13 +747,35 @@ struct fan_subject {
     struct kernel_vfs_node *node;
 };
 
+struct fan_senders {
+    struct kernel_pid *identity[2];
+    unsigned sampled;
+};
+
+static struct kernel_pid *fan_sender(struct fan_senders *senders, const struct fan_group *group)
+{
+    unsigned thread = !!(group->init_flags & FAN_REPORT_TID);
+    unsigned bit = 1U << thread;
+    if (!(senders->sampled & bit)) {
+        senders->identity[thread] =
+            kernel_task_identity_get_current(thread ? KERNEL_PID_TID : KERNEL_PID_TGID);
+        senders->sampled |= bit;
+    }
+    return senders->identity[thread];
+}
+
+static void fan_senders_release(struct fan_senders *senders)
+{
+    if (senders->identity[0]) kernel_task_identity_put(senders->identity[0]);
+    if (senders->identity[1]) kernel_task_identity_put(senders->identity[1]);
+}
+
 struct fan_delivery {
     struct fan_subject object, directory, destination;
     const struct kernel_vfs_path *path;
     const char *name, *new_name;
     uint16_t name_bytes, new_name_bytes;
-    struct kernel_pid *sender;
-    bool sender_sampled;
+    struct fan_senders senders;
 };
 
 static struct fan_file_id *file_id(struct fan_subject *subject)
@@ -750,11 +850,9 @@ static void dispatch_delivery(struct fan_delivery *delivery, struct fan_key *key
             event, -1, &mask, &fsid, &matched);
         if (!group) break;
         if (mask && (group->fid || delivery->path)) {
-            if (!delivery->sender_sampled) {
-                (void)kernel_task_identity_get(0, &delivery->sender);
-                delivery->sender_sampled = true;
-            }
-            struct fan_event identity = {.sender = delivery->sender, .mask = mask, .fsid = fsid};
+            struct fan_event identity = {
+                .sender = fan_sender(&delivery->senders, group), .mask = mask, .fsid = fsid,
+            };
             if (group->fid) {
                 /* Rename keys are old directory, new directory, filesystem.
                  * A filesystem mark represents both names. */
@@ -788,7 +886,7 @@ static void notify(const struct kernel_vfs_file *file, const struct kernel_vfs_p
         .name = name, .name_bytes = name ? strlen(name) + 1 : 0,
     };
     dispatch_delivery(&delivery, keys, count, 1U << 3, event);
-    if (delivery.sender) kernel_task_identity_put(delivery.sender);
+    fan_senders_release(&delivery.senders);
 }
 
 static void notify_entry(const struct kernel_vfs_path *parent, const char *name,
@@ -829,7 +927,7 @@ static void notify_entry(const struct kernel_vfs_path *parent, const char *name,
     } else {
         dispatch_delivery(&delivery, keys, 2, 0, event);
     }
-    if (delivery.sender) kernel_task_identity_put(delivery.sender);
+    fan_senders_release(&delivery.senders);
 }
 
 static int request_permission(struct fan_group *group, const struct kernel_vfs_path *path,
@@ -856,7 +954,7 @@ static int request_permission(struct fan_group *group, const struct kernel_vfs_p
     {
         KERNEL_RAW_SCOPE(guard, &group->queue_lock);
         if (!group->closed) {
-            if (group->queued >= FAN_MAX_EVENTS) {
+            if (group->queued >= FAN_MAX_EVENTS && !(group->init_flags & FAN_UNLIMITED_QUEUE)) {
                 if (!group->overflow_queued) {
                     group->overflow_queued = true;
                     append_event(group, &group->overflow, &ready);
@@ -933,8 +1031,7 @@ static int check_permission(const struct kernel_vfs_file *file, const struct ker
     if (!(event & VFS_NOTIFY_PERMISSION_EVENTS)) return 0;
 
     uint64_t limit = __atomic_load_n(&last_group, __ATOMIC_RELAXED);
-    struct kernel_pid *sender = NULL;
-    bool sender_sampled = false;
+    struct fan_senders senders = {0};
     int result = 0;
     for (int priority = FAN_CLASS_PRE_CONTENT; priority >= FAN_CLASS_CONTENT; priority -= 4) {
         uint64_t after = 0;
@@ -946,25 +1043,60 @@ static int check_permission(const struct kernel_vfs_file *file, const struct ker
                 event, priority, &mask, &fsid, &matched);
             if (!group) break;
             if (mask) {
-                if (!sender_sampled) {
-                    (void)kernel_task_identity_get(0, &sender);
-                    sender_sampled = true;
-                }
-                result = request_permission(group, path, sender, mask & ~FAN_ONDIR);
+                result = request_permission(group, path, fan_sender(&senders, group), mask & ~FAN_ONDIR);
             }
             group_put(group);
             if (result) break;
         }
         if (result) break;
     }
-    if (sender) kernel_task_identity_put(sender);
+    fan_senders_release(&senders);
     return result;
+}
+
+static void notify_filesystem_error(struct kernel_vfs_instance *instance, int error,
+                                    const struct kernel_vfs_handle *handle, int type)
+{
+    struct fan_key key = {.instance = instance, .type = FAN_MARK_FILESYSTEM};
+    struct fan_senders senders = {0};
+    uint64_t after = 0, limit = __atomic_load_n(&last_group, __ATOMIC_RELAXED);
+    for (;;) {
+        uint32_t mask;
+        uint64_t fsid = 0;
+        unsigned matched;
+        struct fan_group *group = select_group(&key, 1, 0, &after, limit,
+            FAN_FS_ERROR, -1, &mask, &fsid, &matched);
+        if (!group) break;
+        if (mask) {
+            struct fan_error_event entry = {0};
+            struct fan_fid_info fid = {
+                .type = FAN_INFO_FID,
+                .len = handle ? sizeof(fid) : offsetof(struct fan_fid_info, handle),
+                .fsid = {(int32_t)fsid, (int32_t)(fsid >> 32)},
+                .handle_bytes = handle ? sizeof(*handle) : 0,
+                .handle_type = handle ? type : FAN_FILEID_INVALID,
+            };
+            struct fan_error_info detail = {
+                .type = FAN_INFO_ERROR, .len = sizeof(detail), .error = error, .count = 1,
+            };
+            if (handle) memcpy(fid.handle, handle, sizeof(*handle));
+            memcpy(entry.records, &fid, fid.len);
+            memcpy(entry.records + fid.len, &detail, sizeof(detail));
+            entry.event.sender = fan_sender(&senders, group);
+            entry.event.fsid = fsid;
+            entry.event.mask = FAN_FS_ERROR;
+            entry.event.info_bytes = fid.len + sizeof(detail);
+            queue_notification(group, &entry.event);
+        }
+        group_put(group);
+    }
+    fan_senders_release(&senders);
 }
 
 static const struct kernel_fanotify_ops fan_ops = {
     .permission = check_permission,
     .notify = notify, .notify_entry = notify_entry, .retire_inode = retire_inode, .retire_mount = retire_mount,
-    .retire_instance = retire_instance,
+    .retire_instance = retire_instance, .filesystem_error = notify_filesystem_error,
 };
 
 static uint32_t poll_events(void *object, uint32_t flags, uint32_t requested,
@@ -1106,7 +1238,7 @@ static int output_event(struct kernel_fanotify_read *read, struct kernel_mm *mm,
 {
     struct fan_group *group = read->group;
     struct fan_event *event = read->event;
-    const size_t size = event_size(event);
+    const size_t size = event_size(group, event);
     struct fan_record record = {0};
     record.metadata = (struct fan_metadata){
         .event_len = (uint32_t)size, .version = 3, .metadata_len = sizeof(record.metadata),
@@ -1141,19 +1273,46 @@ static int output_event(struct kernel_fanotify_read *read, struct kernel_mm *mm,
         record.fid.handle_type = event->handle_type;
         memcpy(record.fid.handle, &event->handle, sizeof(event->handle));
     }
+
+    int32_t pidfd = FAN_NOPIDFD;
+    const bool report_pidfd = !!(group->init_flags & FAN_REPORT_PIDFD);
+    if (report_pidfd && record.metadata.pid) {
+        int error = kernel_pidfd_prepare_event(read->files, event->sender, &read->pidfd);
+        if (!error) pidfd = (int32_t)read->pidfd.fd;
+        else {
+            if (error != -KERNEL_ESRCH) pidfd = FAN_EPIDFD;
+            kernel_pidfd_cancel_prepared(&read->pidfd);
+        }
+    }
     size_t copied = 0;
-    size_t prefix = size - event->info_bytes;
+    size_t prefix = sizeof(record.metadata) + (event->handle_type ? sizeof(record.fid) : 0);
     if (kernel_copy_to_user_iov(mm, cursor, &record, prefix, &copied) || copied != prefix)
         return -KERNEL_EFAULT;
-    if (event->info_bytes &&
-        (kernel_copy_to_user_iov(mm, cursor, event + 1, event->info_bytes, &copied) ||
-         copied != event->info_bytes)) return -KERNEL_EFAULT;
-    if (read->opened) {
+    const unsigned char *records = (const unsigned char *)(event + 1);
+    size_t error_bytes = report_pidfd && event->mask == FAN_FS_ERROR ? sizeof(struct fan_error_info) : 0;
+    size_t info_bytes = event->info_bytes - error_bytes;
+    if (info_bytes &&
+        (kernel_copy_to_user_iov(mm, cursor, records, info_bytes, &copied) ||
+         copied != info_bytes)) return -KERNEL_EFAULT;
+    if (report_pidfd) {
+        const struct fan_pidfd_info info = {
+            .type = FAN_INFO_PIDFD, .len = sizeof(info), .pidfd = pidfd,
+        };
+        if (kernel_copy_to_user_iov(mm, cursor, &info, sizeof(info), &copied) ||
+            copied != sizeof(info)) return -KERNEL_EFAULT;
+    }
+    if (error_bytes &&
+        (kernel_copy_to_user_iov(mm, cursor, records + info_bytes, error_bytes, &copied) ||
+         copied != error_bytes)) return -KERNEL_EFAULT;
+    if (read->opened || read->pidfd.file) {
         KERNEL_FILES_SCOPE(guard, read->files);
-        if (kernel_files_install_owned_locked(read->files, read->reservation.fd,
-                group->event_flags & LINUX_O_CLOEXEC ? KERNEL_FILES_FD_CLOEXEC : 0, &read->opened))
-            __builtin_trap();
-        read->reservation.files = NULL;
+        if (read->opened) {
+            if (kernel_files_install_owned_locked(read->files, read->reservation.fd,
+                    group->event_flags & LINUX_O_CLOEXEC ? KERNEL_FILES_FD_CLOEXEC : 0, &read->opened))
+                __builtin_trap();
+            read->reservation.files = NULL;
+        }
+        if (read->pidfd.file) kernel_pidfd_install_prepared_locked(&read->pidfd);
     }
     struct fan_permission *permission = permission_of(event);
     if (permission) permission->fd = record.metadata.fd;
@@ -1172,7 +1331,7 @@ static int64_t read_records(struct kernel_fanotify_read *read,
             KERNEL_RAW_SCOPE(guard, &group->queue_lock);
             event = group->first;
             if (event) {
-                if (event_size(event) > bytes - done) return done ? (int64_t)done : -KERNEL_EINVAL;
+                if (event_size(group, event) > bytes - done) return done ? (int64_t)done : -KERNEL_EINVAL;
                 unlink_queued_event(group, &group->first);
                 struct fan_permission *permission = permission_of(event);
                 if (permission) permission->state = FAN_PERMISSION_READING;
@@ -1316,6 +1475,7 @@ static enum kernel_files_status create_group(struct kernel_files *files, unsigne
         return KERNEL_FILES_STATUS_OK;
     }
     if ((flags & ~FAN_KNOWN_FLAGS) || (flags & 12U) == 12U ||
+        (flags & (FAN_REPORT_PIDFD | FAN_REPORT_TID)) == (FAN_REPORT_PIDFD | FAN_REPORT_TID) ||
         (event_flags & ~FAN_EVENT_FILE_FLAGS) || (event_flags & 3U) == 3U) {
         *result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
@@ -1329,7 +1489,8 @@ static enum kernel_files_status create_group(struct kernel_files *files, unsigne
         *result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (flags & ~(FAN_CLOEXEC | FAN_NONBLOCK | FAN_FID_FLAGS | FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT)) {
+    if (flags & ~(FAN_CLOEXEC | FAN_NONBLOCK | FAN_FID_FLAGS | FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT |
+                  FAN_UNLIMITED_QUEUE | FAN_UNLIMITED_MARKS | FAN_REPORT_PIDFD | FAN_REPORT_TID)) {
         *result = -KERNEL_EOPNOTSUPP;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -1415,7 +1576,7 @@ static int resolve_mark(struct kernel_files *files, const struct kernel_fs_conte
         struct kernel_open_file_description *file = kernel_files_hold_fd(files, dirfd, &pin);
         if (!file) return -KERNEL_EBADF;
         struct kernel_vfs_path *selected = kernel_open_file_path(file);
-        if (!selected) return -KERNEL_EOPNOTSUPP;
+        if (!selected) return flags & FAN_MARK_TYPE ? -KERNEL_EINVAL : -KERNEL_EOPNOTSUPP;
         int error = kernel_vfs_path_acquire(selected);
         if (!error) *path = selected;
         return error;
@@ -1444,6 +1605,12 @@ static int update_mark(struct fan_group *group, struct fan_key key, unsigned fla
                        uint32_t mask, uint64_t fsid)
 {
     struct fan_mark *candidate = NULL, *retired = NULL;
+    struct fan_error_event *reserve = NULL;
+    bool needs_reserve = (flags & FAN_MARK_ADD) && !(flags & FAN_IGNORE_FLAGS) &&
+        (mask & FAN_FS_ERROR);
+    if (needs_reserve && !__atomic_load_n(&group->error_reserve, __ATOMIC_ACQUIRE))
+        (void)kernel_heap_allocate_zeroed(group->heap, FAN_FS_ERROR_RESERVE, sizeof(*reserve),
+                                         (void **)&reserve);
     if (flags & FAN_MARK_ADD)
         (void)kernel_heap_allocate_zeroed(group->heap, 1, sizeof(*candidate), (void **)&candidate);
     int error = 0;
@@ -1458,12 +1625,20 @@ static int update_mark(struct fan_group *group, struct fan_key key, unsigned fla
         }
         if (flags & FAN_MARK_ADD) {
             if (!mark && !candidate) error = -KERNEL_ENOMEM;
-            else if (!mark && group->account->fanotify_marks == FAN_MAX_MARKS) error = -KERNEL_ENOSPC;
+            else if (!mark && !(group->init_flags & FAN_UNLIMITED_MARKS) &&
+                     group->account->fanotify_marks == FAN_MAX_MARKS) error = -KERNEL_ENOSPC;
             else if (mark && (((flags & FAN_MARK_EVICTABLE) && !mark->evictable) ||
                      ((flags & FAN_MARK_IGNORED_MASK) && mark->ignore_has_flags) ||
                      ((flags & FAN_MARK_IGNORE) && !(flags & FAN_MARK_IGNORED_SURV_MODIFY) &&
                       mark->survive_modify))) error = -KERNEL_EEXIST;
+            else if (needs_reserve && !reserve &&
+                     !__atomic_load_n(&group->error_reserve, __ATOMIC_RELAXED)) error = -KERNEL_ENOMEM;
             else {
+                if (reserve && !__atomic_load_n(&group->error_reserve, __ATOMIC_RELAXED)) {
+                    group->error_reserve_free = UINT32_MAX;
+                    __atomic_store_n(&group->error_reserve, reserve, __ATOMIC_RELEASE);
+                    reserve = NULL;
+                }
                 uint32_t old = mark ? mark_interest(mark) : 0;
                 uint32_t old_parent = mark ? parent_interest(mark) : 0;
                 bool add_pin = key.node && !(flags & FAN_MARK_EVICTABLE) &&
@@ -1486,7 +1661,8 @@ static int update_mark(struct fan_group *group, struct fan_key key, unsigned fla
                     RB_INSERT(fan_marks, &marks, mark);
                     if (!key.instance->fanotify_marks++)
                         __atomic_store_n(&key.instance->fanotify_ops, &fan_ops, __ATOMIC_RELEASE);
-                    group->account->fanotify_marks++;
+                    if (!(group->init_flags & FAN_UNLIMITED_MARKS))
+                        group->account->fanotify_marks++;
                     group->mark_count++;
                 }
                 mark->evictable = !!(flags & FAN_MARK_EVICTABLE);
@@ -1510,6 +1686,7 @@ static int update_mark(struct fan_group *group, struct fan_key key, unsigned fla
         }
     }
     if (candidate) kernel_heap_release(group->heap, candidate);
+    if (reserve) kernel_heap_release(group->heap, reserve);
     if (retired) destroy_mark(group->heap, retired);
     return error;
 }
@@ -1537,6 +1714,7 @@ static int modify_mark(struct kernel_files *files, const struct kernel_fs_contex
         return -KERNEL_EPERM;
     if (type == FAN_MARK_TYPE) return -KERNEL_EOPNOTSUPP;
     if ((mask & VFS_NOTIFY_PERMISSION_EVENTS) && !group->priority) return -KERNEL_EINVAL;
+    if ((mask & FAN_FS_ERROR) && type != FAN_MARK_FILESYSTEM) return -KERNEL_EINVAL;
     if ((mask & (FAN_INODE_EVENTS | FAN_DIRENT_EVENTS)) &&
         (!group->fid || type == FAN_MARK_MOUNT))
         return -KERNEL_EINVAL;
@@ -1555,13 +1733,17 @@ static int modify_mark(struct kernel_files *files, const struct kernel_fs_contex
     if (!node) return -KERNEL_EOPNOTSUPP;
     bool dir = (path->file.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR;
     if ((flags & FAN_MARK_ONLYDIR) && !dir) return -KERNEL_ENOTDIR;
+    if (command == FAN_MARK_ADD && !type && !dir &&
+        (mask & (FAN_DIRENT_EVENTS | FAN_EVENT_FLAGS)) &&
+        ((group->report & FAN_REPORT_TARGET_FID) || (mask & FAN_RENAME) || (flags & FAN_MARK_IGNORE)))
+        return -KERNEL_ENOTDIR;
     if (command == FAN_MARK_ADD && (flags & FAN_MARK_IGNORE) &&
         !(flags & FAN_MARK_IGNORED_SURV_MODIFY) && (type || dir))
         return type ? -KERNEL_EINVAL : -KERNEL_EISDIR;
     error = kernel_vfs_path_permission(path, KERNEL_VFS_MAY_READ);
     if (error) return error;
     uint64_t fsid = 0;
-    if (group->fid) {
+    if (group->fid || (mask & FAN_FS_ERROR)) {
         if (kernel_vfs_handle_type(path,!type) < 0) return -KERNEL_EOPNOTSUPP;
         if (command == FAN_MARK_ADD) {
             struct kernel_vfs_statfs stat;

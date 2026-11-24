@@ -33,6 +33,7 @@ struct fat_mount {
     struct fat_entry_tree entries;
     struct fat_inode *retired_inodes;
     uint64_t next_id, fat_start, data_start, fat_bytes, sector_at;
+    uint64_t handle_epoch;
     uint32_t sectors, sector_size, cluster_size, cluster_count, root_cluster;
     uint32_t free_clusters, next_free, fsinfo, backup_boot;
     unsigned fats, active_fat, mirrored;
@@ -699,6 +700,35 @@ static int open_inode(struct kernel_vfs_mount *mount, const char *path, uint64_t
     }
     return kernel_vfs_publish_node(mount, node, file, 0);
 }
+
+static void handle_filesystem(struct kernel_vfs_instance *instance, unsigned char identity[16])
+{
+    const struct fat_mount *mount = fm(instance);
+    const uint64_t values[2] = {instance->backend_mount.id, mount->handle_epoch};
+    memcpy(identity, values, sizeof(values));
+}
+
+static uint32_t handle_generation(struct kernel_vfs_node *node)
+{
+    (void)node;
+    /* Inode numbers are monotonic within one mounted FAT instance. */
+    return 0;
+}
+
+static int handle_open(struct kernel_vfs_mount *mount, const struct kernel_vfs_handle *handle,
+    struct kernel_vfs_file *file)
+{
+    if (handle->generation) return -KERNEL_ESTALE;
+    return open_inode(mount, NULL, handle->inode, 0, file);
+}
+
+static const struct kernel_vfs_export_ops fat_export = {
+    .type = KERNEL_VFS_HANDLE_FAT32,
+    .filesystem = handle_filesystem,
+    .generation = handle_generation,
+    .open = handle_open,
+};
+
 static int close_node(struct kernel_vfs_node *node)
 {
     struct fat_inode *i = fi(node);
@@ -762,13 +792,45 @@ static int create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const c
     }
     return open_inode(mount, 0, id, 0, file);
 }
-static int mkdir_inode(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode,uint32_t umask)
+static int create_named(struct fat_mount *m, uint64_t parent, const char *name,
+    uint32_t mode, struct kernel_vfs_handle *handle)
 {
-    mode &= ~umask;
-    struct fat_mount *m = fm(mount->private_data);
     KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
     int r = fat_error(&m->instance);
-    return r ? r : create_child(m, parent_inode, path, KERNEL_VFS_S_IFDIR | (mode & 0777), 0);
+    if (r) return r;
+    struct fat_inode *created;
+    r = create_child(m, parent, name, mode, handle ? &created : NULL);
+    if (!r && handle) {
+        *handle = (struct kernel_vfs_handle){.inode = created->id};
+        handle_filesystem(&m->instance, handle->filesystem);
+    }
+    return r;
+}
+
+static int mkdir_inode(struct kernel_vfs_mount *mount, uint64_t parent, const char *name,
+    uint32_t mode, uint32_t umask)
+{
+    return create_named(fm(mount->private_data), parent, name,
+        KERNEL_VFS_S_IFDIR | (mode & ~umask & 0777U), NULL);
+}
+
+static int mknod_inode(struct kernel_vfs_instance *instance, uint64_t parent, const char *name,
+    uint32_t type, uint32_t mode, uint32_t device, uint32_t umask)
+{
+    (void)device;
+    if (type != KERNEL_VFS_S_IFREG) return -KERNEL_EOPNOTSUPP;
+    return create_named(fm(instance), parent, name, type | (mode & ~umask & 0777U), NULL);
+}
+
+static int create_with_handle(struct kernel_vfs_mount *mount, uint64_t parent, const char *name,
+    uint32_t mode, uint32_t device, const char *target, uint32_t umask,
+    struct kernel_vfs_handle *handle)
+{
+    (void)device;
+    (void)target;
+    uint32_t type = mode & KERNEL_VFS_S_IFMT;
+    if (type != KERNEL_VFS_S_IFDIR && type != KERNEL_VFS_S_IFREG) return -KERNEL_EOPNOTSUPP;
+    return create_named(fm(mount->private_data), parent, name, type | (mode & ~umask & 0777U), handle);
 }
 static int empty_directory(struct fat_mount *m, struct fat_inode *i)
 {
@@ -1268,10 +1330,10 @@ static int check_domain(const struct kernel_vfs_node *node, const struct kernel_
     return fi((struct kernel_vfs_node *)node)->id == node->inode ? 0 : -KERNEL_EINVAL;
 }
 static const struct kernel_vfs_backend fat_ops = {
-    .type="vfat",
+    .type="vfat", .export = &fat_export, .create_with_handle = create_with_handle,
     .check_domain = check_domain,
     .error = fat_error, .root = root, .lookup = lookup, .entry_name = entry_name, .open = open_inode, .close_node = close_node,
-    .create = create, .mkdir = mkdir_inode, .unlink = unlink_file, .rmdir = rmdir_inode,
+    .create = create, .mkdir = mkdir_inode, .mknod = mknod_inode, .unlink = unlink_file, .rmdir = rmdir_inode,
     .rename = rename_inode, .release_unlinked = release_unlinked, .dir_entry = dir_entry,
     .direct_alignment=direct_alignment, .direct_write_limit=direct_write_limit,
     .pread = pread_inode, .prepare_write = prepare_write, .complete_write = complete_write,
@@ -1293,6 +1355,7 @@ int kernel_vfs_mount_fat32(struct kernel_vfs_mount *mount, struct kernel_block_d
     if (allocation) return allocation==KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     m->block=block;m->instance.heap=heap;m->instance.page_cache=cache;
     m->instance.backend_data=m;m->instance.ops=&fat_ops;m->instance.read_only=read_only!=0;
+    m->handle_epoch = kernel_time_realtime_ns();
     mount->private_data=&m->instance;mount->id=kernel_vfs_allocate_mount_id();mount->state=VFS_MOUNT_STATE_CLEANUP;
     kernel_vfs_mount_initialize(mount);m->instance.device_id=block->device_number;m->mount=&m->instance.backend_mount;
     int r=kernel_block_claim(block,m->mount);

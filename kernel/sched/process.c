@@ -850,7 +850,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     enum kernel_pid_status pid_status;
     enum kernel_signal_status signal_status;
     enum kernel_scheduler_status status;
-    struct kernel_pidfd_prepared pidfd __attribute__((cleanup(kernel_pidfd_cancel_clone))) = {0};
+    struct kernel_pidfd_prepared pidfd __attribute__((cleanup(kernel_pidfd_cancel_prepared))) = {0};
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
@@ -1169,7 +1169,7 @@ enum kernel_scheduler_status arch_process_clone_current(
             kernel_pid_get(trace_child);
         }
         memcpy(child->comm, parent->comm, sizeof(child->comm));
-        if(pidfd.files) kernel_pidfd_install_clone_locked(&pidfd);
+        if(pidfd.files) kernel_pidfd_install_prepared_locked(&pidfd);
         if (thread_clone) {
             child->group_leader = leader;
             child->group_members = 0;

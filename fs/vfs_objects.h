@@ -274,6 +274,7 @@ struct kernel_vfs_backend {
         const char *new_name, unsigned flags, struct kernel_vfs_rename_result *result);
     /* Failure keeps the attached root and backend owner reachable for retry. */
     int (*remount)(struct kernel_vfs_mount *mount, int read_only);
+    void (*abort_mount)(struct kernel_vfs_instance *);
     int (*prepare_unmount)(struct kernel_vfs_mount *mount);
     int (*unmount)(struct kernel_vfs_mount *mount);
     int (*statfs)(struct kernel_vfs_mount *mount,

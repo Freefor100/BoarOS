@@ -432,6 +432,14 @@ int kernel_task_identity_get(int32_t pid, struct kernel_pid **owner)
     return 0;
 }
 
+struct kernel_pid *kernel_task_identity_get_current(enum kernel_pid_role role)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_pid *identity = process_identity(kernel_task_current(), role);
+    if (identity) kernel_pid_get(identity);
+    return identity;
+}
+
 int kernel_task_identity_get_user(int32_t pid,struct kernel_pid **owner)
 {
     if(!owner)return -KERNEL_EINVAL;

@@ -13,6 +13,8 @@ struct kernel_vfs_mount;
 struct kernel_vfs_node;
 struct kernel_vfs_path;
 
+#define VFS_NOTIFY_FS_ERROR UINT32_C(0x00008000)
+
 struct kernel_fanotify_ops {
     void (*notify)(const struct kernel_vfs_file *, const struct kernel_vfs_path *,
                    struct kernel_vfs_node *parent, const char *name, uint32_t mask);
@@ -25,6 +27,8 @@ struct kernel_fanotify_ops {
     void (*retire_inode)(struct kernel_vfs_node *, bool evicted);
     void (*retire_mount)(struct kernel_vfs_mount *);
     void (*retire_instance)(struct kernel_vfs_instance *);
+    void (*filesystem_error)(struct kernel_vfs_instance *, int error,
+                             const struct kernel_vfs_handle *, int handle_type);
 };
 
 int kernel_vfs_fanotify_encode_handle(const struct kernel_vfs_file *,

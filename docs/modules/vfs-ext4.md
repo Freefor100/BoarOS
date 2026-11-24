@@ -128,6 +128,7 @@ BoarOS 以 `third_party/lwext4` 作为磁盘格式解析基础，在 `fs/ext4_ba
 - **空间操作与稀疏定位**：`fallocate` 支持普通预分配、保持文件长度（`FALLOC_FL_KEEP_SIZE`）、打洞释放块（`FALLOC_FL_PUNCH_HOLE`）以及清零区段（`FALLOC_FL_ZERO_RANGE`，将完整数据块高效转为未写入区段）；`lseek` 支持 `SEEK_DATA` / `SEEK_HOLE` 同时合并磁盘区段映射与页缓存中的未落盘脏页。
 - **POSIX 访问控制列表（ACL）与扩展属性（xattr）**：支持 `system.posix_acl_access` / `system.posix_acl_default` 与通用扩展属性；活跃目录缓存“无默认 ACL”结论，加速同目录连续创建文件。
 - **文件句柄编解码（`name_to_handle_at` / `open_by_handle_at`）**：ext4 句柄编码卷 UUID、32 位 `inode` 号与磁盘代次（`generation`），支持跨重命名重打开以及节点回收复用后的旧句柄失效检测（返回 `ESTALE`）；冷目录句柄通过沿 `".."` 向上重建目录项链恢复路径。
+- **FAT32 文件句柄。** 句柄编码挂载实例身份及实例内单调分配的索引节点号。重命名保留该编号，解除链接或重新挂载后，旧句柄返回 `ESTALE`。目录项创建时可以直接返回新对象的句柄，供 `fanotify` 报告目标身份。
 
 ---
 

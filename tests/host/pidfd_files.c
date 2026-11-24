@@ -65,6 +65,9 @@ void kernel_rwlock_init(struct kernel_rwlock *lock,uint32_t rank,uintptr_t key)
 {*lock=(struct kernel_rwlock){.rank=rank,.key=key};}
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t count,size_t size,void **out)
 {assert(h==&heap && !cpu.raw_locks);if(fail_allocation && !--fail_allocation)return KERNEL_HEAP_STATUS_EMPTY;*out=calloc(count,size);assert(*out);__atomic_fetch_add(&allocations,1,__ATOMIC_RELAXED);return KERNEL_HEAP_STATUS_OK;}
+enum kernel_heap_status kernel_heap_allocate_zeroed_nosleep(struct kernel_heap *h,
+    size_t count, size_t size, void **out)
+{ return kernel_heap_allocate_zeroed(h, count, size, out); }
 void kernel_heap_release(struct kernel_heap *h,void *p)
 {assert(h==&heap && p && !cpu.raw_locks);assert(__atomic_fetch_sub(&allocations,1,__ATOMIC_RELAXED));free(p);}
 enum kernel_open_file_status kernel_open_file_acquire(struct kernel_open_file_description *file)
