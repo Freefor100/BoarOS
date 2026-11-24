@@ -280,6 +280,29 @@ enum kernel_uaccess_status kernel_copy_to_user(
     size_t size, size_t *bytes_copied)
 {
     size_t first=BOAROS_PAGE_SIZE-(user_destination&BOAROS_PAGE_MASK);
+#if defined(__loongarch__)
+    /* A one-shot copy within one destination page owns the pin until the
+     * last byte. Batched callers keep using the reusable write cursor. */
+    if (size && size <= first && mm && kernel_source && bytes_copied) {
+        *bytes_copied = 0;
+        if (kernel_user_range_check(user_destination, size))
+            return KERNEL_UACCESS_STATUS_FAULT;
+        struct kernel_mm_user_pin pin = {0};
+        enum kernel_uaccess_status status =
+            pin_user_prefix(mm, user_destination, 0, KERNEL_MM_WRITE, &pin, NULL);
+        if (status == KERNEL_UACCESS_STATUS_FAULT) {
+            status = access_status(kernel_mm_copy_local_secret(mm, user_destination,
+                (void *)kernel_source, size, SECRET_COPY_OUT, bytes_copied));
+            COST_ADD(COPY_TO_USER, *bytes_copied);
+        } else if (status == KERNEL_UACCESS_STATUS_OK) {
+            copy_to_pinned_page((unsigned char *)pin.page + (user_destination & BOAROS_PAGE_MASK),
+                                kernel_source, size);
+            kernel_mm_unpin_user_page(&pin);
+            *bytes_copied = size;
+        }
+        return status;
+    }
+#endif
     if (size>first && size-first<=BOAROS_PAGE_SIZE && mm && kernel_source &&
         bytes_copied && !kernel_user_range_check(user_destination,size)
 #if ARCH_UACCESS_NATIVE
