@@ -72,7 +72,7 @@
 ### 2.5 其他文件与通知测例判读说明
 
 - **`fanotify03` / `10` / `13` / `16` / `23`**：`fanotify03` 验证打开/读/执行权限拦截；`fanotify10` 同时验证事件过滤与 `/proc/self/fdinfo/<fd>` 中的忽略标记（旧式忽略掩码不支持目录/子项过滤语义，对应 3 种配置与参考 Linux 一致跳过）；`fanotify16` 验证目录句柄、名称、目标句柄与改名事件；`fanotify23` 格式化挂载 ext2 并在缓存回收后核对可回收标记自动撤除而普通标记保留；`fanotify13` 在 ext4 基础与叠加（OverlayFS）变体下，四组原程序各通过 45 项断言（基础 15 项 + 下层/上层各 10 项 + 叠加视图下层/上层各 5 项，其余跳过项与参考 Linux 行为一致）。实现详见 [文件资源层](../modules/kernel-files.md)。
-- **文件系统变体。** `fanotify01`、`fanotify13` 至 `fanotify16`、`fanotify20` 和 `fanotify21` 会遍历可用文件系统，每轮的通过断言均进入原程序的计分摘要。FAT32 已有文件句柄支持，能执行 `fanotify16` 的 vfat 变体。`fanotify22` 指定 ext4，并调用客机的 `debugfs` 修改独立测试分区上的元数据。初赛发布盘缺少这个程序，兼容分支在工具分区交付对应架构的静态程序，启动时链接至 `/bin/debugfs`。
+- **文件系统变体。** `fanotify01`、`fanotify13` 至 `fanotify16`、`fanotify20` 和 `fanotify21` 会遍历可用文件系统，每轮的通过断言均进入原程序的计分摘要。FAT32 文件句柄支持用于 `fanotify16` 的 vfat 变体。ext3 变体使用 `mkfs.ext3` 创建带内部日志的 ext3 文件系统，通过实际 `ext3` 挂载执行同一组目录句柄、名称和改名断言。格式化、挂载和执行均成功时，该变体的通过断言进入原判分摘要。`fanotify22` 指定 ext4，并调用客机的 `debugfs` 修改独立测试分区上的元数据。初赛发布盘缺少这个程序，兼容分支在工具分区交付对应架构的静态程序，启动时链接至 `/bin/debugfs`。
 - **`fallocate04` / `fallocate05`**：`fallocate04` 验证预分配、打洞与 `FALLOC_FL_ZERO_RANGE`（后续 `FALLOC_FL_COLLAPSE_RANGE` 返回 `EOPNOTSUPP` 按配置跳过）；`fallocate05` 需先填满测试盘再测预分配区写入与打洞，顺利填满的配置通过 4 项断言，若发生超时应核查 `tst_fill_fs` 写入进度与盘容量耗时。
 - **`readahead02` 与 `msync03` / `04`**：`readahead02` 依赖进程 I/O 统计、缓存清理与块设备预读参数；`msync04` 经 `/proc/self/pagemap` 与 `/proc/kpageflags` 验证共享映射脏页同步；`msync03` 锁页断言通过但发布程序无计分摘要。
 - **早期块设备启动 `FLUSH` 超时诊断**：旧版块设备驱动在面对类型 4（`FLUSH`）持久刷盘请求 30 秒未见设备完成环推进时会强制复位设备，引发根文件系统挂载失败（日志见 `block queue fault reason=timeout`）。现行驱动改为持续等待设备结果并周期性打印诊断状态；遇到同类日志时需对照请求状态、完成环进展与宿主后备文件同步延迟（详见 [VirtIO 块设备](../modules/riscv-virtio-block.md)）。

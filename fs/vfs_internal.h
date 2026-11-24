@@ -113,6 +113,12 @@ struct kernel_vfs_node *kernel_vfs_file_node(
 /* Per-call NOAPPEND cannot bypass inode format restrictions. */
 int kernel_vfs_file_noappend_allowed(const struct kernel_vfs_file *);
 int kernel_vfs_file_mincore_allowed(const struct kernel_vfs_file *);
+/* The caller pins the mount and holds its topology stable. */
+int kernel_vfs_mount_root_string(const struct kernel_vfs_mount *,const struct kernel_vfs_path *,
+    char *,size_t);
+const char *kernel_vfs_mount_type(const struct kernel_vfs_mount *);
+uint64_t kernel_vfs_mount_dominating_group(const struct kernel_vfs_mount *,const struct kernel_vfs_path *);
+int kernel_vfs_mount_set_source(struct kernel_vfs_mount *,const char *);
 int kernel_vfs_namespace_requires_cpu0(const struct kernel_vfs_mount *);
 int kernel_vfs_file_metadata_requires_cpu0(const struct kernel_vfs_file *file);
 uint64_t kernel_vfs_file_max_size(const struct kernel_vfs_file *file);
@@ -157,7 +163,7 @@ int kernel_vfs_file_is_control(const struct kernel_vfs_file *file,int write);
 size_t kernel_vfs_file_control_prefix(const struct kernel_vfs_file *file);
 int kernel_vfs_file_control_open_credentials(const struct kernel_vfs_file *);
 int kernel_vfs_file_control_permission(const struct kernel_vfs_file *file, int write);
-int kernel_vfs_file_control(const struct kernel_vfs_file *file, int write,
+int kernel_vfs_file_control(const struct kernel_vfs_file *file, void *open_context, int write,
     uint64_t *offset, char *buffer, size_t size, size_t *count);
 int kernel_vfs_file_generated(const struct kernel_vfs_file *file);
 int kernel_vfs_check_io_domain(const struct kernel_vfs_node *,const struct kernel_heap *,

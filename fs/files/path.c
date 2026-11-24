@@ -600,7 +600,9 @@ int kernel_files_name_to_handle(struct kernel_files *files, const struct kernel_
     } output;
     _Static_assert(offsetof(typeof(output), handle) == 8, "native file handle payload");
     uint64_t mount = kernel_vfs_path_mount(resolved)->id;
-    size_t mount_size = flags & LINUX_HANDLE_MNT_ID_UNIQUE ? sizeof(mount) : sizeof(uint32_t);
+    int unique = !!(flags & LINUX_HANDLE_MNT_ID_UNIQUE);
+    if (unique) mount=kernel_vfs_unique_mount_id(mount);
+    size_t mount_size = unique ? sizeof(mount) : sizeof(uint32_t);
     if (handle_copy(mm, &mount, user_mount, mount_size, 1)) return -KERNEL_EFAULT;
     size_t bytes = sizeof(output.header);
     output.header.bytes = sizeof(output.handle);

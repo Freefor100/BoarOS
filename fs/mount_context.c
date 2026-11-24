@@ -31,7 +31,7 @@ static const struct mount_type {
     const char *name;
     bool block;
 } mount_types[] = {
-    {"devtmpfs", false}, {"tmpfs", false}, {"ext4", true}, {"ext2", true},
+    {"devtmpfs", false}, {"tmpfs", false}, {"ext4", true}, {"ext3", true}, {"ext2", true},
     {"vfat", true}, {"devpts", false}, {"proc", false}, {"mqueue", false},
     {"bpf", false}, {"tracefs", false}, {"sysfs", false}, {"cgroup2", false},
     {"overlay", false},
@@ -153,7 +153,8 @@ static int mount_overlay(const struct kernel_fs_context *fs,const struct kernel_
     } else error=kernel_overlay_mount(fs->heap,p->flags,creator,p->overlay_layers,&mount);
     if (error) return error;
     mount_creation_flags(mount,p->flags);
-    error=kernel_vfs_detach_created_mount(mount,fs->heap,kernel_fs_context_namespace_id(fs),owner);
+    error=kernel_vfs_mount_set_source(mount,p->source);
+    if (!error) error=kernel_vfs_detach_created_mount(mount,fs->heap,kernel_fs_context_namespace_id(fs),owner);
     if (error && kernel_vfs_unmount(mount)) __builtin_trap();
     return error;
 }
@@ -232,7 +233,8 @@ int kernel_mount_create(const struct kernel_fs_context *fs,const struct kernel_m
 
     if(error)return error;
     mount_creation_flags(mount, p->flags);
-    error=kernel_vfs_detach_created_mount(mount,fs->heap,kernel_fs_context_namespace_id(fs),owner);
+    if (!disk) error=kernel_vfs_mount_set_source(mount,p->source);
+    if (!error) error=kernel_vfs_detach_created_mount(mount,fs->heap,kernel_fs_context_namespace_id(fs),owner);
     if(error) {
         int cleanup=kernel_vfs_unmount(mount);
         if(cleanup){if(disk)kernel_vfs_disk_defer_cleanup(mount);else __builtin_trap();}

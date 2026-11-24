@@ -402,6 +402,12 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
         if (syscall_handle_mount(caller, request, &decoded,
                 request->number == LINUX_SYSCALL_UMOUNT2) !=
             KERNEL_SYSCALL_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 457U) {
+        if (syscall_handle_statmount(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 458U) {
+        if (syscall_handle_listmount(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_UTIMENSAT) {
         if (syscall_handle_utimensat(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

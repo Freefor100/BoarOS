@@ -20,4 +20,20 @@ static inline uint32_t kernel_first_set_u64(uint64_t bits)
 #endif
 }
 
+/* bits must be nonzero. */
+static inline uint32_t kernel_last_set_u64(uint64_t bits)
+{
+#if defined(__riscv) && !defined(__riscv_zbb)
+    uint32_t bit = 0;
+    if (bits >> 32U) { bits >>= 32U; bit += 32U; }
+    if (bits >> 16U) { bits >>= 16U; bit += 16U; }
+    if (bits >> 8U) { bits >>= 8U; bit += 8U; }
+    if (bits >> 4U) { bits >>= 4U; bit += 4U; }
+    if (bits >> 2U) { bits >>= 2U; bit += 2U; }
+    return bit + (uint32_t)(bits >> 1U);
+#else
+    return 63U - (uint32_t)__builtin_clzll(bits);
+#endif
+}
+
 #endif

@@ -20,6 +20,27 @@ enum kernel_hugetlb_status kernel_hstate_resize(struct kernel_hstate *h,uint64_t
 int kernel_proc_coredump_filter(kernel_pid_t p,uint64_t i,int t,unsigned *v,int w)
 {(void)p;(void)i;(void)t;(void)v;(void)w;abort();}
 #endif
+/* Other generated controls are outside the large-page fixture. */
+int kernel_proc_timerslack(kernel_pid_t p, uint64_t i, uint64_t *v, int w)
+{ (void)p; (void)i; (void)v; (void)w; abort(); }
+unsigned kernel_keys_quota_get(enum kernel_key_quota q) { (void)q; abort(); }
+int kernel_keys_quota_set(enum kernel_key_quota q, unsigned v) { (void)q; (void)v; abort(); }
+uint64_t kernel_aio_quota(int maximum) { (void)maximum; abort(); }
+void kernel_aio_set_max(uint64_t maximum) { (void)maximum; abort(); }
+unsigned kernel_vfs_cache_pressure(void) { abort(); }
+void kernel_vfs_set_cache_pressure(unsigned value) { (void)value; abort(); }
+void kernel_vfs_drop_caches(struct physical_page_allocator *allocator, unsigned mask)
+{ (void)allocator; (void)mask; abort(); }
+int kernel_vfs_lease_break_time(void) { abort(); }
+void kernel_vfs_set_lease_break_time(int seconds) { (void)seconds; abort(); }
+uint32_t kernel_pipe_max_size(void) { abort(); }
+int kernel_pipe_set_max_size(uint64_t limit) { (void)limit; abort(); }
+int kernel_ipc_shm_limit_read(const struct kernel_shm_limits *limits, enum kernel_shm_limit which,
+    uint64_t *value)
+{ (void)limits; (void)which; (void)value; abort(); }
+int kernel_ipc_shm_limit_set(struct kernel_shm_limits *limits, enum kernel_shm_limit which,
+    uint64_t value)
+{ (void)limits; (void)which; (void)value; abort(); }
 int kernel_proc_comm(kernel_pid_t p,uint64_t i,int t,char n[16],int w)
 {(void)p;(void)i;(void)t;(void)n;(void)w;abort();}
 struct kernel_namespace *kernel_task_uts_namespace(void){abort();}
@@ -49,15 +70,15 @@ int main(void)
     assert(proc_permission(&node,&cred,2)==-KERNEL_EACCES);
     assert(!proc_permission(&node,&cred,4));cred.euid=0;assert(!proc_permission(&node,&cred,6));
     uint64_t offset=0;size_t count=0;char data[24]={0};
-    assert(!proc_control(&node,0,&offset,data,sizeof(data),&count) && count==2 && !memcmp(data,"0\n",2));
+    assert(!proc_control(&node,NULL,0,&offset,data,sizeof(data),&count) && count==2 && !memcmp(data,"0\n",2));
     assert(!creates && !acquired && !pool_exists);
     offset=0;memcpy(data,"9\n",2);
-    assert(!proc_control(&node,1,&offset,data,2,&count) && count==2 && huge_model.total==4 && !acquired);
+    assert(!proc_control(&node,NULL,1,&offset,data,2,&count) && count==2 && huge_model.total==4 && !acquired);
     offset=0;memset(data,0,sizeof(data));
-    assert(!proc_control(&node,0,&offset,data,sizeof(data),&count) && count==2 && !memcmp(data,"4\n",2));
-    offset=0;memcpy(data,"-1\n",3);assert(proc_control(&node,1,&offset,data,3,&count)==-KERNEL_EINVAL);
-    offset=0;memcpy(data,"0x2\n",4);assert(!proc_control(&node,1,&offset,data,4,&count) && huge_model.total==2);
-    offset=4;memcpy(data,"4\n",2);assert(!proc_control(&node,1,&offset,data,2,&count) && huge_model.total==2);
+    assert(!proc_control(&node,NULL,0,&offset,data,sizeof(data),&count) && count==2 && !memcmp(data,"4\n",2));
+    offset=0;memcpy(data,"-1\n",3);assert(proc_control(&node,NULL,1,&offset,data,3,&count)==-KERNEL_EINVAL);
+    offset=0;memcpy(data,"0x2\n",4);assert(!proc_control(&node,NULL,1,&offset,data,4,&count) && huge_model.total==2);
+    offset=4;memcpy(data,"4\n",2);assert(!proc_control(&node,NULL,1,&offset,data,2,&count) && huge_model.total==2);
     assert(!acquired);
     puts("proc huge pool: path, EUID permissions, zero-without-create, actual partial growth and parse verified");
 }

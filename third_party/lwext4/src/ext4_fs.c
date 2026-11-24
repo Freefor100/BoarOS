@@ -69,7 +69,7 @@
 #include <stdlib.h>
 
 int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
-		 bool read_only, bool ext2_format)
+		 bool read_only, enum ext4_disk_format format)
 {
 	int r, i;
 	uint16_t tmp;
@@ -94,7 +94,7 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	TAILQ_INIT(&fs->pending_inode_goals);
 	fs->super_replay_required = false;
 	fs->journaled_session = false;
-	fs->ext2_format = ext2_format;
+	fs->ext2_format = format == EXT4_DISK_EXT2;
 	fs->nojournal_error = EOK;
 
 	fs->read_only = read_only;
@@ -105,6 +105,15 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 
 	if (!ext4_sb_check_geometry(ext4_fs_super(fs)))
 		return EUCLEAN;
+	if (format == EXT4_DISK_EXT3) {
+		struct ext4_sblock *sb = ext4_fs_super(fs);
+		const uint32_t incompatible = EXT3_SUPPORTED_FINCOM | EXT4_FINCOM_RECOVER;
+		const uint32_t read_only_features = EXT3_SUPPORTED_FRO_COM | EXT4_FRO_COM_BTREE_DIR;
+		if (!ext4_sb_feature_com(sb, EXT4_FCOM_HAS_JOURNAL) ||
+		    (ext4_get32(sb, features_incompatible) & ~incompatible) ||
+		    (!read_only && (ext4_get32(sb, features_read_only) & ~read_only_features)))
+			return EINVAL;
+	}
 	if (!ext4_sb_check(ext4_fs_super(fs))) {
 		/* A checkpoint can tear a 1 KiB superblock across atomic sectors.
 		 * Its immutable geometry is checked here; recovery must supply a

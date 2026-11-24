@@ -56,7 +56,7 @@ flowchart LR
 - **挂载上下文捕获**：传统 `mount` 使用调用时刻的当前 IPC 命名空间；新版文件系统配置接口 `fsopen("mqueue")` 则在打开配置上下文时立即捕获当前 IPC 命名空间，即便调用者在 `FSCONFIG_CMD_CREATE` 前切换了命名空间，最终创建的挂载实例仍归属最初捕获的空间。
 - **额度归属**：队列数量上限按 IPC 命名空间独立计数；但 `RLIMIT_MSGQUEUE` 字节配额与 `SHM_LOCK` 锁页配额均记在创建者的**真实 UID 账户**上，不因切换命名空间而清零，也不因 `chown` 而转移。
 
-> **当前范围边界**：运行时动态调整 IPC 上限的 `sysctl`（`/proc/sys/kernel/{shm*,sem,msg*}`）暂不在当前支持范围内。
+每个 IPC 命名空间可以通过 `/proc/sys/kernel/{shmmax,shmall,shmmni}` 调整共享内存接纳限额。配置文件描述符保存打开时的配置记录，命名空间销毁后返回 `ENOENT`。信号量与消息队列仍使用各自的启动默认上限。详见 [System V 共享内存](sysv-shm.md)。
 
 ---
 

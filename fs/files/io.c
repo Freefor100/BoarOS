@@ -144,8 +144,8 @@ static enum kernel_files_status control_read(
 {
     char buffer[KERNEL_UTS_FIELD_SIZE];
     size_t length = 0, copied = 0;
-    int result = kernel_vfs_file_control_permission(&description->file, 0);
-    if (!result) result = kernel_vfs_file_control(&description->file, 0, &offset, buffer,
+    int result = kernel_open_file_control_permission(description, 0);
+    if (!result) result = kernel_open_file_control(description, 0, &offset, buffer,
         count < sizeof(buffer) ? (size_t)count : sizeof(buffer), &length);
     if (!result && length) {
         enum kernel_uaccess_status access = kernel_copy_to_user_iov(
@@ -1370,7 +1370,7 @@ static int control_write_as_opener(struct kernel_open_file_description *descript
     int opener_credentials = kernel_vfs_file_control_open_credentials(&description->file);
     const struct kernel_credentials *previous = opener_credentials ?
         kernel_credentials_override(description->credentials) : 0;
-    int error = kernel_vfs_file_control(&description->file,1,offset,buffer,size,accepted);
+    int error = kernel_open_file_control(description,1,offset,buffer,size,accepted);
     if (opener_credentials) kernel_credentials_override(previous);
     return error;
 }
@@ -1416,7 +1416,7 @@ static enum kernel_files_status control_write(
 
     char *buffer = 0;
     size_t copied = 0, accepted = 0;
-    int result = kernel_vfs_file_control_permission(&description->file, 1);
+    int result = kernel_open_file_control_permission(description, 1);
     if (result) { *linux_result = result; return KERNEL_FILES_STATUS_OK; }
     if (!count) { *linux_result = 0; return KERNEL_FILES_STATUS_OK; }
     enum kernel_heap_status allocation = kernel_heap_allocate(

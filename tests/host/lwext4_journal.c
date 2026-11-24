@@ -1377,7 +1377,11 @@ int main(int argc, char **argv)
     };
     struct ext4_blockdev dev = { .bdif = &iface, .part_size = disk.device.capacity_bytes };
     CHECK(ext4_device_register(&dev, "journal-test") == EOK);
-    CHECK(ext4_mount("journal-test", "/", !strcmp(argv[2], "recover-readonly")) == EOK);
+    bool read_only = !strcmp(argv[2], "recover-readonly");
+    int mounted = getenv("JOURNAL_EXT3") ?
+        ext4_mount_ext3("journal-test", "/", read_only) :
+        ext4_mount("journal-test", "/", read_only);
+    CHECK(mounted == EOK);
     struct jbd_fs jfs;
     struct jbd_journal journal;
     CHECK(jbd_get_fs(dev.fs, &jfs) == EOK);

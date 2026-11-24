@@ -36,10 +36,14 @@ int kernel_vfs_chown_allowed(uint32_t owner, uint32_t group, uint32_t mode, uint
 uint32_t kernel_vfs_chown_mode(uint32_t mode, uint32_t old_gid, uint32_t new_gid);
 uint32_t kernel_vfs_write_mode(uint32_t mode, uint32_t gid);
 
+#define KERNEL_VFS_MOUNT_UNIQUE_ID_BASE (UINT64_C(1) << 31)
 uint64_t kernel_vfs_allocate_mount_id(void);
+static inline uint64_t kernel_vfs_unique_mount_id(uint64_t id)
+{ return KERNEL_VFS_MOUNT_UNIQUE_ID_BASE + id; }
 struct kernel_vfs_path;
 struct kernel_vfs_dentry;
 struct kernel_fs_context;
+struct kernel_mount_namespace;
 struct kernel_open_file_description;
 struct kernel_lock_guard;
 struct kernel_vfs_mount {
@@ -55,6 +59,7 @@ struct kernel_vfs_mount {
     struct kernel_vfs_mount *previous_sibling;
     uint32_t child_mounts;
     const char *source_name; /* Borrowed from the mount owner. */
+    struct kernel_mount_namespace *namespace_owner; /* Weak, only on the namespace tree root. */
     /* Optional owner release, invoked only after backend teardown succeeds. */
     void (*release_owner)(struct kernel_vfs_mount *mount);
     /* 路径借用实际挂载；重配置成功后在状态锁内发布。 */
@@ -372,6 +377,9 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     struct kernel_block_device *block, struct kernel_heap *heap,
     struct kernel_page_cache *page_cache, int read_only);
 int kernel_vfs_mount_ext2(struct kernel_vfs_mount *mount,
+    struct kernel_block_device *block, struct kernel_heap *heap,
+    struct kernel_page_cache *page_cache, int read_only);
+int kernel_vfs_mount_ext3(struct kernel_vfs_mount *mount,
     struct kernel_block_device *block, struct kernel_heap *heap,
     struct kernel_page_cache *page_cache, int read_only);
 int kernel_vfs_mount_fat32(struct kernel_vfs_mount *mount,

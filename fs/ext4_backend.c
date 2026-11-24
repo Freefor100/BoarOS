@@ -174,13 +174,14 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
 static int ext4_backend_writeback(struct kernel_vfs_node *node,
     struct file_write_span *spans, size_t count);
 
-static struct kernel_vfs_backend ext4_backend, ext2_backend;
+static struct kernel_vfs_backend ext4_backend, ext2_backend, ext3_backend;
 static int ext4_check_domain(const struct kernel_vfs_node *node,
     const struct kernel_heap *heap, const struct physical_page_allocator *allocator)
 {
     if (!node || !node->instance || !node->mount ||
         node->closed || node->retired || (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG ||
-        (node->instance->ops != &ext4_backend && node->instance->ops != &ext2_backend) ||
+        (node->instance->ops != &ext4_backend && node->instance->ops != &ext2_backend &&
+         node->instance->ops != &ext3_backend) ||
         node->mount->private_data != node->instance ||
         !kernel_page_cache_check_domain(node->instance->page_cache,heap,allocator)) return -KERNEL_EINVAL;
     return 0;
@@ -1646,7 +1647,8 @@ static int cleanup_mount(struct kernel_vfs_mount *mount)
 static int mount_ext_filesystem(struct kernel_vfs_mount *mount,
                           struct kernel_block_device *block,
                           struct kernel_heap *heap,
-                          struct kernel_page_cache *page_cache, int read_only, bool ext2)
+                          struct kernel_page_cache *page_cache, int read_only,
+                          enum ext4_disk_format format)
 {
     struct lwext4_mount_adapter *adapter;
     struct ext4_sblock *superblock;
@@ -1697,7 +1699,8 @@ static int mount_ext_filesystem(struct kernel_vfs_mount *mount,
     kernel_raw_lock_init(&adapter->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
     initialize_backend();
     adapter->instance.backend_data = adapter;
-    adapter->instance.ops = ext2 ? &ext2_backend : &ext4_backend;
+    adapter->instance.ops = format == EXT4_DISK_EXT2 ? &ext2_backend :
+                            format == EXT4_DISK_EXT3 ? &ext3_backend : &ext4_backend;
     adapter->instance.heap = heap;
     adapter->block = block;
     adapter->instance.page_cache = page_cache;
@@ -1758,8 +1761,17 @@ static int mount_ext_filesystem(struct kernel_vfs_mount *mount,
     }
     adapter->registered = 1U;
     adapter->instance.read_only = (uint8_t)(read_only != 0 ? 1U : 0U);
-    result = ext2 ? ext4_mount_ext2(adapter->device_name, adapter->mount_point, read_only != 0) :
-        ext4_mount(adapter->device_name, adapter->mount_point, read_only != 0);
+    switch (format) {
+    case EXT4_DISK_EXT2:
+        result = ext4_mount_ext2(adapter->device_name, adapter->mount_point, read_only != 0);
+        break;
+    case EXT4_DISK_EXT3:
+        result = ext4_mount_ext3(adapter->device_name, adapter->mount_point, read_only != 0);
+        break;
+    default:
+        result = ext4_mount(adapter->device_name, adapter->mount_point, read_only != 0);
+        break;
+    }
     if (result != EOK) {
         (void)cleanup_mount(mount);
         return lwext4_error(result);
@@ -1822,12 +1834,17 @@ static int mount_ext_filesystem(struct kernel_vfs_mount *mount,
 int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     struct kernel_block_device *block, struct kernel_heap *heap,
     struct kernel_page_cache *page_cache, int read_only)
-{ return mount_ext_filesystem(mount, block, heap, page_cache, read_only, false); }
+{ return mount_ext_filesystem(mount, block, heap, page_cache, read_only, EXT4_DISK_EXT4); }
 
 int kernel_vfs_mount_ext2(struct kernel_vfs_mount *mount,
     struct kernel_block_device *block, struct kernel_heap *heap,
     struct kernel_page_cache *page_cache, int read_only)
-{ return mount_ext_filesystem(mount, block, heap, page_cache, read_only, true); }
+{ return mount_ext_filesystem(mount, block, heap, page_cache, read_only, EXT4_DISK_EXT2); }
+
+int kernel_vfs_mount_ext3(struct kernel_vfs_mount *mount,
+    struct kernel_block_device *block, struct kernel_heap *heap,
+    struct kernel_page_cache *page_cache, int read_only)
+{ return mount_ext_filesystem(mount, block, heap, page_cache, read_only, EXT4_DISK_EXT3); }
 
 int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
                           struct kernel_block_device *block,
@@ -3642,5 +3659,8 @@ static void initialize_backend(void)
     ext2_backend.type = "ext2";
     ext2_backend.abort_mount = NULL;
     ext2_backend.pread_batch = ext4_backend_pread_batch;
+    ext3_backend = ext4_backend;
+    ext3_backend.type = "ext3";
+    ext3_backend.pread_batch = ext4_backend_pread_batch;
     __atomic_store_n(&ext4_backend.pread_batch,ext4_backend_pread_batch,__ATOMIC_RELEASE);
 }

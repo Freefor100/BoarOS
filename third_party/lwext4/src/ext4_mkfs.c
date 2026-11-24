@@ -827,7 +827,7 @@ int ext4_mkfs(struct ext4_fs *fs, struct ext4_blockdev *bd,
 	if (r != EOK)
 		goto cache_fini;
 
-	r = ext4_fs_init(fs, bd, false, false);
+	r = ext4_fs_init(fs, bd, false, EXT4_DISK_EXT4);
 	if (r != EOK)
 		goto cache_fini;
 

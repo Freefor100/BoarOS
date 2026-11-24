@@ -311,6 +311,7 @@ int ext4_mount(const char *dev_name,
 	       const char *mount_point,
 	       bool read_only);
 int ext4_mount_ext2(const char *dev_name, const char *mount_point, bool read_only);
+int ext4_mount_ext3(const char *dev_name, const char *mount_point, bool read_only);
 
 /**@brief   Umount operation.
  *

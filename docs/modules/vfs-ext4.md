@@ -1,6 +1,6 @@
 # 虚拟文件系统（VFS）、ext4 与叠加文件系统
 
-BoarOS 的虚拟文件系统（Virtual File System，VFS）屏蔽了不同存储后端的格式差异，向上为所有系统调用提供统一的路径解析、权限检查、挂载视图与页缓存服务，向下接入 **ext4 / ext2（含 JBD2 事务日志）、可写叠加文件系统（OverlayFS）、FAT32/VFAT、tmpfs、procfs、sysfs、devpts、tracefs、bpffs 与 cgroup2** 等多类文件系统。
+BoarOS 的虚拟文件系统（Virtual File System，VFS）屏蔽了不同存储后端的格式差异，向上为所有系统调用提供统一的路径解析、权限检查、挂载视图与页缓存服务，向下接入 **ext4、ext3、ext2、可写叠加文件系统（OverlayFS）、FAT32/VFAT、tmpfs、procfs、sysfs、devpts、tracefs、bpffs 与 cgroup2** 等多类文件系统。
 
 ---
 
@@ -53,6 +53,9 @@ flowchart LR
 - **路径与文件解耦**：同一文件系统实例可通过绑定挂载暴露出多个独立的 `kernel_vfs_mount` 视图（各自拥有独立的 `read_only`、`noexec`、`nodev`、`nosuid` 与 `atime` 策略）；同一 `inode` 可对应多个硬链接 `dentry`；文件被改名或删除后，已打开的 `OFD` 仍通过持有 `dentry` 和 `inode` 引用继续访问原文件本体。
 - **挂载命名空间与现代挂载 API**：进程可通过 `clone`/`unshare(CLONE_NEWNS)` 复制整棵挂载视图树（失败时按叶到根迭代回滚，不消耗递归栈），通过 `setns` 加入目标挂载命名空间；同时支持 Linux 新一代基于文件描述符的挂载接口：`fsopen(430)`、`fsconfig(431)`、`fsmount(432)`、`fspick(433)`、`open_tree(428)`、`move_mount(429)`、`mount_setattr(442)` 以及 `pivot_root(41)`。旧 `mount(40)` 与新接口共用 `fs/mount_context.c` 的同一套实例创建与重配置实现。
 
+- **结构化挂载查询**：`statmount(457)` 查询挂载及文件系统属性，`listmount(458)` 按唯一挂载编号分页列举可见的挂载子树。两者接受当前命名空间或挂载命名空间文件描述符。`statmount` 还可以通过带路径的文件描述符查询实际挂载，延迟卸载后的旧描述符仍能取得原挂载属性，响应省略挂载点和命名空间编号。挂载树只在树根记录命名空间归属，查询沿父连接定位归属，树根退休时撤下关联。
+- `statmount`、`listmount`、`statx(STATX_MNT_ID_UNIQUE)` 和 `name_to_handle_at(AT_HANDLE_MNT_ID_UNIQUE)` 共用唯一挂载编号。`/proc/<pid>/mountinfo` 继续输出传统编号。查询在挂载拓扑锁内捕获连接、路径和传播属性，在锁外完成排序、文件系统查询和用户复制。支持掩码列出实际返回的字段。其他命名空间的数字编号查询返回 `EOPNOTSUPP`，持有其文件描述符即可查询。
+
 ### 2.2 高效路径解析与三级缓存
 
 路径查找（`resolve_object`）通过复用路径对象和文件系统元数据减少查盘与动态内存分配：
@@ -94,7 +97,9 @@ flowchart LR
 
 ## 四、ext4 后端：日志、延迟分配、直接 I/O 与多核并行
 
-BoarOS 以 `third_party/lwext4` 作为磁盘格式解析基础，在 `fs/ext4_backend.c`、`fs/lwext4_port.c` 与本地日志/并发扩展中构建了完整的生产级 ext4 后端（同时支持可写无日志 ext2/ext4）：
+BoarOS 以 `third_party/lwext4` 作为磁盘格式解析基础，在 `fs/ext4_backend.c`、`fs/lwext4_port.c` 和日志并发实现中共用 ext 系列磁盘后端，支持带日志的 ext3、ext4 和可写无日志 ext2、ext4。
+
+调用 `mount()` 或 `fsopen()` 选择 `ext3` 时，后端在读取超级块后、执行磁盘写入前检查内部日志和格式特性。扩展区段、64 位块组等 ext3 不兼容特性返回 `EINVAL`。可写挂载先恢复已提交的日志事务和遗留孤儿节点，再向挂载树发布该实例。处于待恢复状态的只读请求返回 `EUCLEAN`（文件系统需要清理），因而不会在只读挂载时写盘。已挂载的实例保留 `ext3` 类型和原真实磁盘对象，文件句柄和访问通知沿共用后端处理，重新挂载沿已有日志排空、停止和重新启动流程切换读写模式。
 
 ### 4.1 分组 JBD2 事务日志与持久化目标
 

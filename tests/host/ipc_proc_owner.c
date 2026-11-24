@@ -48,6 +48,10 @@ struct kernel_vfs_node *kernel_vfs_file_node(const struct kernel_vfs_file *file)
 {(void)file;return 0;}
 int kernel_page_cache_needs_cpu0(const struct kernel_page_cache *cache)
 {(void)cache;return 0;}
+void kernel_vfs_lease_release(struct kernel_vfs_file *file)
+{ assert(!file->lease_owner); }
+void kernel_vfs_notify_close(const struct kernel_vfs_file *file, uint32_t mask, struct kernel_vfs_path **backing)
+{ (void)file; (void)backing; (void)mask; abort(); }
 void kernel_block_file_close(struct kernel_open_file_description *file)
 {assert(file->kind==KERNEL_OPEN_FILE_KIND_GENERATED);}
 void kernel_flock_release(struct kernel_flock_owner *owner)
@@ -69,6 +73,9 @@ const struct kernel_credentials *kernel_credentials_current(void){return NULL;}
 const struct kernel_credentials *kernel_credentials_get(const struct kernel_credentials *cred){assert(!cred);return NULL;}
 struct kernel_namespace *kernel_task_ipc_namespace(void){return &ipc;}
 int kernel_procfs_ipc_file(const struct kernel_vfs_file *f){(void)f;return 1;}
+int kernel_procfs_shm_limits_open(const struct kernel_vfs_file *f, struct kernel_shm_limits **owner)
+{ (void)f; assert(!*owner); return 0; }
+void kernel_ipc_shm_limits_put(struct kernel_shm_limits *limits) { assert(!limits); }
 int kernel_procfs_kpageflags_file(const struct kernel_vfs_file *f){(void)f;return 0;}
 int kernel_procfs_pagemap_open(const struct kernel_vfs_file *f, struct kernel_heap *heap,
     struct kernel_mm_pagemap **view)

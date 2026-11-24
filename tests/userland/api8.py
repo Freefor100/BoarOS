@@ -64,6 +64,9 @@ SOURCES['perf_cpu_clock']='resource/perf_cpu_clock.c'
 SOURCES['fanotify']='fs/fanotify.c'
 SOURCES['overlay']='fs/overlay.c'
 SOURCES['clock_domains']='resource/clock_domains.c'
+SOURCES['mount_query']='resource/mount_query.c'
+SOURCES['shm_limits']='resource/shm_limits.c'
+SOURCES['ext3']='fs/ext3.c'
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -143,7 +146,12 @@ def build(args,work):
 
 def accepted(raw,arch,cpus,target,selected=None):
     programs=[name for name in (selected or LEGACY) if name!='icache' or arch=='riscv']
-    if target=='boaros' and arch=='riscv' and ('mount_api' in programs or 'mount_context' in programs or 'system_control' in programs or 'sched_control' in programs or 'async_io' in programs or 'tty_async' in programs or 'uts_namespace' in programs or 'ipc_namespace' in programs or 'pid_namespace' in programs or 'nsfs_pid' in programs or any(p in programs for p in ('ptrace','ptrace_signal','ptrace_tools','process_memory','personality','process_control','file_flags','file_ioctl','fanotify','clock_domains','overlay'))):
+    stack_checked = {'mount_api', 'mount_context', 'system_control', 'sched_control',
+        'async_io', 'tty_async', 'uts_namespace', 'ipc_namespace', 'pid_namespace',
+        'nsfs_pid', 'ptrace', 'ptrace_signal', 'ptrace_tools', 'process_memory',
+        'personality', 'process_control', 'file_flags', 'file_ioctl', 'fanotify',
+        'clock_domains', 'overlay', 'mount_query', 'shm_limits', 'ext3'}
+    if target=='boaros' and arch=='riscv' and stack_checked.intersection(programs):
         free=re.search(r'task stacks released=0x[0-9a-f]+ min-free=0x([0-9a-f]+)',raw)
         if not free or int(free[1],16)<1024:return False
     ends=[line for line in raw.replace('\r','').splitlines() if line.startswith('API8 END ')]
@@ -159,6 +167,9 @@ def accepted(raw,arch,cpus,target,selected=None):
     known['fanotify']=['FANOTIFY PASS fd-delivery faults scopes fid namespace privacy']
     known['perf_cpu_clock']=['PERF CPU CLOCK PASS']
     known['overlay']=['OVERLAY PASS scope copy-up whiteouts remount detach']
+    known['mount_query']=['MOUNT QUERY PASS']
+    known['shm_limits']=['SHM LIMITS PASS']
+    known['ext3']=['EXT3 PASS']
     known['clock_domains']=['CLOCK DOMAINS PASS tai-retarget-and-cancel-isolation',
         'CLOCK DOMAINS PASS tai-signal-and-stop-restart absolute=0',
         'CLOCK DOMAINS PASS tai-signal-and-stop-restart absolute=1',
@@ -209,11 +220,14 @@ def main():
         if args.only!='linux':kernels.append(('boaros',args.kernel or ROOT/profile.kernel))
         qemu=os.environ.get('QEMU_RISCV64' if args.arch=='riscv' else 'QEMU_LOONGARCH64',profile.qemu)
         report['qemu']=subprocess.check_output([qemu,'--version'],text=True)
-        overlay_volume=None
-        if 'overlay' in programs:
-            overlay_volume=work/'overlay-volume.img'
-            with overlay_volume.open('wb') as stream:stream.truncate(32*1024*1024)
-            harness.run_logged(['mkfs.ext4','-q','-F','-b','4096',str(overlay_volume)],work/'overlay-mkfs.log')
+        volumes={}
+        for name,filesystem in (('overlay','ext4'),('ext3','ext3')):
+            if name not in programs:continue
+            volume=work/(name+'-volume.img')
+            with volume.open('wb') as stream:stream.truncate(32*1024*1024)
+            harness.run_logged(['mke2fs','-t',filesystem,'-q','-F','-b','4096',str(volume)],
+                               work/(name+'-mkfs.log'))
+            volumes[name]=volume
         for target,kernel in kernels:
             snapshot=work/(target+'-kernel');shutil.copyfile(kernel,snapshot)
             disk=work/(target+'.img');shutil.copyfile(fixture,disk)
@@ -231,19 +245,29 @@ def main():
                 device=('virtio-blk-device,drive=fat,bus=virtio-mmio-bus.1' if args.arch=='riscv'
                         else 'virtio-blk-pci,drive=fat,addr=2,disable-legacy=on')
                 command+=['-drive',f'file={fat},if=none,format=raw,id=fat','-device',device]
-            extra=None
-            if overlay_volume:
-                extra=work/(target+'-overlay-volume.img');shutil.copyfile(overlay_volume,extra)
+            extra_volumes={}
+            first_extra=2 if fat else 1
+            if volumes and args.arch=='riscv' and target=='linux':
+                # Linux probes the VirtIO MMIO buses in descending order.
+                root=profile.block('modern')
+                command[command.index(root)]=root.replace('bus.0',f'bus.{len(volumes)}')
+            for index,(name,volume) in enumerate(volumes.items(),first_extra):
+                extra=work/(target+'-'+name+'-volume.img')
+                shutil.copyfile(volume,extra)
+                extra_volumes[name]=extra
                 if args.arch=='riscv':
-                    bus=2 if fat else 1
-                    if target=='linux':
-                        # The reference probes virtio-mmio buses in reverse order.
-                        command[command.index(profile.block('modern'))]=profile.block('modern').replace('bus.0','bus.1')
-                        bus=0
-                    device=f'virtio-blk-device,drive=extra,bus=virtio-mmio-bus.{bus}'
+                    bus=len(volumes)-index if target=='linux' else index
+                    device=f'virtio-blk-device,drive={name},bus=virtio-mmio-bus.{bus}'
                 else:
-                    device=f'virtio-blk-pci,drive=extra,disable-legacy=on,addr={3 if fat else 2}'
-                command+=['-drive',f'file={extra},if=none,format=raw,id=extra','-device',device]
+                    device=f'virtio-blk-pci,drive={name},disable-legacy=on,addr={index+1}'
+                command+=['-drive',f'file={extra},if=none,format=raw,id={name}','-device',device]
+                if name=='ext3':
+                    hint=work/'ext3-device'
+                    hint.write_text('vd'+chr(ord('a')+index)+'\n')
+                    batch=work/'ext3.debugfs'
+                    batch.write_text(f'write "{hint}" /ext3-device\n')
+                    harness.run_logged(['debugfs','-w','-f',str(batch),str(disk)],
+                                       work/(target+'-ext3-install.log'))
             if target=='linux':
                 # setns installs the namespace root. Use a real root mount on
                 # both architectures, rather than a LA-only chroot in initrd.
@@ -259,12 +283,13 @@ def main():
             harness.run_logged(['e2fsck','-fn',str(disk)],work/(target+'-fsck.log'))
             if fat:
                 harness.run_logged(['fsck.fat','-n',str(fat)],work/'fat-fsck.log');fat.unlink()
-            if extra:
-                harness.run_logged(['e2fsck','-fn',str(extra)],work/(target+'-overlay-fsck.log'));extra.unlink()
+            for name,extra in extra_volumes.items():
+                harness.run_logged(['e2fsck','-fn',str(extra)],work/(target+'-'+name+'-fsck.log'))
+                extra.unlink()
             if any(digest(row['path'])!=row['sha256'] for row in programs.values()):
                 raise RuntimeError('caller ELF changed during comparison')
             disk.unlink();print(target,'PASS',work,flush=True)
-        if overlay_volume:overlay_volume.unlink()
+        for volume in volumes.values():volume.unlink()
         fixture.unlink();report['status']='passed'
     except Exception as error:
         report.update(status='failed',error=str(error));raise

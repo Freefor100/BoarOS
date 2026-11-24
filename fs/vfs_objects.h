@@ -65,6 +65,7 @@ struct kernel_vfs_instance {
     unsigned fanotify_interest_count[32], fanotify_parent_count[32];
     unsigned fanotify_create_targets;
     uint64_t device_id; /* Filesystem st_dev, shared by every mount view. */
+    char *owned_source_name; /* Non-disk mount source retained by the instance. */
 };
 
 
@@ -221,7 +222,7 @@ struct kernel_vfs_backend {
     /* Controls use a complete kernel buffer and return the new position,
      * which can differ from old position + accepted bytes. The files layer
      * commits that position only after successful user copying. */
-    int (*control)(struct kernel_vfs_node *node, int write, uint64_t *offset,
+    int (*control)(struct kernel_vfs_node *node, void *open_context, int write, uint64_t *offset,
         char *buffer, size_t size, size_t *count);
     int (*truncate)(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed);
     bool fallocate_zero_range;

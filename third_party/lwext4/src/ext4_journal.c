@@ -2427,14 +2427,15 @@ static int jbd_publish_private(struct jbd_trans *trans, struct jbd_trans *runnin
     struct jbd_buf *jb, *super = NULL;
     if (ext4_operation_super_changed(&trans->operation)) {
         struct ext4_operation *op = &trans->operation;
-        struct ext4_sblock merged;
-        int result = ext4_operation_prepare_super(op, &merged);
-        if (result) return result;
         uint64_t lba = EXT4_SUPERBLOCK_OFFSET / journal->block_size;
         super = jbd_trans_find_buf(trans, lba);
         if (!super || !super->private_access || !super->modified) __builtin_trap();
         size_t offset = EXT4_SUPERBLOCK_OFFSET % journal->block_size;
-        memcpy((uint8_t *)super->after->data + offset, &merged, sizeof(merged));
+        /* Merge into the prepared private image. Acceptance below is still
+         * the only point at which the new superblock can become visible. */
+        struct ext4_sblock *merged = (void *)((uint8_t *)super->after->data + offset);
+        int result = ext4_operation_prepare_super(op, merged);
+        if (result) return result;
     }
     if (trans->allocation_groups) (void)jbd_claim_versions(trans,false);
     TAILQ_FOREACH(jb, &trans->buf_queue, buf_node) {
