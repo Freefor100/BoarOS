@@ -681,6 +681,33 @@ static struct kernel_block_stat_operation block_operation_snapshot(
     };
 }
 
+void kernel_block_usage_snapshot(const struct kernel_block_device *device, struct kernel_block_usage *out)
+{
+    const struct kernel_block_usage *usage = &device->usage;
+    *out = (struct kernel_block_usage){
+        .read = block_operation_snapshot(&usage->read),
+        .write = block_operation_snapshot(&usage->write),
+        .flush = block_operation_snapshot(&usage->flush),
+        .in_flight = __atomic_load_n(&usage->in_flight, __ATOMIC_RELAXED),
+        .busy_milliseconds = __atomic_load_n(&usage->busy_milliseconds, __ATOMIC_RELAXED),
+    };
+}
+
+void kernel_block_stat_values(const struct kernel_block_usage *usage,
+    uint64_t values[KERNEL_BLOCK_STAT_FIELDS])
+{
+    /* Linux's common diskstats/sysfs ordering. The block layer has no
+     * merge or discard counters. Weighted time is the sum over operations. */
+    const uint64_t fields[KERNEL_BLOCK_STAT_FIELDS] = {
+        usage->read.completed, 0, usage->read.sectors, usage->read.elapsed_ns / 1000000U,
+        usage->write.completed, 0, usage->write.sectors, usage->write.elapsed_ns / 1000000U,
+        usage->in_flight, usage->busy_milliseconds,
+        (usage->read.elapsed_ns + usage->write.elapsed_ns + usage->flush.elapsed_ns) / 1000000U,
+        0, 0, 0, 0, usage->flush.completed, usage->flush.elapsed_ns / 1000000U,
+    };
+    memcpy(values, fields, sizeof(fields));
+}
+
 int kernel_block_stat(uint64_t number, uint64_t generation, struct kernel_block_usage *out)
 {
     uintptr_t irq = registry_lock();
@@ -688,16 +715,7 @@ int kernel_block_stat(uint64_t number, uint64_t generation, struct kernel_block_
     while (device && (!device->registered || device->device_number != number ||
             device->registration_generation != generation))
         device = device->registry_next;
-    if (device) {
-        struct kernel_block_usage *usage = &device->usage;
-        *out = (struct kernel_block_usage){
-            .read = block_operation_snapshot(&usage->read),
-            .write = block_operation_snapshot(&usage->write),
-            .flush = block_operation_snapshot(&usage->flush),
-            .in_flight = __atomic_load_n(&usage->in_flight, __ATOMIC_RELAXED),
-            .busy_milliseconds = __atomic_load_n(&usage->busy_milliseconds, __ATOMIC_RELAXED),
-        };
-    }
+    if (device) kernel_block_usage_snapshot(device, out);
     registry_unlock(irq);
     return device ? 0 : -KERNEL_ENODEV;
 }

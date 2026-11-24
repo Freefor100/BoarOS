@@ -9,6 +9,7 @@
 #include <kernel/random.h>
 #include <kernel/personality.h>
 #include <kernel/rlimit.h>
+#include <kernel/rseq.h>
 #include <kernel/vma.h>
 #include <kernel/vdso.h>
 
@@ -456,7 +457,7 @@ static enum kernel_elf_image_status prepare_stack_layout(
     total_bytes = string_bytes + random_bytes;
     table_words = 1U + (uint64_t)layout->argument_count + 1U +
                   (uint64_t)layout->environment_count + 1U +
-                  2U * (17U + KERNEL_HAS_VDSO_ELF + ARCH_ELF_AUX_EXTRA);
+                  2U * (19U + KERNEL_HAS_VDSO_ELF + ARCH_ELF_AUX_EXTRA);
     if (table_words > UINT64_MAX / sizeof(uint64_t)) {
         return KERNEL_ELF_IMAGE_STATUS_STACK_LIMIT;
     }
@@ -684,6 +685,8 @@ static enum kernel_elf_image_status build_stack(
 #if KERNEL_HAS_VDSO_ELF
     POPULATE_AUXILIARY(33U, layout->vdso); /* AT_SYSINFO_EHDR */
 #endif
+    POPULATE_AUXILIARY(KERNEL_AT_RSEQ_FEATURE_SIZE, KERNEL_RSEQ_FEATURE_SIZE);
+    POPULATE_AUXILIARY(KERNEL_AT_RSEQ_ALIGN, KERNEL_RSEQ_SIZE);
     POPULATE_AUXILIARY(0U, 0U);
 #undef POPULATE_AUXILIARY
     if (arch_mmu_user_space_populate(space,

@@ -68,6 +68,9 @@ SOURCES['mount_query']='resource/mount_query.c'
 SOURCES['shm_limits']='resource/shm_limits.c'
 SOURCES['ext3']='fs/ext3.c'
 SOURCES['huge_files']='resource/huge_files.c'
+SOURCES['cache_nowait']='io/cache_nowait.c'
+SOURCES['proc_system_stats']='resource/proc_system_stats.c'
+SOURCES['rseq']='resource/rseq.c'
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -151,7 +154,8 @@ def accepted(raw,arch,cpus,target,selected=None):
         'async_io', 'tty_async', 'uts_namespace', 'ipc_namespace', 'pid_namespace',
         'nsfs_pid', 'ptrace', 'ptrace_signal', 'ptrace_tools', 'process_memory',
         'personality', 'process_control', 'file_flags', 'file_ioctl', 'fanotify',
-        'clock_domains', 'overlay', 'mount_query', 'shm_limits', 'ext3', 'huge_files'}
+        'clock_domains', 'overlay', 'mount_query', 'shm_limits', 'ext3', 'huge_files',
+        'cache_nowait', 'proc_system_stats', 'rseq'}
     if target=='boaros' and arch=='riscv' and stack_checked.intersection(programs):
         free=re.search(r'task stacks released=0x[0-9a-f]+ min-free=0x([0-9a-f]+)',raw)
         if not free or int(free[1],16)<1024:return False
@@ -172,6 +176,11 @@ def accepted(raw,arch,cpus,target,selected=None):
     known['shm_limits']=['SHM LIMITS PASS']
     known['ext3']=['EXT3 PASS']
     known['huge_files']=['HUGE FILES PASS']
+    known['cache_nowait']=['CACHE NOWAIT PASS']
+    known['proc_system_stats']=['PROC SYSTEM STATS PASS']
+    known['rseq']=['RSEQ PASS complete']
+    if cpus>1:
+        known['rseq'].append('RSEQ PASS membarrier-scoped membarrier-all migration')
     known['clock_domains']=['CLOCK DOMAINS PASS tai-retarget-and-cancel-isolation',
         'CLOCK DOMAINS PASS tai-signal-and-stop-restart absolute=0',
         'CLOCK DOMAINS PASS tai-signal-and-stop-restart absolute=1',
@@ -182,8 +191,10 @@ def accepted(raw,arch,cpus,target,selected=None):
     success=(f'Linux {"RV" if arch=="riscv" else "LA"} root application passed' in raw
              if target=='linux' else PROFILES[arch].root_success(raw,0))
     mmsg=[line for line in lines if re.fullmatch(r'MMSG PASS cases=[1-9][0-9]*',line)]
-    limited=('vectors_v2' not in programs or target!='boaros' or all(
-        lines.count(f'VECTORS2 CAP flag={flag} result=-95')==1 for flag in (8,64,128,2147483648)))
+    limited=('vectors_v2' not in programs or target!='boaros' or (
+        lines.count('VECTORS2 CAP flag=8 result=2')==1 and all(
+            lines.count(f'VECTORS2 CAP flag={flag} result=-95')==1
+            for flag in (64,128,2147483648))))
     return limited and ends==expected and ('mmsg' not in programs or len(mmsg)==1) and all(lines.count(marker)==1 for marker in markers) and success and 'API8 FAIL' not in raw
 
 def main():

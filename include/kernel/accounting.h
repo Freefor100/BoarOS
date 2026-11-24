@@ -3,6 +3,17 @@
 #include <stdint.h>
 struct kernel_task;
 struct kernel_linux_rusage;
+enum kernel_cpu_time {
+    KERNEL_CPU_TIME_USER, KERNEL_CPU_TIME_NICE, KERNEL_CPU_TIME_SYSTEM,
+    KERNEL_CPU_TIME_IDLE, KERNEL_CPU_TIME_IRQ, KERNEL_CPU_TIME_COUNT,
+};
+struct kernel_cpu_statistics {
+    uint64_t ticks[KERNEL_CPU_TIME_COUNT];
+    uint64_t interrupts, switches, tasks;
+};
+/* Return a bitmap of online CPU indices and timing in hardware ticks. */
+unsigned kernel_cpu_statistics_snapshot(struct kernel_cpu_statistics *);
+void kernel_scheduler_task_statistics(uint64_t *runnable, uint64_t *io_waiters);
 struct kernel_task_usage {
     uint64_t user_ns, kernel_ns;
     uint64_t minor_faults, major_faults, maxrss_pages;

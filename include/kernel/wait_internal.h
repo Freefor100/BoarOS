@@ -97,9 +97,20 @@ static inline void kernel_wait_record_transition(struct kernel_wait_record *reco
 static inline int kernel_wait_record_interruptible(const struct kernel_wait_record *record)
 {
 #if BOAROS_MAX_CPUS > 1
-    return !!(kernel_wait_record_load(record)&48U);
+    unsigned mode = (unsigned)(kernel_wait_record_load(record) >> 4) & 3U;
 #else
-    return record->interruptible;
+    unsigned mode = record->interruptible;
+#endif
+    return mode == KERNEL_WAIT_INTERRUPTIBLE || mode == KERNEL_WAIT_KILLABLE;
+}
+static inline int kernel_wait_record_io_blocked(const struct kernel_wait_record *record)
+{
+#if BOAROS_MAX_CPUS > 1
+    uint64_t state = kernel_wait_record_load(record);
+    return (state & 3U) == KERNEL_WAIT_COMMITTED &&
+        ((state >> 4) & 3U) == KERNEL_WAIT_BLOCK_IO;
+#else
+    return record->phase == KERNEL_WAIT_COMMITTED && record->interruptible == KERNEL_WAIT_BLOCK_IO;
 #endif
 }
 static inline uint64_t kernel_wait_signal_generation(const struct kernel_wait_record *record,

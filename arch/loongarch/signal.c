@@ -118,6 +118,7 @@ void la_signal_prepare_user_return(struct arch_trap_frame *frame)
         frame->regs[4]=(uint64_t)(int64_t)-KERNEL_EINTR;frame->era+=4;
     }
     if(selected==KERNEL_SIGNAL_SELECT_HANDLER) {
+        if (task->rseq.address) kernel_rseq_signal(task, &frame->era, delivery.info.signal);
         /* 无handler的普通返回和重启只处理寄存器，不需要查询MM。 */
         struct kernel_mm *mm;
         if(kernel_task_mm_borrow_mutable(task,&mm)!=KERNEL_TASK_STATUS_OK) bad_frame();

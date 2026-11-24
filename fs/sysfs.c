@@ -28,13 +28,8 @@ static int block_stat_snapshot(uint64_t device, uint64_t generation, struct kern
     struct kernel_block_usage usage;
     int error = kernel_block_stat(device, generation, &usage);
     if (error) return error;
-    const uint64_t fields[] = {
-        usage.read.completed, 0, usage.read.sectors, usage.read.elapsed_ns / 1000000U,
-        usage.write.completed, 0, usage.write.sectors, usage.write.elapsed_ns / 1000000U,
-        usage.in_flight, usage.busy_milliseconds,
-        (usage.read.elapsed_ns + usage.write.elapsed_ns + usage.flush.elapsed_ns) / 1000000U,
-        0, 0, 0, 0, usage.flush.completed, usage.flush.elapsed_ns / 1000000U,
-    };
+    uint64_t fields[KERNEL_BLOCK_STAT_FIELDS];
+    kernel_block_stat_values(&usage, fields);
     char *data;
     if (kernel_heap_allocate(heap, sizeof(fields) / sizeof(fields[0]) * 21U, (void **)&data))
         return -KERNEL_ENOMEM;

@@ -418,6 +418,8 @@ enum kernel_files_status kernel_files_preadv2(struct kernel_files *,struct kerne
     int64_t fd,uint64_t user_iov,uint64_t count,int64_t offset,uint32_t flags,int64_t *result);
 enum kernel_files_status kernel_files_pwritev2(struct kernel_files *,struct kernel_mm *,
     int64_t fd,uint64_t user_iov,uint64_t count,int64_t offset,uint32_t flags,int64_t *result);
+enum kernel_files_status kernel_files_cachestat(struct kernel_files *, struct kernel_mm *,
+    uint32_t fd, uint64_t range, uint64_t stat, uint32_t flags, int64_t *result);
 
 /* Install the console description at an empty fixed slot for PID 1 stdio. */
 enum kernel_files_status kernel_files_open_console(

@@ -648,6 +648,26 @@ enum kernel_syscall_status syscall_handle_positioned_iov(
                                           : KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
 }
 
+enum kernel_syscall_status syscall_handle_cachestat(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;
+    struct kernel_mm *mm;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    enum kernel_task_status status = kernel_task_file_io_borrow(caller, &files, &mm);
+    if (status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        decoded->value = -KERNEL_EBADF;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (status != KERNEL_TASK_STATUS_OK ||
+        kernel_files_cachestat(files, mm, (uint32_t)request->arguments[0],
+            request->arguments[1], request->arguments[2], (uint32_t)request->arguments[3],
+            &decoded->value) != KERNEL_FILES_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 enum kernel_syscall_status syscall_handle_pread64(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

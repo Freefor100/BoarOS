@@ -257,7 +257,7 @@ int kernel_wait_backend_park_local(const struct kernel_wait_token *token,
         /* A remote signal takes this queue after publishing pending state.
          * It either precedes this sample or sees the committed wait. Resolve
          * a positive sample in the signal domain, which owns group state. */
-        if (task->wait.interruptible && kernel_wait_backend_signal(task)) return 0;
+        if (kernel_wait_record_interruptible(&task->wait) && kernel_wait_backend_signal(task)) return 0;
         if (!kernel_wait_try_commit(&task->wait,token->generation)) {
             *status=KERNEL_SCHEDULER_STATUS_OK;
             return 1;

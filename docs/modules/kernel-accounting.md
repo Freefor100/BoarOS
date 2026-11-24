@@ -21,7 +21,7 @@ BoarOS 将**热路径无锁硬件计数**、**线程组聚合历史**、**16 项
 
 如果每次系统调用陷入或返回用户态都去抢占全局调度锁或执行 64 位纳秒除法，会给高频短系统调用带来不可接受的开销。BoarOS 采用**“本地累计硬件滴答 + 切栈/查询时惰性换算纳秒”**策略：
 
-- **三态模式切换**：每个正在执行栈上的任务维护 `accounting_mode`（`ACCOUNT_USER`、`ACCOUNT_KERNEL`、`ACCOUNT_INTERRUPT`）。在常规陷入入口（`kernel_cpu_account_trap_begin`）和最终返回用户态（`kernel_cpu_account_user_return`）的既有本地关中断区间内，当前 CPU 仅读取一次硬件计数器并将差值累加到本核的 `accounting_user_ticks` 或 `accounting_kernel_ticks`，**不获取全局锁、不执行纳秒换算**。硬件中断（IRQ）进入时切入 `ACCOUNT_INTERRUPT`，返回时恢复被打断的模式，从而精准排除中断处理开销。
+- **执行模式切换**。常规陷入入口 `kernel_cpu_account_trap_begin` 和用户态返回入口 `kernel_cpu_account_user_return` 在既有本地关中断区间内各采样一次硬件计数器。处理器按当时的执行模式累计用户态、正 nice 值的用户态、内核态、空闲或硬件中断时间。整个更新在本核完成，继续使用硬件节拍。硬件中断返回时恢复被打断的执行模式。任务用量合计两类用户态时间，硬件中断时间计入处理器统计。
 - **栈归属与切栈交接**：CPU 上的活跃时间片始终归属当前真正运行在该栈上的 `cpu->accounting_owner`。即便调度器已提前选出并发布 `next`，仍要等到物理切栈前的 `scheduler_cpu_time_switch()` 才将本核累计滴答换算为纳秒归入旧任务的 `usage.user_ns`/`usage.kernel_ns`（同时推进公平调度器虚拟运行时间 `scheduler_fair_account()`），并把 `accounting_owner` 移交给新任务。阻塞、排队和睡眠期间均无活跃执行片段；此外 `scheduled_ticks` 另行记录包含中断在内的整段调度占用，供 `kernel_task_scheduled_ns()`（`PERF_COUNT_SW_CPU_CLOCK`）使用。
 - **多核无等待读写一致（Seqlock）**：在 `BOAROS_MAX_CPUS > 1` 配置下，每核维护单调递增的 `accounting_sequence`。本地写者在更新计数前将其增为奇数、完成后增为偶数（单核编译时零开销省去），期间只访问常驻结构与硬件计数器，绝不分配或等待。远端查询者先持调度域固定目标任务与 CPU 归属，随后在无锁循环中校验前后偶序列一致并读取快照；RISC-V 多核通过 `arch_time_read_ordered()` 施加时间输入域屏障，确保硬件计数器采样严格落在两次序列读取之间。
 

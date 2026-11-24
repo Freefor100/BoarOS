@@ -702,6 +702,64 @@ static enum kernel_files_status read_device_zeros(
     return KERNEL_FILES_STATUS_OK;
 }
 
+static int64_t read_ready_file(struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description *file, struct kernel_uaccess_iov_cursor *cursor,
+    uint64_t request, uint64_t position, bool advance)
+{
+    struct kernel_vfs_node *node = kernel_open_file_node(file);
+    struct kernel_page_cache *cache = kernel_vfs_file_page_cache(&file->file);
+    int no_reuse = kernel_open_file_read_no_reuse(file);
+    uint64_t total = 0;
+    int error = 0;
+
+    while (!error && total < request && position < kernel_vfs_node_size(node)) {
+        uint64_t physical;
+        size_t valid;
+        size_t offset = position & BOAROS_PAGE_MASK;
+        enum kernel_page_cache_status status = kernel_page_cache_lookup_nowait(cache,
+            &file->file, position >> BOAROS_PAGE_SHIFT, &physical, &valid, no_reuse);
+        if (status == KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE) break;
+        if (status) {
+            error = -KERNEL_EAGAIN;
+            break;
+        }
+        if (offset < valid) {
+            void *page;
+            if (physical_page_map_owned(cache->allocator, physical, &page)) __builtin_trap();
+            size_t remaining = valid - offset;
+            if (remaining > request - total) remaining = request - total;
+            const unsigned char *source = (const unsigned char *)page + offset;
+            KERNEL_FILES_NOTE(files, read_chunks, 1);
+            while (remaining) {
+                uint64_t address;
+                size_t chunk = kernel_uaccess_iov_span(cursor, remaining, &address);
+                if (!chunk) __builtin_trap();
+                struct kernel_mm_user_pin pin = {0};
+                enum kernel_mm_status pinned = kernel_mm_try_pin_ready_user_write(mm, address, &pin);
+                if (pinned) {
+                    error = pinned == KERNEL_MM_STATUS_NOT_MAPPED ||
+                        pinned == KERNEL_MM_STATUS_ACCESS ? -KERNEL_EFAULT : -KERNEL_EAGAIN;
+                    break;
+                }
+                memcpy((unsigned char *)pin.page + (address & BOAROS_PAGE_MASK), source, chunk);
+                kernel_mm_unpin_user_page(&pin);
+                cursor->offset += chunk;
+                position += chunk;
+                total += chunk;
+                source += chunk;
+                remaining -= chunk;
+                if (advance) file->offset = position;
+            }
+        }
+        if (physical_page_release(cache->allocator, physical)) __builtin_trap();
+        if (offset >= valid || valid < BOAROS_PAGE_SIZE) break;
+    }
+    if (!total && error) KERNEL_FILES_NOTE(files, read_failures, 1);
+    if (total) kernel_vfs_file_accessed_nowait(&file->file, kernel_open_file_flags(file));
+    KERNEL_FILES_NOTE(files, bytes_read, total);
+    return total ? (int64_t)total : error;
+}
+
 static enum kernel_files_status read_file_data(struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description, struct kernel_uaccess_iov_cursor *cursor,
     uint64_t count, int scalar, int64_t *linux_result, enum kernel_open_file_kind kind,
@@ -1040,14 +1098,15 @@ static enum kernel_files_status pread_iov_pinned(
     uint64_t count, int64_t offset, enum positioned_read_mode mode, int64_t *linux_result);
 
 static int vector_request_error(struct kernel_open_file_description *file,
-    uint64_t position,uint64_t count,uint32_t flags)
+    uint64_t position,uint64_t count,uint32_t flags, bool allow_nowait)
 {
     if ((file->kind==KERNEL_OPEN_FILE_KIND_REGULAR || file->kind==KERNEL_OPEN_FILE_KIND_GENERATED) &&
         (position>INT64_MAX || count>INT64_MAX-position)) return -KERNEL_EINVAL;
     if (flags&~UINT32_C(0x1ff)) return -KERNEL_EOPNOTSUPP;
     if ((flags&(KERNEL_RWF_APPEND|KERNEL_RWF_NOAPPEND))==
         (KERNEL_RWF_APPEND|KERNEL_RWF_NOAPPEND)) return -KERNEL_EINVAL;
-    if (flags&(KERNEL_RWF_NOWAIT|KERNEL_RWF_ATOMIC|KERNEL_RWF_DONTCACHE))
+    if ((flags&(KERNEL_RWF_ATOMIC|KERNEL_RWF_DONTCACHE)) ||
+        ((flags&KERNEL_RWF_NOWAIT) && !allow_nowait))
         return -KERNEL_EOPNOTSUPP;
     if ((flags&KERNEL_RWF_NOAPPEND) &&
         (kernel_open_file_flags(file)&KERNEL_FILES_O_APPEND) &&
@@ -1121,13 +1180,25 @@ static enum kernel_files_status readv_request(
         status = KERNEL_FILES_STATUS_OK;
         goto out;
     }
+    bool nowait = (flags & KERNEL_RWF_NOWAIT) &&
+        !(kernel_open_file_flags(description) & KERNEL_FILES_O_DIRECT) &&
+        kernel_vfs_node_cache_reporting(kernel_open_file_node(description));
     if (!positioned && (description->kind==KERNEL_OPEN_FILE_KIND_REGULAR ||
-        description->kind==KERNEL_OPEN_FILE_KIND_GENERATED))
-        kernel_mutex_lock(&description->offset_lock,&offset_guard);
+        description->kind==KERNEL_OPEN_FILE_KIND_GENERATED)) {
+        if (nowait) {
+            if (!kernel_mutex_try_lock(&description->offset_lock, &offset_guard)) {
+                *linux_result = -KERNEL_EAGAIN;
+                goto out;
+            }
+        } else kernel_mutex_lock(&description->offset_lock,&offset_guard);
+    }
     *linux_result=vector_request_error(description,positioned?(uint64_t)offset:kernel_open_file_offset(description),
-        snapshot.total,flags);
+        snapshot.total,flags,nowait);
     if (*linux_result) goto out;
-    if (description->file.notify_access_perm) {
+    if (nowait) {
+        *linux_result = kernel_vfs_fanotify_access_nowait(&description->file);
+        if (*linux_result) goto out;
+    } else if (description->file.notify_access_perm) {
         int shared_position = offset_guard.lock != NULL;
         if (shared_position) kernel_lock_release(&offset_guard);
         *linux_result = kernel_vfs_fanotify_permission(&description->file, VFS_NOTIFY_ACCESS_PERM, NULL);
@@ -1135,11 +1206,16 @@ static enum kernel_files_status readv_request(
         if (shared_position) {
             kernel_mutex_lock(&description->offset_lock, &offset_guard);
             *linux_result = vector_request_error(description, kernel_open_file_offset(description),
-                snapshot.total, flags);
+                snapshot.total, flags, nowait);
             if (*linux_result) goto out;
         }
     }
-    if (positioned) {
+    if (nowait) {
+        struct kernel_uaccess_iov_cursor cursor = {snapshot.view, snapshot.count, 0, 0};
+        uint64_t position = positioned ? (uint64_t)offset : kernel_open_file_offset(description);
+        *linux_result = read_ready_file(files, mm, description, &cursor, snapshot.total,
+            position, !positioned);
+    } else if (positioned) {
         status = pread_iov_pinned(files, mm, &description, snapshot.view, snapshot.count,
                                   snapshot.total, offset, POSITIONED_READ_VECTOR, linux_result);
     } else if (description->device && description->device->readv) {
@@ -1163,6 +1239,43 @@ out:
         KERNEL_FILES_NOTE(files, read_failures, 1);
     }
     return kernel_files_release_io(files, &description, status);
+}
+
+enum kernel_files_status kernel_files_cachestat(struct kernel_files *files, struct kernel_mm *mm,
+    uint32_t fd, uint64_t range_address, uint64_t stat_address, uint32_t flags,
+    int64_t *linux_result)
+{
+    if (!kernel_files_is_live(files) || !mm || !linux_result)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    KERNEL_FILES_PIN_SCOPE(pin);
+    struct kernel_open_file_description *file = NULL;
+    enum kernel_files_status status = kernel_files_pin_data(files, fd, &file, linux_result);
+    if (status || *linux_result) return status;
+    pin = (struct kernel_files_pin_guard){files, file};
+    struct { uint64_t off, len; } range;
+    size_t copied;
+    if (kernel_copy_from_user(mm, &range, range_address, sizeof(range), &copied))
+        *linux_result = -KERNEL_EFAULT;
+    else {
+        struct kernel_vfs_node *node = kernel_open_file_node(file);
+        if (!kernel_vfs_node_cache_reporting(node))
+            *linux_result = -KERNEL_EOPNOTSUPP;
+        else if (!kernel_open_file_writable(file) && !kernel_vfs_file_mincore_allowed(&file->file))
+            *linux_result = -KERNEL_EPERM;
+        else if (flags)
+            *linux_result = -KERNEL_EINVAL;
+        else {
+            uint64_t first = range.off >> BOAROS_PAGE_SHIFT;
+            uint64_t last = range.len ? (range.off + range.len - 1) >> BOAROS_PAGE_SHIFT :
+                UINT64_MAX;
+            struct kernel_page_cache_range_statistics stats;
+            kernel_page_cache_range_statistics(kernel_vfs_file_page_cache(&file->file),
+                node, first, last, &stats);
+            if (kernel_copy_to_user(mm, stat_address, &stats, sizeof(stats), &copied))
+                *linux_result = -KERNEL_EFAULT;
+        }
+    }
+    return KERNEL_FILES_STATUS_OK;
 }
 
 
@@ -2171,7 +2284,7 @@ static enum kernel_files_status writev_request(
         description->kind==KERNEL_OPEN_FILE_KIND_GENERATED))
         kernel_mutex_lock(&description->offset_lock,&offset_guard);
     *linux_result=vector_request_error(description,positioned?(uint64_t)offset:kernel_open_file_offset(description),
-        snapshot.total,flags);
+        snapshot.total,flags,false);
     if (*linux_result) goto out;
     if (!positioned && description->device && description->device->writev) {
         status = description->device->writev(description->device_instance,
@@ -2379,7 +2492,7 @@ int kernel_files_aio_rw(struct kernel_files *files,struct kernel_mm *mm,
         scalar.length=count;
     }
     if (offset<0 || count>(uint64_t)(INT64_MAX-offset)) {error=-KERNEL_EINVAL;goto out;}
-    error=vector_request_error(file,(uint64_t)offset,count,flags);
+    error=vector_request_error(file,(uint64_t)offset,count,flags,false);
     if (error) goto out;
     if (count && !writing && file->file.notify_access_perm) {
         error = kernel_vfs_fanotify_permission(&file->file, VFS_NOTIFY_ACCESS_PERM, NULL);
@@ -2812,7 +2925,7 @@ int64_t kernel_files_uring_rw(struct kernel_files *files, struct kernel_mm *mm,
         if (file->kind == KERNEL_OPEN_FILE_KIND_REGULAR ||
             file->kind == KERNEL_OPEN_FILE_KIND_GENERATED)
             kernel_mutex_lock(&file->offset_lock, &position);
-        result = vector_request_error(file, kernel_open_file_offset(file), count, flags);
+        result = vector_request_error(file, kernel_open_file_offset(file), count, flags, false);
         if (result) goto out;
         if (writing) {
             if (file->device && file->device->writev) {
@@ -2858,7 +2971,7 @@ int64_t kernel_files_uring_fixed_rw(struct kernel_files *files,
         kernel_mutex_lock(&file->offset_lock, &guard);
     uint64_t position = offset < 0 ? kernel_open_file_offset(file) : (uint64_t)offset;
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
-    int error = vector_request_error(file, position, count, flags);
+    int error = vector_request_error(file, position, count, flags, false);
     if (error || !count) return error;
     if (writing) {
         int append = (flags & KERNEL_RWF_APPEND) ||

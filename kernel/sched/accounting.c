@@ -6,7 +6,7 @@
 #include <kernel/accounting.h>
 #include <kernel/credentials.h>
 
-enum { ACCOUNT_KERNEL, ACCOUNT_USER, ACCOUNT_INTERRUPT };
+enum { ACCOUNT_KERNEL, ACCOUNT_USER, ACCOUNT_INTERRUPT, ACCOUNT_NICE };
 
 static inline uint64_t accounting_counter(void)
 {
@@ -38,25 +38,46 @@ static inline void accounting_write_end(struct kernel_cpu *cpu)
     (void)cpu;
 #endif
 }
+static inline void accounting_add(uint64_t *counter, uint64_t ticks)
+{
+    __atomic_store_n(counter, __atomic_load_n(counter, __ATOMIC_RELAXED) + ticks, __ATOMIC_RELAXED);
+}
+
+static inline int accounting_user_mode(uint32_t mode)
+{
+    return mode == ACCOUNT_USER || mode == ACCOUNT_NICE;
+}
+
 static inline void account_interval(struct kernel_cpu *cpu, uint64_t now, uint64_t *counter)
 {
     uint64_t started=__atomic_load_n(&cpu->accounting_started_ticks,__ATOMIC_RELAXED);
     if (now<started) __builtin_trap();
-    if (counter) __atomic_store_n(counter,
-        __atomic_load_n(counter,__ATOMIC_RELAXED) + (now - started), __ATOMIC_RELAXED);
+    accounting_add(counter, now - started);
     __atomic_store_n(&cpu->accounting_started_ticks,now,__ATOMIC_RELAXED);
 }
 
 static __attribute__((always_inline)) inline void account_time(struct kernel_cpu *cpu,uint64_t now)
 {
     struct kernel_task *task=cpu->accounting_owner;
-    uint64_t *counter = NULL;
-    if (!task->idle && task!=cpu->idle) {
-        uint32_t mode=__atomic_load_n(&task->accounting_mode,__ATOMIC_RELAXED);
-        counter=mode==ACCOUNT_USER ? &cpu->accounting_user_ticks :
-            mode==ACCOUNT_KERNEL ? &cpu->accounting_kernel_ticks : 0;
-    }
+    uint32_t mode=__atomic_load_n(&task->accounting_mode,__ATOMIC_RELAXED);
+    uint64_t *counter;
+    if (mode == ACCOUNT_INTERRUPT)
+        counter = &cpu->statistics.ticks[KERNEL_CPU_TIME_IRQ];
+    else if (task->idle || task == cpu->idle)
+        counter = &cpu->statistics.ticks[KERNEL_CPU_TIME_IDLE];
+    else if (mode == ACCOUNT_USER)
+        counter = &cpu->accounting_user_ticks;
+    else if (mode == ACCOUNT_NICE)
+        counter = &cpu->accounting_nice_ticks;
+    else
+        counter = &cpu->accounting_kernel_ticks;
     account_interval(cpu, now, counter);
+}
+
+static inline uint64_t accounting_user_ticks(const struct kernel_cpu *cpu)
+{
+    return __atomic_load_n(&cpu->accounting_user_ticks,__ATOMIC_RELAXED) +
+           __atomic_load_n(&cpu->accounting_nice_ticks,__ATOMIC_RELAXED);
 }
 /* 首次绑定有独立的控制资格和失败分支，保持在常规trap及用户返回的记账路径之外。 */
 static __attribute__((noinline)) int accounting_initialize(struct kernel_cpu *cpu)
@@ -81,13 +102,13 @@ uint64_t scheduler_cpu_execution_ns(struct kernel_cpu *cpu,const struct kernel_t
 #endif
         uint64_t total=task->usage.user_ns+task->usage.kernel_ns;
         if(cpu->accounting_owner==task) {
-            uint64_t u=__atomic_load_n(&cpu->accounting_user_ticks,__ATOMIC_RELAXED);
+            uint64_t u=accounting_user_ticks(cpu);
             uint64_t k=__atomic_load_n(&cpu->accounting_kernel_ticks,__ATOMIC_RELAXED);
             uint64_t started=__atomic_load_n(&cpu->accounting_started_ticks,__ATOMIC_RELAXED);
             uint32_t mode=__atomic_load_n(&task->accounting_mode,__ATOMIC_RELAXED);
             uint64_t now=accounting_counter();
             if(now<started)__builtin_trap();
-            if(mode==ACCOUNT_USER)u+=now-started;
+            if(accounting_user_mode(mode))u+=now-started;
             else if(mode==ACCOUNT_KERNEL)k+=now-started;
             total+=kernel_time_ticks_to_ns(u)+kernel_time_ticks_to_ns(k);
         }
@@ -129,8 +150,13 @@ void scheduler_cpu_time_switch(struct kernel_task *previous,struct kernel_task *
     accounting_write_begin(cpu);
     account_time(cpu,now);
     /* task保存已结束执行片段的纳秒值；本CPU的硬件tick只在查询/交接换算。 */
-    previous->usage.user_ns+=kernel_time_ticks_to_ns(cpu->accounting_user_ticks);
+    previous->usage.user_ns+=kernel_time_ticks_to_ns(accounting_user_ticks(cpu));
     previous->usage.kernel_ns+=kernel_time_ticks_to_ns(cpu->accounting_kernel_ticks);
+    accounting_add(&cpu->statistics.ticks[KERNEL_CPU_TIME_USER], cpu->accounting_user_ticks);
+    accounting_add(&cpu->statistics.ticks[KERNEL_CPU_TIME_NICE], cpu->accounting_nice_ticks);
+    accounting_add(&cpu->statistics.ticks[KERNEL_CPU_TIME_SYSTEM], cpu->accounting_kernel_ticks);
+    accounting_add(&cpu->statistics.switches, 1U);
+    __atomic_store_n(&cpu->accounting_nice_ticks,0,__ATOMIC_RELAXED);
     if(!previous->idle)scheduler_fair_account(previous,previous->usage.user_ns+previous->usage.kernel_ns);
     __atomic_store_n(&cpu->accounting_user_ticks,0,__ATOMIC_RELAXED);
     __atomic_store_n(&cpu->accounting_kernel_ticks,0,__ATOMIC_RELAXED);
@@ -185,7 +211,7 @@ void scheduler_task_cpu_time_locked(const struct kernel_task *task,uint64_t *use
             uint64_t sequence=__atomic_load_n(&cpu->accounting_sequence,__ATOMIC_ACQUIRE);
             if (sequence&1U) continue;
 #endif
-            uint64_t u=__atomic_load_n(&cpu->accounting_user_ticks,__ATOMIC_RELAXED);
+            uint64_t u=accounting_user_ticks(cpu);
             uint64_t k=__atomic_load_n(&cpu->accounting_kernel_ticks,__ATOMIC_RELAXED);
             uint64_t started=__atomic_load_n(&cpu->accounting_started_ticks,__ATOMIC_RELAXED);
             uint32_t mode=__atomic_load_n(&task->accounting_mode,__ATOMIC_RELAXED);
@@ -196,7 +222,7 @@ void scheduler_task_cpu_time_locked(const struct kernel_task *task,uint64_t *use
 #endif
             if (now<started) __builtin_trap();
             uint64_t elapsed=now-started;
-            *user=task->usage.user_ns+kernel_time_ticks_to_ns(u+(mode==ACCOUNT_USER ? elapsed : 0));
+            *user=task->usage.user_ns+kernel_time_ticks_to_ns(u+(accounting_user_mode(mode) ? elapsed : 0));
             *system=task->usage.kernel_ns+kernel_time_ticks_to_ns(k+(mode==ACCOUNT_KERNEL ? elapsed : 0));
             return;
         }
@@ -213,8 +239,11 @@ void kernel_cpu_account_trap_begin(struct kernel_cpu_account_scope *scope,int us
     struct kernel_task *task=cpu->accounting_owner;
     accounting_write_begin(cpu);
     uint64_t now = accounting_counter();
-    if (user) account_interval(cpu, now, &cpu->accounting_user_ticks);
-    else account_time(cpu, now);
+    if (user) {
+        uint64_t *counter = task->accounting_mode == ACCOUNT_NICE
+            ? &cpu->accounting_nice_ticks : &cpu->accounting_user_ticks;
+        account_interval(cpu, now, counter);
+    } else account_time(cpu, now);
     /* Synchronous traps stay in kernel accounting through return preparation.
      * Only an interrupt needs a saved mode and an end-of-handler transition. */
     if (interrupt) {
@@ -240,8 +269,87 @@ void kernel_cpu_account_user_return(void)
     if (!cpu->accounting_owner && !accounting_initialize(cpu)) __builtin_trap();
     accounting_write_begin(cpu);
     account_interval(cpu, accounting_counter(), &cpu->accounting_kernel_ticks);
-    __atomic_store_n(&cpu->accounting_owner->accounting_mode,ACCOUNT_USER,__ATOMIC_RELAXED);
+    struct kernel_task *task = cpu->accounting_owner;
+    /* Only the published nice value determines this user-time bucket. */
+    uint64_t priority = __atomic_load_n(&task->scheduling.execution_priority, __ATOMIC_RELAXED);
+    uint32_t mode = (int32_t)(priority >> 32) > 0 ? ACCOUNT_NICE : ACCOUNT_USER;
+    __atomic_store_n(&task->accounting_mode, mode, __ATOMIC_RELAXED);
     accounting_write_end(cpu);
+}
+
+static void cpu_statistics_read(const struct kernel_cpu *cpu, struct kernel_cpu_statistics *out)
+{
+    /* The scheduler locks pin accounting_owner. Trap writers only need the
+     * local IRQ scope, and the sequence includes their active interval. */
+    for (;;) {
+#if BOAROS_MAX_CPUS > 1
+        uint64_t sequence = __atomic_load_n(&cpu->accounting_sequence, __ATOMIC_ACQUIRE);
+        if (sequence & 1U) continue;
+#endif
+        for (unsigned i = 0; i < KERNEL_CPU_TIME_COUNT; i++)
+            out->ticks[i] = __atomic_load_n(&cpu->statistics.ticks[i], __ATOMIC_RELAXED);
+        out->ticks[KERNEL_CPU_TIME_USER] += __atomic_load_n(&cpu->accounting_user_ticks, __ATOMIC_RELAXED);
+        out->ticks[KERNEL_CPU_TIME_NICE] += __atomic_load_n(&cpu->accounting_nice_ticks, __ATOMIC_RELAXED);
+        out->ticks[KERNEL_CPU_TIME_SYSTEM] += __atomic_load_n(&cpu->accounting_kernel_ticks, __ATOMIC_RELAXED);
+        const struct kernel_task *task = cpu->accounting_owner;
+        if (task) {
+            uint64_t started = __atomic_load_n(&cpu->accounting_started_ticks, __ATOMIC_RELAXED);
+            uint32_t mode = __atomic_load_n(&task->accounting_mode, __ATOMIC_RELAXED);
+            unsigned bucket = mode == ACCOUNT_INTERRUPT ? KERNEL_CPU_TIME_IRQ :
+                task->idle || task == cpu->idle ? KERNEL_CPU_TIME_IDLE :
+                mode == ACCOUNT_USER ? KERNEL_CPU_TIME_USER :
+                mode == ACCOUNT_NICE ? KERNEL_CPU_TIME_NICE : KERNEL_CPU_TIME_SYSTEM;
+            out->ticks[bucket] += accounting_counter() - started;
+        }
+#if BOAROS_MAX_CPUS > 1
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (sequence != __atomic_load_n(&cpu->accounting_sequence, __ATOMIC_RELAXED)) continue;
+#endif
+        out->interrupts = __atomic_load_n(&cpu->statistics.interrupts, __ATOMIC_RELAXED);
+        out->switches = cpu->statistics.switches;
+        out->tasks = cpu->statistics.tasks;
+        return;
+    }
+}
+
+unsigned kernel_cpu_statistics_snapshot(struct kernel_cpu_statistics *statistics)
+{
+    unsigned online = 0;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    KERNEL_RUN_SET(runs);
+    for (const struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next) {
+#if BOAROS_MAX_CPUS > 1
+        if (!kernel_cpu_online(cpu)) continue;
+        unsigned index = cpu->logical_id;
+#else
+        unsigned index = 0;
+#endif
+        cpu_statistics_read(cpu, &statistics[index]);
+        online |= 1U << index;
+    }
+    return online;
+}
+
+void kernel_scheduler_task_statistics(uint64_t *runnable, uint64_t *io_waiters)
+{
+    *runnable = 0;
+    *io_waiters = 0;
+    struct scheduler_task_cursor cursor;
+    scheduler_task_cursor_begin(&cursor);
+    while (cursor.task) {
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            const struct kernel_task *task = cursor.task;
+            if (task->accounted && !task->idle) {
+                unsigned state = __atomic_load_n(&task->state, __ATOMIC_RELAXED);
+                if (state == KERNEL_THREAD_STATE_READY || state == KERNEL_THREAD_STATE_RUNNING)
+                    (*runnable)++;
+                if (state == KERNEL_THREAD_STATE_BLOCKED && kernel_wait_record_io_blocked(&task->wait))
+                    (*io_waiters)++;
+            }
+        }
+        scheduler_task_cursor_next(&cursor);
+    }
 }
 
 void scheduler_usage_add(struct kernel_task_usage *to, const struct kernel_task_usage *from)

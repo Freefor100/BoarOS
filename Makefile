@@ -440,6 +440,7 @@ COMMON_C_SOURCES := \
 	kernel/syscall/mqueue.c \
 	kernel/syscall/time.c \
 	kernel/syscall/membarrier.c \
+	kernel/syscall/rseq.c \
 	kernel/syscall/aio.c \
 	kernel/syscall/io_uring.c \
 	kernel/syscall/io_uring_files.c \

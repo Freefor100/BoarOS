@@ -191,6 +191,8 @@ int kernel_vfs_node_writeback(struct kernel_vfs_node *node,
 
 /* 调用者已有node owner；尺寸由inode修改者发布，不重复查询生命周期。 */
 uint64_t kernel_vfs_node_size(const struct kernel_vfs_node *node);
+int kernel_vfs_node_cache_reporting(const struct kernel_vfs_node *node);
+void kernel_vfs_file_accessed_nowait(struct kernel_vfs_file *file, uint32_t open_flags);
 const struct kernel_vfs_mount *kernel_vfs_node_mount(
     const struct kernel_vfs_node *node);
 

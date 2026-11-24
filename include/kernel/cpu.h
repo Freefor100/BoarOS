@@ -2,6 +2,7 @@
 #define BOAROS_KERNEL_CPU_H
 #include <arch/context.h>
 #include <arch/switch_context.h>
+#include <kernel/accounting.h>
 #include <kernel/sched_policy.h>
 #include <kernel/cpu_config.h>
 #include <kernel/cost.h>
@@ -96,6 +97,8 @@ struct kernel_cpu {
     uint64_t active_mm_record_page,borrowed_mm_record_page;
     uint64_t borrowed_mm_root,borrowed_mm_context,borrowed_mm_identity;
     uint64_t borrowed_mm_generation,borrowed_mm_kernel_context;
+    uint64_t accounting_nice_ticks;
+    struct kernel_cpu_statistics statistics;
 };
 #if BOAROS_COST_DIAGNOSTICS
 _Static_assert(offsetof(struct kernel_cpu, cost) == 32, "cost assembly CPU prefix");
@@ -109,6 +112,13 @@ static inline struct kernel_cpu *kernel_cpu_current(void)
     struct kernel_cpu *cpu = arch_current_cpu_get();
     if (!cpu || cpu->initialized != KERNEL_CPU_INITIALIZED) __builtin_trap();
     return cpu;
+}
+
+/* Only the current CPU writes, in a hardware interrupt with local IRQs masked. */
+static inline void kernel_cpu_interrupt_handled(void)
+{
+    uint64_t *count = &kernel_cpu_current()->statistics.interrupts;
+    __atomic_store_n(count, __atomic_load_n(count, __ATOMIC_RELAXED) + 1U, __ATOMIC_RELAXED);
 }
 /* Validated boot topology, published before mounts and unchanged thereafter.
  * This counts configured executors, including secondaries not yet started. */

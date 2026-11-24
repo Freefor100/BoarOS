@@ -73,11 +73,15 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         if (!pending) return;
     }
 #if BOAROS_MAX_CPUS > 1
-    if(!code && (pending&(1U<<12)))la_smp_handle_ipi();
+    if (!code && (pending & (1U << 12))) {
+        kernel_cpu_interrupt_handled();
+        la_smp_handle_ipi();
+    }
 #endif
     int external_handled=!code && (pending&4);
     if(external_handled) la_virt_irq_dispatch();
     if (!code && (pending&(UINT64_C(1)<<11))) {
+        kernel_cpu_interrupt_handled();
         uint64_t elapsed;
         if (la_timer_interrupt(&elapsed)!=ARCH_TIMER_STATUS_OK) la_virt_fatal("timer interrupt");
 #if BOAROS_MAX_CPUS > 1
@@ -228,18 +232,26 @@ void la_trap_return_prepare(struct arch_trap_frame *frame)
     if ((frame->prmd&3)==3) {
         if(__atomic_load_n(&kernel_task_current()->ptrace,__ATOMIC_ACQUIRE))
             kernel_ptrace_user_return(kernel_task_current(),frame);
-#if BOAROS_USER_SMP
-        do {
-            if(kernel_task_prepare_user_return()) {
+        for (;;) {
+            if (kernel_task_prepare_user_return()) {
                 la_signal_prepare_user_return(frame);
-                if(kernel_scheduler_user_service_active())kernel_scheduler_leave_user_service();
+#if BOAROS_USER_SMP
+                if (kernel_scheduler_user_service_active())
+                    kernel_scheduler_leave_user_service();
+#endif
             }
-            if(kernel_task_current()->ptrace)kernel_ptrace_user_return(kernel_task_current(),frame);
-        } while(kernel_scheduler_user_return_pending());
+            struct kernel_task *task = kernel_task_current();
+            if (task->ptrace) kernel_ptrace_user_return(task, frame);
+            if (__builtin_expect(task->rseq.pending, 0) &&
+                kernel_rseq_resume(task, &frame->era))
+                continue;
+#if BOAROS_USER_SMP
+            if (kernel_scheduler_user_return_pending()) continue;
+#endif
+            break;
+        }
+#if BOAROS_USER_SMP
         kernel_cpu_current()->user_returns++;
-#else
-        kernel_task_prepare_user_return();la_signal_prepare_user_return(frame);
-        if(kernel_task_current()->ptrace)kernel_ptrace_user_return(kernel_task_current(),frame);
 #endif
         kernel_cpu_account_user_return();
 #if BOAROS_COST_DIAGNOSTICS

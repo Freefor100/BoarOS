@@ -120,6 +120,10 @@ enum kernel_mm_status kernel_mm_pin_user_page(
  * no page is faulted in and no MM editor is waited for. */
 enum kernel_mm_status kernel_mm_try_pin_user_page(const struct kernel_mm *,
     uint64_t address,uint32_t access,struct kernel_mm_user_pin *);
+/* Resident writable RAM only. ACCESS/NOT_MAPPED prove an invalid destination;
+ * CONFLICT means that fault handling or a blocking owner would be needed. */
+enum kernel_mm_status kernel_mm_try_pin_ready_user_write(const struct kernel_mm *,
+    uint64_t address,struct kernel_mm_user_pin *);
 void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *);
 /* Borrow the first page, plus an already accessible second page. Only the
  * first address can wait; a missing second page leaves a usable prefix. */

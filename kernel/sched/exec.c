@@ -156,6 +156,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
         kernel_mm_coredump_filter_set(&transaction->image.mm,
             kernel_mm_coredump_filter_get(&thread->mm));
         kernel_mm_thp_disable_set(&transaction->image.mm,kernel_mm_thp_disable_get(&thread->mm));
+        thread->rseq = (struct kernel_rseq){0};
         transaction->retired_mm = thread->mm;
         thread->mm = transaction->image.mm;
         previous=thread->credentials;

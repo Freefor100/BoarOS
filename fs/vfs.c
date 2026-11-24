@@ -1047,7 +1047,7 @@ static const struct kernel_fanotify_ops *fanotify_ops(const struct kernel_vfs_in
 }
 
 static int notify_permission_path(const struct kernel_vfs_file *file,
-    const struct kernel_vfs_path *path, uint32_t mask, uint8_t *track_access)
+    const struct kernel_vfs_path *path, uint32_t mask, uint8_t *track_access, bool nowait)
 {
     const struct kernel_vfs_node *node = file->private_data;
     struct kernel_vfs_instance *instance = node->instance;
@@ -1072,11 +1072,11 @@ static int notify_permission_path(const struct kernel_vfs_file *file,
     uint32_t ordered[] = {VFS_NOTIFY_OPEN_EXEC_PERM, VFS_NOTIFY_OPEN_PERM, VFS_NOTIFY_ACCESS_PERM};
     int result = 0;
     if (!(mask & interest)) {
-        result = ops->permission(file, path, parent, directory, track_access);
+        result = ops->permission(file, path, parent, directory, track_access, nowait);
     } else {
         for (size_t i = 0; i < sizeof(ordered) / sizeof(*ordered); i++) {
             if (!(mask & interest & ordered[i])) continue;
-            result = ops->permission(file, path, parent, ordered[i] | directory, track_access);
+            result = ops->permission(file, path, parent, ordered[i] | directory, track_access, nowait);
             if (result) break;
             track_access = NULL;
         }
@@ -1086,24 +1086,24 @@ static int notify_permission_path(const struct kernel_vfs_file *file,
 }
 
 static int __attribute__((noinline)) notify_permission(const struct kernel_vfs_file *file,
-    struct kernel_vfs_node *node, uint32_t mask, uint8_t *track_access)
+    struct kernel_vfs_node *node, uint32_t mask, uint8_t *track_access, bool nowait)
 {
     unsigned type = file->mode & KERNEL_VFS_S_IFMT;
     if (type != KERNEL_VFS_S_IFREG && type != KERNEL_VFS_S_IFDIR) return 0;
-    int result = notify_permission_path(file, file->path, mask, track_access);
+    int result = notify_permission_path(file, file->path, mask, track_access, nowait);
     if (result || !node->instance->ops->event_backing) return result;
 
     struct kernel_vfs_path *backing = node->instance->ops->event_backing(node);
     if (backing) {
         struct kernel_vfs_file real = backing->file;
         real.mount = &((struct kernel_vfs_node *)real.private_data)->instance->backend_mount;
-        result = notify_permission_path(&real, backing, mask, track_access);
+        result = notify_permission_path(&real, backing, mask, track_access, nowait);
     }
     return result;
 }
 
-int kernel_vfs_fanotify_permission(const struct kernel_vfs_file *file, uint32_t mask,
-                                   uint8_t *track_access)
+static inline int fanotify_permission(const struct kernel_vfs_file *file, uint32_t mask,
+                                      uint8_t *track_access, bool nowait)
 {
     struct kernel_vfs_node *node = file->private_data;
     if (!node || !file->path || file->notify_suppressed) return 0;
@@ -1111,8 +1111,15 @@ int kernel_vfs_fanotify_permission(const struct kernel_vfs_file *file, uint32_t 
     uint32_t wanted = mask | (track_access ? VFS_NOTIFY_ACCESS_PERM : 0);
     if (!(__atomic_load_n(&instance->fanotify_interest, __ATOMIC_ACQUIRE) & wanted) &&
         !instance->ops->event_backing) return 0;
-    return notify_permission(file, node, mask, track_access);
+    return notify_permission(file, node, mask, track_access, nowait);
 }
+
+int kernel_vfs_fanotify_permission(const struct kernel_vfs_file *file, uint32_t mask,
+                                   uint8_t *track_access)
+{ return fanotify_permission(file, mask, track_access, false); }
+
+int kernel_vfs_fanotify_access_nowait(const struct kernel_vfs_file *file)
+{ return fanotify_permission(file, VFS_NOTIFY_ACCESS_PERM, NULL, true); }
 
 static const struct kernel_fanotify_ops *fanotify_interest(
     const struct kernel_vfs_instance *instance, uint32_t mask)
@@ -6432,6 +6439,8 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         break;
     }
     struct kernel_vfs_instance *instance = node->instance;
+    if (__atomic_load_n(&node->cache_shadow_count, __ATOMIC_ACQUIRE))
+        instance->ops->forget_cache_shadows(instance->page_cache, node);
     const struct kernel_fanotify_ops *fanotify = fanotify_ops(instance);
     if (fanotify) fanotify->retire_inode(node, true);
     kernel_flock_destroy(&node->flock_identity);
@@ -6465,6 +6474,11 @@ uint64_t kernel_vfs_node_size(const struct kernel_vfs_node *node)
     return __atomic_load_n(&node->size,__ATOMIC_ACQUIRE);
 }
 
+int kernel_vfs_node_cache_reporting(const struct kernel_vfs_node *node)
+{
+    return node && node->instance->page_cache && node->instance->ops->accessed_nowait &&
+        (node->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG;
+}
 
 struct kernel_page_cache_dirty *kernel_vfs_node_dirty_pages(struct kernel_vfs_node *node)
 { return &node->dirty_cache_pages; }
@@ -7259,6 +7273,12 @@ static void file_accessed(struct kernel_vfs_file *file,uint32_t open_flags,bool 
 void kernel_vfs_file_accessed(struct kernel_vfs_file *file,uint32_t open_flags)
 {
     file_accessed(file,open_flags,false);
+}
+void kernel_vfs_file_accessed_nowait(struct kernel_vfs_file *file, uint32_t open_flags)
+{
+    if ((open_flags & 01000000U) || !kernel_vfs_file_atime_enabled(file)) return;
+    struct kernel_vfs_instance *instance = file->mount->private_data;
+    instance->ops->accessed_nowait(file);
 }
 
 int kernel_vfs_file_modified(struct kernel_vfs_file *file,

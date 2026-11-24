@@ -67,6 +67,7 @@ void riscv_plic_dispatch(void)
         uint32_t source = *reg(plic.claim);
         if (!source) { dispatching = 0; return; }
         if (source > plic.sources) __builtin_trap();
+        kernel_cpu_interrupt_handled();
         if (plic.handlers[source].handle)
             plic.handlers[source].handle(plic.handlers[source].owner);
         else *reg(plic.enable + (source / 32) * 4) &= ~(1U << (source % 32));

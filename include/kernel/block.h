@@ -146,6 +146,10 @@ typedef int (*kernel_block_devnode_fn)(struct kernel_block_device *const *, size
 void kernel_block_set_devnode_publisher(kernel_block_devnode_fn);
 int kernel_block_snapshot(struct kernel_block_device **, size_t capacity, size_t *count);
 int kernel_block_stat(uint64_t number, uint64_t generation, struct kernel_block_usage *);
+/* The caller pins this registration while sampling its counters. */
+void kernel_block_usage_snapshot(const struct kernel_block_device *, struct kernel_block_usage *);
+enum { KERNEL_BLOCK_STAT_FIELDS = 17 };
+void kernel_block_stat_values(const struct kernel_block_usage *, uint64_t values[KERNEL_BLOCK_STAT_FIELDS]);
 int kernel_block_register(struct kernel_block_device *device, uint64_t number);
 int kernel_block_unregister(struct kernel_block_device *device);
 /* Explicit GPT discovery on 512-byte-sector disks. Stable zeroed children

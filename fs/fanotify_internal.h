@@ -23,7 +23,8 @@ struct kernel_fanotify_ops {
                          const struct kernel_vfs_path *new_parent, const char *new_name,
                          uint32_t mask);
     int (*permission)(const struct kernel_vfs_file *, const struct kernel_vfs_path *,
-                      struct kernel_vfs_node *parent, uint32_t mask, uint8_t *track_access);
+                      struct kernel_vfs_node *parent, uint32_t mask, uint8_t *track_access,
+                      bool nowait);
     void (*retire_inode)(struct kernel_vfs_node *, bool evicted);
     void (*retire_mount)(struct kernel_vfs_mount *);
     void (*retire_instance)(struct kernel_vfs_instance *);

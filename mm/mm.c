@@ -2840,6 +2840,8 @@ static __attribute__((always_inline)) inline void register_user_pin(const struct
     link_user_pin(kernel_io_context_current(),mm,record,head,physical,order,pointer,access,pin);
 }
 
+enum { PIN_WRITE_NO_FILE_ALIAS = 2 };
+
 /* PTE、resident索引与权限许可由同一短读资格固定；实际页acquire不能移出。 */
 static __attribute__((always_inline)) inline enum kernel_mm_status pin_mapping(const struct kernel_mm *mm,
     struct kernel_mm_record *record, uint64_t address, uint32_t access,
@@ -2874,6 +2876,8 @@ static __attribute__((always_inline)) inline enum kernel_mm_status pin_mapping(c
         struct mm_file_alias_resident *resident = file_alias_resident(
             find_file_resident(record, address & ~BOAROS_PAGE_MASK));
         if (resident && kernel_page_cache_alias_active(&resident->alias)) {
+            /* Returning an alias writer can take a sleepable cache lock. */
+            if (cache_write == PIN_WRITE_NO_FILE_ALIAS) return KERNEL_MM_STATUS_CONFLICT;
             enum kernel_page_cache_status admitted=kernel_page_cache_alias_write_begin(&resident->alias,&pin->cache_write);
             if (admitted==KERNEL_PAGE_CACHE_STATUS_BUSY) return KERNEL_MM_STATUS_ACCESS;
             if (admitted) __builtin_trap();
@@ -2944,6 +2948,42 @@ enum kernel_mm_status kernel_mm_pin_user_page(const struct kernel_mm *mm,
 enum kernel_mm_status kernel_mm_try_pin_user_page(const struct kernel_mm *mm,
     uint64_t address,uint32_t access,struct kernel_mm_user_pin *pin)
 { return pin_user_prefix(mm,address,0,access,pin,NULL,0); }
+
+enum kernel_mm_status kernel_mm_try_pin_ready_user_write(const struct kernel_mm *mm,
+    uint64_t address,struct kernel_mm_user_pin *pin)
+{
+    if (address < BOAROS_PAGE_SIZE || address >= ARCH_MMU_USER_LIMIT)
+        return KERNEL_MM_STATUS_NOT_MAPPED;
+    struct kernel_mm_record *record;
+    enum kernel_mm_status status = resolve_record(mm, &record);
+    if (status) return status;
+    {
+        KERNEL_RAW_READ_SCOPE(raw, &record->metadata);
+        if (pin_admission_closed(record)) return KERNEL_MM_STATUS_CONFLICT;
+        status = pin_mapping(mm, record, address, KERNEL_MM_WRITE, pin,
+                             PIN_WRITE_NO_FILE_ALIAS, 0);
+    }
+    if (status != KERNEL_MM_STATUS_NOT_MAPPED && status != KERNEL_MM_STATUS_ACCESS)
+        return status;
+
+    /* An absent or read-only PTE could still admit a demand write or COW.
+     * Consult the VMA without waiting behind an address-space editor. */
+    KERNEL_LOCK_SCOPE(gate);
+    KERNEL_LOCK_SCOPE(vmas);
+    if (!kernel_rwlock_try_read(&record->operations, &gate) ||
+        !kernel_rwlock_try_read(&record->vma_lock, &vmas) || !record->vmas)
+        return KERNEL_MM_STATUS_CONFLICT;
+    struct kernel_vma vma;
+    if (!kernel_vma_set_lookup(record->vmas, address, &vma))
+        return (user_effective_permissions(vma.permissions) & KERNEL_MM_WRITE) ?
+            KERNEL_MM_STATUS_CONFLICT : KERNEL_MM_STATUS_ACCESS;
+    if (address >= 2 * BOAROS_PAGE_SIZE &&
+        !kernel_vma_set_next(record->vmas, address, &vma) &&
+        kernel_vma_grows_down(&vma) &&
+        (user_effective_permissions(vma.permissions) & KERNEL_MM_WRITE))
+        return KERNEL_MM_STATUS_CONFLICT;
+    return KERNEL_MM_STATUS_NOT_MAPPED;
+}
 
 enum kernel_mm_status kernel_mm_pin_user_pair(const struct kernel_mm *mm,
     uint64_t first,uint64_t second,uint32_t access,struct kernel_mm_user_pin pins[2],unsigned *count)

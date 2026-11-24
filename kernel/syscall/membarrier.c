@@ -4,7 +4,7 @@
 #include <kernel/errno.h>
 #include <kernel/membarrier.h>
 #include <kernel/mm.h>
-#include <kernel/task.h>
+#include <kernel/task_state.h>
 
 enum {
     GLOBAL = 1 << 0,
@@ -12,9 +12,13 @@ enum {
     REGISTER_GLOBAL_EXPEDITED = 1 << 2,
     PRIVATE_EXPEDITED = 1 << 3,
     REGISTER_PRIVATE_EXPEDITED = 1 << 4,
+    PRIVATE_EXPEDITED_RSEQ = 1 << 7,
+    REGISTER_PRIVATE_EXPEDITED_RSEQ = 1 << 8,
     GET_REGISTRATIONS = 1 << 9,
+    FLAG_CPU = 1U,
     COMMANDS = GLOBAL | GLOBAL_EXPEDITED | REGISTER_GLOBAL_EXPEDITED |
-               PRIVATE_EXPEDITED | REGISTER_PRIVATE_EXPEDITED | GET_REGISTRATIONS,
+               PRIVATE_EXPEDITED | REGISTER_PRIVATE_EXPEDITED |
+               PRIVATE_EXPEDITED_RSEQ | REGISTER_PRIVATE_EXPEDITED_RSEQ | GET_REGISTRATIONS,
 };
 
 #if BOAROS_MAX_CPUS > 1
@@ -23,12 +27,14 @@ enum {
 static struct __attribute__((aligned(64))) barrier_mailbox {
     unsigned sources;
     uint64_t generation;
+    const struct kernel_mm_record *rseq_record;
     uint64_t acknowledged[BOAROS_MAX_CPUS];
 } mailboxes[BOAROS_MAX_CPUS];
 
 void kernel_membarrier_receive(void)
 {
-    unsigned target = kernel_cpu_current()->logical_id;
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    unsigned target = cpu->logical_id;
     unsigned sources = __atomic_exchange_n(&mailboxes[target].sources, 0, __ATOMIC_ACQUIRE);
     if (!sources)
         return;
@@ -38,11 +44,18 @@ void kernel_membarrier_receive(void)
         sources &= sources - 1U;
         struct barrier_mailbox *mailbox = &mailboxes[source];
         uint64_t generation = __atomic_load_n(&mailbox->generation, __ATOMIC_RELAXED);
+        const struct kernel_mm_record *record =
+            __atomic_load_n(&mailbox->rseq_record, __ATOMIC_RELAXED);
+        struct kernel_task *task = cpu->current;
+        /* A task that moved since the snapshot already has switch-in work.
+         * Only a current user of the original MM needs the IPI event. */
+        if (record && task && task->mm.record == record)
+            kernel_rseq_mark(&task->rseq);
         __atomic_store_n(&mailbox->acknowledged[target], generation, __ATOMIC_RELEASE);
     }
 }
 
-static void rendezvous(const struct kernel_mm *mm)
+static void rendezvous(const struct kernel_mm *mm, int rseq, int target_cpu)
 {
     kernel_preempt_disable();
     unsigned self = kernel_cpu_current()->logical_id;
@@ -51,12 +64,19 @@ static void rendezvous(const struct kernel_mm *mm)
     /* MM activation/deactivation already publish sequenced CPU membership.
      * A join missed by this snapshot observes the publication on its switch. */
     unsigned targets = mm ? kernel_mm_membarrier_active(mm) : ~0U;
-    targets &= (1U << kernel_cpu_get_boot_count()) - 1U;
+    unsigned booted = kernel_cpu_get_boot_count();
+    targets &= (1U << booted) - 1U;
+    if (target_cpu >= 0) {
+        targets &= (unsigned)target_cpu < booted ? 1U << (unsigned)target_cpu : 0U;
+        if (targets & (1U << self))
+            kernel_rseq_mark(&kernel_cpu_current()->current->rseq);
+    }
     targets &= ~(1U << self);
     if (targets) {
         uint64_t generation = __atomic_load_n(&mailbox->generation, __ATOMIC_RELAXED) + 1U;
         if (!generation) __builtin_trap();
         __atomic_store_n(&mailbox->generation, generation, __ATOMIC_RELAXED);
+        __atomic_store_n(&mailbox->rseq_record, rseq ? mm->record : NULL, __ATOMIC_RELAXED);
         unsigned remaining = targets;
         while (remaining) {
             unsigned target = kernel_cpu_first_in_mask(remaining);
@@ -83,9 +103,11 @@ static void rendezvous(const struct kernel_mm *mm)
     kernel_preempt_enable();
 }
 #else
-static void rendezvous(const struct kernel_mm *mm)
+static void rendezvous(const struct kernel_mm *mm, int rseq, int target_cpu)
 {
     (void)mm;
+    (void)rseq;
+    (void)target_cpu;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 #endif
@@ -97,7 +119,8 @@ enum kernel_syscall_status syscall_handle_membarrier(struct kernel_task *caller,
     unsigned flags = (unsigned)request->arguments[1];
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = 0;
-    if (flags || (command && ((command & (command - 1U)) || !(command & COMMANDS)))) {
+    if ((flags && (command != PRIVATE_EXPEDITED_RSEQ || flags != FLAG_CPU)) ||
+        (command && ((command & (command - 1U)) || !(command & COMMANDS)))) {
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
@@ -106,7 +129,7 @@ enum kernel_syscall_status syscall_handle_membarrier(struct kernel_task *caller,
         return KERNEL_SYSCALL_STATUS_OK;
     }
     if (command == GLOBAL || command == GLOBAL_EXPEDITED) {
-        rendezvous(NULL);
+        rendezvous(NULL, 0, -1);
         return KERNEL_SYSCALL_STATUS_OK;
     }
     struct kernel_mm *mm;
@@ -115,13 +138,17 @@ enum kernel_syscall_status syscall_handle_membarrier(struct kernel_task *caller,
     unsigned registrations = kernel_mm_membarrier_registrations(mm);
     if (command == GET_REGISTRATIONS) {
         decoded->value = registrations;
-    } else if (command == PRIVATE_EXPEDITED) {
-        if (registrations & REGISTER_PRIVATE_EXPEDITED)
-            rendezvous(mm);
-        else
+    } else if (command == PRIVATE_EXPEDITED || command == PRIVATE_EXPEDITED_RSEQ) {
+        int rseq = command == PRIVATE_EXPEDITED_RSEQ;
+        unsigned required = rseq ? REGISTER_PRIVATE_EXPEDITED_RSEQ : REGISTER_PRIVATE_EXPEDITED;
+        if (!(registrations & required)) {
             decoded->value = -KERNEL_EPERM;
+        } else if (!rseq || (kernel_mm_user_count(mm) > 1U && kernel_cpu_get_boot_count() > 1U)) {
+            int target_cpu = flags == FLAG_CPU ? (int32_t)request->arguments[2] : -1;
+            rendezvous(mm, rseq, target_cpu);
+        }
     } else if (!(registrations & command)) {
-        rendezvous(mm);
+        rendezvous(mm, 0, -1);
         kernel_mm_membarrier_register(mm, command);
     }
     return KERNEL_SYSCALL_STATUS_OK;

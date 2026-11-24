@@ -549,7 +549,7 @@ static void wait_for_progress(struct virtio_block_device *device, struct kernel_
     if (!completion_wait_needed(device, request)) return;
     struct kernel_wait_token token;
     enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
-    if (kernel_wait_prepare(queue, deadline, 0, &token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    if (kernel_wait_prepare(queue, deadline, KERNEL_WAIT_BLOCK_IO, &token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     if (also) {
         *capacity_node=(struct kernel_wait_node){.task=token.task};
         if (kernel_wait_node_bind(also,capacity_node,&token)) __builtin_trap();
