@@ -775,6 +775,25 @@ static void lru_touch(struct kernel_page_cache_record *record,
     lru_insert_head(record, entry);
 }
 
+/* The caller visited this run from tail to head, the order that produces
+ * the same recency list as touching each page separately. */
+static void lru_touch_run(struct kernel_page_cache_record *record,
+    struct kernel_page_cache_entry *head, struct kernel_page_cache_entry *tail,
+    int cursor_in_run)
+{
+    struct kernel_page_cache_entry *previous = head->lru_previous;
+    if (cursor_in_run && (previous || head != tail))
+        record->reclaim_cursor = previous ? previous : tail;
+    if (!previous) return;
+    struct kernel_page_cache_entry *next = tail->lru_next;
+    previous->lru_next = next;
+    if (next) next->lru_previous = previous;
+    else record->lru_tail = previous;
+    head->lru_previous = NULL;
+    tail->lru_next = record->lru_head;
+    record->lru_head->lru_previous = tail;
+    record->lru_head = head;
+}
 #endif
 
 static int cleanup_entry(struct kernel_page_cache *cache,
@@ -1824,7 +1843,7 @@ static int read_cache_open(struct kernel_vfs_node *node)
     uint64_t epoch;
     return !kernel_file_mapping_epoch(node,&epoch);
 }
-static int read_entry_ready(struct kernel_page_cache_entry *entry)
+static inline int read_entry_ready(struct kernel_page_cache_entry *entry)
 {
     return entry_load_status(entry) == KERNEL_PAGE_CACHE_STATUS_OK && !entry_retired(entry) &&
         (!(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&CACHE_ENTRY_CLOSED));
@@ -1897,22 +1916,43 @@ unsigned kernel_page_cache_acquire_ready(struct kernel_page_cache *cache,
 #endif
     if (!read_cache_open(node)) return 0;
     uint64_t size = kernel_vfs_node_size(node);
+    if (!size) return 0;
+    uint64_t last = (size - 1) >> BOAROS_PAGE_SHIFT;
     unsigned acquired = 0, count = 0;
+#if BOAROS_MAX_CPUS == 1
+    struct kernel_page_cache_entry *run_head = NULL, *run_tail = NULL;
+    int cursor_in_run = 0;
+#endif
     struct kernel_page_cache_entry *entry = index_at_or_after(node, first);
     while (entry && count < capacity && entry->page_index - first < KERNEL_PAGE_CACHE_READY_WINDOW) {
         unsigned slot = entry->page_index - first;
         unsigned bit = 1U << slot;
-        if (bit > selected || !size || entry->page_index > (size - 1) >> BOAROS_PAGE_SHIFT) break;
+        if (bit > selected || entry->page_index > last) break;
         if ((selected & bit) && read_entry_ready(entry)) {
             addresses[count++] = entry->physical_address;
             acquired |= bit;
             /* File I/O qualification excludes replacement; the physical
              * reference excludes clean reclaim until alias publication. */
             if (bindings) bindings[slot].entry = entry;
+#if BOAROS_MAX_CPUS == 1
+            if (KERNEL_PAGE_CACHE_READY_WINDOW > 4) {
+                if (!run_head || entry->lru_next != run_head) {
+                    if (run_head) lru_touch_run(cache->record, run_head, run_tail, cursor_in_run);
+                    run_tail = entry;
+                    cursor_in_run = 0;
+                }
+                run_head = entry;
+                cursor_in_run |= cache->record->reclaim_cursor == entry;
+            } else
+#endif
             note_read_access(cache, entry, 0);
         }
+        if (count == capacity) break;
         entry = RB_NEXT(kernel_page_cache_tree, &node->cache_pages, entry);
     }
+#if BOAROS_MAX_CPUS == 1
+    if (run_head) lru_touch_run(cache->record, run_head, run_tail, cursor_in_run);
+#endif
     if ((acquired & required) != required) return 0;
     physical_page_acquire_batch(cache->allocator, addresses, count);
     if (count) note_read_hits(cache, count);

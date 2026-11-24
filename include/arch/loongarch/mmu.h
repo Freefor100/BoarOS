@@ -124,6 +124,11 @@ enum arch_mmu_status arch_mmu_user_cow_commit(
  * reference observed by physical_page_cow_borrow under that writer. */
 enum arch_mmu_status arch_mmu_user_cow_upgrade(
     struct arch_mmu_user_space *, uint64_t *slot, uint64_t cookie, uint32_t permissions);
+/* The caller stabilizes the slot and owns the newly allocated base page.
+ * Success transfers that reference to the table and retires the old one. */
+enum arch_mmu_status arch_mmu_user_cow_replace_prepared(
+    struct arch_mmu_user_space *, uint64_t *slot, uint64_t cookie, uint64_t replacement,
+    uint32_t permissions, struct kernel_mm_retirement *);
 enum arch_mmu_status arch_mmu_user_next_owned(
     struct arch_mmu_user_space *, uint64_t *, uint64_t end, uint64_t *);
 enum arch_mmu_status arch_mmu_user_owned_snapshot(
@@ -209,6 +214,9 @@ enum arch_mmu_status arch_mmu_user_protect_owned_range(
     uint32_t permissions);
 enum arch_mmu_status arch_mmu_user_protect_resident_page(
     struct arch_mmu_user_space *, uint64_t, uint32_t);
+enum arch_mmu_status arch_mmu_user_protect_batch(struct arch_mmu_user_space *,
+    uint64_t *cursor, uint64_t begin, uint64_t end,
+    uint32_t (*permissions)(void *, uint64_t), void *context);
 
 
 
@@ -258,6 +266,7 @@ uint64_t arch_mmu_current_context(void);
 enum arch_mmu_status arch_mmu_switch_context(uint64_t);
 void arch_mmu_sync_instructions(void);
 void arch_mmu_flush_address(uint64_t);
+void la_mmu_flush_range(uint64_t address, uint64_t size);
 int arch_mmu_kernel_window_active(void);
 enum arch_mmu_status arch_mmu_kernel_window_map(struct physical_page_allocator *, uint64_t, uint64_t);
 enum arch_mmu_status arch_mmu_kernel_window_unmap(struct physical_page_allocator *, uint64_t);

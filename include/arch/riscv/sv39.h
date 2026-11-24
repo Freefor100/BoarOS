@@ -306,4 +306,9 @@ enum riscv_sv39_status riscv_sv39_user_cow_commit_order(struct riscv_sv39_user_s
  * reference observed by physical_page_cow_borrow under that writer. */
 enum riscv_sv39_status riscv_sv39_user_cow_upgrade(struct riscv_sv39_user_space *,
     uint64_t *slot, uint64_t cookie, uint32_t permissions);
+/* The caller stabilizes the slot and owns the newly allocated base page.
+ * Success transfers that reference to the table and retires the old one. */
+enum riscv_sv39_status riscv_sv39_user_cow_replace_prepared(
+    struct riscv_sv39_user_space *, uint64_t *slot, uint64_t cookie, uint64_t replacement,
+    uint32_t permissions, struct kernel_mm_retirement *);
 #endif

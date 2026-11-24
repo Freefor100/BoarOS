@@ -122,7 +122,7 @@ static void consume_fences(struct kernel_cpu *cpu)
             if(!(__atomic_load_n(&r->pending,__ATOMIC_RELAXED)&bit) || !(r->targets&bit))__builtin_trap();
             generation=r->generation;address=r->address;size=r->size;instructions=r->instructions;
         }
-        if(size==BOAROS_PAGE_SIZE)arch_mmu_flush_address(address);else arch_mmu_flush_all();
+        la_mmu_flush_range(address,size);
         if(instructions)arch_mmu_sync_instructions();
 #if BOAROS_LA_SMP_TEST == 4
         if(cpu->logical_id==topology.count-1)continue;
@@ -305,7 +305,7 @@ void la_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instru
 {
     uintptr_t irq=arch_interrupt_save();struct kernel_cpu *cpu=kernel_cpu_current();
     if(cpu->raw_locks || (targets&~((1U<<BOAROS_MAX_CPUS)-1)))__builtin_trap();
-    if(size==BOAROS_PAGE_SIZE)arch_mmu_flush_address(address);else arch_mmu_flush_all();
+    la_mmu_flush_range(address,size);
     if(instructions)arch_mmu_sync_instructions();
     if(!cpus[0]){arch_interrupt_restore(irq);return;}
     if(targets&~online_mask())__builtin_trap();

@@ -1717,6 +1717,16 @@ enum riscv_sv39_status riscv_sv39_user_cow_upgrade(struct riscv_sv39_user_space 
     s->cow_in_place++;
     return RISCV_SV39_STATUS_OK;
 }
+enum riscv_sv39_status riscv_sv39_user_cow_replace_prepared(struct riscv_sv39_user_space *s,
+    uint64_t *slot, uint64_t cookie, uint64_t replacement, uint32_t permissions,
+    struct kernel_mm_retirement *batch)
+{
+    if (*slot != cookie) return RISCV_SV39_STATUS_CONFLICT;
+    store_cow_leaf(s, slot, cookie, replacement, permissions, 1);
+    s->cow_copies++;
+    kernel_mm_retirement_add(batch, entry_address(cookie), 0);
+    return RISCV_SV39_STATUS_OK;
+}
 enum riscv_sv39_status riscv_sv39_user_cow_commit_order(struct riscv_sv39_user_space *s,
     uint64_t address, uint64_t cookie, uint64_t replacement, uint32_t permissions, uint32_t order,
     struct kernel_mm_retirement *batch)
