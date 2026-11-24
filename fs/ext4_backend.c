@@ -3259,6 +3259,8 @@ static int ext4_backend_reserve_write(struct kernel_vfs_node *node,uint64_t offs
 }
 static void ext4_backend_accept_reservation(struct kernel_vfs_node *node,struct file_write_reservation *ticket,uint64_t start,uint64_t end)
 { ext4_file_accept_reservation(lwext4_node_file(node),ticket,start,end); }
+static bool ext4_backend_overwrite_mapped(struct kernel_vfs_node *node, uint64_t offset, size_t length)
+{ return ext4_file_overwrite_mapped(lwext4_node_file(node), offset, length); }
 static void ext4_backend_finish_reservation(struct kernel_vfs_node *node,struct file_write_reservation *ticket,uint64_t start,uint64_t end)
 { ext4_file_finish_reservation(lwext4_node_file(node),ticket,start,end); }
 static int ext4_backend_complete_write(struct kernel_vfs_node *node)
@@ -3428,6 +3430,7 @@ static void initialize_backend(void)
     ops->fallocate_zero_range = true;
     ops->fallocate = ext4_backend_fallocate;
     ops->reserve_write = ext4_backend_reserve_write;
+    ops->overwrite_mapped = ext4_backend_overwrite_mapped;
     ops->finish_reservation = ext4_backend_finish_reservation;
     ops->accept_reservation = ext4_backend_accept_reservation;
     ops->complete_write = ext4_backend_complete_write;

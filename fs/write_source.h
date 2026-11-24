@@ -18,6 +18,7 @@ struct kernel_vfs_write_source {
     enum kernel_uaccess_status access;
     size_t chunks;
     int direct, user_payload;
+    bool overwrite_mapped;
     const struct kernel_lock_guard *operation;
     const struct kernel_page_cache_read_page *cached;
     size_t cached_offset;

@@ -4725,6 +4725,8 @@ static int vfs_write_source_locked(struct kernel_vfs_file *file,uint64_t offset,
         if (result) return result;
     }
     if (node->file_seals&KERNEL_SEAL_WRITES) return -KERNEL_EPERM;
+    source->overwrite_mapped = size <= BOAROS_PAGE_SIZE && node->instance->ops->overwrite_mapped &&
+        node->instance->ops->overwrite_mapped(node, offset, size);
     kernel_lock_release(&node_guard);
     int direct=0;
     if (source->direct && node->instance->ops->direct_write_limit) {

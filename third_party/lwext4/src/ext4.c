@@ -4429,6 +4429,17 @@ void ext4_file_release_reservations(ext4_file *file,uint64_t size)
     ext4_file_drain_reservations(file);
 }
 
+bool ext4_file_overwrite_mapped(const ext4_file *file, uint64_t offset, size_t length)
+{
+    const struct ext4_delalloc *da = file->delalloc;
+    struct ext4_fs *fs = &file->mp->fs;
+    if (!da || !da->mapped_end || !fs->jbd_journal || fs->read_only || ext4_current_operation(fs))
+        return false;
+    uint64_t block = fs->bdev->lg_bsize;
+    uint64_t end = da->mapped_end * block;
+    return offset >= da->mapped_first * block && offset <= end && length <= end - offset;
+}
+
 int ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t *ready,
     struct file_write_reservation *ticket)
 {

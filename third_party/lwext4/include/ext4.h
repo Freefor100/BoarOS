@@ -578,6 +578,7 @@ int ext4_file_prepare_write(ext4_file *file, uint64_t offset, size_t length,
 int ext4_file_complete_write(ext4_file *file);
 /* Adapter owns the live inode I/O writer and supplies a zeroed first record. */
 int ext4_file_reserve_write(ext4_file *, uint64_t, size_t, size_t *, struct file_write_reservation *);
+bool ext4_file_overwrite_mapped(const ext4_file *, uint64_t offset, size_t length);
 void ext4_file_accept_reservation(ext4_file *, struct file_write_reservation *, uint64_t start, uint64_t accepted_end);
 /* Finishing holds the adapter inode I/O writer, excluding concurrent mapping
  * acceptance, truncation and writeback of the same reservation tree. */

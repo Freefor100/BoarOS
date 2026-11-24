@@ -6844,6 +6844,9 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
     unsigned required = include_demand ? 1U << demand_slot : 0;
     int revalidate = include_demand && operation->shared;
     unsigned selected=0,slots=KERNEL_PAGE_CACHE_READY_WINDOW;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+    uint64_t *empty_slots = NULL;
+#endif
     {
         /* A continuously held MM writer also stabilizes the empty-slot scan. */
         struct kernel_raw_read_guard raw __attribute__((cleanup(kernel_raw_read_scope_release)))={0};
@@ -6851,6 +6854,12 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
         if (shared && record->resident_capacity-record->resident_count<slots)
             slots=record->resident_capacity-record->resident_count;
         if (!slots) return end;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+        if (include_demand && !revalidate && !shared) {
+            if (riscv_sv39_user_empty_window_slot(&record->space, first, window_pages,
+                    &selected, &empty_slots) || !empty_slots) return end;
+        } else
+#endif
         if (arch_mmu_user_empty_window(&record->space,first,window_pages,&selected)) return end;
     }
     if (!selected || (selected & required) != required) return end;
@@ -6863,9 +6872,10 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
         kernel_page_cache_acquire_ready(cache,backing,offset>>BOAROS_PAGE_SHIFT,
             selected,refs,slots,required,shared ? aliases : NULL);
     if (!ready) return end;
-    void *residents[KERNEL_PAGE_CACHE_READY_WINDOW] = {0};
+    void *residents[KERNEL_PAGE_CACHE_READY_WINDOW];
     unsigned allocated = 0;
     if (shared) {
+        memset(residents, 0, sizeof(residents));
         unsigned count = 0;
         for (unsigned bits = ready; bits; bits &= bits - 1) count++;
         allocated = kernel_heap_allocate_zeroed_batch_nosleep(record->vma_heap, count,
@@ -6890,6 +6900,13 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
             uint32_t permissions = backend_permissions_from_mm(
                 user_effective_permissions(vma->permissions) & ~KERNEL_MM_WRITE);
             int flags = shared ? 0 : KERNEL_MM_LEAF_COW | (source ? 0 : KERNEL_MM_LEAF_FILE);
+#if !defined(BOAROS_ARCH_LOONGARCH)
+            if (empty_slots) {
+                riscv_sv39_user_publish_empty_window(&record->space, empty_slots,
+                    prepared_mask, refs, permissions, flags);
+                installed = prepared_mask;
+            } else
+#endif
             installed = include_demand ? arch_mmu_user_map_required_window(&record->space,
                 first, prepared_mask, refs, permissions, flags, demand_slot) :
                 arch_mmu_user_map_owned_window(&record->space, first, prepared_mask, refs, permissions, flags);
@@ -6912,7 +6929,7 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
             unsigned i = 0;
             for (unsigned bits = ready, index = 0; bits; bits >>= 1, index++) {
                 if (!(bits & 1)) continue;
-                struct mm_file_resident *page = residents[i];
+                struct mm_file_resident *page = shared ? residents[i] : NULL;
                 uint64_t physical = refs[i++];
                 if (!(installed & (1U << index))) continue;
                 uint64_t address = first + (uint64_t)index * BOAROS_PAGE_SIZE;
@@ -6943,7 +6960,7 @@ static __attribute__((noinline)) uint64_t map_file_neighbours(
             page = demand;
             aliases[index].entry = NULL;
         } else {
-            page = residents[i];
+            page = shared ? residents[i] : NULL;
             if (!(installed & bit)) {
                 refs[unused++] = refs[i++];
                 if (page) kernel_heap_release(record->vma_heap, page);

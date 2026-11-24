@@ -1242,8 +1242,8 @@ enum riscv_sv39_status riscv_sv39_user_leaf_snapshot(const struct riscv_sv39_use
     uint64_t v, struct kernel_mm_leaf *out)
 { return riscv_sv39_user_leaf_probe(s,v,out,NULL); }
 
-enum riscv_sv39_status riscv_sv39_user_empty_window(const struct riscv_sv39_user_space *s,
-    uint64_t address, unsigned count, unsigned *empty)
+enum riscv_sv39_status riscv_sv39_user_empty_window_slot(const struct riscv_sv39_user_space *s,
+    uint64_t address, unsigned count, unsigned *empty, uint64_t **base_slot)
 {
     const uint64_t span=UINT64_C(1)<<21;
     if (!empty || !count || count>32 || (address&BOAROS_PAGE_MASK) ||
@@ -1252,12 +1252,16 @@ enum riscv_sv39_status riscv_sv39_user_empty_window(const struct riscv_sv39_user
     uint32_t order;
     enum riscv_sv39_status status=resolve_leaf_order(s,address,&slot,&order,0);
     if (status && status!=RISCV_SV39_STATUS_NOT_MAPPED) return status;
+    if (base_slot) *base_slot = order ? NULL : slot;
     unsigned mask=0;
     if (order) mask=status ? UINT32_MAX>>(32-count) : 0;
     else for (unsigned i=0;i<count;i++) if (!slot[i]) mask|=1U<<i;
     *empty=mask;
     return RISCV_SV39_STATUS_OK;
 }
+enum riscv_sv39_status riscv_sv39_user_empty_window(const struct riscv_sv39_user_space *s,
+    uint64_t address, unsigned count, unsigned *empty)
+{ return riscv_sv39_user_empty_window_slot(s, address, count, empty, NULL); }
 enum riscv_sv39_status riscv_sv39_user_lookup(const struct riscv_sv39_user_space *s,
     uint64_t v, struct riscv_sv39_mapping *out)
 {
@@ -1895,6 +1899,34 @@ enum riscv_sv39_status riscv_sv39_user_fork_commit_window(
     return RISCV_SV39_STATUS_OK;
 }
 
+static inline __attribute__((always_inline)) unsigned publish_window(struct riscv_sv39_user_space *s,
+    uint64_t *slot, unsigned pages, const uint64_t *physical, uint32_t permissions,
+    int flags, int already_empty)
+{
+    int cow = (flags & KERNEL_MM_LEAF_COW) != 0;
+    uint64_t attributes = encode_user_entry(0, permissions, flags);
+    uint32_t *owned = permissions ? &s->leaf_pages : &s->protected_pages;
+    uint32_t available = UINT32_MAX - *owned;
+    if (cow && available > UINT32_MAX - s->cow_pages)
+        available = UINT32_MAX - s->cow_pages;
+    /* Order the prepared contents before publishing this window. */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    unsigned installed = 0, count = 0;
+    for (unsigned index = 0; pages; pages >>= 1, index++) {
+        if (!(pages & 1)) continue;
+        uint64_t p = *physical++;
+        if (!already_empty && slot[index]) continue;
+        if ((p & BOAROS_PAGE_MASK) || count == available) __builtin_trap();
+        uint64_t entry = ((p >> BOAROS_PAGE_SHIFT) << 10U) | attributes;
+        __atomic_store_n(&slot[index], entry, __ATOMIC_RELAXED);
+        installed |= 1U << index;
+        count++;
+    }
+    *owned += count;
+    if (cow) s->cow_pages += count;
+    resident_peak(s);
+    return installed;
+}
 static unsigned map_owned_window(struct riscv_sv39_user_space *s, uint64_t address,
     unsigned pages, const uint64_t *physical, uint32_t permissions, int flags,
     int required_slot)
@@ -1911,29 +1943,13 @@ static unsigned map_owned_window(struct riscv_sv39_user_space *s, uint64_t addre
     enum riscv_sv39_status result = resolve_leaf_order(s, address, &slot, &order, NULL);
     if (result && result != RISCV_SV39_STATUS_NOT_MAPPED) __builtin_trap();
     if (order || (required_slot >= 0 && slot[required_slot])) return 0;
-    uint64_t attributes = encode_user_entry(0, permissions, flags);
-    uint32_t *owned = permissions ? &s->leaf_pages : &s->protected_pages;
-    uint32_t available = UINT32_MAX - *owned;
-    if (cow && available > UINT32_MAX - s->cow_pages)
-        available = UINT32_MAX - s->cow_pages;
-    /* The caller holds the mapping writer. Order the prepared contents of
-     * every page before any page-table entry in this window becomes visible. */
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    unsigned installed = 0, count = 0;
-    for (unsigned index = 0; pages; pages >>= 1, index++) {
-        if (!(pages & 1)) continue;
-        uint64_t p = *physical++;
-        if (slot[index]) continue;
-        if ((p & BOAROS_PAGE_MASK) || count == available) __builtin_trap();
-        uint64_t entry = ((p >> BOAROS_PAGE_SHIFT) << 10U) | attributes;
-        __atomic_store_n(&slot[index], entry, __ATOMIC_RELAXED);
-        installed |= 1U << index;
-        count++;
-    }
-    *owned += count;
-    if (cow) s->cow_pages += count;
-    resident_peak(s);
-    return installed;
+    return publish_window(s, slot, pages, physical, permissions, flags, 0);
+}
+
+void riscv_sv39_user_publish_empty_window(struct riscv_sv39_user_space *s,
+    uint64_t *slot, unsigned pages, const uint64_t *physical, uint32_t permissions, int flags)
+{
+    publish_window(s, slot, pages, physical, permissions, flags, 1);
 }
 
 unsigned riscv_sv39_user_map_owned_window(struct riscv_sv39_user_space *s, uint64_t address,

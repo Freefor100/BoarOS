@@ -1859,6 +1859,16 @@ void physical_page_release_batch(struct physical_page_allocator *a,
     }
     PAGE_METADATA_SCOPE(work, a);
     if (count == 2 && addresses[0] == addresses[1]) {
+        uint32_t page;
+        if (page_lookup_work(a, addresses[0], NULL, &page, &work)) {
+            struct physical_page_metadata *metadata = &a->metadata[page];
+            struct buddy_owner head = {.first = page, .order = 0, .state = BUDDY_ALLOCATED};
+            if (metadata->reference_count > 2 && head_valid(a, &head, &work)) {
+                metadata->reference_count -= 2;
+                page_written(&work);
+                return;
+            }
+        }
         physical_page_release_buddy(a, addresses[0], 0U, 2, &work);
         return;
     }
