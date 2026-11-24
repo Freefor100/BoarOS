@@ -1242,6 +1242,32 @@ enum riscv_sv39_status riscv_sv39_user_leaf_snapshot(const struct riscv_sv39_use
     uint64_t v, struct kernel_mm_leaf *out)
 { return riscv_sv39_user_leaf_probe(s,v,out,NULL); }
 
+#if BOAROS_MAX_CPUS == 1
+unsigned riscv_sv39_user_readable_pages(const struct riscv_sv39_user_space *space,
+    uint64_t first, unsigned count, uint64_t *physical)
+{
+    if (first & BOAROS_PAGE_MASK) return 0;
+    unsigned done=0;
+    while (done<count) {
+        uint64_t address=first+(uint64_t)done*BOAROS_PAGE_SIZE;
+        uint64_t *slot;
+        uint32_t order;
+        if (resolve_leaf_order(space,address,&slot,&order,NULL) || order)
+            break;
+        unsigned remaining=(RISCV_SV39_PAGE_SIZE_2M-
+            (address & (RISCV_SV39_PAGE_SIZE_2M-1)))>>BOAROS_PAGE_SHIFT;
+        if (remaining>count-done) remaining=count-done;
+        for (unsigned i=0;i<remaining;i++) {
+            uint64_t entry=slot[i];
+            if (!(entry & RISCV_SV39_PTE_READ) || !valid_user_leaf_entry(entry))
+                return done;
+            physical[done++]=entry_address(entry);
+        }
+    }
+    return done;
+}
+#endif
+
 enum riscv_sv39_status riscv_sv39_user_empty_window_slot(const struct riscv_sv39_user_space *s,
     uint64_t address, unsigned count, unsigned *empty, uint64_t **base_slot)
 {

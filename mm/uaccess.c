@@ -173,6 +173,26 @@ enum kernel_uaccess_status kernel_uaccess_write_cursor_copy(
 #if ARCH_UACCESS_NATIVE
     if (local_user_mm(mm)) {
         kernel_uaccess_write_cursor_finish(cursor);
+#if BOAROS_MAX_CPUS == 1
+        /* Whole-page copies can alternate between two translations at the
+         * same index. QEMU's direct-mapped table uses at least six index bits. */
+        const uint64_t index_mask=63U*BOAROS_PAGE_SIZE;
+        const uintptr_t source_address=(uintptr_t)kernel_source;
+        if (size==BOAROS_PAGE_SIZE &&
+            !((user_destination | source_address)&BOAROS_PAGE_MASK) &&
+            !((user_destination ^ source_address)&index_mask) &&
+            !kernel_mm_try_pin_user_page(mm,user_destination,KERNEL_MM_WRITE,&cursor->pin)) {
+            uintptr_t mapped=(uintptr_t)cursor->pin.page;
+            bool separated=!cursor->pin.cache_write.entry &&
+                ((mapped ^ source_address)&index_mask);
+            if (separated) copy_to_pinned_page(cursor->pin.page,kernel_source,size);
+            kernel_uaccess_write_cursor_finish(cursor);
+            if (separated) {
+                *bytes_copied=size;
+                return KERNEL_UACCESS_STATUS_OK;
+            }
+        }
+#endif
         return local_copy(mm,user_destination,(void *)kernel_source,size,bytes_copied,1);
     }
 #endif
