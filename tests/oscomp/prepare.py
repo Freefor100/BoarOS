@@ -85,7 +85,7 @@ def main():
         '    echo "BOAROS-BOOT ERROR /dev/vda2 already exists" >&2; exit 125\n'
         'fi\n'
         '$BB ln -s /dev/vdb2 /dev/vda2\n'
-        'install_mkfs() {\n'
+        'install_e2fs_tool() {\n'
         '    if [ -e "$2" ] || [ -L "$2" ]; then\n'
         '        if [ ! -L "$2" ] || [ "$($BB readlink "$2")" != "$BB" ]; then\n'
         '            echo "BOAROS-BOOT ERROR unexpected tool at $2" >&2; return 125\n'
@@ -94,8 +94,9 @@ def main():
         '    fi\n'
         '    $BB ln -s "$1" "$2"\n'
         '}\n'
-        'install_mkfs /boaros-tools/mke2fs /bin/mke2fs\n' +
-        '\n'.join(f'install_mkfs /boaros-tools/mkfs.ext{i} /bin/mkfs.ext{i}' for i in (2, 3, 4)) + '\n'
+        'install_e2fs_tool /boaros-tools/mke2fs /bin/mke2fs\n'
+        'install_e2fs_tool /boaros-tools/debugfs /bin/debugfs\n' +
+        '\n'.join(f'install_e2fs_tool /boaros-tools/mkfs.ext{i} /bin/mkfs.ext{i}' for i in (2, 3, 4)) + '\n'
         'export MKE2FS_CONFIG=/boaros-tools/mke2fs.conf\n'
         'export LTP_DEV=/dev/vdb3 LTP_DEV_FS_TYPE=ext4')
     # The kernel carries policy; the read-only tools partition carries executable content.

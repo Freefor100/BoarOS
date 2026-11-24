@@ -85,12 +85,12 @@ def fixed_source(cache):
         if not source.exists():
             with tarfile.open(archive) as content:
                 content.extractall(cache)
-        apply_portability_patch(source)
+        apply_portability_patch(source, facts['portability_patch'])
+        apply_portability_patch(source, facts['debugfs_patch'])
     return source
 
 
-def apply_portability_patch(source):
-    facts = INPUTS['e2fsprogs']['portability_patch']
+def apply_portability_patch(source, facts):
     patch = ROOT / facts['path']
     if patch.is_symlink() or sha(patch) != facts['sha256']:
         raise RuntimeError('e2fsprogs portability patch checksum differs')
@@ -200,8 +200,9 @@ def build_tools(cache, arch):
                     'cc': str(cc), 'cc_sha256': sha(cc),
                     'cc_version': subprocess.check_output([cc, '--version'], text=True),
                     'flags': flags, 'link_flags': link, 'configure': options}
-        names = ['mke2fs', 'mke2fs.conf', 'e2fsck'] if arch == 'host' else ['mke2fs', 'mke2fs.conf', 'seed']
+        names = ['mke2fs', 'mke2fs.conf', 'e2fsck'] if arch == 'host' else ['mke2fs', 'mke2fs.conf', 'debugfs', 'seed']
         if arch != 'host':
+            identity['debugfs_patch_sha256'] = INPUTS['e2fsprogs']['debugfs_patch']['sha256']
             identity['seed_source_sha256'] = sha(HERE / 'seed.c')
             for library in ('libc.a', 'libgcc.a'):
                 identity[library] = sha(subprocess.check_output([cc, '-print-file-name=' + library], text=True).strip())
@@ -210,7 +211,7 @@ def build_tools(cache, arch):
         if (previous.get('inputs') == identity and all((target / name).is_file() and
                 previous.get('products', {}).get(name) == sha(target / name) for name in names)):
             if arch != 'host':
-                for name in ('mke2fs', 'seed'): verify_target(target / name, arch)
+                for name in ('mke2fs', 'debugfs', 'seed'): verify_target(target / name, arch)
             return target
         build = target / 'build'
         # Reuse verified filesystem tools when only the startup program changes.
@@ -231,6 +232,9 @@ def build_tools(cache, arch):
             run_logged(['make', '-C', 'misc', '-j8', 'mke2fs'], build, log, environment)
             shutil.copy2(build / 'misc/mke2fs', target / 'mke2fs')
             shutil.copy2(build / 'misc/mke2fs.conf', target / 'mke2fs.conf')
+            if arch != 'host':
+                run_logged(['make', '-C', 'debugfs', '-j8', 'debugfs'], build, log, environment)
+                shutil.copy2(build / 'debugfs/debugfs', target / 'debugfs')
         if arch == 'host':
             run_logged(['make', '-C', 'e2fsck', '-j8', 'e2fsck'], build, log, environment)
             shutil.copy2(build / 'e2fsck/e2fsck', target / 'e2fsck')
@@ -238,7 +242,7 @@ def build_tools(cache, arch):
             run_logged([cc, *flags, *link, '-Wall', '-Wextra', '-Werror',
                         '-DSEED_ARCH=' + str(INPUTS['architectures'][arch]['elf_machine']),
                         '-Wl,--build-id=none', '-o', target / 'seed', HERE / 'seed.c'], target, log, environment)
-            for name in ('mke2fs', 'seed'): verify_target(target / name, arch)
+            for name in ('mke2fs', 'debugfs', 'seed'): verify_target(target / name, arch)
         stamp.write_text(json.dumps({'inputs': identity, 'products': {name: sha(target / name) for name in names}}, indent=2) + '\n')
         return target
 
@@ -278,7 +282,7 @@ def prepare_assets(cache, arch):
         return cache / arch
     host, target = build_tools(cache, 'host'), build_tools(cache, arch)
     files = payload_files(arch)
-    for name in ('mke2fs', 'mke2fs.conf', 'seed', 'stat', 'df'):
+    for name in ('mke2fs', 'mke2fs.conf', 'debugfs', 'seed', 'stat', 'df'):
         files[name] = target / name
     if arch == 'loongarch':
         files['dash'] = target / 'dash'

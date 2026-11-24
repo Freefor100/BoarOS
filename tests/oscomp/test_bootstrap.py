@@ -145,6 +145,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn('export LTP_DEV=/dev/vdb3 LTP_DEV_FS_TYPE=ext4\n', script)
         self.assertNotIn('LTP_SINGLE_FS_TYPE', script)
         self.assertIn('/boaros-tools/mkfs.ext4 /bin/mkfs.ext4', script)
+        self.assertIn('/boaros-tools/debugfs /bin/debugfs', script)
         self.assertNotIn('MKE2FS_PAYLOAD=', script)
         subprocess.run(['sh', '-n', '-c', script], check=True)
 
@@ -162,8 +163,8 @@ class BootstrapTests(unittest.TestCase):
         result, target = self.generate('riscv', 243)
         self.assertEqual(result.returncode, 0, result.stderr)
         script = json.loads(target.read_text())['argv'][3]
-        links = script.split('install_mkfs() {', 1)[1].split('export MKE2FS_CONFIG=', 1)[0]
-        links = 'install_mkfs() {' + links
+        links = script.split('install_e2fs_tool() {', 1)[1].split('export MKE2FS_CONFIG=', 1)[0]
+        links = 'install_e2fs_tool() {' + links
         binary = self.root / 'bin'; binary.mkdir()
         tools = self.root / 'tools'; tools.mkdir()
         busybox = self.root / 'busybox'
@@ -173,7 +174,7 @@ class BootstrapTests(unittest.TestCase):
         command = 'set -e\nBB=' + str(busybox) + '\n' + links
         result = subprocess.run(['sh', '-c', command], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        for name in ('mke2fs', 'mkfs.ext2', 'mkfs.ext3', 'mkfs.ext4'):
+        for name in ('mke2fs', 'debugfs', 'mkfs.ext2', 'mkfs.ext3', 'mkfs.ext4'):
             self.assertEqual((binary / name).readlink(), tools / name)
             (binary / name).unlink()
         foreign = binary / 'mke2fs'; foreign.write_text('existing external tool')

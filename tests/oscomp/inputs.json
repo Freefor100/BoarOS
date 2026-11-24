@@ -50,6 +50,13 @@
       "original_sha256": "48f60b0aef7170a178d753813dc081b2e946ff35480267b60ef3901b1c362e5b",
       "patched_sha256": "fef0edf19e0309c26f249cf88fd4bc12d1cb498a8d847c505a203080aecbeee4"
     },
+    "debugfs_patch": {
+      "path": "tests/oscomp/e2fsprogs-debugfs-options.patch",
+      "sha256": "b5484643f825faa9cd265f95933d8722a317babcaf7efb504fc29938fa801780",
+      "target": "debugfs/debugfs.c",
+      "original_sha256": "9f18d79c59d531bb43ba92cdf6df185d72b928388d2b53f0439d307ce95b6533",
+      "patched_sha256": "d642eec7c0e8066c8e128281f69636d5604e070f2bd737069fe33688a994d55d"
+    },
     "archive": "third_party/sources/e2fsprogs-1.47.2.tar.xz"
   },
   "coreutils": {

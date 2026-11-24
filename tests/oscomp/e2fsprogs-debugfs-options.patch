@@ -1,0 +1,6 @@
+--- a/debugfs/debugfs.c
++++ b/debugfs/debugfs.c
+@@ -2600 +2600,2 @@
+-	while ((c = getopt (argc, argv, opt_string)) != EOF) {
++	/* Accept options following the device argument on musl. */
++	while ((c = getopt_long(argc, argv, opt_string, NULL, NULL)) != EOF) {

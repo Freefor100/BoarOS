@@ -23,14 +23,19 @@ class PatchTests(unittest.TestCase):
     def test_patch_identity_is_pinned_with_unmodified_archive(self):
         facts = disks.INPUTS['e2fsprogs']
         self.assertEqual(facts['sha256'], '08242e64ca0e8194d9c1caad49762b19209a06318199b63ce74ae4ef2d74e63c')
-        self.assertEqual(disks.sha(ROOT / facts['portability_patch']['path']), facts['portability_patch']['sha256'])
+        for port in (facts['portability_patch'], facts['debugfs_patch']):
+            self.assertEqual(disks.sha(ROOT / port['path']), port['sha256'])
 
     def test_patch_is_idempotent_and_rejects_changed_source(self):
         facts = disks.INPUTS['e2fsprogs']
         archive = ROOT / facts['archive']
         if not archive.is_file(): self.skipTest('prepare the pinned e2fsprogs archive first')
         self.assertEqual(disks.sha(archive), facts['sha256'])
-        port = facts['portability_patch']
+        for port in (facts['portability_patch'], facts['debugfs_patch']):
+            with self.subTest(target=port['target']):
+                self.check_patch(facts, archive, port)
+
+    def check_patch(self, facts, archive, port):
         with tarfile.open(archive) as content:
             original = content.extractfile('e2fsprogs-' + facts['version'] + '/' + port['target']).read()
         with tempfile.TemporaryDirectory() as temporary:
@@ -38,14 +43,14 @@ class PatchTests(unittest.TestCase):
             target = source / port['target']; target.parent.mkdir(parents=True)
             target.write_bytes(original)
             self.assertEqual(disks.sha(target), port['original_sha256'])
-            disks.apply_portability_patch(source)
+            disks.apply_portability_patch(source, port)
             self.assertEqual(disks.sha(target), port['patched_sha256'])
             modified = target.stat().st_mtime_ns
-            disks.apply_portability_patch(source)
+            disks.apply_portability_patch(source, port)
             self.assertEqual(target.stat().st_mtime_ns, modified)
             target.write_bytes(target.read_bytes() + b'\n/* unexpected local change */\n')
             with self.assertRaisesRegex(RuntimeError, 'target checksum'):
-                disks.apply_portability_patch(source)
+                disks.apply_portability_patch(source, port)
 
 
 class NativeMke2fsTests(unittest.TestCase):

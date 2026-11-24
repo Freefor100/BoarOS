@@ -170,7 +170,7 @@ class PreparedDeliveryTests(unittest.TestCase):
                 subprocess.run(['dd', 'if=' + str(disk), 'of=' + str(partition), 'bs=1M',
                                 'skip=1', 'count=128', 'conv=sparse', 'status=none'], check=True)
                 files = disks.payload_files(arch)
-                for name in ('mke2fs', 'mke2fs.conf', 'seed'): files[name] = assets / name
+                for name in ('mke2fs', 'mke2fs.conf', 'debugfs', 'seed'): files[name] = assets / name
                 for name, original in files.items():
                     actual = subprocess.check_output(['debugfs', '-R', 'cat /' + name, str(partition)],
                                                      stderr=subprocess.DEVNULL)
@@ -180,7 +180,7 @@ class PreparedDeliveryTests(unittest.TestCase):
                                                      stderr=subprocess.DEVNULL, text=True)
                     self.assertIn('symlink', actual)
                     self.assertIn('mke2fs', actual)
-            for name in ('mke2fs', 'seed'): disks.verify_target(assets / name, arch)
+            for name in ('mke2fs', 'debugfs', 'seed'): disks.verify_target(assets / name, arch)
             with (assets / 'delivery-template.img').open('rb') as stream:
                 stream.seek(4096)
                 self.assertEqual(stream.read(4096), bytes(4096))

@@ -43,6 +43,7 @@
 工具分区携带的所有第三方工具源码归档均随仓库保存在 `third_party/sources/`（来源与校验见 [第三方组件](../third-party.md)），完全离线交叉编译、不访问网络：
 
 - **`e2fsprogs 1.47.2`**：使用官方容器内置的 RISC-V / LoongArch `musl` 交叉编译器生成静态 ELF 可执行文件（LP64D 调用约定，LoongArch 装载段满足 16 KiB 页对齐）；宿主侧制盘用的 `mke2fs` 与 `e2fsck` 由同一份源码构建。仅施加最小移植补丁 `tests/oscomp/e2fsprogs-boaros-uname.patch`，让 `is_before_linux_ver()` 将 UTS 版本字符串 `#1 BoarOS` 识别为未知 Linux 年代，避免 `mke2fs` 把内核发布号误判为早期 Linux 而生成 `revision 0` 镜像（真实 Linux 仍走原有版本判断）。客户机内 `/bin/mke2fs`、`mkfs.ext2`、`mkfs.ext3`、`mkfs.ext4` 均链接至上游原版二进制并使用原版 `mke2fs.conf`。
+- 初赛客机的 `/bin/debugfs` 指向工具分区中的静态 `debugfs`。该程序与 `mke2fs` 使用同一份 `e2fsprogs` 源码，由 `fanotify22` 用来修改已卸载测试分区的元数据。命令行解析使用 `getopt_long()`，使静态 musl 版本也能识别设备名之后的 `-R` 选项。
 - **`GNU Coreutils 9.5` 与 `Dash 0.5.12`**：离线交叉编译 `stat` 与 `df`（仅在执行 `df01.sh` 时优先放入 `PATH`），并为 LoongArch 交叉编译 `Dash` 作为部分脚本解释器。FAT32 分区由固定容器内的 `dosfstools 4.2`（`/usr/sbin/mkfs.fat`）创建。
 - **确定性缓存复用**：工具与模板盘缓存存放在 `build/tools/oscomp-local/`（可通过 `OSCOMP_LOCAL_CACHE` 重定向）。复用前校验编译器、C 库、源码、编译参数与工具哈希；若当前宿主机缺少对应交叉工具链，本地准备脚本会以 `--pull=never --network none` 及宿主 UID/GID 自动拉起固定容器执行同一准备逻辑。`make prune-build` 默认保留该工具缓存。
 
