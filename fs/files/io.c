@@ -645,6 +645,42 @@ static enum kernel_files_status read_device_zeros(
     return KERNEL_FILES_STATUS_OK;
 }
 
+static enum kernel_files_status read_file_data(struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description *description, struct kernel_uaccess_iov_cursor *cursor,
+    uint64_t count, int scalar, int64_t *linux_result, enum kernel_open_file_kind kind,
+    const struct kernel_lock_guard *borrowed_offset)
+{
+    if (scalar && (kernel_user_range_check(cursor->iov[0].base,count) ||
+        scalar_empty_range_fault(cursor->iov[0].base,count))) {
+        KERNEL_FILES_NOTE(files,read_failures,1);
+        *linux_result=-KERNEL_EFAULT;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (scalar && description->file.notify_access_perm) {
+        *linux_result = kernel_vfs_fanotify_permission(&description->file, VFS_NOTIFY_ACCESS_PERM, NULL);
+        if (*linux_result) return KERNEL_FILES_STATUS_OK;
+    }
+    if (count == 0U && !description->proc_page_stream) {
+        *linux_result = 0;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    KERNEL_LOCK_SCOPE(offset_guard);
+    if ((kind == KERNEL_OPEN_FILE_KIND_REGULAR || kind == KERNEL_OPEN_FILE_KIND_GENERATED) &&
+        !regular_borrows_offset(description,borrowed_offset))
+        kernel_mutex_lock(&description->offset_lock, &offset_guard);
+    uint64_t position = kernel_open_file_offset(description);
+    uint64_t request = count > KERNEL_FILES_MAX_RW_COUNT ? KERNEL_FILES_MAX_RW_COUNT : count;
+    if (kind == KERNEL_OPEN_FILE_KIND_GENERATED)
+        return generated_read(files, mm, description, cursor, request, position, 1, linux_result);
+    if (kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
+        kernel_open_file_read_begin(description, position);
+        kernel_vfs_file_accessed(&description->file,kernel_open_file_flags(description));
+    }
+    if (kernel_open_file_memory_backed(description))
+        return memory_read(files, mm, description, cursor, request, position, 1, linux_result);
+    return disk_read(files, mm, description, cursor, request, position, 1, linux_result);
+}
+
 static enum kernel_files_status read_pinned(
     struct kernel_files *files,
     struct kernel_mm *mm,
@@ -672,6 +708,16 @@ static enum kernel_files_status read_pinned(
         return status;
     }
     const enum kernel_open_file_kind kind = kernel_open_file_kind(description);
+    if (kind == KERNEL_OPEN_FILE_KIND_REGULAR && !description->device) {
+        if (!kernel_open_file_readable(description)) {
+            *linux_result = -KERNEL_EBADF;
+            KERNEL_FILES_NOTE(files, read_failures, 1);
+            return KERNEL_FILES_STATUS_OK;
+        }
+        struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0U, 0U};
+        return read_file_data(files, mm, description, &cursor, count, scalar, linux_result,
+            kind, borrowed_offset);
+    }
     if(kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
         KERNEL_LOCK_SCOPE(guard);kernel_mutex_lock(&description->offset_lock,&guard);
         return mqueue_read_text(files,mm,description,iov,iov_count,count,
@@ -703,8 +749,6 @@ static enum kernel_files_status read_pinned(
     KERNEL_SERVICE_SCOPE_IF(service, !description->proc_page_stream &&
         !(description->device && description->device->stateless_io) && kind != KERNEL_OPEN_FILE_KIND_INOTIFY &&
         kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE);
-    KERNEL_LOCK_SCOPE(offset_guard);
-    uint64_t request;
     uint64_t total = 0U;
     struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0U, 0U};
 
@@ -813,7 +857,7 @@ static enum kernel_files_status read_pinned(
             return status;
         }
         unsigned char staging[64];
-        request = count > KERNEL_FILES_MAX_RW_COUNT
+        uint64_t request = count > KERNEL_FILES_MAX_RW_COUNT
                       ? KERNEL_FILES_MAX_RW_COUNT : count;
         while (total < request || (device->read_once && !total)) {
             if (device->interruptible_bulk && total >= 256U &&
@@ -881,49 +925,8 @@ static enum kernel_files_status read_pinned(
         *linux_result = -KERNEL_EISDIR;
         return KERNEL_FILES_STATUS_OK;
     }
-    if ((kind == KERNEL_OPEN_FILE_KIND_REGULAR || kind == KERNEL_OPEN_FILE_KIND_GENERATED) &&
-        !kernel_open_file_readable(description)) {
-        KERNEL_FILES_NOTE(files, read_failures, 1);
-        *linux_result = -KERNEL_EBADF;
-        return KERNEL_FILES_STATUS_OK;
-    }
-    if (scalar && (kernel_user_range_check(iov[0].base,count) ||
-        scalar_empty_range_fault(iov[0].base,count))) {
-        KERNEL_FILES_NOTE(files,read_failures,1);
-        *linux_result=-KERNEL_EFAULT;
-        return KERNEL_FILES_STATUS_OK;
-    }
-    if (scalar && description->file.notify_access_perm) {
-        *linux_result = kernel_vfs_fanotify_permission(&description->file, VFS_NOTIFY_ACCESS_PERM, NULL);
-        if (*linux_result) return KERNEL_FILES_STATUS_OK;
-    }
-    if (count == 0U && !description->proc_page_stream) {
-        *linux_result = 0;
-        return KERNEL_FILES_STATUS_OK;
-    }
-    if ((kind == KERNEL_OPEN_FILE_KIND_REGULAR || kind == KERNEL_OPEN_FILE_KIND_GENERATED) &&
-        !regular_borrows_offset(description,borrowed_offset))
-        kernel_mutex_lock(&description->offset_lock, &offset_guard);
-    if (kind == KERNEL_OPEN_FILE_KIND_GENERATED) {
-        request = count > KERNEL_FILES_MAX_RW_COUNT
-                      ? KERNEL_FILES_MAX_RW_COUNT : count;
-        return generated_read(files, mm, description, &cursor, request,
-                              kernel_open_file_offset(description), 1,
-                              linux_result);
-    }
-    if (kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
-        kernel_open_file_read_begin(description, kernel_open_file_offset(description));
-        kernel_vfs_file_accessed(&description->file,kernel_open_file_flags(description));
-    }
-    request = count > KERNEL_FILES_MAX_RW_COUNT
-                  ? KERNEL_FILES_MAX_RW_COUNT
-                  : count;
-    if (kernel_open_file_memory_backed(description))
-        return memory_read(files, mm, description, &cursor, request,
-                           kernel_open_file_offset(description), 1, linux_result);
-    return disk_read(files, mm, description, &cursor, request,
-                     kernel_open_file_offset(description), 1, linux_result
-                     );
+    return read_file_data(files, mm, description, &cursor, count, scalar, linux_result,
+        kind, borrowed_offset);
 }
 
 enum kernel_files_status kernel_files_read(
@@ -2310,7 +2313,7 @@ static enum kernel_files_status lseek_pinned(
     struct kernel_open_file_description *description, int64_t offset,
     uint64_t whence, int64_t *linux_result,const struct kernel_lock_guard *borrowed)
 {
-    if (kernel_open_file_io_requires_cpu0(description) && whence >= 3U) {
+    if (whence >= KERNEL_FILES_SEEK_DATA && kernel_open_file_io_requires_cpu0(description)) {
         if (!regular_caller_ready()) return KERNEL_FILES_STATUS_STATE;
         KERNEL_LOCK_SCOPE(guard);
         kernel_mutex_lock(&description->offset_lock,&guard);
@@ -2318,13 +2321,19 @@ static enum kernel_files_status lseek_pinned(
             .offset_borrow=&guard};
         return regular_dispatch(&call,seek_cpu0);
     }
+    const enum kernel_open_file_kind kind = kernel_open_file_kind(description);
+    if (kind == KERNEL_OPEN_FILE_KIND_REGULAR && !description->block && !description->device &&
+        !borrowed && whence == KERNEL_FILES_SEEK_SET && offset >= 0 &&
+        kernel_open_file_try_seek_regular(description, (uint64_t)offset)) {
+        *linux_result = offset;
+        return KERNEL_FILES_STATUS_OK;
+    }
     int64_t current, target;
     KERNEL_LOCK_SCOPE(offset_guard);
     if (!regular_borrows_offset(description,borrowed))
         kernel_mutex_lock(&description->offset_lock, &offset_guard);
     if ((description->device && !description->device->positioned) ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
+        kind == KERNEL_OPEN_FILE_KIND_PIPE || kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
         *linux_result = -KERNEL_ESPIPE;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -2333,12 +2342,11 @@ static enum kernel_files_status lseek_pinned(
         *linux_result = 0;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL ||
-        (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EVENTFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_TIMERFD || kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SIGNALFD)) {
+    if (kind == KERNEL_OPEN_FILE_KIND_EPOLL || kind == KERNEL_OPEN_FILE_KIND_EVENTFD ||
+        kind == KERNEL_OPEN_FILE_KIND_TIMERFD || kind == KERNEL_OPEN_FILE_KIND_SIGNALFD) {
         *linux_result = (int64_t)kernel_open_file_offset(description);
         return KERNEL_FILES_STATUS_OK;
     }
-    current = (int64_t)kernel_open_file_offset(description);
     int control = kernel_vfs_file_is_control(&description->file, 0);
     if (control && (whence == 3U || whence == 4U)) {
         /* default_llseek treats sysctl i_size (zero) as the EOF hole. */
@@ -2349,8 +2357,7 @@ static enum kernel_files_status lseek_pinned(
         if (whence == 4U) offset = 0;
         whence = KERNEL_FILES_SEEK_SET;
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED &&
-        !control && whence == KERNEL_FILES_SEEK_END) {
+    if (kind == KERNEL_OPEN_FILE_KIND_GENERATED && !control && whence == KERNEL_FILES_SEEK_END) {
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -2359,6 +2366,7 @@ static enum kernel_files_status lseek_pinned(
         target = offset;
         break;
     case KERNEL_FILES_SEEK_CUR:
+        current = (int64_t)kernel_open_file_offset(description);
         if ((offset > 0 && current > INT64_MAX - offset) ||
             (offset < 0 && current < INT64_MIN - offset)) {
             *linux_result = -KERNEL_EINVAL;
@@ -2377,7 +2385,7 @@ static enum kernel_files_status lseek_pinned(
         break;
     case KERNEL_FILES_SEEK_DATA:
     case KERNEL_FILES_SEEK_HOLE: {
-        if (kernel_open_file_kind(description)!=KERNEL_OPEN_FILE_KIND_REGULAR) {
+        if (kind != KERNEL_OPEN_FILE_KIND_REGULAR) {
             *linux_result=-KERNEL_EINVAL;
             return KERNEL_FILES_STATUS_OK;
         }
@@ -2399,7 +2407,7 @@ static enum kernel_files_status lseek_pinned(
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (description->kind == KERNEL_OPEN_FILE_KIND_GENERATED && !description->proc_page_stream && !control && target &&
+    if (kind == KERNEL_OPEN_FILE_KIND_GENERATED && !description->proc_page_stream && !control && target &&
         (uint64_t)target != description->generated_read_offset) {
         kernel_open_file_reset_generated(description);
         int error = kernel_open_file_generate(description);
@@ -2415,8 +2423,7 @@ static enum kernel_files_status lseek_pinned(
         KERNEL_OPEN_FILE_STATUS_OK) {
         return KERNEL_FILES_STATUS_STATE;
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED &&
-        target == 0)
+    if (kind == KERNEL_OPEN_FILE_KIND_GENERATED && target == 0)
         kernel_open_file_reset_generated(description);
     *linux_result = target;
     return KERNEL_FILES_STATUS_OK;

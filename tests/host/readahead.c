@@ -95,10 +95,20 @@ static void prediction_boundaries(struct kernel_open_file_description *file,stru
         read_bytes(file,offset,count);offset+=count;
     }
     assert(file->readahead_cookie);
+    assert(!kernel_open_file_try_seek_regular(file, BOAROS_PAGE_SIZE));
+    assert(!kernel_open_file_offset(file) && file->readahead_cookie);
     kernel_open_file_read_begin(file,0);
     assert(!file->readahead_cookie && !file->read_sequential);
     read_bytes(file,0,1);
-    assert(!kernel_open_file_seek(file,0) && !file->read_sequential && !file->read_end);
+    {
+        KERNEL_LOCK_SCOPE(position);
+        kernel_mutex_lock(&file->offset_lock, &position);
+        assert(!kernel_open_file_try_seek_regular(file, BOAROS_PAGE_SIZE));
+        assert(!kernel_open_file_offset(file));
+    }
+    assert(kernel_open_file_try_seek_regular(file, BOAROS_PAGE_SIZE) &&
+           kernel_open_file_offset(file) == BOAROS_PAGE_SIZE &&
+           !file->read_sequential && !file->read_end);
     puts("PASS nonsequential begin and seek cancel the current prediction");
 
     cold_stream(file,cache);

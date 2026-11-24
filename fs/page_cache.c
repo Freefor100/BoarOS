@@ -2496,11 +2496,13 @@ void kernel_page_cache_put_batch(struct kernel_page_cache *cache,
     int clean = 0;
     {
         CACHE_SCOPE(guard, cache);
+        size_t released_entries = 0;
         for (size_t i = 0; i < count; i++) {
             if (pages[i].status == KERNEL_PAGE_CACHE_STATUS_OK) {
                 struct kernel_page_cache_entry *entry = pages[i].entry;
                 if (entry) {
-                    clean |= entry_return(entry);
+                    clean |= entry_return_locked(entry);
+                    released_entries++;
                     pages[i].entry = NULL;
                 } else if (pages[i].physical_address) {
                     physical_page_release(cache->allocator, pages[i].physical_address);
@@ -2508,6 +2510,7 @@ void kernel_page_cache_put_batch(struct kernel_page_cache *cache,
                 }
             }
         }
+        if (released_entries) entry_borrows_sub(cache->record, released_entries);
     }
     if (clean) {
         uint64_t released = 0;

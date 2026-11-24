@@ -85,6 +85,12 @@ struct kernel_io_context {
 };
 struct kernel_mutex { struct kernel_rwlock lock; };
 
+/* Caller holds metadata. A pending handoff still owns its place in the queue. */
+static inline int kernel_rwlock_busy_locked(const struct kernel_rwlock *lock, int write)
+{
+    return lock->writer || lock->pending_head || lock->handoff_owner || (write && lock->readers);
+}
+
 /* I/O owner of the executing task, or the bootstrap context before scheduling. */
 struct kernel_io_context *kernel_io_context_current(void);
 void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key);

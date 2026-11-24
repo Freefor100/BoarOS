@@ -134,7 +134,7 @@ unsigned kernel_mm_try_pin_user_read_batch(const struct kernel_mm *, uint64_t fi
 void kernel_mm_unpin_user_read_batch(struct kernel_mm_user_pin *, unsigned count);
 
 #if defined(__riscv) && BOAROS_MAX_CPUS == 1
-#define KERNEL_MM_COPY_READY_PAGES 8U
+#define KERNEL_MM_COPY_READY_PAGES 16U
 /* Resident writable base pages, excluding shared file-write aliases. */
 unsigned kernel_mm_copy_to_ready_user_pages(struct kernel_mm *, uint64_t first,
     const void *const *source, unsigned count);

@@ -96,20 +96,46 @@ int kernel_open_file_fallocate(struct kernel_open_file_description *file,
     return result;
 }
 
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+static uint64_t reset_read_prediction_locked(struct kernel_open_file_description *file)
+{
+    uint64_t cookie = file->readahead_cookie;
+    file->readahead_cookie = 0;
+    __atomic_store_n(&file->read_sequential, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&file->read_end, 0, __ATOMIC_RELAXED);
+    file->readahead_end = 0;
+    file->readahead_pages = 0;
+    return cookie;
+}
+#endif
+
 static void reset_read_prediction(struct kernel_open_file_description *file)
 {
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
     uint64_t cookie;
     {
         KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
-        cookie=file->readahead_cookie;
-        file->readahead_cookie=0;__atomic_store_n(&file->read_sequential,0,__ATOMIC_RELAXED);
-        __atomic_store_n(&file->read_end,0,__ATOMIC_RELAXED);file->readahead_end=0;file->readahead_pages=0;
+        cookie = reset_read_prediction_locked(file);
     }
     if (cookie) kernel_page_cache_cancel_readahead(kernel_vfs_file_page_cache(&file->file),cookie);
 #else
     (void)file;
 #endif
+}
+
+int kernel_open_file_try_seek_regular(struct kernel_open_file_description *file, uint64_t offset)
+{
+    struct kernel_rwlock *lock = &file->offset_lock.lock;
+    KERNEL_RAW_SCOPE(position, &lock->metadata);
+    /* With no outstanding position owner, the update can finish under the
+     * lock metadata. A competing owner or cancellation uses the full path. */
+    if (kernel_rwlock_busy_locked(lock, 1)) return 0;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    if (file->readahead_cookie) return 0;
+    (void)reset_read_prediction_locked(file);
+#endif
+    file->offset = offset;
+    return 1;
 }
 
 int kernel_open_file_advise(struct kernel_open_file_description *file,int64_t offset,
@@ -948,62 +974,8 @@ struct kernel_socket *kernel_open_file_socket(
 enum kernel_open_file_kind kernel_open_file_kind(
     const struct kernel_open_file_description *file)
 {
-    if (file == 0) {
-        return KERNEL_OPEN_FILE_KIND_REGULAR;
-    }
-    switch (file->kind) {
-    case KERNEL_OPEN_FILE_KIND_FS_CONTEXT: return KERNEL_OPEN_FILE_KIND_FS_CONTEXT;
-    case KERNEL_OPEN_FILE_KIND_BPF:
-        return KERNEL_OPEN_FILE_KIND_BPF;
-    case KERNEL_OPEN_FILE_KIND_NAMESPACE:
-        return KERNEL_OPEN_FILE_KIND_NAMESPACE;
-    case KERNEL_OPEN_FILE_KIND_INOTIFY:
-        return KERNEL_OPEN_FILE_KIND_INOTIFY;
-    case KERNEL_OPEN_FILE_KIND_FANOTIFY:
-        return KERNEL_OPEN_FILE_KIND_FANOTIFY;
-    case KERNEL_OPEN_FILE_KIND_USERFAULTFD:
-        return KERNEL_OPEN_FILE_KIND_USERFAULTFD;
-    case KERNEL_OPEN_FILE_KIND_MQUEUE:
-        return KERNEL_OPEN_FILE_KIND_MQUEUE;
-    case KERNEL_OPEN_FILE_KIND_PIDFD:
-        return KERNEL_OPEN_FILE_KIND_PIDFD;
-    case KERNEL_OPEN_FILE_KIND_SIGNALFD:
-        return KERNEL_OPEN_FILE_KIND_SIGNALFD;
-    case KERNEL_OPEN_FILE_KIND_TIMERFD:
-        return KERNEL_OPEN_FILE_KIND_TIMERFD;
-    case KERNEL_OPEN_FILE_KIND_EVENTFD:
-        return KERNEL_OPEN_FILE_KIND_EVENTFD;
-    case KERNEL_OPEN_FILE_KIND_DIRECTORY:
-        return KERNEL_OPEN_FILE_KIND_DIRECTORY;
-    case KERNEL_OPEN_FILE_KIND_CONSOLE:
-        return KERNEL_OPEN_FILE_KIND_CONSOLE;
-    case KERNEL_OPEN_FILE_KIND_PIPE:
-        return KERNEL_OPEN_FILE_KIND_PIPE;
-    case KERNEL_OPEN_FILE_KIND_EPOLL:
-        return KERNEL_OPEN_FILE_KIND_EPOLL;
-    case KERNEL_OPEN_FILE_KIND_NULL:
-        return KERNEL_OPEN_FILE_KIND_NULL;
-    case KERNEL_OPEN_FILE_KIND_FULL:
-        return KERNEL_OPEN_FILE_KIND_FULL;
-    case KERNEL_OPEN_FILE_KIND_ZERO:
-        return KERNEL_OPEN_FILE_KIND_ZERO;
-    case KERNEL_OPEN_FILE_KIND_SOCKET:
-        return KERNEL_OPEN_FILE_KIND_SOCKET;
-    case KERNEL_OPEN_FILE_KIND_GENERATED:
-        return KERNEL_OPEN_FILE_KIND_GENERATED;
-    case KERNEL_OPEN_FILE_KIND_RANDOM:
-        return KERNEL_OPEN_FILE_KIND_RANDOM;
-    case KERNEL_OPEN_FILE_KIND_URANDOM:
-        return KERNEL_OPEN_FILE_KIND_URANDOM;
-    case KERNEL_OPEN_FILE_KIND_PATH:
-        return KERNEL_OPEN_FILE_KIND_PATH;
-    case KERNEL_OPEN_FILE_KIND_RTC:
-        return KERNEL_OPEN_FILE_KIND_RTC;
-    case KERNEL_OPEN_FILE_KIND_BLOCK:
-        return KERNEL_OPEN_FILE_KIND_BLOCK;
-    default:
-        return KERNEL_OPEN_FILE_KIND_REGULAR;
-    }
+    return file && (unsigned)file->kind < KERNEL_OPEN_FILE_KIND_COUNT ?
+        file->kind : KERNEL_OPEN_FILE_KIND_REGULAR;
 }
 
 int kernel_open_file_supports_epoll(
