@@ -642,7 +642,7 @@ enum arch_mmu_status arch_mmu_user_map_prepared_order(struct arch_mmu_user_space
 {
     if (!live(s) || !supported_order(order) || (permissions & ~7U) || !physical ||
         physical > PTE_ADDRESS || (physical & (leaf_size(order) - 1)) ||
-        ((flags & KERNEL_MM_LEAF_FILE) && (order || !(flags & KERNEL_MM_LEAF_COW))))
+        ((flags & KERNEL_MM_LEAF_FILE) && !(flags & KERNEL_MM_LEAF_COW)))
         return ARCH_MMU_STATUS_INVALID;
     int cow = (flags & KERNEL_MM_LEAF_COW) != 0;
     uint32_t pages = 1U << order;

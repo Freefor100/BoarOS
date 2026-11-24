@@ -1,4 +1,5 @@
 #include <kernel/hugetlb.h>
+#include <kernel/avl.h>
 #include <kernel/physical_page.h>
 #include <kernel/heap.h>
 #include <kernel/page.h>
@@ -10,7 +11,16 @@
 #define HSTATE_BUCKETS 64U
 enum slot_state { SLOT_AVAILABLE, SLOT_PREPARING, SLOT_USED, SLOT_REMOVED, SLOT_REVOKED };
 struct huge_block { struct huge_block *hash_next, *free_next; uint64_t address; unsigned free; };
-struct huge_slot { uint64_t physical; uint32_t state, pending, reserved, adopted; };
+struct kernel_hugetlb_slot {
+    uint64_t physical;
+    uint32_t state, pending;
+    uint8_t reserved, adopted, restore_reservation;
+};
+struct kernel_hugetlb_file_slot {
+    struct kernel_avl_node index;
+    struct kernel_hugetlb_file_slot *next;
+    struct kernel_hugetlb_slot slot;
+};
 struct kernel_hstate {
     struct kernel_heap *heap;
     struct physical_page_allocator *allocator;
@@ -25,10 +35,45 @@ struct kernel_hstate {
 };
 struct kernel_hugetlb_map {
     struct kernel_hstate *h;
-    uint64_t count, lineage, resident;
-    uint32_t references, mode, noreserve, registrations, mapping_borrows;
-    struct huge_slot slots[];
+    uint64_t count, lineage, resident, file_index;
+    struct kernel_avl_node *file_slots;
+    uint32_t references, mode, noreserve, registrations, mapping_borrows, is_file;
+    struct kernel_hugetlb_slot slots[];
 };
+
+static struct kernel_hugetlb_file_slot *file_slot_at_or_after(
+    const struct kernel_hugetlb_map *map, uint64_t index)
+{
+    struct kernel_avl_node *found=NULL;
+    for (struct kernel_avl_node *node=map->file_slots;node;) {
+        if (node->key<index) node=node->right;
+        else { found=node;node=node->left; }
+    }
+    return (struct kernel_hugetlb_file_slot *)found;
+}
+
+static struct kernel_hugetlb_file_slot *file_slot_at(
+    const struct kernel_hugetlb_map *map, uint64_t index)
+{
+    struct kernel_hugetlb_file_slot *entry=file_slot_at_or_after(map,index);
+    return entry && entry->index.key==index ? entry : NULL;
+}
+
+static struct kernel_hugetlb_slot *map_slot_at(struct kernel_hugetlb_map *map, uint64_t index)
+{
+    if (!map->is_file) return &map->slots[index];
+    struct kernel_hugetlb_file_slot *entry=file_slot_at(map,index);
+    return entry ? &entry->slot : NULL;
+}
+
+static struct kernel_hugetlb_file_slot *allocate_file_slot(struct kernel_hstate *h, uint64_t index)
+{
+    struct kernel_hugetlb_file_slot *slot;
+    if (kernel_heap_allocate_zeroed_nosleep(h->heap,1,sizeof(*slot),(void **)&slot)) return NULL;
+    slot->index.key=index;
+    slot->index.height=1;
+    return slot;
+}
 static unsigned bucket(struct kernel_hstate *h,uint64_t address)
 { return (unsigned)((address>>(BOAROS_PAGE_SHIFT+h->order))%HSTATE_BUCKETS); }
 static struct huge_block *find(struct kernel_hstate *h,uint64_t address)
@@ -155,11 +200,9 @@ enum kernel_hugetlb_status kernel_hstate_grow(struct kernel_hstate *h,uint64_t c
     }
     return KERNEL_HUGETLB_OK;
 }
-uint64_t kernel_hstate_shrink(struct kernel_hstate *h,uint64_t count)
+static uint64_t trim_surplus(struct kernel_hstate *h,uint64_t count)
 {
     uint64_t removed=0;
-    { KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
-      if (!h->resizing) h->target=count<h->total?h->total-count:0; }
     while (removed<count) {
         struct huge_block *b;
         {
@@ -172,6 +215,13 @@ uint64_t kernel_hstate_shrink(struct kernel_hstate *h,uint64_t count)
         kernel_heap_release(h->heap,b);removed++;
     }
     return removed;
+}
+
+uint64_t kernel_hstate_shrink(struct kernel_hstate *h,uint64_t count)
+{
+    { KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
+      if (!h->resizing) h->target=count<h->total?h->total-count:0; }
+    return trim_surplus(h,count);
 }
 enum kernel_hugetlb_status kernel_hstate_destroy(struct kernel_hstate **owner)
 {
@@ -207,9 +257,9 @@ enum kernel_hugetlb_status kernel_hugetlb_map_create(struct kernel_hstate *h,uin
     enum kernel_hugetlb_mode mode,int noreserve,struct kernel_hugetlb_map **out)
 {
     if (!h || !out || !pages || mode>KERNEL_HUGETLB_CHILD ||
-        pages>(SIZE_MAX-sizeof(struct kernel_hugetlb_map))/sizeof(struct huge_slot)) return KERNEL_HUGETLB_INVALID;
+        pages>(SIZE_MAX-sizeof(struct kernel_hugetlb_map))/sizeof(struct kernel_hugetlb_slot)) return KERNEL_HUGETLB_INVALID;
     struct kernel_hugetlb_map *m;
-    if (kernel_heap_allocate_zeroed(h->heap,1,sizeof(*m)+pages*sizeof(struct huge_slot),(void **)&m))
+    if (kernel_heap_allocate_zeroed(h->heap,1,sizeof(*m)+pages*sizeof(struct kernel_hugetlb_slot),(void **)&m))
         return KERNEL_HUGETLB_NO_MEMORY;
     m->h=h;m->count=pages;m->references=1;m->mode=mode;m->noreserve=!!noreserve || mode==KERNEL_HUGETLB_CHILD;
     if (!m->noreserve) for (uint64_t i=0;i<pages;i++) m->slots[i].reserved=1;
@@ -233,6 +283,150 @@ enum kernel_hugetlb_status kernel_hugetlb_map_create(struct kernel_hstate *h,uin
 }
 static void acquire_locked(struct kernel_hugetlb_map *m)
 { if (!m->references || m->references==UINT32_MAX) __builtin_trap();m->references++; }
+
+enum kernel_hugetlb_status kernel_hugetlb_file_create(struct kernel_hstate *h,
+    struct kernel_hugetlb_map **out)
+{
+    if (!h || !out || *out) return KERNEL_HUGETLB_INVALID;
+    struct kernel_hugetlb_map *map;
+    if (kernel_heap_allocate_zeroed(h->heap,1,sizeof(*map),(void **)&map))
+        return KERNEL_HUGETLB_NO_MEMORY;
+    map->h=h;
+    map->count=UINT64_MAX;
+    map->references=1;
+    map->mode=KERNEL_HUGETLB_SHARED;
+    map->is_file=1;
+    {
+        KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
+        h->maps++;
+    }
+    *out=map;
+    return KERNEL_HUGETLB_OK;
+}
+
+static int file_reserved(const struct kernel_hugetlb_slot *slot)
+{
+    return slot && (slot->reserved || slot->restore_reservation || slot->adopted);
+}
+
+enum kernel_hugetlb_status kernel_hugetlb_file_reserve_begin(struct kernel_hugetlb_map *map,
+    uint64_t first, uint64_t end, struct kernel_hugetlb_reservation *reservation)
+{
+    if (!map || !map->is_file || first>end || !reservation || reservation->map)
+        return KERNEL_HUGETLB_INVALID;
+    struct kernel_hstate *h=map->h;
+    kernel_hugetlb_map_acquire(map);
+    reservation->map=map;
+    uint64_t index;
+    for (index=first;index<end;index++) {
+        {
+            KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
+            if (file_reserved(map_slot_at(map,index))) continue;
+            if (h->free==h->reserved) break;
+            h->reserved++;
+        }
+        struct kernel_hugetlb_file_slot *slot=allocate_file_slot(h,index);
+        if (!slot) {
+            { KERNEL_RAW_SCOPE(guard,&h->allocator->lock);h->reserved--; }
+            (void)trim_surplus(h,1);
+            break;
+        }
+        slot->next=reservation->candidates;
+        reservation->candidates=slot;
+    }
+    if (index==end) return KERNEL_HUGETLB_OK;
+    kernel_hugetlb_file_reserve_finish(reservation,0);
+    return KERNEL_HUGETLB_NO_MEMORY;
+}
+
+void kernel_hugetlb_file_reserve_finish(struct kernel_hugetlb_reservation *reservation,int accepted)
+{
+    struct kernel_hugetlb_map *map=reservation->map;
+    if (!map) return;
+    struct kernel_hstate *h=map->h;
+    struct kernel_hugetlb_file_slot *candidate=reservation->candidates;
+    uint64_t returned=0;
+    *reservation=(struct kernel_hugetlb_reservation){0};
+    while (candidate) {
+        struct kernel_hugetlb_file_slot *next=candidate->next;
+        {
+            KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
+            struct kernel_hugetlb_slot *slot=accepted ? map_slot_at(map,candidate->index.key) : NULL;
+            if (!accepted || file_reserved(slot)) { h->reserved--;returned++; }
+            else if (!slot) {
+                candidate->slot.reserved=1;
+                candidate->next=NULL;
+                map->file_slots=kernel_avl_insert_node(map->file_slots,&candidate->index);
+                candidate=NULL;
+            } else if (slot->state==SLOT_AVAILABLE) slot->reserved=1;
+            else {
+                /* A fault already took a page without using this charge. If
+                 * every claimant rejects it, restore the now reserved slot. */
+                slot->restore_reservation=1;
+                h->reserved--;
+                returned++;
+            }
+        }
+        if (candidate) kernel_heap_release(h->heap,candidate);
+        candidate=next;
+    }
+    if (returned) (void)trim_surplus(h,returned);
+    kernel_hugetlb_map_release(&map);
+}
+
+enum kernel_hugetlb_status kernel_hugetlb_file_find_page(struct kernel_hugetlb_map *map,
+    uint64_t index, uint64_t *physical)
+{
+    if (!map || !map->is_file || !physical) return KERNEL_HUGETLB_INVALID;
+    struct kernel_hstate *h=map->h;
+    uint64_t address;
+    {
+        KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
+        struct kernel_hugetlb_slot *slot=map_slot_at(map,index);
+        if (!slot || !slot->adopted) return KERNEL_HUGETLB_NOT_FOUND;
+        address=slot->physical;
+    }
+    /* The caller's inode reader or registered MM gate keeps the inode's
+     * reference in place through this physical reference acquisition. */
+    physical_page_acquire_order(h->allocator,address,h->order);
+    *physical=address;
+    return KERNEL_HUGETLB_OK;
+}
+
+static void remove_file_slots(struct kernel_hugetlb_map *map,uint64_t first,uint64_t end,int punch)
+{
+    struct kernel_hstate *h=map->h;
+    uint64_t returned=0;
+    for (;;) {
+        struct kernel_hugetlb_file_slot *entry;
+        {
+            KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
+            entry=file_slot_at_or_after(map,first);
+            if (!entry || entry->index.key>=end) break;
+            struct kernel_hugetlb_slot *slot=&entry->slot;
+            if (slot->pending || slot->state==SLOT_PREPARING || slot->restore_reservation)
+                __builtin_trap();
+            if (punch && !slot->adopted) {
+                first=entry->index.key+1;
+                continue;
+            }
+            map->file_slots=kernel_avl_remove_node(map->file_slots,&entry->index);
+            if (slot->reserved) { h->reserved--;returned++; }
+            if (slot->adopted) map->resident--;
+        }
+        if (entry->slot.adopted)
+            physical_page_release_order(h->allocator,entry->slot.physical,h->order);
+        kernel_heap_release(h->heap,entry);
+    }
+    if (returned) (void)trim_surplus(h,returned);
+}
+
+void kernel_hugetlb_file_remove(struct kernel_hugetlb_map *map,uint64_t first,uint64_t end)
+{ remove_file_slots(map,first,end,0); }
+
+void kernel_hugetlb_file_punch(struct kernel_hugetlb_map *map,uint64_t first,uint64_t end)
+{ remove_file_slots(map,first,end,1); }
+
 void kernel_hugetlb_map_acquire(struct kernel_hugetlb_map *m)
 { KERNEL_RAW_SCOPE(guard,&m->h->allocator->lock);acquire_locked(m); }
 void kernel_hugetlb_map_release(struct kernel_hugetlb_map **owner)
@@ -244,13 +438,14 @@ void kernel_hugetlb_map_release(struct kernel_hugetlb_map **owner)
         if (!m->references) __builtin_trap();
         if (--m->references) return;
         if (m->registrations || m->mapping_borrows) __builtin_trap();
-        for (uint64_t i=0;i<m->count;i++) {
-            struct huge_slot *slot=&m->slots[i];
+        for (uint64_t i=0;!m->is_file && i<m->count;i++) {
+            struct kernel_hugetlb_slot *slot=&m->slots[i];
             if (slot->pending || slot->state==SLOT_PREPARING) __builtin_trap();
             if (slot->reserved) { if (!h->reserved) __builtin_trap();h->reserved--;slot->reserved=0; }
         }
     }
-    if (m->mode==KERNEL_HUGETLB_SHARED)
+    if (m->is_file) kernel_hugetlb_file_remove(m,0,UINT64_MAX);
+    else if (m->mode==KERNEL_HUGETLB_SHARED)
         for (uint64_t i=0;i<m->count;i++) if (m->slots[i].state==SLOT_USED)
             physical_page_release_order(h->allocator,m->slots[i].physical,h->order);
     { KERNEL_RAW_SCOPE(guard,&h->allocator->lock);if (!h->maps) __builtin_trap();h->maps--; }
@@ -274,8 +469,31 @@ enum kernel_hugetlb_status kernel_hugetlb_map_fork(struct kernel_hugetlb_map *so
     }
     if (busy) { kernel_hugetlb_map_release(&child);return KERNEL_HUGETLB_BUSY; }
     child->lineage=source->lineage;
+    child->file_index=source->file_index;
     *out=child;return KERNEL_HUGETLB_OK;
 }
+
+void kernel_hugetlb_map_set_file_index(struct kernel_hugetlb_map *map,uint64_t first)
+{ map->file_index=first; }
+
+uint64_t kernel_hugetlb_map_file_index(const struct kernel_hugetlb_map *map)
+{ return map->file_index; }
+
+void kernel_hugetlb_private_reset(struct kernel_hugetlb_map *map,uint64_t first,uint64_t end)
+{
+    if (map->mode==KERNEL_HUGETLB_SHARED || first>end || end>map->count) __builtin_trap();
+    struct kernel_hstate *h=map->h;
+    while (first<end) {
+        KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
+        uint64_t batch=end-first>16 ? first+16 : end;
+        for (;first<batch;first++) {
+            struct kernel_hugetlb_slot *slot=&map->slots[first];
+            if (slot->pending || slot->state==SLOT_PREPARING) __builtin_trap();
+            if (slot->state==SLOT_USED) slot->state=SLOT_AVAILABLE;
+        }
+    }
+}
+
 enum kernel_hugetlb_status kernel_hugetlb_map_unmap(struct kernel_hugetlb_map *m,uint64_t first,uint64_t end)
 {
     if (!m || first>end || end>m->count) return KERNEL_HUGETLB_INVALID;
@@ -297,7 +515,8 @@ int kernel_hugetlb_map_resident(struct kernel_hugetlb_map *m,uint64_t index)
 {
     if (!m || index>=m->count || m->mode!=KERNEL_HUGETLB_SHARED) return 0;
     KERNEL_RAW_SCOPE(guard,&m->h->allocator->lock);
-    return m->slots[index].state==SLOT_USED && m->slots[index].adopted;
+    struct kernel_hugetlb_slot *slot=map_slot_at(m,index);
+    return slot && slot->adopted;
 }
 enum kernel_hugetlb_status kernel_hugetlb_map_revoke(struct kernel_hugetlb_map *m,uint64_t index)
 {
@@ -306,52 +525,96 @@ enum kernel_hugetlb_status kernel_hugetlb_map_revoke(struct kernel_hugetlb_map *
     if (m->slots[index].pending) return KERNEL_HUGETLB_BUSY;
     m->slots[index].state=SLOT_REVOKED;return KERNEL_HUGETLB_OK;
 }
-enum kernel_hugetlb_status kernel_hugetlb_fault_begin(struct kernel_hugetlb_map *m,
-    uint64_t index,int cow,struct kernel_hugetlb_claim *claim)
+
+/* A missing sparse slot needs a heap candidate before taking a physical
+ * page. Recheck the tree after allocation because another fault may win. */
+static enum kernel_hugetlb_status prepare_fault(struct kernel_hugetlb_map *m,
+    uint64_t index,int cow,struct kernel_hugetlb_claim *claim,
+    struct kernel_hugetlb_file_slot **candidate,int *fresh)
 {
-    if (!m || !claim || claim->map || index>=m->count || (cow && m->mode==KERNEL_HUGETLB_SHARED))
-        return KERNEL_HUGETLB_INVALID;
-    struct kernel_hstate *h=m->h;struct huge_slot *slot=&m->slots[index];
-    uint64_t address;int shared=m->mode==KERNEL_HUGETLB_SHARED, fresh=0, reserved=0;
-    {
-        KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
-        if (m->lineage && h->closing_lineage==m->lineage) return KERNEL_HUGETLB_BUSY;
-        if (slot->state==SLOT_REMOVED || slot->state==SLOT_REVOKED) return KERNEL_HUGETLB_BUS;
-        if (cow && slot->state!=SLOT_USED) return KERNEL_HUGETLB_INVALID;
-        if (slot->state==SLOT_PREPARING || (!shared && slot->pending)) return KERNEL_HUGETLB_BUSY;
-        if (shared && slot->state==SLOT_USED) address=slot->physical;
-        else {
-            reserved=!cow && slot->reserved;
-            if (!h->free || (!reserved && h->free<=h->reserved))
-                return cow && m->mode==KERNEL_HUGETLB_PRIVATE && !m->noreserve ?
-                    KERNEL_HUGETLB_REVOKE_CHILDREN : KERNEL_HUGETLB_BUS;
-            if (!cow && !shared && slot->state==SLOT_USED) return KERNEL_HUGETLB_INVALID;
-            struct huge_block *b=take_locked(h);address=b->address;fresh=1;
-            if (reserved) { h->reserved--;slot->reserved=0; }
-            if (!cow) slot->state=SLOT_PREPARING;
-            if (shared) slot->physical=address;
-        }
-        if (slot->pending==UINT32_MAX) __builtin_trap();
-        slot->pending++;acquire_locked(m);
+    struct kernel_hstate *h=m->h;
+    uint64_t address;
+    int shared=m->mode==KERNEL_HUGETLB_SHARED,reserved=0;
+    KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
+    struct kernel_hugetlb_slot *slot=map_slot_at(m,index);
+    if (!slot) {
+        if (h->free==h->reserved) return KERNEL_HUGETLB_BUS;
+        struct kernel_hugetlb_file_slot *entry=*candidate;
+        if (!entry) return KERNEL_HUGETLB_NOT_FOUND;
+        m->file_slots=kernel_avl_insert_node(m->file_slots,&entry->index);
+        slot=&entry->slot;
+        *candidate=NULL;
     }
-    if (fresh && !cow) {
+    if (m->lineage && h->closing_lineage==m->lineage) return KERNEL_HUGETLB_BUSY;
+    if (slot->state==SLOT_REMOVED || slot->state==SLOT_REVOKED) return KERNEL_HUGETLB_BUS;
+    if (cow && slot->state!=SLOT_USED) return KERNEL_HUGETLB_INVALID;
+    if (slot->state==SLOT_PREPARING || (!shared && slot->pending)) return KERNEL_HUGETLB_BUSY;
+    if (shared && slot->state==SLOT_USED) address=slot->physical;
+    else {
+        reserved=!cow && slot->reserved;
+        if (!h->free || (!reserved && h->free<=h->reserved))
+            return cow && m->mode==KERNEL_HUGETLB_PRIVATE && !m->noreserve ?
+                KERNEL_HUGETLB_REVOKE_CHILDREN : KERNEL_HUGETLB_BUS;
+        if (!cow && !shared && slot->state==SLOT_USED) return KERNEL_HUGETLB_INVALID;
+        struct huge_block *b=take_locked(h);address=b->address;*fresh=1;
+        if (reserved) { h->reserved--;slot->reserved=0; }
+        if (!cow) slot->state=SLOT_PREPARING;
+        if (shared) {
+            slot->physical=address;
+            slot->restore_reservation=reserved;
+        }
+    }
+    if (slot->pending==UINT32_MAX) __builtin_trap();
+    slot->pending++;acquire_locked(m);
+    *claim=(struct kernel_hugetlb_claim){m,slot,index,address,h->order,!!cow,!!reserved,!!shared};
+    return KERNEL_HUGETLB_OK;
+}
+
+static enum kernel_hugetlb_status begin_fault(struct kernel_hugetlb_map *m,
+    uint64_t index,int cow,int clear,struct kernel_hugetlb_claim *claim)
+{
+    if (!m || !claim || claim->map || index>=m->count ||
+        ((cow || !clear) && m->mode==KERNEL_HUGETLB_SHARED))
+        return KERNEL_HUGETLB_INVALID;
+    struct kernel_hstate *h=m->h;
+    struct kernel_hugetlb_file_slot *candidate=NULL;
+    int fresh=0;
+    enum kernel_hugetlb_status status=prepare_fault(m,index,cow,claim,&candidate,&fresh);
+    if (status==KERNEL_HUGETLB_NOT_FOUND) {
+        candidate=allocate_file_slot(h,index);
+        status=prepare_fault(m,index,cow,claim,&candidate,&fresh);
+        if (status==KERNEL_HUGETLB_NOT_FOUND) return KERNEL_HUGETLB_NO_MEMORY;
+    }
+    if (candidate) kernel_heap_release(h->heap,candidate);
+    if (status) return status;
+    uint64_t address=claim->physical_address;
+    if (fresh && !cow && clear) {
         void *bytes;
         if (physical_page_map_owned(h->allocator,address,&bytes)) __builtin_trap();
         memset(bytes,0,(size_t)BOAROS_PAGE_SIZE<<h->order);
     }
-    if (shared) {
+    if (claim->shared) {
         /* slot's cache owner cannot disappear while pending retains it. */
         physical_page_acquire_order(h->allocator,address,h->order);
-        if (fresh) { KERNEL_RAW_SCOPE(guard,&h->allocator->lock);slot->state=SLOT_USED; }
+        if (fresh) { KERNEL_RAW_SCOPE(guard,&h->allocator->lock);claim->slot->state=SLOT_USED; }
     }
-    *claim=(struct kernel_hugetlb_claim){m,index,address,h->order,!!cow,!!reserved,!!shared};
     return KERNEL_HUGETLB_OK;
 }
+
+enum kernel_hugetlb_status kernel_hugetlb_fault_begin(struct kernel_hugetlb_map *m,
+    uint64_t index,int cow,struct kernel_hugetlb_claim *claim)
+{ return begin_fault(m,index,cow,1,claim); }
+
+enum kernel_hugetlb_status kernel_hugetlb_private_copy_begin(struct kernel_hugetlb_map *m,
+    uint64_t index,struct kernel_hugetlb_claim *claim)
+{ return begin_fault(m,index,0,0,claim); }
+
 void kernel_hugetlb_fault_finish(struct kernel_hugetlb_claim *claim,int accepted)
 {
     if (!claim || !claim->map) __builtin_trap();
     struct kernel_hugetlb_map *m=claim->map;struct kernel_hstate *h=m->h;
-    struct huge_slot *slot=&m->slots[claim->index];
+    struct kernel_hugetlb_slot *slot=claim->slot;
+    struct kernel_hugetlb_file_slot *empty=NULL;
     if (!accepted && claim->shared) physical_page_release_order(h->allocator,claim->physical_address,h->order);
     {
         KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
@@ -359,7 +622,11 @@ void kernel_hugetlb_fault_finish(struct kernel_hugetlb_claim *claim,int accepted
         slot->pending--;
         if (accepted) {
             slot->state=SLOT_USED;
-            if (claim->shared && !slot->adopted) { slot->adopted=1;m->resident++; }
+            if (claim->shared && !slot->adopted) {
+                slot->adopted=1;
+                slot->restore_reservation=0;
+                m->resident++;
+            }
         } else if (!claim->shared) {
             put_locked(h,find(h,claim->physical_address));
             if (!claim->cow) slot->state=SLOT_AVAILABLE;
@@ -367,8 +634,20 @@ void kernel_hugetlb_fault_finish(struct kernel_hugetlb_claim *claim,int accepted
         } else if (!slot->pending && !slot->adopted) {
             put_locked(h,find(h,slot->physical));
             slot->state=SLOT_AVAILABLE;
-            if (!m->noreserve) { slot->reserved=1;h->reserved++; }
+            if (slot->restore_reservation) {
+                slot->reserved=1;
+                slot->restore_reservation=0;
+                h->reserved++;
+            } else if (m->is_file) {
+                empty=(struct kernel_hugetlb_file_slot *)((char *)slot-
+                    offsetof(struct kernel_hugetlb_file_slot,slot));
+                m->file_slots=kernel_avl_remove_node(m->file_slots,&empty->index);
+            }
         }
+    }
+    if (empty) {
+        kernel_heap_release(h->heap,empty);
+        (void)trim_surplus(h,1);
     }
     *claim=(struct kernel_hugetlb_claim){0};kernel_hugetlb_map_release(&m);
 }
@@ -383,7 +662,7 @@ enum kernel_hugetlb_status kernel_hugetlb_discard_begin(struct kernel_hugetlb_ma
     if (physical_page_reference_count(h->allocator,address,&refs)) return KERNEL_HUGETLB_INVALID;
     exclusive=exclusive && refs==1;
     KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
-    struct huge_slot *slot=&m->slots[index];struct huge_block *b=find(h,address);
+    struct kernel_hugetlb_slot *slot=&m->slots[index];struct huge_block *b=find(h,address);
     if (!b || b->free || slot->state!=SLOT_USED) return KERNEL_HUGETLB_INVALID;
     if (slot->pending || (m->lineage && h->closing_lineage==m->lineage)) return KERNEL_HUGETLB_BUSY;
     int reserve=!m->noreserve && !exclusive;
@@ -404,7 +683,7 @@ void kernel_hugetlb_discard_finish(struct kernel_hugetlb_discard_claim *claim,in
     }
     {
         KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
-        struct huge_slot *slot=&m->slots[claim->index];
+        struct kernel_hugetlb_slot *slot=&m->slots[claim->index];
         if (slot->state!=SLOT_USED || slot->pending!=1 || slot->reserved) __builtin_trap();
         slot->pending--;
         if (accepted) {
@@ -430,7 +709,7 @@ enum kernel_hugetlb_status kernel_hugetlb_discard(struct kernel_hugetlb_map *m,
     int transferred=0;
     {
         KERNEL_RAW_SCOPE(guard,&h->allocator->lock);
-        struct huge_slot *slot=&m->slots[index];struct huge_block *b=find(h,address);
+        struct kernel_hugetlb_slot *slot=&m->slots[index];struct huge_block *b=find(h,address);
         if (!b || b->free || slot->state!=SLOT_USED) return KERNEL_HUGETLB_INVALID;
         if (slot->pending) return KERNEL_HUGETLB_BUSY;
         if (!m->noreserve && refs!=1 && h->free<=h->reserved) return KERNEL_HUGETLB_BUSY;

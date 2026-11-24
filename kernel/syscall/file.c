@@ -39,7 +39,6 @@ enum kernel_syscall_status syscall_handle_memfd_create(struct kernel_task *calle
     enum kernel_uaccess_status copied=kernel_copy_string_from_user(mm,name+6,
         request->arguments[0],KERNEL_MEMFD_NAME_MAX+1,&length);
     if (copied) decoded->value=copied==KERNEL_UACCESS_STATUS_TOO_LONG ? -KERNEL_EINVAL : -KERNEL_EFAULT;
-    else if (flags&KERNEL_MFD_HUGETLB) decoded->value=-KERNEL_EOPNOTSUPP;
     else if (kernel_files_memfd(files,name,flags,&decoded->value)) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     return KERNEL_SYSCALL_STATUS_OK;
 }

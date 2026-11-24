@@ -55,7 +55,7 @@ flowchart TD
 | **共享匿名与 SysV 共享内存** | `MAP_SHARED \| MAP_ANONYMOUS`、`shmat` | 由稀疏页后备对象 `struct kernel_memory_object` 维护物理页，`fork` 后父子保持可写共享 |
 | **私有 / 共享文件映射** | 普通文件的 `mmap` | 与文件读写共用统一页缓存（Page Cache）；私有映射首次写入触发写时复制，共享映射通过反向别名登记追踪脏页与写回 |
 | **ELF 程序段映射** | `execve` 加载可执行文件与动态库 | 使用独立 `kernel_elf64_source`：纯文件页共享页缓存，文件与零填充（BSS）边界页按需私有物化并精确清零尾部 |
-| **原生大页映射** | `MAP_HUGETLB`、`SHM_HUGETLB` | 由 `mm/hugetlb.c` 维护连续高阶物理页池与预留配额，直接安装中间级大页表项 |
+| **原生大页映射** | `MAP_HUGETLB`、`SHM_HUGETLB`、`hugetlbfs` 和 `MFD_HUGETLB` 文件映射 | `mm/hugetlb.c` 维护连续物理大页和预留额度，文件的共享映射按实际偏移合用同一个后备页 |
 | **内核对象共享映射** | eBPF Map / RingBuf、`AF_PACKET` 接收环（`TPACKET_V3`） | 映射建立时直接安装固定内核物理页，不参与普通按需装页；解除映射后访问未映射槽位触发总线错误（`SIGBUS`） |
 | **vDSO 与 vVAR** | 内核向每个进程注入的快速时钟与信号返回页 | `vDSO` 映射内核内嵌共享代码页，`vVAR` 只读映射共享时钟数据页（默认排除出核心转储） |
 

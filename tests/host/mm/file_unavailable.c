@@ -58,6 +58,9 @@ EXCLUDED(kernel_socket_rights_changed)
 EXCLUDED(kernel_pidfd_close)
 EXCLUDED(kernel_pipe_release_endpoint)
 EXCLUDED(kernel_pipe_destroy)
+struct kernel_mm_pagemap;
+__attribute__((weak)) void kernel_mm_pagemap_put(struct kernel_mm_pagemap *view)
+{ (void)view; mm_file_unavailable(); }
 /* Direct-write/fallocate code is linked by shared VFS routines, but this
  * tmpfs-only fixture never owns a disk cache. Reject accidental entry. */
 struct kernel_page_cache;

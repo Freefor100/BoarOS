@@ -67,6 +67,63 @@ static void *worker(void *arg)
     physical_page_release_order(&allocator,parallel_heads[id],order);
     return NULL;
 }
+
+static void check_file_slots(struct kernel_hstate *h)
+{
+    /* A large hole must not cost storage or charge data pages. */
+    const uint64_t first=UINT64_C(1)<<26;
+    struct kernel_hugetlb_map *file=NULL,*alias=NULL;
+    struct kernel_hugetlb_reservation reserve={0};
+    struct kernel_hugetlb_claim one={0},two={0};
+    uint64_t physical;
+    assert(!kernel_hugetlb_file_create(h,&file));
+    assert(kernel_hugetlb_file_find_page(file,first,&physical)==KERNEL_HUGETLB_NOT_FOUND);
+    assert(!kernel_hugetlb_file_reserve_begin(file,first,first+2,&reserve));
+    assert(snapshot(h).reserved==2);
+    kernel_hugetlb_file_reserve_finish(&reserve,0);
+    assert(!snapshot(h).reserved);
+    assert(kernel_hugetlb_file_reserve_begin(file,first,first+4,&reserve)==KERNEL_HUGETLB_NO_MEMORY);
+    assert(!reserve.map && !snapshot(h).reserved);
+
+    /* Reserve while an unreserved fault has already prepared its physical
+     * page. The last rejected claimant must restore that new reservation. */
+    assert(!kernel_hugetlb_fault_begin(file,first,0,&one));
+    assert(!kernel_hugetlb_fault_begin(file,first,0,&two));
+    assert(!kernel_hugetlb_file_reserve_begin(file,first,first+2,&reserve));
+    kernel_hugetlb_file_reserve_finish(&reserve,1);
+    assert(snapshot(h).reserved==1);
+    kernel_hugetlb_fault_finish(&one,0);
+    kernel_hugetlb_fault_finish(&two,0);
+    assert(snapshot(h).reserved==2 && snapshot(h).free==3);
+    assert(!kernel_hugetlb_file_reserve_begin(file,first,first+2,&reserve));
+    kernel_hugetlb_file_reserve_finish(&reserve,1);
+    assert(snapshot(h).reserved==2);
+    assert(!kernel_hugetlb_map_fork(file,&alias) && alias==file);
+    physical=instantiate(alias,first);
+    physical_page_release_order(&allocator,physical,order);
+    uint64_t read;
+    assert(!kernel_hugetlb_file_find_page(file,first,&read) && read==physical);
+    assert(kernel_hugetlb_map_resident_pages(file)==huge_size/BOAROS_PAGE_SIZE);
+    kernel_hugetlb_file_remove(file,first,UINT64_MAX);
+    assert(!snapshot(h).reserved && snapshot(h).free==2);
+    assert(kernel_hugetlb_file_find_page(file,first,&physical)==KERNEL_HUGETLB_NOT_FOUND);
+    physical_page_release_order(&allocator,read,order);
+    assert(snapshot(h).free==3);
+    assert(!kernel_hugetlb_fault_begin(file,first+2,0,&one));
+    kernel_hugetlb_fault_finish(&one,0);
+    assert(!snapshot(h).reserved && snapshot(h).free==3);
+    assert(!kernel_hugetlb_file_reserve_begin(file,first+7,first+8,&reserve));
+    assert(!kernel_hstate_resize(h,0));
+    assert(snapshot(h).surplus==1 && snapshot(h).reserved==1);
+    kernel_hugetlb_file_reserve_finish(&reserve,1);
+    kernel_hugetlb_file_remove(file,0,UINT64_MAX);
+    assert(!snapshot(h).total && !snapshot(h).reserved);
+    kernel_hugetlb_map_release(&alias);
+    kernel_hugetlb_map_release(&file);
+    assert(!kernel_hstate_resize(h,3));
+    assert(!snapshot(h).maps && snapshot(h).free==3);
+}
+
 int main(void)
 {
     mm_test_attach(0);order=BOAROS_PAGE_SHIFT==12?9:11;huge_size=(size_t)BOAROS_PAGE_SIZE<<order;
@@ -181,6 +238,7 @@ int main(void)
     assert(snapshot(h).free==2 && snapshot(h).maps==1);
     futex_key_release(&queued);
     assert(snapshot(h).free==3 && !snapshot(h).maps);
+    check_file_slots(h);
 
     assert(!kernel_hugetlb_map_create(h,2,KERNEL_HUGETLB_PRIVATE,0,&parallel_map));
     assert(!pthread_barrier_init(&gate,NULL,2));pthread_t threads[2];

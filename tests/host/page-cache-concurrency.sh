@@ -19,7 +19,7 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
         ${CACHE_HOST_TEST_SOURCE:-tests/host/page_cache_concurrency.c} tests/host/mm/context.c \
         tests/host/mm/disk_context.c tests/host/sync/notifications.c kernel/cpu.c kernel/raw_lock.c \
         kernel/credentials.c kernel/posix_acl.c kernel/sched/sync.c kernel/sched/accounting.c kernel/sched/park.c kernel/physical_page.c \
-        mm/heap.c mm/memory_object.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c \
+        mm/heap.c mm/memory_object.c mm/hugetlb.c fs/vfs.c fs/tmpfs.c fs/file_mapping.c \
         fs/record_lock.c fs/flock.c fs/page_cache.c fs/ext4_backend.c fs/lwext4_port.c \
         kernel/block.c third_party/lwext4/src/*.c ${CACHE_HOST_SOURCES:-} \
         -Wl,--wrap=memcpy,--gc-sections,--wrap=kernel_time_monotonic_ns,--wrap=kernel_vfs_node_pread,--wrap=kernel_vfs_node_pread_batch,--wrap=physical_page_allocate,--wrap=physical_page_allocate_batch,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_heap_allocate,--wrap=kernel_vfs_node_writeback,--wrap=ext4_fpwrite_batch,--wrap=ext4_trans_write_data,--wrap=ext4_balloc_verify_bitmap_csum,--wrap=kernel_thread_join,--wrap=kernel_open_file_prepare_mapping_page \

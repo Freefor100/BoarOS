@@ -140,7 +140,7 @@ static int vma_valid(const struct kernel_vma *vma)
         vma->kind < KERNEL_VMA_KIND_ANONYMOUS ||
         vma->kind > KERNEL_VMA_KIND_HUGETLB_SHARED ||
         vma->role < KERNEL_VMA_ROLE_NONE ||
-        vma->role > KERNEL_VMA_ROLE_SYSV_SHM ||
+        vma->role > KERNEL_VMA_ROLE_HUGETLB_FILE ||
         vma->fault_policy < KERNEL_VMA_FAULT_RESIDENT_REQUIRED ||
         vma->fault_policy > KERNEL_VMA_FAULT_HUGETLB) {
         return 0;
@@ -155,7 +155,12 @@ static int vma_valid(const struct kernel_vma *vma)
     if (vma->backing_owner && !kernel_vma_userfault(vma) &&
         vma->kind != KERNEL_VMA_KIND_FILE_PRIVATE &&
         vma->kind != KERNEL_VMA_KIND_FILE_SHARED && vma->kind != KERNEL_VMA_KIND_ELF_PRIVATE &&
-        vma->kind != KERNEL_VMA_KIND_OBJECT_SHARED && !kernel_vma_shm_attachment(vma))
+        vma->kind != KERNEL_VMA_KIND_OBJECT_SHARED && !kernel_vma_shm_attachment(vma) &&
+        vma->role != KERNEL_VMA_ROLE_HUGETLB_FILE)
+        return 0;
+    if (vma->role == KERNEL_VMA_ROLE_HUGETLB_FILE &&
+        (!vma->backing_owner || (vma->kind != KERNEL_VMA_KIND_HUGETLB_PRIVATE &&
+                                vma->kind != KERNEL_VMA_KIND_HUGETLB_SHARED)))
         return 0;
     if (vma->kind == KERNEL_VMA_KIND_ANONYMOUS &&
         (vma->backing_offset != 0U || vma->backing != 0 ||
@@ -683,7 +688,8 @@ enum kernel_vma_status kernel_vma_set_backing_in_use(
     }
     *in_use = 0;
     for (index = 0U; index < set->count; index++) {
-        if (set->entries[index].backing == backing) {
+        if (set->entries[index].backing == backing ||
+            set->entries[index].backing_owner == backing) {
             *in_use = 1;
             break;
         }

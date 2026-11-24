@@ -106,7 +106,7 @@ flowchart LR
 - **段表快照与锁外用户拷贝**：查询类 `shmctl` 与 `/proc/sysvipc/shm` 在 CPU0 局部中断保护下抓取有界结构快照后即刻退出保护，随后再向用户空间拷贝；拷贝期间原段被删除不影响本次快照，短拷贝返回 `-EFAULT`。
 - **任务归属与 `fork` 规则**：共享地址空间（多线程）在非最后引用退出时不改写 `lpid`；异步地址空间回收显式传递实际操作任务而非后台回收线程。`fork` 仅为继承的 VMA 增加引用（带 `MADV_DONTFORK` 的片段直接跳过且不对父页表施加写时复制），遇到内存不足时通过统一销毁钩子回滚。
 - **锁页账户归属**：`SHM_LOCK` 扣除锁定时调用者真实 UID 账户的锁页配额；后续 `IPC_SET` 修改段所有者或进程切换 UID 均不转移已接纳的额度，直至 `SHM_UNLOCK` 或段销毁时归还给原账户（详见 [虚拟内存管理](kernel-mm.md)）。
-- **暂不支持项**：大页 `mremap`、`MADV_REMOVE`、可写 `hugetlb_shm_group` 系统控制参数、透明大页与独立 `hugetlbfs` 挂载尚未实现。
+- **System V 大页段的边界**。大页 `mremap`、`MADV_REMOVE`、可写 `hugetlb_shm_group` 系统控制参数和透明大页待补。System V 大页段和 [`hugetlbfs` 文件](hugepages.md) 共用架构的大页池，分别管理段和文件的生命周期。
 
 ### 定向验证入口
 

@@ -11,6 +11,7 @@
 #include <stdint.h>
 
 struct kernel_vfs_node;
+struct kernel_hugetlb_map;
 /* 单次用户操作借用调用者的限额；后台写回不重新套用它。
  * exceeded只报告限额拒绝，文件系统自身的最大尺寸错误保持独立。 */
 struct kernel_vfs_size_limit {
@@ -597,6 +598,9 @@ int kernel_vfs_node_acquire(struct kernel_vfs_node *node);
 int kernel_vfs_node_release(struct kernel_vfs_node **owner);
 /* Call under inode I/O qualification; the OFD covers the returned counter. */
 uint64_t *kernel_vfs_node_shared_write_counter(struct kernel_vfs_node *, int *sealed);
+struct kernel_hugetlb_map *kernel_vfs_node_hugetlb(const struct kernel_vfs_node *);
+/* Caller holds the inode writer and has admitted a huge-aligned mapping. */
+void kernel_vfs_hugetlb_grow(struct kernel_vfs_node *, uint64_t size);
 
 int kernel_vfs_file_xattr(struct kernel_vfs_file *, enum kernel_xattr_operation,
     const char *, void *, size_t, uint32_t);

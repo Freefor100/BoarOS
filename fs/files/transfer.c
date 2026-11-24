@@ -390,7 +390,8 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     uint32_t input_flags=kernel_open_file_flags(input);
     int datagram=kernel_socket_preserves_messages(kernel_open_file_socket(output));
     int direct=output->kind==KERNEL_OPEN_FILE_KIND_SOCKET && !datagram &&
-        !(input_flags&KERNEL_FILES_O_DIRECT);
+        !(input_flags&KERNEL_FILES_O_DIRECT) &&
+        (kernel_open_file_memory_backed(input) || kernel_open_file_page_cache(input));
     struct kernel_task_io_buffer source_buffer = {0};
     if (!direct && !datagram && kernel_task_io_buffer_acquire(&source_buffer, mm->allocator) != KERNEL_TASK_STATUS_OK)
         return -KERNEL_ENOMEM;
@@ -748,7 +749,8 @@ static int read_transfer_page(struct kernel_open_file_description *file,struct k
     uint64_t position,size_t wanted,void **page,size_t *offset,size_t *done,int *miss,uint32_t status_flags)
 {
     *done=0;*offset=0;*miss=0;
-    if (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR && !(status_flags&KERNEL_FILES_O_DIRECT)) {
+    if (file->kind==KERNEL_OPEN_FILE_KIND_REGULAR && !(status_flags&KERNEL_FILES_O_DIRECT) &&
+        (kernel_open_file_memory_backed(file) || kernel_open_file_page_cache(file))) {
         uint64_t physical=0;size_t valid=0;
         enum kernel_page_cache_status status;
         if (kernel_open_file_memory_backed(file)) {

@@ -1,6 +1,6 @@
 # 原生大页与复合页
 
-原生大页（Hugepage / Hugetlb）允许处理器使用更高层级的硬件页表项直接映射一整段大尺寸连续物理内存，从而大幅减少页表层级占用与转换后备缓冲器（Translation Lookaside Buffer，TLB）未命中次数。BoarOS 在底层 [物理页分配模块](physical-pages.md) 的高阶整块所有权之上构建了跨架构原生大页池与预留配额子系统，同时支撑 `mmap(MAP_HUGETLB)` 匿名大页映射与 System V `shmget(SHM_HUGETLB)` 共享内存大页。
+原生大页（Huge Page，HugeTLB）使用更高层级的硬件页表项映射连续物理内存，可减少页表占用和转换后备缓冲器（Translation Lookaside Buffer，TLB）未命中次数。BoarOS 从[物理页分配器](physical-pages.md)取得整块连续页面，由一个原生大页池同时供给匿名映射（`MAP_HUGETLB`）、System V 共享内存（`SHM_HUGETLB`）、`hugetlbfs` 文件和 `memfd_create(MFD_HUGETLB)` 创建的匿名文件。
 
 ---
 
@@ -58,7 +58,7 @@ flowchart LR
 
 ## 四、预留配额、写时复制与子映射撤销
 
-在 Linux 大页语义中，创建一个 `MAP_HUGETLB` 映射时若未显式声明 `MAP_NORESERVE`，内核必须在映射建立瞬间就为该区域**预留**足够的空闲大页配额（`h->reserved += pages`），确保后续首次缺页装入时绝不会因物理池耗尽而意外崩溃。BoarOS 通过 `struct kernel_hugetlb_map`（包含按大页索引的 `slots[]` 状态数组）精确实现了这套预留与派生规则：
+创建带预留的匿名大页映射时，内核在发布映射前从大页池扣留所需额度。首次缺页用该额度领取物理块，未使用的额度随映射释放。匿名映射和 System V 共享内存使用 `struct kernel_hugetlb_map` 的连续槽位保存该状态，文件后备的稀疏槽位按实际文件偏移建立。
 
 | 映射模式 | 创建来源 | 预留与共享策略 | 池耗尽时的缺页结果 |
 | :--- | :--- | :--- | :--- |
@@ -84,12 +84,20 @@ flowchart LR
 
 ---
 
+## 五、`hugetlbfs` 文件与大页 memfd
+
+管理员可通过 `mount -t hugetlbfs none /mnt/huge` 或基于文件描述符的挂载接口创建实例。挂载参数支持原生 `pagesize`、根目录的 `mode`、`uid`、`gid` 和 `nr_inodes`。未命名的 `MFD_HUGETLB` 文件由内核内部实例承载，创建时长度和预留量都为零。文件封印、关闭时执行标志和执行权限沿用普通 memfd 入口。
+
+- **文件大小、页和预留分别变化。** `ftruncate()` 按大页边界设置长度，扩展出来的空洞可以读取为零。可写映射可扩展文件至映射结束处。共享映射按文件偏移联合预留，第二个描述符映射同一范围时复用已存在的预留和数据。普通 `write()`／`pwrite()` 返回 `EINVAL`，程序可通过共享映射写入，或用 `fallocate()` 建立实际后备页。
+- **私有映射按需分离。** 首次读取可直接引用文件已驻留的大页。首次写入取得该私有映射的物理页面，完整复制原内容，再发布新的页表项。后续写入只修改该私有副本。每次映射各自保持打开文件的引用，关闭文件描述符、删除文件名或延迟卸载后，原映射仍可使用。
+- **截短和打洞先撤销完整大页的映射。** 虚拟文件系统（Virtual File System，VFS）关闭该文件的缺页发布资格，释放索引节点保护后通知已登记的地址空间。各地址空间撤销对应的页表项，等待其他处理器核确认失效，再归还引用。截短还会释放被截区间尚未使用的预留。完整大页打洞只撤下已装入的文件页，部分大页打洞只对对应字节清零。可写共享映射上的 `MADV_REMOVE` 也使用这条文件打洞路径。
+
 <details>
 <summary>展开查看：当前范围边界与定向验证入口</summary>
 
 ### 当前实现边界
 
-- 每个物理页分配器固定维护单一原生大页尺寸池（RV64 2 MiB、LA64 32 MiB），尚未提供多尺寸并存（多 `hstate`）、独立挂载的 `hugetlbfs` 文件系统、透明大页（Transparent Huge Pages，THP）或针对大页区间的 `mremap`。
+- 每个物理页分配器维护一个原生尺寸的大页池。每个挂载的独立大页容量（`size`、`min_size`）、多尺寸池、透明大页（Transparent Huge Pages，THP）、大页 `mremap`，以及直接从大页文件装载可执行与可链接格式（Executable and Linkable Format，ELF）映像待补。
 - 共享 `futex` 等待在阻塞期间持有大页映射对象引用，直至等待退出；System V `SHM_HUGETLB` 的段、附加句柄与 VMA 共同维系后备对象寿命（详见 [SysV 共享内存](sysv-shm.md)）。
 
 ### 定向验证入口
@@ -97,5 +105,6 @@ flowchart LR
 - **宿主大页池、预留配额与双基页模型**：`make test-hugetlb-host`、`make test-mm-huge-host`
 - **双架构硬件大叶测试**：`make test-huge-riscv`、`tests/loongarch/mmu.c`
 - **用户态端到端对照（RV64 / LA64）**：`tests/userland/hugetlb.py`（覆盖私有/共享匿名大页、缺页、CoW、边界拒绝、管道页借用、SysV 附加与 `SIGBUS`）
+- **文件后备与生命周期**。`tests/userland/api8.py --program huge_files` 验证命名文件和大页 memfd 的共享后备、写时复制、预留失败、封印、截短、打洞和延迟卸载。
 
 </details>
