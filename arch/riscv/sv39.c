@@ -2807,41 +2807,6 @@ enum riscv_sv39_status riscv_sv39_user_space_move(
     return RISCV_SV39_STATUS_OK;
 }
 
-static enum riscv_sv39_status detach_destroy_leaf(
-    struct riscv_sv39_user_space *space,
-    uint64_t *entry, uint32_t order)
-{
-    uint32_t pages=1U<<order;
-    uint64_t saved_entry = *entry;
-
-    if (!valid_user_leaf_entry(saved_entry) &&
-        !valid_protected_entry(saved_entry)) {
-        return RISCV_SV39_STATUS_STATE;
-    }
-    if ((valid_user_leaf_entry(saved_entry) &&
-         space->leaf_pages < pages) ||
-        (valid_protected_entry(saved_entry) &&
-         space->protected_pages < pages)) {
-        return RISCV_SV39_STATUS_STATE;
-    }
-    if ((present_cow_entry(saved_entry) ||
-         protected_cow_entry(saved_entry)) &&
-        space->cow_pages < pages) {
-        return RISCV_SV39_STATUS_STATE;
-    }
-    *entry = 0U;
-    if (valid_protected_entry(saved_entry)) {
-        space->protected_pages-=pages;
-    } else {
-        space->leaf_pages-=pages;
-    }
-    if (present_cow_entry(saved_entry) ||
-        protected_cow_entry(saved_entry)) {
-        space->cow_pages-=pages;
-    }
-    return RISCV_SV39_STATUS_OK;
-}
-
 static enum riscv_sv39_status release_child_table(
     struct riscv_sv39_user_space *space,
     uint64_t *entry)
@@ -2876,12 +2841,21 @@ static enum riscv_sv39_status destroy_level0(
     }
     uint64_t refs[PHYSICAL_PAGE_REFERENCE_BATCH_MAX];
     unsigned count=0;
+    uint32_t present = 0, protected = 0, cow = 0;
     const unsigned limit = RISCV_SV39_INDEX_MASK + 1U;
-    for (unsigned index = next_table_entry(entries, 0, limit); index < limit;
+    /* The root entry was detached and any remote walks have completed.
+     * Classify once and account for this leaf table as a unit. */
+    unsigned index = next_table_entry(entries, 0, limit);
+    for (; index < limit;
          index = next_table_entry(entries, index + 1, limit)) {
         uint64_t old=entries[index];
-        status=detach_destroy_leaf(space,&entries[index],0);
-        if (status) break;
+        if (valid_user_leaf_entry(old)) {
+            if (++present > space->leaf_pages) break;
+            if ((old & RISCV_SV39_PTE_COW) && ++cow > space->cow_pages) break;
+        } else if (valid_protected_entry(old)) {
+            if (++protected > space->protected_pages) break;
+            if (protected_cow_entry(old) && ++cow > space->cow_pages) break;
+        } else break;
         refs[count++]=entry_address(old);
         if (count==PHYSICAL_PAGE_REFERENCE_BATCH_MAX) {
             physical_page_release_batch(space->allocator,refs,count);
@@ -2889,7 +2863,10 @@ static enum riscv_sv39_status destroy_level0(
         }
     }
     physical_page_release_batch(space->allocator,refs,count);
-    if (status) return status;
+    if (index != limit) return RISCV_SV39_STATUS_STATE;
+    space->leaf_pages -= present;
+    space->protected_pages -= protected;
+    space->cow_pages -= cow;
     return release_child_table(space, parent_entry);
 }
 
@@ -2913,9 +2890,17 @@ static enum riscv_sv39_status destroy_level1(
     for (unsigned index = next_table_entry(entries, 0, limit); index < limit;
          index = next_table_entry(entries, index + 1, limit)) {
         uint64_t old=entries[index];
-        if (valid_user_leaf_entry(old) || valid_protected_entry(old)) {
-            status=detach_destroy_leaf(space,&entries[index],9);
-            if (!status) physical_page_release_order(space->allocator,entry_address(old),9);
+        int present = valid_user_leaf_entry(old);
+        if (present || valid_protected_entry(old)) {
+            const unsigned pages = 1U << 9;
+            uint32_t *total = present ? &space->leaf_pages : &space->protected_pages;
+            int cow = present ? (old & RISCV_SV39_PTE_COW) != 0 : protected_cow_entry(old);
+            if (*total < pages || (cow && space->cow_pages < pages))
+                return RISCV_SV39_STATUS_STATE;
+            *total -= pages;
+            if (cow) space->cow_pages -= pages;
+            physical_page_release_order(space->allocator,entry_address(old),9);
+            status = RISCV_SV39_STATUS_OK;
         } else status=destroy_level0(space,&entries[index]);
         if (status != RISCV_SV39_STATUS_OK) {
             return status;
