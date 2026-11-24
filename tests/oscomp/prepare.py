@@ -97,7 +97,7 @@ def main():
         'install_mkfs /boaros-tools/mke2fs /bin/mke2fs\n' +
         '\n'.join(f'install_mkfs /boaros-tools/mkfs.ext{i} /bin/mkfs.ext{i}' for i in (2, 3, 4)) + '\n'
         'export MKE2FS_CONFIG=/boaros-tools/mke2fs.conf\n'
-        'export LTP_DEV=/dev/vdb3 LTP_DEV_FS_TYPE=ext4 LTP_SINGLE_FS_TYPE=ext4')
+        'export LTP_DEV=/dev/vdb3 LTP_DEV_FS_TYPE=ext4')
     # The kernel carries policy; the read-only tools partition carries executable content.
     startup = startup.replace('# BOAROS_CASE_PAYLOAD', '\n'.join(
         f'$BB ln -s /boaros-tools/{source} /tmp/boaros-{target}' for source, target in

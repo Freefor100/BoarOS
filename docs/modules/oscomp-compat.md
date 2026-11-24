@@ -90,7 +90,7 @@ LoongArch 手动启动改为 `--arch loongarch` 与独立输出目录，QEMU 使
 
 1. **基础目录与设备节点**：创建 `/bin`、`busybox --install -s /bin`、各类字符与块设备节点（根盘 `252:0`、第二整盘 `252:16`、分区 `252:17..19` 及 loop 节点），并挂载 `/proc`、`/sys` 与 `/dev/shm`。
 2. **动态链接器路径对齐**：按 `tests/oscomp/inputs.json` 为两个架构的 `glibc` 与 `musl` 创建实际 `PT_INTERP` 解释器链接（LoongArch 涵盖 `/lib`、`/lib64`、`/usr/lib64`，RISC-V 涵盖普通与软浮点 `musl` 名称）。
-3. **工具分区与启动熵**：将 `/dev/vdb1` 只读挂载至 `/boaros-tools`，运行 `seed` 完成熵注入并建立 `/dev/vda2` 别名（若已有同名节点则视为冲突报错），随后导出 `LTP_DEV=/dev/vdb3`、`LTP_DEV_FS_TYPE=ext4` 与 `LTP_SINGLE_FS_TYPE=ext4`。
+3. **工具分区与启动熵**：将 `/dev/vdb1` 只读挂载至 `/boaros-tools`，运行 `seed` 向内核随机数池注入熵，再建立 `/dev/vda2` 别名。LTP 使用 `/dev/vdb3` 作为可重新格式化的测试分区，需要默认格式时使用 ext4。遍历文件系统的测例按内核支持、可用的格式化工具及测例自身的筛选规则选择文件系统。
 4. **测试组遍历与环境隔离**：默认按 `basic`、`busybox`、`cyclictest`、`iozone`、`iperf`、`libcbench`、`libctest`、`lmbench`、`lua`、`netperf`、`ltp` 顺序运行，每组均先 `glibc` 后 `musl`，分别设置独立工作目录与 `LD_LIBRARY_PATH`。
    - 对 `basic/run-all.sh` 仅补齐执行权限（原发布镜像为 `0644`）；
    - 对 `lmbench` 在 `/code/lmbench_src/bin/build/lmbench_all` 建立指向当前 C 库原二进制的链接；
