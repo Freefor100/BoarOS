@@ -1828,7 +1828,7 @@ enum riscv_sv39_status riscv_sv39_user_map_prepared_order(struct riscv_sv39_user
     struct kernel_mm_leaf_preparation *prepared)
 {
     if ((order != 0 && order != 9) || !s || (permissions && !valid_user_permissions(permissions)) ||
-        ((flags & KERNEL_MM_LEAF_FILE) && (order || !(flags & KERNEL_MM_LEAF_COW))) ||
+        ((flags & KERNEL_MM_LEAF_FILE) && !(flags & KERNEL_MM_LEAF_COW)) ||
         ((physical|address) & (((uint64_t)BOAROS_PAGE_SIZE<<order)-1)))
         return RISCV_SV39_STATUS_INVALID;
     int cow = (flags & KERNEL_MM_LEAF_COW) != 0;

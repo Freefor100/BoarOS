@@ -6,6 +6,7 @@
 #include "lease.h"
 #include "write_source.h"
 #include <arch/context.h>
+#include <arch/mmu.h>
 
 #include <kernel/accounting.h>
 #include <kernel/block.h>
@@ -4456,7 +4457,7 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
     *bytes_read = 0;
     if (options) options->cache_miss=0;
     if (offset > INT64_MAX) return -KERNEL_EOVERFLOW;
-    if (node->memory) {
+    if (node->memory || node->hugetlb) {
         KERNEL_LOCK_SCOPE(node_guard);
         kernel_vfs_node_lock(node, &node_guard, 0);
         return node->instance->ops->pread(node, offset, buffer, size, bytes_read);
@@ -4514,10 +4515,10 @@ static void apply_truncated_size(struct kernel_vfs_node *node,
                                  struct kernel_vfs_file *file, uint64_t size)
 {
     uint64_t old_size = node->size;
-    node->size = size;
-    file->size = node->size;
-    if (node->size < old_size && !node->memory) {
-        kernel_file_mapping_notify(node, node->size);
+    __atomic_store_n(&node->size,size,__ATOMIC_RELEASE);
+    file->size = size;
+    if (size < old_size && !node->memory && !node->hugetlb) {
+        kernel_file_mapping_notify(node, size);
     }
     if (size < old_size && node->instance->page_cache)
         kernel_page_cache_truncate(node->instance->page_cache, node, size);
@@ -4769,6 +4770,7 @@ static int vfs_write_source_locked(struct kernel_vfs_file *file,uint64_t offset,
     int result;
 
     *bytes_written=0;
+    if (node->hugetlb) return -KERNEL_EINVAL;
     if (node->instance->ops->copy_up) {
         if (kernel_vfs_mount_is_readonly(file->mount)) return -KERNEL_EROFS;
         uint32_t denied=KERNEL_VFS_INODE_IMMUTABLE |
@@ -5066,16 +5068,18 @@ static int fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
     if (end > node->max_size) return -KERNEL_EFBIG;
     /* ext4 file_modified precedes its new-size/FSIZE and allocation checks.
      * A later space failure preserves this already accepted privilege removal. */
-    if (node->instance->ops->killpriv) {
-        int privilege=node->instance->ops->killpriv(node,kernel_vfs_write_mode(node->mode,node->gid));
-        if (privilege) return privilege;
+    if (!node->hugetlb) {
+        if (node->instance->ops->killpriv) {
+            int privilege=node->instance->ops->killpriv(node,kernel_vfs_write_mode(node->mode,node->gid));
+            if (privilege) return privilege;
+        }
+        int modified=kernel_vfs_file_modified(file,offset,0);
+        if (modified) return modified;
     }
-    int modified=kernel_vfs_file_modified(file,offset,0);
-    if (modified) return modified;
     /* shmem validates reservations beyond EOF against FSIZE even KEEP_SIZE;
      * disk allocation retains the existing size-changing-only check. */
     if ((!(mode & KERNEL_VFS_FALLOC_KEEP_SIZE) ||
-         (node->memory && mode==KERNEL_VFS_FALLOC_KEEP_SIZE)) &&
+         ((node->memory || node->hugetlb) && mode==KERNEL_VFS_FALLOC_KEEP_SIZE)) &&
         end > old_size && limit && end > limit->maximum) {
         limit->exceeded = 1;
         return -KERNEL_EFBIG;
@@ -5089,7 +5093,11 @@ static int fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
     kernel_lock_release(&io);
     uint64_t first = offset & ~BOAROS_PAGE_MASK;
     uint64_t last = (end + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
-    if (changes_data) kernel_file_mapping_invalidate_range(node,first,last);
+    if (node->hugetlb) {
+        first = (offset + ARCH_MMU_HUGE_SIZE - 1U) & ~(ARCH_MMU_HUGE_SIZE - 1U);
+        last = end & ~(ARCH_MMU_HUGE_SIZE - 1U);
+    }
+    if (changes_data && first<last) kernel_file_mapping_invalidate_range(node,first,last);
     /* Buffered EOF can lead persistent EOF. Publish its dirty prefix before
      * a range update changes the cached data or computes its new size. */
     result = cache ? kernel_page_cache_writeback_range_borrowing(cache,node,0,UINT64_MAX,
@@ -5180,9 +5188,10 @@ static int ftruncate_borrowing(struct kernel_vfs_file *file,
     /* Even a same-size ftruncate updates mtime/ctime. Reconciliation also
      * preserves visible inode mutations when the backend reports an error. */
     if (size > node->max_size) return -KERNEL_EFBIG;
+    if (node->hugetlb && (size & (ARCH_MMU_HUGE_SIZE - 1U))) return -KERNEL_EINVAL;
     if ((size<node->size && (node->file_seals&KERNEL_SEAL_SHRINK)) ||
         (size>node->size && (node->file_seals&KERNEL_SEAL_GROW))) return -KERNEL_EPERM;
-    if (node->memory) {
+    if (node->memory || node->hugetlb) {
         /* 关闭旧候选的发布，释放inode锁后才逐MM撤销。登记/OFD覆盖回调
          * 寿命；缺页最终校验取得IO读锁，因此关闭与提交有唯一先后关系。 */
         uint64_t old_size = node->size;
@@ -5197,7 +5206,7 @@ static int ftruncate_borrowing(struct kernel_vfs_file *file,
         }
         kernel_file_mapping_close(node);
         kernel_lock_release(&node_guard);
-        if (size < old_size) kernel_file_mapping_notify(node, size);
+        if (size < old_size || node->hugetlb) kernel_file_mapping_notify(node, size);
         kernel_vfs_node_lock(node, &node_guard, 1);
         uint64_t actual;
         int changed;
@@ -7752,6 +7761,9 @@ uint64_t *kernel_vfs_node_shared_write_counter(struct kernel_vfs_node *node,int 
     *sealed=!!(node->file_seals&KERNEL_SEAL_WRITES);
     return node->memfd ? &node->shared_write_bytes : NULL;
 }
+
+struct kernel_hugetlb_map *kernel_vfs_node_hugetlb(const struct kernel_vfs_node *node)
+{ return node ? node->hugetlb : NULL; }
 
 struct kernel_memory_object *kernel_vfs_file_memory(const struct kernel_vfs_file *file)
 { struct kernel_vfs_node *n = kernel_vfs_file_node(file); return n ? n->memory : 0; }

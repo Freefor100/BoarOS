@@ -5,6 +5,7 @@
 #include <kernel/nvme.h>
 #include <kernel/tmpfs.h>
 #include <kernel/credentials.h>
+#include <kernel/hugetlb.h>
 #include <kernel/posix_acl.h>
 #include <kernel/scheduler.h>
 #include <kernel/memory_object.h>
@@ -12,6 +13,7 @@
 #include <kernel/page.h>
 #include <kernel/errno.h>
 #include <kernel/time.h>
+#include <arch/mmu.h>
 #include "../third_party/lwext4/include/misc/tree.h"
 #include <string.h>
 
@@ -37,6 +39,7 @@ struct tmp_inode {
     uint8_t memfd, initial_seals, attributes;
     struct kernel_vfs_timespec atime, mtime, ctime;
     struct tmp_xattr *xattrs, *capability, *access_acl, *default_acl;
+    struct kernel_hugetlb_map *hugetlb;
 };
 struct tmp_entry {
     RB_ENTRY(tmp_entry) name_index;
@@ -68,7 +71,7 @@ static int cookie_compare(const struct tmp_entry *a, const struct tmp_entry *b)
 RB_GENERATE_INTERNAL(tmp_inode_tree, tmp_inode, index, inode_compare, static inline)
 RB_GENERATE_INTERNAL(tmp_name_tree, tmp_entry, name_index, entry_name_compare, static inline)
 RB_GENERATE_INTERNAL(tmp_cookie_tree, tmp_entry, cookie_index, cookie_compare, static inline)
-static const struct kernel_vfs_backend tmp_ops;
+static const struct kernel_vfs_backend tmp_ops, huge_ops;
 int kernel_tmpfs_is_mount(const struct kernel_vfs_mount *mount)
 {
     const struct kernel_vfs_instance *instance = mount ? mount->private_data : 0;
@@ -76,6 +79,7 @@ int kernel_tmpfs_is_mount(const struct kernel_vfs_mount *mount)
 }
 static struct tmp_mount *tm(struct kernel_vfs_instance *i) { return i->backend_data; }
 static struct tmp_inode *ti(struct kernel_vfs_node *n) { return n->backend_data; }
+static bool huge_mount(const struct tmp_mount *m) { return m->instance.ops == &huge_ops; }
 int kernel_tmpfs_check_domain(const struct kernel_vfs_node *node,
     const struct kernel_heap *heap, const struct physical_page_allocator *allocator)
 {
@@ -101,6 +105,31 @@ static int allocate(struct tmp_mount *m, size_t n, void **out)
 {
     enum kernel_heap_status r = kernel_heap_allocate_zeroed(m->instance.heap, 1, n, out);
     return r == KERNEL_HEAP_STATUS_OK ? 0 : r == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+}
+static int regular_backing(struct tmp_mount *m, struct tmp_inode *i)
+{
+    struct kernel_heap *heap=m->instance.heap;
+    if (huge_mount(m)) {
+        struct kernel_hstate *state=NULL;
+        enum kernel_hugetlb_status status=kernel_hstate_get_or_create(heap,heap->page_allocator,
+            ARCH_MMU_HUGE_ORDER,&state);
+        if (!status) {
+            status=kernel_hugetlb_file_create(state,&i->hugetlb);
+            kernel_hstate_put(state);
+        }
+        return status ? -KERNEL_ENOMEM : 0;
+    }
+    if (kernel_memory_object_create(heap,heap->page_allocator,&i->memory))
+        return -KERNEL_ENOMEM;
+    kernel_memory_object_set_budget(i->memory,&m->pages);
+    return 0;
+}
+
+static void release_backing(struct tmp_mount *m, struct tmp_inode *i)
+{
+    if (!i->memory) dispose(m,i->target);
+    else kernel_memory_object_release(&i->memory);
+    if (i->hugetlb) kernel_hugetlb_map_release(&i->hugetlb);
 }
 static struct tmp_inode *inode(struct tmp_mount *m, uint64_t id)
 {
@@ -217,8 +246,7 @@ static void collect_inode(struct tmp_mount *m, struct tmp_inode *i)
     if (!m->inode_count || !RB_EMPTY(&i->names) || !RB_EMPTY(&i->cookies) ||
         RB_REMOVE(tmp_inode_tree, &m->inodes, i) != i) __builtin_trap();
     m->inode_count--;
-    if (!i->memory) dispose(m, i->target);
-    if (i->memory) kernel_memory_object_release(&i->memory);
+    release_backing(m,i);
     while (i->xattrs) remove_attribute(m,i,i->xattrs);
     dispose(m, i);
 }
@@ -313,11 +341,7 @@ static int create_child(struct tmp_mount *m, uint64_t parent_inode, const char *
     i->attributes=parent->attributes&KERNEL_VFS_INODE_NODUMP;
     i->mode = mode; i->parent = parent->number;
     if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) i->size = 2 * TMPFS_DIRENT_SIZE;
-    if (!r && (mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
-        if (kernel_memory_object_create(m->instance.heap, m->instance.heap->page_allocator,
-                                        &i->memory) != KERNEL_MEMORY_OBJECT_OK) r = -KERNEL_ENOMEM;
-        else kernel_memory_object_set_budget(i->memory, &m->pages);
-    }
+    if (!r && type == KERNEL_VFS_S_IFREG) r=regular_backing(m,i);
     if (target && !r) {
         i->size = strlen(target);
         if (i->size + 1 > BOAROS_PAGE_SIZE) r = -KERNEL_ENAMETOOLONG;
@@ -347,8 +371,7 @@ static int create_child(struct tmp_mount *m, uint64_t parent_inode, const char *
     }
     if (r || m->next_inode == UINT64_MAX) {
         while (i->xattrs) remove_attribute(m,i,i->xattrs);
-        if (!i->memory) dispose(m, i->target);
-        if (i->memory) kernel_memory_object_release(&i->memory);
+        release_backing(m,i);
         dispose(m, i); dispose(m, e);
         return r ? r : -KERNEL_EOVERFLOW;
     }
@@ -389,7 +412,7 @@ static int open_inode(struct kernel_vfs_mount *mount, const char *path, uint64_t
     r = allocate(m, sizeof(*n), (void **)&n); if (r) return r;
     n->inode = i->number; n->mode = i->mode; n->uid=i->uid; n->gid=i->gid; n->size = i->size; n->max_size = INT64_MAX;
     n->attributes=i->attributes;
-    n->backend_data = i; n->memory = i->memory; i->handles++;
+    n->backend_data=i; n->memory=i->memory; n->hugetlb=i->hugetlb; i->handles++;
     n->memfd=i->memfd; n->unlinked=i->memfd;
     n->file_seals=i->memfd ? i->initial_seals : KERNEL_SEAL_SEAL;
     return kernel_vfs_publish_node(mount, n, file, 0);
@@ -503,7 +526,13 @@ static void unlink_inode(struct tmp_mount *m, struct tmp_inode *i)
 {
     if (!i->links) __builtin_trap();
     if ((i->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) i->links = 0;
-    else { if (i->links > 1) { if (!m->inode_count) __builtin_trap(); m->inode_count--; } i->links--; }
+    else {
+        if (i->links > 1 && !huge_mount(m)) {
+            if (!m->inode_count) __builtin_trap();
+            m->inode_count--;
+        }
+        i->links--;
+    }
     i->ctime = now();
     if (!i->links) {
         uintptr_t irq = arch_interrupt_save();
@@ -544,11 +573,12 @@ static int link_common(struct kernel_vfs_instance *instance, uint64_t source, ui
     if (temporary && i->links) return -KERNEL_EINVAL;
     if ((i->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) return -KERNEL_EPERM;
     if (i->links == UINT32_MAX) return -KERNEL_EMLINK;
-    if (!temporary && m->inode_limit && m->inode_count >= m->inode_limit) return -KERNEL_ENOSPC;
+    bool charge_link=!temporary && !huge_mount(m);
+    if (charge_link && m->inode_limit && m->inode_count >= m->inode_limit) return -KERNEL_ENOSPC;
     size_t n = strlen(name);
     if (entry(p, name, n)) return -KERNEL_EEXIST;
     struct tmp_entry *e = 0; int r = allocate_entry(m,p,name,n,&e); if(r) return r;
-    publish_entry(e,i); if (!temporary) m->inode_count++; i->links++; i->ctime = now(); p->ctime = p->mtime = now(); return 0;
+    publish_entry(e,i); if (charge_link) m->inode_count++; i->links++; i->ctime = now(); p->ctime = p->mtime = now(); return 0;
 }
 static int link_inode(struct kernel_vfs_instance *instance,uint64_t source,uint64_t parent,const char *name)
 { return link_common(instance,source,parent,name,0); }
@@ -612,10 +642,13 @@ static int set_flags(struct kernel_vfs_node *node,uint32_t flags)
 static int stat_inode(const struct kernel_vfs_file *f, struct kernel_vfs_stat *s)
 {
     struct kernel_vfs_node *n=f->private_data; struct tmp_inode *i=ti(n);
+    uint64_t pages=i->hugetlb ? kernel_hugetlb_map_resident_pages(i->hugetlb) : 0;
+    uint64_t block_size=huge_mount(tm(n->instance)) ? ARCH_MMU_HUGE_SIZE : BOAROS_PAGE_SIZE;
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
+    if (i->memory) pages=kernel_memory_object_resident_pages(i->memory);
     *s=(struct kernel_vfs_stat){.dev=n->instance->backend_mount.id,.ino=i->number,.mode=i->mode,.nlink=i->links,.uid=i->uid,.gid=i->gid,.rdev=i->rdev,
-        .size=i->size,.blksize=BOAROS_PAGE_SIZE,.attributes=i->attributes,.attributes_mask=KERNEL_VFS_INODE_ATTRIBUTES,
-        .blocks=i->memory ? kernel_memory_object_resident_pages(i->memory)*(BOAROS_PAGE_SIZE/512) : 0,
+        .size=i->size,.blksize=block_size,.attributes=i->attributes,.attributes_mask=KERNEL_VFS_INODE_ATTRIBUTES,
+        .blocks=pages*(BOAROS_PAGE_SIZE/512),
         .atime=i->atime,.mtime=i->mtime,.ctime=i->ctime}; return 0;
 }
 static int statfs(struct kernel_vfs_mount *mount, struct kernel_vfs_statfs *s)
@@ -626,6 +659,14 @@ static int statfs(struct kernel_vfs_mount *mount, struct kernel_vfs_statfs *s)
         .available_blocks=m->pages.limit ? m->pages.limit-__atomic_load_n(&m->pages.used, __ATOMIC_ACQUIRE) : 0,
         .inodes=m->inode_limit,.free_inodes=m->inode_limit ? m->inode_limit-m->inode_count : 0,
         .fsid=m->instance.backend_mount.id,.name_length=255,.flags=m->instance.read_only ? 1 : 0}; return 0;
+}
+static int huge_statfs(struct kernel_vfs_mount *mount, struct kernel_vfs_statfs *s)
+{
+    struct tmp_mount *m=tm(mount->private_data);
+    *s=(struct kernel_vfs_statfs){.type=0x958458f6,.block_size=ARCH_MMU_HUGE_SIZE,
+        .inodes=m->inode_limit,.free_inodes=m->inode_limit ? m->inode_limit-m->inode_count : 0,
+        .fsid=m->instance.device_id,.name_length=255,.flags=m->instance.read_only ? 1 : 0};
+    return 0;
 }
 static int read_directory(struct kernel_vfs_file *file, struct kernel_vfs_dir_batch *batch)
 {
@@ -651,12 +692,68 @@ static int truncate_inode(struct kernel_vfs_node *n,uint64_t size,uint64_t *actu
 {
     struct tmp_inode *i=ti(n);
     /* Growth retains KEEP_SIZE reservations beyond the new EOF. */
-    if (size<=i->size) kernel_memory_object_truncate(i->memory,size);
+    if (i->hugetlb) kernel_hugetlb_file_remove(i->hugetlb,size/ARCH_MMU_HUGE_SIZE,UINT64_MAX);
+    else if (size<=i->size) kernel_memory_object_truncate(i->memory,size);
     if (i->capability) remove_attribute(tm(n->instance),i,i->capability);
     i->mode=n->mode=kernel_vfs_write_mode(n->mode,n->gid);
     struct kernel_vfs_timespec time=now();
     KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
     i->size=size; i->ctime=i->mtime=time; *actual=size; *changed=1; return 0;
+}
+
+void kernel_vfs_hugetlb_grow(struct kernel_vfs_node *node, uint64_t size)
+{
+    struct tmp_inode *i=ti(node);
+    KERNEL_RAW_SCOPE(metadata,&node->io_lock.metadata);
+    i->size=size;
+    __atomic_store_n(&node->size,size,__ATOMIC_RELEASE);
+}
+
+static void huge_zero_partial(struct kernel_vfs_node *n,uint64_t offset,uint64_t end)
+{
+    uint64_t physical;
+    if (kernel_hugetlb_file_find_page(n->hugetlb,offset/ARCH_MMU_HUGE_SIZE,&physical))
+        return;
+    struct physical_page_allocator *allocator=n->instance->heap->page_allocator;
+    void *bytes;
+    if (physical_page_map_owned(allocator,physical,&bytes)) __builtin_trap();
+    memset((unsigned char *)bytes+(offset&(ARCH_MMU_HUGE_SIZE-1)),0,end-offset);
+    if (physical_page_release_order(allocator,physical,ARCH_MMU_HUGE_ORDER)) __builtin_trap();
+}
+
+static int huge_fallocate(struct kernel_vfs_node *n,unsigned mode,uint64_t offset,
+    uint64_t length,uint64_t *actual,int *changed)
+{
+    struct tmp_inode *i=ti(n);
+    *actual=i->size; *changed=0;
+    uint64_t end=offset+length;
+    const uint64_t mask=ARCH_MMU_HUGE_SIZE-1;
+    if (mode == (KERNEL_VFS_FALLOC_KEEP_SIZE | KERNEL_VFS_FALLOC_PUNCH_HOLE)) {
+        uint64_t first_full=(offset+mask)&~mask, end_full=end&~mask;
+        if (offset<first_full) huge_zero_partial(n,offset,end<first_full?end:first_full);
+        if (end_full>=first_full && end_full<end) huge_zero_partial(n,end_full,end);
+        if (first_full<end_full)
+            kernel_hugetlb_file_punch(n->hugetlb,first_full/ARCH_MMU_HUGE_SIZE,end_full/ARCH_MMU_HUGE_SIZE);
+        return 0;
+    } else if (!mode || mode==KERNEL_VFS_FALLOC_KEEP_SIZE) {
+        struct physical_page_allocator *allocator=n->instance->heap->page_allocator;
+        for (uint64_t index=offset/ARCH_MMU_HUGE_SIZE;index<(end+mask)/ARCH_MMU_HUGE_SIZE;index++) {
+            struct kernel_hugetlb_claim claim={0};
+            enum kernel_hugetlb_status status=kernel_hugetlb_fault_begin(n->hugetlb,index,0,&claim);
+            if (status) return status==KERNEL_HUGETLB_BUS ? -KERNEL_ENOSPC :
+                status==KERNEL_HUGETLB_BUSY ? -KERNEL_EAGAIN : -KERNEL_ENOMEM;
+            uint64_t physical=claim.physical_address;
+            kernel_hugetlb_fault_finish(&claim,1);
+            if (physical_page_release_order(allocator,physical,ARCH_MMU_HUGE_ORDER)) __builtin_trap();
+        }
+    } else return -KERNEL_EOPNOTSUPP;
+
+    struct kernel_vfs_timespec time=now();
+    KERNEL_RAW_SCOPE(metadata,&n->io_lock.metadata);
+    if (!mode && end>i->size) i->size=end;
+    i->ctime=time;
+    *actual=i->size; *changed=1;
+    return 0;
 }
 static int fallocate_inode(struct kernel_vfs_node *n,unsigned mode,uint64_t offset,
     uint64_t length,uint64_t *actual,int *changed)
@@ -696,6 +793,29 @@ static int pread_inode(struct kernel_vfs_node *n,uint64_t offset,void *buffer,si
             (void)physical_page_release(m->instance.heap->page_allocator,address);
         } else return -KERNEL_EIO;
         *read+=count; offset+=count;
+    }
+    return 0;
+}
+static int huge_pread(struct kernel_vfs_node *n,uint64_t offset,void *buffer,size_t size,size_t *read)
+{
+    struct tmp_inode *i=ti(n);
+    struct physical_page_allocator *allocator=n->instance->heap->page_allocator;
+    *read=0;
+    while (*read<size && offset<i->size) {
+        uint64_t physical;
+        size_t within=offset&(ARCH_MMU_HUGE_SIZE-1), chunk=ARCH_MMU_HUGE_SIZE-within;
+        if (chunk>size-*read) chunk=size-*read;
+        if (chunk>i->size-offset) chunk=i->size-offset;
+        enum kernel_hugetlb_status status=kernel_hugetlb_file_find_page(i->hugetlb,
+            offset/ARCH_MMU_HUGE_SIZE,&physical);
+        if (status==KERNEL_HUGETLB_NOT_FOUND) memset((unsigned char *)buffer+*read,0,chunk);
+        else if (!status) {
+            void *bytes;
+            if (physical_page_map_owned(allocator,physical,&bytes)) __builtin_trap();
+            memcpy((unsigned char *)buffer+*read,(unsigned char *)bytes+within,chunk);
+            if (physical_page_release_order(allocator,physical,ARCH_MMU_HUGE_ORDER)) __builtin_trap();
+        } else return -KERNEL_EIO;
+        *read+=chunk; offset+=chunk;
     }
     return 0;
 }
@@ -832,7 +952,7 @@ static int unmount(struct kernel_vfs_mount *mount)
         while ((e = RB_MIN(tmp_name_tree, &parent->names))) {
             struct tmp_inode *i = e->inode;
             /* 父目录仍被inode索引持有；移除所有名字后再统一释放inode。 */
-            if ((i->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR && i->links > 1) {
+            if (!huge_mount(m) && (i->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR && i->links > 1) {
                 if (!m->inode_count) __builtin_trap();
                 i->links--; m->inode_count--;
             }
@@ -863,19 +983,37 @@ static const struct kernel_vfs_backend tmp_ops = {
     .acl_permission=permission,
 };
 
-/* Internal shmem has no reachable root, mount entry or memory quota.
- * Only the inodes, data and disconnected paths allocate from the heap. */
-static struct tmp_mount memfd_mount;
-static int memfd_mount_prepare(struct kernel_heap *heap)
+static int huge_check_domain(const struct kernel_vfs_node *node,const struct kernel_heap *heap,
+    const struct physical_page_allocator *allocator)
 {
-    struct tmp_mount *m=&memfd_mount;
+    return node && node->hugetlb && node->instance->heap==heap &&
+        heap->page_allocator==allocator ? 0 : -KERNEL_EINVAL;
+}
+static const struct kernel_vfs_backend huge_ops = {
+    .type="hugetlbfs", .owns_dentry_names=true, .check_domain=huge_check_domain,
+    .error=error, .root=root, .lookup=lookup, .open=open_inode, .close_node=close_node,
+    .create=create, .tmpfile=tmpfile_inode, .link_tmpfile=link_tmpfile,
+    .mkdir=mkdir, .symlink=symlink, .mknod=mknod_node, .readlink=readlink,
+    .unlink=unlink_file, .rmdir=rmdir, .release_unlinked=release_unlinked, .link=link_inode,
+    .rename=rename_inode, .stat=stat_inode, .statfs=huge_statfs, .read_directory=read_directory,
+    .truncate=truncate_inode, .fallocate=huge_fallocate, .pread=huge_pread,
+    .set_times=set_times, .set_mode=set_mode, .set_owner=set_owner,
+    .accessed=accessed, .modified=modified, .killpriv=killpriv, .writeback_allowed=no_writeback,
+    .flush=error, .unmount=unmount,
+};
+
+/* The memfd backends own disconnected inodes; they have no visible mount. */
+static struct tmp_mount memfd_mount, huge_memfd_mount;
+static int memfd_mount_prepare(struct tmp_mount *m, struct kernel_heap *heap,
+    const struct kernel_vfs_backend *ops)
+{
     struct kernel_vfs_instance *instance=&m->instance;
     if (!__atomic_load_n(&instance->heap,__ATOMIC_ACQUIRE)) {
         uint64_t id=kernel_vfs_allocate_mount_id();
         KERNEL_TASK_LOCK_SCOPE(guard,&kernel_vfs_state_lock);
         if (!instance->heap) {
             instance->backend_data=m;
-            instance->ops=&tmp_ops;
+            instance->ops=ops;
             m->next_inode=2;
             kernel_rwlock_init(&instance->reconfiguration,19,(uintptr_t)instance);
             kernel_mutex_init(&instance->namespace_lock,20,(uintptr_t)instance);
@@ -884,6 +1022,7 @@ static int memfd_mount_prepare(struct kernel_heap *heap)
                 .state=VFS_MOUNT_STATE_LIVE,.references=1};
             instance->backend_mount=(struct kernel_vfs_mount){.private_data=instance,.id=id,
                 .state=VFS_MOUNT_STATE_LIVE,.backend_owner=1};
+            if (ops==&huge_ops) instance->device_id=id;
             __atomic_store_n(&instance->heap,heap,__ATOMIC_RELEASE);
         }
     }
@@ -892,17 +1031,20 @@ static int memfd_mount_prepare(struct kernel_heap *heap)
 
 int kernel_tmpfs_memfd(struct kernel_heap *heap,const char *name,uint32_t flags,struct kernel_vfs_file *file)
 {
-    int result=memfd_mount_prepare(heap);
+    bool huge=flags&KERNEL_MFD_HUGETLB;
+    unsigned shift=flags>>26;
+    if (huge && shift && shift!=BOAROS_PAGE_SHIFT+ARCH_MMU_HUGE_ORDER) return -KERNEL_ENODEV;
+    struct tmp_mount *m=huge?&huge_memfd_mount:&memfd_mount;
+    int result=memfd_mount_prepare(m,heap,huge?&huge_ops:&tmp_ops);
     if (result) return result;
-    struct tmp_mount *m=&memfd_mount;
     struct tmp_inode *i=NULL;
     result=allocate(m,sizeof(*i),(void **)&i);
     if (result) return result;
-    if (kernel_memory_object_create(heap,heap->page_allocator,&i->memory)) {
+    result=regular_backing(m,i);
+    if (result) {
         dispose(m,i);
-        return -KERNEL_ENOMEM;
+        return result;
     }
-    kernel_memory_object_set_budget(i->memory,&m->pages);
     i->mode=KERNEL_VFS_S_IFREG | ((flags&KERNEL_MFD_NOEXEC_SEAL) ? 0666U : 0777U);
     const struct kernel_credentials *cred=kernel_credentials_current();
     i->uid=cred->fsuid;i->gid=cred->fsgid;
@@ -915,7 +1057,7 @@ int kernel_tmpfs_memfd(struct kernel_heap *heap,const char *name,uint32_t flags,
         KERNEL_LOCK_SCOPE(namespace);
         kernel_vfs_namespace_lock(&m->mount,&namespace);
         if (m->next_inode==UINT64_MAX) {
-            kernel_memory_object_release(&i->memory);
+            release_backing(m,i);
             dispose(m,i);
             return -KERNEL_EOVERFLOW;
         }
@@ -937,7 +1079,7 @@ int kernel_tmpfs_memfd(struct kernel_heap *heap,const char *name,uint32_t flags,
 int kernel_tmpfs_file_seals(struct kernel_vfs_file *file,int add,uint32_t seals)
 {
     struct kernel_vfs_node *node=kernel_vfs_file_node(file);
-    if (!node || node->instance->ops!=&tmp_ops ||
+    if (!node || (node->instance->ops!=&tmp_ops && node->instance->ops!=&huge_ops) ||
         (node->mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG) return -KERNEL_EINVAL;
     KERNEL_LOCK_SCOPE(operation);
     if (add) kernel_vfs_file_write_lock(file,&operation);
@@ -1038,25 +1180,95 @@ int kernel_tmpfs_check_mount_parameter(struct kernel_heap *heap,const char *key,
     return parse_mount_parameter(physical_page_total(heap->page_allocator),key,strlen(key),
         value,value?strlen(value):0,&pages,&inodes,&mode);
 }
-int kernel_tmpfs_create(struct kernel_heap *heap,uint64_t flags,const char *options,struct kernel_vfs_mount **owner)
+
+struct huge_mount_options {
+    uint64_t inodes;
+    uint32_t uid, gid, mode;
+    bool limit_inodes;
+};
+
+static int parse_huge_parameter(const char *key,size_t keys,const char *value,
+    size_t length,struct huge_mount_options *parameters)
+{
+    if (!length) return -KERNEL_EINVAL;
+    uint64_t result;
+    if (keys==8 && !memcmp(key,"pagesize",8))
+        return memory_number(value,length,&result)==length && result==ARCH_MMU_HUGE_SIZE ?
+            0 : -KERNEL_EINVAL;
+    if (keys==9 && !memcmp(key,"nr_inodes",9)) {
+        if (memory_number(value,length,&result)!=length || result>INT64_MAX)
+            return -KERNEL_EINVAL;
+        parameters->limit_inodes=true;
+        parameters->inodes=result;
+        return 0;
+    }
+    if (keys==4 && !memcmp(key,"mode",4)) {
+        if (number(value,length,8,&result) || result>UINT32_MAX) return -KERNEL_EINVAL;
+        parameters->mode=(uint32_t)result&01777U;
+        return 0;
+    }
+    if (keys==3 && (!memcmp(key,"uid",3) || !memcmp(key,"gid",3))) {
+        if (number(value,length,10,&result) || result>=UINT32_MAX) return -KERNEL_EINVAL;
+        if (key[0]=='u') parameters->uid=(uint32_t)result;
+        else parameters->gid=(uint32_t)result;
+        return 0;
+    }
+    if ((keys==4 && !memcmp(key,"size",4)) || (keys==8 && !memcmp(key,"min_size",8)))
+        return -KERNEL_EOPNOTSUPP;
+    return -KERNEL_EINVAL;
+}
+
+int kernel_hugetlbfs_check_mount_parameter(const char *key,const char *value)
+{
+    struct huge_mount_options parameters={0};
+    return parse_huge_parameter(key,strlen(key),value,value?strlen(value):0,&parameters);
+}
+
+static int parse_huge_options(const char *options,struct huge_mount_options *parameters)
+{
+    for (const char *p=options?options:"";*p;) {
+        const char *end=p;
+        while (*end && *end!=',') end++;
+        const char *eq=p;
+        while (eq<end && *eq!='=') eq++;
+        if (eq==end) return -KERNEL_EINVAL;
+        int error=parse_huge_parameter(p,(size_t)(eq-p),eq+1,(size_t)(end-eq-1),parameters);
+        if (error) return error;
+        p=*end?end+1:end;
+    }
+    return parameters->limit_inodes && !parameters->inodes ? -KERNEL_ENOMEM : 0;
+}
+
+static int ramfs_create(struct kernel_heap *heap,uint64_t flags,const char *options,
+    struct kernel_vfs_mount **owner,bool huge)
 {
     if(!heap || !owner || *owner) return -KERNEL_EINVAL;
     struct tmp_mount *m=0;
     if(kernel_heap_allocate_zeroed(heap,1,sizeof(*m),(void **)&m)!=KERNEL_HEAP_STATUS_OK) return -KERNEL_ENOMEM;
     m->instance.heap=heap; m->instance.backend_data=m;
-    m->pages.limit=physical_page_total(heap->page_allocator)/2;
-    m->inode_limit=m->pages.limit; uint32_t mode=01777;
-    int r=parse_mount_options(physical_page_total(heap->page_allocator),options,&m->pages.limit,&m->inode_limit,&mode);
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    uint32_t uid=cred->fsuid,gid=cred->fsgid,mode=01777;
+    int r;
+    if (huge) {
+        struct huge_mount_options parameters={.uid=uid,.gid=gid,.mode=0755};
+        r=parse_huge_options(options,&parameters);
+        uid=parameters.uid;gid=parameters.gid;mode=parameters.mode;
+        m->inode_limit=parameters.inodes;
+    } else {
+        uint64_t total=physical_page_total(heap->page_allocator);
+        m->pages.limit=total/2;m->inode_limit=m->pages.limit;
+        r=parse_mount_options(total,options,&m->pages.limit,&m->inode_limit,&mode);
+    }
     if(r) {dispose(m,m);return r;}
     struct tmp_inode *i=0; r=allocate(m,sizeof(*i),(void **)&i);
     if(r) {dispose(m,m);return r;}
     i->number=i->parent=1; i->mode=KERNEL_VFS_S_IFDIR|mode; i->links=2;
-    i->uid=kernel_credentials_current()->fsuid;i->gid=kernel_credentials_current()->fsgid;
+    i->uid=uid;i->gid=gid;
     i->size=2 * TMPFS_DIRENT_SIZE;
     i->atime=i->mtime=i->ctime=now();
     if (RB_INSERT(tmp_inode_tree, &m->inodes, i)) __builtin_trap();
     m->inode_count=1; m->next_inode=2; m->next_cookie=2;
-    m->instance.ops=&tmp_ops; m->instance.read_only=(flags & 1)!=0;
+    m->instance.ops=huge?&huge_ops:&tmp_ops; m->instance.read_only=(flags & 1)!=0;
     kernel_rwlock_init(&m->instance.reconfiguration, 19, (uintptr_t)&m->instance);
     kernel_mutex_init(&m->instance.namespace_lock,20,(uintptr_t)&m->instance);
     kernel_raw_lock_init(&m->instance.error_lock, KERNEL_RAW_RANK_OBJECT);
@@ -1064,6 +1276,11 @@ int kernel_tmpfs_create(struct kernel_heap *heap,uint64_t flags,const char *opti
     kernel_vfs_mount_initialize(&m->mount);
     *owner=&m->mount; return 0;
 }
+int kernel_tmpfs_create(struct kernel_heap *heap,uint64_t flags,const char *options,struct kernel_vfs_mount **owner)
+{ return ramfs_create(heap,flags,options,owner,false); }
+
+int kernel_hugetlbfs_create(struct kernel_heap *heap,uint64_t flags,const char *options,struct kernel_vfs_mount **owner)
+{ return ramfs_create(heap,flags,options,owner,true); }
 
 /* The hidden, writable view owns the instance until boot teardown. User mounts
  * clone only the view, including when the last user mount was unmounted. */

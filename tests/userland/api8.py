@@ -67,6 +67,7 @@ SOURCES['clock_domains']='resource/clock_domains.c'
 SOURCES['mount_query']='resource/mount_query.c'
 SOURCES['shm_limits']='resource/shm_limits.c'
 SOURCES['ext3']='fs/ext3.c'
+SOURCES['huge_files']='resource/huge_files.c'
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -150,7 +151,7 @@ def accepted(raw,arch,cpus,target,selected=None):
         'async_io', 'tty_async', 'uts_namespace', 'ipc_namespace', 'pid_namespace',
         'nsfs_pid', 'ptrace', 'ptrace_signal', 'ptrace_tools', 'process_memory',
         'personality', 'process_control', 'file_flags', 'file_ioctl', 'fanotify',
-        'clock_domains', 'overlay', 'mount_query', 'shm_limits', 'ext3'}
+        'clock_domains', 'overlay', 'mount_query', 'shm_limits', 'ext3', 'huge_files'}
     if target=='boaros' and arch=='riscv' and stack_checked.intersection(programs):
         free=re.search(r'task stacks released=0x[0-9a-f]+ min-free=0x([0-9a-f]+)',raw)
         if not free or int(free[1],16)<1024:return False
@@ -170,6 +171,7 @@ def accepted(raw,arch,cpus,target,selected=None):
     known['mount_query']=['MOUNT QUERY PASS']
     known['shm_limits']=['SHM LIMITS PASS']
     known['ext3']=['EXT3 PASS']
+    known['huge_files']=['HUGE FILES PASS']
     known['clock_domains']=['CLOCK DOMAINS PASS tai-retarget-and-cancel-isolation',
         'CLOCK DOMAINS PASS tai-signal-and-stop-restart absolute=0',
         'CLOCK DOMAINS PASS tai-signal-and-stop-restart absolute=1',

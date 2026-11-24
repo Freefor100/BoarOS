@@ -5,7 +5,7 @@
 
 enum kernel_mm_leaf_flags {
     KERNEL_MM_LEAF_COW = 1U,
-    KERNEL_MM_LEAF_FILE = 2U, /* Unmodified page of a private disk mapping; implies COW. */
+    KERNEL_MM_LEAF_FILE = 2U, /* Private mapping still references file data; implies COW. */
 };
 /* Snapshot while the caller holds the MM metadata qualification. The PTE owns
  * exactly one reference to physical_address at order, including PROT_NONE.

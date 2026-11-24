@@ -110,13 +110,14 @@ struct kernel_vfs_node {
     struct kernel_rwlock namespace_lock;
     uint32_t uid, gid;
     uint8_t attributes; /* Three Linux inode flags, published after backend acceptance. */
-    uint8_t file_seals; /* tmpfs seals, protected by the inode I/O qualification. */
+    uint8_t file_seals; /* Protected by the inode I/O qualification. */
     uint8_t memfd;
     uint64_t shared_write_bytes; /* Committed MAYWRITE VMA bytes, including read-only mappings. */
 #if BOAROS_MAX_CPUS > 1
     struct kernel_raw_lock cache_index_lock;
     uint8_t cache_index_closed;
 #endif
+    struct kernel_hugetlb_map *hugetlb;
 };
 
 /* A dentry owns its inode and canonical parent; mount aliases share mutations. */

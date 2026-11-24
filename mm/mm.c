@@ -1049,6 +1049,33 @@ static struct mm_file_resident *find_file_resident(
     return link ? *link : 0;
 }
 
+static struct kernel_vfs_node *huge_file_node(const struct kernel_vma *vma)
+{
+    if (vma->role != KERNEL_VMA_ROLE_HUGETLB_FILE) return NULL;
+    const struct kernel_mm_file_source *source = vma->backing_owner;
+    return kernel_open_file_node(source->file);
+}
+
+static void unmap_huge_file_ranges(struct kernel_mm_record *record,
+    struct kernel_vfs_node *node, uint64_t first, uint64_t end)
+{
+    for (uint32_t i=0; i<kernel_vma_set_count(record->vmas); i++) {
+        struct kernel_vma vma;
+        if (kernel_vma_set_get_at(record->vmas,i,&vma)) __builtin_trap();
+        if (huge_file_node(&vma)!=node || vma.backing_offset>=end) continue;
+        uint64_t offset=vma.backing_offset, length=vma.end-vma.start;
+        uint64_t start=first>offset?first-offset:0;
+        if (start>=length) continue;
+        uint64_t last=end-offset<length?end-offset:length;
+        if (unmap_space_range(record,vma.start+start,vma.start+last)) __builtin_trap();
+        if (vma.kind==KERNEL_VMA_KIND_HUGETLB_PRIVATE) {
+            uint64_t base=kernel_hugetlb_map_file_index(vma.backing);
+            kernel_hugetlb_private_reset(vma.backing,(offset+start)/ARCH_MMU_HUGE_SIZE-base,
+                (offset+last)/ARCH_MMU_HUGE_SIZE-base);
+        }
+    }
+}
+
 static void truncate_file_residents(void *owner, struct kernel_vfs_node *node,
                                     uint64_t size)
 {
@@ -1059,6 +1086,10 @@ static void truncate_file_residents(void *owner, struct kernel_vfs_node *node,
     KERNEL_LOCK_SCOPE(operation);
     kernel_rwlock_write(&record->operations,&operation);
     if (record->stage != KERNEL_MM_RECORD_LIVE) return;
+    if (kernel_vfs_node_hugetlb(node)) {
+        unmap_huge_file_ranges(record,node,size,UINT64_MAX);
+        return;
+    }
     /* 先按VMA形成EOF外的连续区间；不能每个resident重新扫描同一叶表。 */
     uint64_t first=0,end=0;
     for (uint32_t index=0;index<kernel_vma_set_count(record->vmas);index++) {
@@ -1153,6 +1184,10 @@ static void invalidate_file_residents(void *owner, struct kernel_vfs_node *node,
     KERNEL_LOCK_SCOPE(operation);
     kernel_rwlock_write(&record->operations,&operation);
     if (record->stage != KERNEL_MM_RECORD_LIVE) return;
+    if (kernel_vfs_node_hugetlb(node)) {
+        unmap_huge_file_ranges(record,node,start,end);
+        return;
+    }
     invalidate_private_disk_range(record, node, start, end);
     struct mm_file_resident **link = &record->file_residents;
     while (*link) {
@@ -1295,7 +1330,7 @@ static enum kernel_mm_status drain_file_sources(
         if (!unused_only && source->operations) __builtin_trap();
         if (source->file != 0) {
             if (unused_only && kernel_vma_set_backing_in_use(record->vmas,
-                    source->file, &in_use) != KERNEL_VMA_STATUS_OK)
+                    source, &in_use) != KERNEL_VMA_STATUS_OK)
                 __builtin_trap();
             if (in_use != 0) {
                 link = &source->next;
@@ -1500,7 +1535,8 @@ static void drain_huge_maps(struct kernel_mm_record *record,int unused_only)
                 if (v.backing!=entry->map) continue;
                 used=1;
                 if (v.kind == KERNEL_VMA_KIND_HUGETLB_SHARED) break;
-                uint64_t first=v.backing_offset/ARCH_MMU_HUGE_SIZE;
+                uint64_t first=v.backing_offset/ARCH_MMU_HUGE_SIZE-
+                    kernel_hugetlb_map_file_index(entry->map);
                 uint64_t end=first+(v.end-v.start)/ARCH_MMU_HUGE_SIZE;
                 if (first<cursor || end>entry->pages) __builtin_trap();
                 if (kernel_hugetlb_map_unmap(entry->map,cursor,first)) __builtin_trap();
@@ -4851,8 +4887,15 @@ static enum kernel_mm_status mm_munmap_impl(
     return KERNEL_MM_STATUS_OK;
 }
 
+struct mm_huge_file_request {
+    struct kernel_open_file_description *file;
+    uint64_t offset;
+    int retry;
+};
+
 static enum kernel_mm_status mmap_hugetlb(struct kernel_mm *, uint64_t, uint64_t,
-    uint32_t, uint32_t, int, int, uint64_t *, struct kernel_shm_segment *, uint32_t);
+    uint32_t, uint32_t, int, int, uint64_t *, struct kernel_shm_segment *, uint32_t,
+    struct mm_huge_file_request *);
 
 enum kernel_mm_status kernel_mm_shmat(
     struct kernel_mm *mm,
@@ -4871,7 +4914,7 @@ enum kernel_mm_status kernel_mm_shmat(
             map_flags = (flags & KERNEL_SHM_REMAP) ? KERNEL_MM_MAP_FIXED : KERNEL_MM_MAP_FIXED_NOREPLACE;
         } else if (flags & KERNEL_SHM_REMAP) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
         return mmap_hugetlb(mm, hint, segment->aligned_size, permissions, map_flags,
-            1, 0, out_address, segment, flags);
+            1, 0, out_address, segment, flags, NULL);
     }
     struct kernel_mm_record *record;
     struct kernel_vma vma;
@@ -5837,7 +5880,7 @@ static enum kernel_hugetlb_status revoke_huge_child(void *owner,
     enum kernel_mm_status status=mm_operation_begin(&entry->mm,&operation);
     if (status) return status==KERNEL_MM_STATUS_CONFLICT?KERNEL_HUGETLB_BUSY:KERNEL_HUGETLB_OK;
     struct kernel_mm_record *record=operation.record;
-    uint64_t offset=index*ARCH_MMU_HUGE_SIZE;
+    uint64_t offset=(index+kernel_hugetlb_map_file_index(map))*ARCH_MMU_HUGE_SIZE;
     if (!record->vmas) return KERNEL_HUGETLB_OK;
     for (uint32_t i=0;i<kernel_vma_set_count(record->vmas);i++) {
         struct kernel_vma v;
@@ -5867,7 +5910,7 @@ static void prepare_huge_registration(struct mm_huge_map *entry)
 static enum kernel_mm_status mmap_hugetlb(struct kernel_mm *mm,
     uint64_t hint,uint64_t length,uint32_t permissions,uint32_t flags,
     int shared,int noreserve,uint64_t *address, struct kernel_shm_segment *segment,
-    uint32_t shm_flags)
+    uint32_t shm_flags,struct mm_huge_file_request *file_request)
 {
     KERNEL_NO_RECLAIM_IO;
     uint32_t normalized;
@@ -5879,6 +5922,10 @@ static enum kernel_mm_status mmap_hugetlb(struct kernel_mm *mm,
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     if (length>UINT64_MAX-mask) return KERNEL_MM_STATUS_NO_MEMORY;
     length=(length+mask)&~mask;
+    uint64_t file_offset=file_request?file_request->offset:0;
+    if (file_request && ((file_offset&mask) || length>INT64_MAX ||
+        file_offset>(uint64_t)INT64_MAX-length))
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     MM_RANGE_OPERATION(mm,hint,(flags&KERNEL_MM_MAP_FIXED)?length:0);
     struct kernel_mm_record *record=operation.record;
     if (!record->vmas || !record->vma_heap) return KERNEL_MM_STATUS_STATE;
@@ -5926,18 +5973,66 @@ static enum kernel_mm_status mmap_hugetlb(struct kernel_mm *mm,
         __attribute__((cleanup(kernel_shm_attachment_release))) = 0;
     if (segment && kernel_shm_attachment_create(segment,start,end,0,&attachment))
         return KERNEL_MM_STATUS_NO_MEMORY;
+    struct kernel_open_file_description *file=file_request?file_request->file:NULL;
+    struct kernel_vfs_node *node=file?kernel_open_file_node(file):NULL;
+    struct kernel_hugetlb_map *shared_map=segment?segment->hugetlb:
+        file && shared?kernel_vfs_node_hugetlb(node):NULL;
+    struct kernel_mm_file_source *source=NULL,*prepared=NULL;
+    struct mm_file_mapping *registration=NULL;
+    struct kernel_hugetlb_reservation reservation={0};
+    uint64_t *mapping_bytes=NULL;
+    uint32_t maximum_permissions=KERNEL_VMA_ALL_PERMISSIONS;
+    KERNEL_LOCK_SCOPE(inode);
+    enum kernel_mm_status status;
+    if (file) {
+        kernel_vfs_node_lock(node,&inode,1);
+        uint64_t epoch;
+        if (kernel_file_mapping_epoch(node,&epoch)) {
+            file_request->retry=1;
+            return KERNEL_MM_STATUS_CONFLICT;
+        }
+        if (kernel_open_file_mapping_noexec(file)) maximum_permissions&=~KERNEL_MM_EXECUTE;
+        if (shared) {
+            if (kernel_vfs_node_attributes(node)&KERNEL_VFS_INODE_APPEND)
+                return KERNEL_MM_STATUS_ACCESS;
+            int sealed=0,may_write=kernel_open_file_writable(file);
+            if (may_write)
+                mapping_bytes=kernel_vfs_node_shared_write_counter(node,&sealed);
+            if (sealed && (normalized&KERNEL_MM_WRITE)) return KERNEL_MM_STATUS_SEALED;
+            if (!may_write || sealed) {
+                maximum_permissions&=~KERNEL_MM_WRITE;
+                mapping_bytes=NULL;
+            }
+        }
+        if ((normalized&~maximum_permissions)!=0) return KERNEL_MM_STATUS_ACCESS;
+        source=find_file_source(record,file);
+        if (!source) {
+            if (kernel_heap_allocate_zeroed(record->vma_heap,1,sizeof(*prepared),(void **)&prepared))
+                return KERNEL_MM_STATUS_NO_MEMORY;
+            source=prepared;
+        }
+        status=prepare_file_registration(record,file,&registration);
+        if (status) goto fail_file;
+        if (shared_map && !noreserve) {
+            status=huge_status(kernel_hugetlb_file_reserve_begin(shared_map,file_offset/ARCH_MMU_HUGE_SIZE,
+                (file_offset+length)/ARCH_MMU_HUGE_SIZE,&reservation));
+            if (status) goto fail_file;
+        }
+    }
     struct mm_huge_map *entry = 0;
-    if (segment) {
+    if (shared_map) {
         for (entry=record->huge_maps; entry; entry=entry->next)
-            if (entry->map==segment->hugetlb) break;
+            if (entry->map==shared_map) break;
     }
     int new_entry = !entry;
     if (new_entry) {
-        if (kernel_heap_allocate_zeroed(record->vma_heap,1,sizeof(*entry),(void **)&entry))
-            return KERNEL_MM_STATUS_NO_MEMORY;
+        if (kernel_heap_allocate_zeroed(record->vma_heap,1,sizeof(*entry),(void **)&entry)) {
+            status=KERNEL_MM_STATUS_NO_MEMORY;
+            goto fail_file;
+        }
         enum kernel_hugetlb_status hs = KERNEL_HUGETLB_OK;
-        if (segment) {
-            entry->map=segment->hugetlb;
+        if (shared_map) {
+            entry->map=shared_map;
             kernel_hugetlb_map_acquire(entry->map);
         } else {
             struct kernel_hstate *h = 0;
@@ -5946,17 +6041,24 @@ static enum kernel_mm_status mmap_hugetlb(struct kernel_mm *mm,
                 shared?KERNEL_HUGETLB_SHARED:KERNEL_HUGETLB_PRIVATE,noreserve,&entry->map);
             if (h) kernel_hstate_put(h);
         }
-        if (hs) { kernel_heap_release(record->vma_heap,entry);return huge_status(hs); }
+        if (hs) {
+            kernel_heap_release(record->vma_heap,entry);
+            status=huge_status(hs);
+            goto fail_file;
+        }
+        if (file && !shared)
+            kernel_hugetlb_map_set_file_index(entry->map,file_offset/ARCH_MMU_HUGE_SIZE);
         entry->pages=length/ARCH_MMU_HUGE_SIZE;entry->mm=*mm;
         prepare_huge_registration(entry);
     }
     struct kernel_vma v={.start=start,.end=end,.permissions=normalized,
-        .maximum_permissions=KERNEL_VMA_ALL_PERMISSIONS &
+        .maximum_permissions=maximum_permissions &
             ((shm_flags & KERNEL_SHM_RDONLY) ? ~KERNEL_MM_WRITE : KERNEL_VMA_ALL_PERMISSIONS),
         .kind=shared?KERNEL_VMA_KIND_HUGETLB_SHARED:KERNEL_VMA_KIND_HUGETLB_PRIVATE,
-        .role=segment?KERNEL_VMA_ROLE_SYSV_SHM:KERNEL_VMA_ROLE_MMAP,.backing_owner=attachment,.fault_policy=KERNEL_VMA_FAULT_HUGETLB,.backing=entry->map,
+        .role=segment?KERNEL_VMA_ROLE_SYSV_SHM:file?KERNEL_VMA_ROLE_HUGETLB_FILE:KERNEL_VMA_ROLE_MMAP,
+        .backing_owner=file?(void *)source:attachment,.fault_policy=KERNEL_VMA_FAULT_HUGETLB,
+        .backing=entry->map,.backing_offset=file_offset,.shared_mapping_bytes=mapping_bytes,
         .flags=mapping_lock_flags(record,flags)};
-    enum kernel_mm_status status;
     if (flags&KERNEL_MM_MAP_FIXED) {
         struct kernel_vma_edit edit;
         status=status_from_vma(kernel_vma_set_prepare_replace(record->vmas,start,end,&v,&edit));
@@ -5965,26 +6067,59 @@ static enum kernel_mm_status mmap_hugetlb(struct kernel_mm *mm,
     } else status=status_from_vma(kernel_vma_set_insert(record->vmas,&v));
     if (status) {
         if (new_entry) { kernel_hugetlb_map_release(&entry->map);kernel_heap_release(record->vma_heap,entry); }
-        return status;
+        goto fail_file;
     }
     if (new_entry) {
         entry->next=record->huge_maps;record->huge_maps=entry;
         if (kernel_hugetlb_mapping_register(&entry->registration,0)) __builtin_trap();
     }
-    drain_shared_anon(record,1);
-    (void)drain_file_sources(record,1);(void)drain_elf_sources(record,1);
+    if (file) {
+        if (shared && !noreserve) kernel_hugetlb_file_reserve_finish(&reservation,1);
+        if ((normalized&KERNEL_MM_WRITE) && file_offset+length>kernel_vfs_node_size(node))
+            kernel_vfs_hugetlb_grow(node,file_offset+length);
+        if (registration) {
+            registration->next=record->file_mappings;
+            record->file_mappings=registration;
+            if (kernel_file_mapping_register(&registration->registration)) __builtin_trap();
+        }
+        kernel_lock_release(&inode);
+        finish_file_mapping(record,&file,prepared,1);
+    } else {
+        drain_shared_anon(record,1);
+        (void)drain_file_sources(record,1);(void)drain_elf_sources(record,1);
+    }
     *address=start;
     uint32_t policy=v.flags & KERNEL_VMA_LOCK_MASK;
     mm_operation_end(&operation);
     if (policy==KERNEL_VMA_LOCKED) (void)populate_locked(mm,start,end);
     return KERNEL_MM_STATUS_OK;
+
+fail_file:
+    if (file && shared && !noreserve) kernel_hugetlb_file_reserve_finish(&reservation,0);
+    if (prepared) kernel_heap_release(record->vma_heap,prepared);
+    if (registration) kernel_heap_release(record->vma_heap,registration);
+    return status;
 }
 
 enum kernel_mm_status kernel_mm_mmap_hugetlb(struct kernel_mm *mm,
     uint64_t hint,uint64_t length,uint32_t permissions,uint32_t flags,
     int shared,int noreserve,uint64_t *address)
 {
-    return mmap_hugetlb(mm,hint,length,permissions,flags,shared,noreserve,address,0,0);
+    return mmap_hugetlb(mm,hint,length,permissions,flags,shared,noreserve,address,NULL,0,NULL);
+}
+
+enum kernel_mm_status kernel_mm_mmap_hugetlb_file(struct kernel_mm *mm,
+    struct kernel_open_file_description *file,uint64_t hint,uint64_t length,
+    uint64_t offset,uint32_t permissions,uint32_t flags,int noreserve,uint64_t *address)
+{
+    struct mm_huge_file_request request={.file=file,.offset=offset};
+    for (;;) {
+        request.retry=0;
+        enum kernel_mm_status status=mmap_hugetlb(mm,hint,length,permissions,flags,
+            !!(flags&KERNEL_MM_MAP_SHARED),noreserve,address,NULL,0,&request);
+        if (!request.retry || current_pins(mm)) return status;
+        kernel_file_mapping_wait(kernel_open_file_node(file));
+    }
 }
 
 /* 复制期间不能迁移或借用CPU0时，退休来源留在MM；真实用户返回前
@@ -8328,6 +8463,31 @@ static void fault_retry(struct kernel_mm_record *record, uint64_t address)
     (void)address;
 #endif
 }
+
+static int huge_file_fault_lock(struct mm_operation *operation, const struct kernel_vma *vma,
+    struct kernel_vfs_node *node, struct kernel_lock_guard *inode)
+{
+    uint64_t epoch;
+    int locked=kernel_vfs_node_try_read(node,inode);
+    if (locked && !kernel_file_mapping_epoch(node,&epoch)) return 1;
+    if (locked) kernel_lock_release(inode);
+    if (current_pins(operation->mm)) return 0;
+
+    /* Keep the node alive while releasing MM qualification for the inode
+     * writer or for truncation's mapping notifications to run. */
+    struct kernel_mm_file_source *source=vma->backing_owner;
+    if (__atomic_fetch_add(&source->operations,1,__ATOMIC_RELAXED)==UINT32_MAX)
+        __builtin_trap();
+    mm_operation_release(operation);
+    if (!locked) {
+        kernel_vfs_node_lock(node,inode,0);
+        kernel_lock_release(inode);
+    }
+    kernel_file_mapping_wait(node);
+    __atomic_fetch_sub(&source->operations,1,__ATOMIC_RELEASE);
+    return 0;
+}
+
 static enum kernel_mm_status huge_fault(struct mm_operation *operation,uint64_t address,
     uint32_t access,const struct fault_vma *view,int force)
 {
@@ -8335,9 +8495,12 @@ static enum kernel_mm_status huge_fault(struct mm_operation *operation,uint64_t 
     const struct kernel_vma *v=&view->vma;
     if (operation->shared || !huge_vma(v)) __builtin_trap();
     if (!remote_access_allowed(v,access,force)) return KERNEL_MM_STATUS_ACCESS;
+    struct kernel_vfs_node *node=huge_file_node(v);
     uint64_t base=address & ~(ARCH_MMU_HUGE_SIZE-1);
-    uint64_t index=(v->backing_offset+base-v->start)/ARCH_MMU_HUGE_SIZE;
+    uint64_t file_index=(v->backing_offset+base-v->start)/ARCH_MMU_HUGE_SIZE;
     struct kernel_hugetlb_map *map=v->backing;
+    uint64_t origin=node?kernel_hugetlb_map_file_index(map):0;
+    uint64_t index=file_index-origin;
     struct kernel_mm_leaf old={0};
     int cow=0, borrowed=0;
     unsigned missing=0;
@@ -8371,7 +8534,7 @@ static enum kernel_mm_status huge_fault(struct mm_operation *operation,uint64_t 
             }
             cow=1;
             uint32_t refs=physical_page_cow_borrow_order(record->space.allocator,old.physical_address,old.order);
-            if (refs==1) {
+            if (refs==1 && !old.file_backed) {
                 if (arch_mmu_user_cow_commit_order(&record->space,base,old.cookie,KERNEL_MM_NO_PAGE,
                     backend_permissions_from_mm(v->permissions),old.order,&batch)) __builtin_trap();
                 if (operation->fault_pin && pin_mapping(operation->mm,record,address,access,operation->fault_pin,0,force)) __builtin_trap();
@@ -8386,8 +8549,29 @@ static enum kernel_mm_status huge_fault(struct mm_operation *operation,uint64_t 
                 return KERNEL_MM_STATUS_ADDRESS_SPACE;
         } else return KERNEL_MM_STATUS_ADDRESS_SPACE;
     }
+    KERNEL_NO_RECLAIM_IO;
+    KERNEL_LOCK_SCOPE(inode);
+    uint64_t file_page=KERNEL_MM_NO_PAGE;
+    int private_file=node && v->kind==KERNEL_VMA_KIND_HUGETLB_PRIVATE;
+    if (node && !cow) {
+        if (!huge_file_fault_lock(operation,v,node,&inode))
+            return KERNEL_MM_STATUS_CONFLICT;
+        uint64_t eof=kernel_vfs_node_size(node)/ARCH_MMU_HUGE_SIZE;
+        if (private_file || file_index>=eof) {
+            enum kernel_hugetlb_status found=kernel_hugetlb_file_find_page(
+                kernel_vfs_node_hugetlb(node),file_index,&file_page);
+            if (found && found!=KERNEL_HUGETLB_NOT_FOUND) return huge_status(found);
+        }
+        if (file_index>=eof && file_page==KERNEL_MM_NO_PAGE) return KERNEL_MM_STATUS_BUS_FAULT;
+    }
+    int file_alias=file_page!=KERNEL_MM_NO_PAGE && (!private_file || access!=KERNEL_MM_WRITE);
     struct kernel_hugetlb_claim claim={0};
-    enum kernel_hugetlb_status hs=kernel_hugetlb_fault_begin(map,index,cow,&claim);
+    enum kernel_hugetlb_status hs=KERNEL_HUGETLB_OK;
+    if (!file_alias) {
+        if ((cow && old.file_backed) || file_page!=KERNEL_MM_NO_PAGE)
+            hs=kernel_hugetlb_private_copy_begin(map,index,&claim);
+        else hs=kernel_hugetlb_fault_begin(map,index,cow,&claim);
+    }
     if (hs==KERNEL_HUGETLB_REVOKE_CHILDREN) {
         kernel_hugetlb_map_acquire(map);
         if (operation->pins_closed) {
@@ -8402,7 +8586,7 @@ static enum kernel_mm_status huge_fault(struct mm_operation *operation,uint64_t 
             struct fault_vma fresh;
             if (!read_fault_vma(operation,address,&fresh,0,0) && fresh.vma.backing==map &&
                 fresh.vma.kind==KERNEL_VMA_KIND_HUGETLB_PRIVATE &&
-                (fresh.vma.backing_offset+base-fresh.vma.start)/ARCH_MMU_HUGE_SIZE==index &&
+                (fresh.vma.backing_offset+base-fresh.vma.start)/ARCH_MMU_HUGE_SIZE==file_index &&
                 remote_access_allowed(&fresh.vma,access,force)) {
                 close_record_pins(record,0);operation->pins_closed=1;
                 physical_page_release_order(record->space.allocator,old.physical_address,old.order);
@@ -8430,9 +8614,9 @@ static enum kernel_mm_status huge_fault(struct mm_operation *operation,uint64_t 
     }
     enum kernel_mm_status status=huge_status(hs);
     struct kernel_mm_leaf_preparation prepared=KERNEL_MM_LEAF_PREPARATION_INIT;
-    if (!status && cow) {
+    if (!status && !file_alias && (cow || file_page!=KERNEL_MM_NO_PAGE)) {
         void *from,*to;
-        if (physical_page_map_owned(record->space.allocator,old.physical_address,&from) ||
+        if (physical_page_map_owned(record->space.allocator,cow?old.physical_address:file_page,&from) ||
             physical_page_map_owned(record->space.allocator,claim.physical_address,&to)) __builtin_trap();
         memcpy(to,from,ARCH_MMU_HUGE_SIZE);
     }
@@ -8449,8 +8633,10 @@ static enum kernel_mm_status huge_fault(struct mm_operation *operation,uint64_t 
         enum arch_mmu_status published=cow ?
             arch_mmu_user_cow_commit_order(&record->space,base,old.cookie,claim.physical_address,
                 backend_permissions_from_mm(v->permissions),ARCH_MMU_HUGE_ORDER,&batch) :
-            arch_mmu_user_map_prepared_order(&record->space,base,claim.physical_address,
-                backend_permissions_from_mm(v->permissions),0,ARCH_MMU_HUGE_ORDER,&prepared);
+            arch_mmu_user_map_prepared_order(&record->space,base,
+                file_alias?file_page:claim.physical_address,backend_permissions_from_mm(v->permissions),
+                file_alias && private_file?KERNEL_MM_LEAF_COW|KERNEL_MM_LEAF_FILE:0,
+                ARCH_MMU_HUGE_ORDER,&prepared);
         if (published) status=published==ARCH_MMU_STATUS_CONFLICT?KERNEL_MM_STATUS_CONFLICT:KERNEL_MM_STATUS_ADDRESS_SPACE;
         else {
             if (operation->fault_pin && pin_mapping(operation->mm,record,address,access,operation->fault_pin,0,force)) __builtin_trap();
@@ -8461,6 +8647,8 @@ static enum kernel_mm_status huge_fault(struct mm_operation *operation,uint64_t 
     for (unsigned i=0;i<2;i++) if (prepared.tables[i]!=KERNEL_MM_NO_PAGE)
         physical_page_release(record->space.allocator,prepared.tables[i]);
     if (claim.map) kernel_hugetlb_fault_finish(&claim,!status);
+    if (file_page!=KERNEL_MM_NO_PAGE && (!file_alias || status))
+        physical_page_release_order(record->space.allocator,file_page,ARCH_MMU_HUGE_ORDER);
     if (borrowed) physical_page_release_order(record->space.allocator,old.physical_address,old.order);
     return status;
 }
@@ -9164,7 +9352,10 @@ enum kernel_mm_status kernel_mm_proc_maps_snapshot(const struct kernel_mm *mm,
                     vma.kind == KERNEL_VMA_KIND_ANON_SHARED ||
                     vma.kind == KERNEL_VMA_KIND_SYSV_SHM ||
                     vma.kind == KERNEL_VMA_KIND_OBJECT_SHARED };
-            if (vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE ||
+            if (vma.role == KERNEL_VMA_ROLE_HUGETLB_FILE) {
+                const struct kernel_mm_file_source *source=vma.backing_owner;
+                row->file=source->file;row->offset=vma.backing_offset;
+            } else if (vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE ||
                 vma.kind == KERNEL_VMA_KIND_FILE_SHARED || vma.kind == KERNEL_VMA_KIND_OBJECT_SHARED) {
                 row->file = vma.backing; row->offset = vma.backing_offset;
             } else if (vma.kind == KERNEL_VMA_KIND_ELF_PRIVATE)
@@ -9413,13 +9604,15 @@ static int advise_remove(struct mm_operation *operation,const struct kernel_vma 
         kernel_memory_object_release(&object);
         return mm_operation_begin(mm,operation) ? -KERNEL_EAGAIN : 0;
     }
-    if (vma->kind != KERNEL_VMA_KIND_FILE_SHARED && vma->kind != KERNEL_VMA_KIND_FILE_PRIVATE)
+    int huge_file=vma->role==KERNEL_VMA_ROLE_HUGETLB_FILE;
+    if (!huge_file && vma->kind!=KERNEL_VMA_KIND_FILE_SHARED && vma->kind!=KERNEL_VMA_KIND_FILE_PRIVATE)
         return -KERNEL_EINVAL;
-    if (vma->kind != KERNEL_VMA_KIND_FILE_SHARED || !(vma->maximum_permissions & KERNEL_MM_WRITE))
+    if ((vma->kind!=KERNEL_VMA_KIND_FILE_SHARED && vma->kind!=KERNEL_VMA_KIND_HUGETLB_SHARED) ||
+        !(vma->maximum_permissions & KERNEL_MM_WRITE))
         return -KERNEL_EACCES;
-    struct kernel_open_file_description *file=vma->backing;
     struct kernel_mm_file_source *source=vma->backing_owner;
     if (!source || source->operations==UINT32_MAX) __builtin_trap();
+    struct kernel_open_file_description *file=source->file;
     source->operations++;
     uint64_t offset=vma->backing_offset+address-vma->start;
     const struct kernel_mm *mm=operation->mm;
@@ -9507,9 +9700,14 @@ static int advise_huge_discard(struct mm_operation *op,const struct kernel_vma *
           enum arch_mmu_status st=arch_mmu_user_leaf_snapshot(&r->space,va,&leaf);
           if (st==ARCH_MMU_STATUS_NOT_MAPPED) continue;
           if (st || leaf.order!=ARCH_MMU_HUGE_ORDER) __builtin_trap(); }
+        if (leaf.file_backed) {
+            if (unmap_space_range(r,va,va+ARCH_MMU_HUGE_SIZE)) __builtin_trap();
+            continue;
+        }
         struct kernel_hugetlb_discard_claim claim={0};
         enum kernel_hugetlb_status hs=kernel_hugetlb_discard_begin(v->backing,
-            (v->backing_offset+va-v->start)/ARCH_MMU_HUGE_SIZE,leaf.physical_address,1,&claim);
+            (v->backing_offset+va-v->start)/ARCH_MMU_HUGE_SIZE-
+                kernel_hugetlb_map_file_index(v->backing),leaf.physical_address,1,&claim);
         if (hs) return hs==KERNEL_HUGETLB_BUSY?-KERNEL_EAGAIN:-KERNEL_ENOMEM;
         struct kernel_mm_detach_cursor cursor={0};
         enum arch_mmu_status st;
@@ -9564,9 +9762,11 @@ int kernel_mm_madvise(struct kernel_mm *mm, uint64_t address, uint64_t length, i
         if (status) __builtin_trap();
         uint64_t finish = vma.end < end ? vma.end : end;
         int error = 0;
-        if (huge_vma(&vma) && (address&(ARCH_MMU_HUGE_SIZE-1))) return -KERNEL_EINVAL;
-        if (huge_vma(&vma) && advice!=KERNEL_MM_ADVICE_DONTNEED &&
-            (finish&(ARCH_MMU_HUGE_SIZE-1))) return -KERNEL_EINVAL;
+        if (huge_vma(&vma) &&
+            !(advice==KERNEL_MM_ADVICE_REMOVE && vma.role==KERNEL_VMA_ROLE_HUGETLB_FILE)) {
+            if (address&(ARCH_MMU_HUGE_SIZE-1)) return -KERNEL_EINVAL;
+            if (advice!=KERNEL_MM_ADVICE_DONTNEED && (finish&(ARCH_MMU_HUGE_SIZE-1))) return -KERNEL_EINVAL;
+        }
         if (advice == KERNEL_MM_ADVICE_DONTNEED) {
             if (vma.flags & KERNEL_VMA_LOCKED) return -KERNEL_EINVAL;
             if (huge_vma(&vma)) error=advise_huge_discard(&operation,&vma,address,finish & ~(ARCH_MMU_HUGE_SIZE-1));
@@ -9723,6 +9923,10 @@ int kernel_mm_mincore(struct kernel_mm *mm, uint64_t address, unsigned count,
             struct kernel_mm_file_source *source = vma.backing_owner;
             if (!source) __builtin_trap();
             borrow = &source->operations;
+        } else if (vma.role == KERNEL_VMA_ROLE_HUGETLB_FILE) {
+            struct kernel_mm_file_source *source = vma.backing_owner;
+            file = source->file;
+            borrow = &source->operations;
         } else if (vma.kind == KERNEL_VMA_KIND_ELF_PRIVATE) {
             struct kernel_elf64_source *source = vma.backing;
             file = kernel_elf64_source_file(source);
@@ -9750,7 +9954,7 @@ int kernel_mm_mincore(struct kernel_mm *mm, uint64_t address, unsigned count,
             if (status != ARCH_MMU_STATUS_OK && status != ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
             present = status == ARCH_MMU_STATUS_OK;
         }
-        if (!present && vma.kind==KERNEL_VMA_KIND_HUGETLB_SHARED)
+        if (!present && !file && vma.kind==KERNEL_VMA_KIND_HUGETLB_SHARED)
             present=kernel_hugetlb_map_resident(vma.backing,
                 (vma.backing_offset+address-vma.start)/ARCH_MMU_HUGE_SIZE);
         if (file || object) {
@@ -9760,6 +9964,9 @@ int kernel_mm_mincore(struct kernel_mm *mm, uint64_t address, unsigned count,
              * end the MM gate before taking inode/cache/object qualifications. */
             mm_operation_end(&operation);
             if (file && !kernel_vfs_file_mincore_allowed(kernel_open_file_vfs_borrow(file))) present = 1;
+            else if (!present && vma.role == KERNEL_VMA_ROLE_HUGETLB_FILE)
+                present=kernel_hugetlb_map_resident(kernel_vfs_node_hugetlb(kernel_open_file_node(file)),
+                    offset/ARCH_MMU_HUGE_SIZE);
             else if (!present) {
                 struct kernel_memory_object *backing = object ? object : kernel_vfs_file_memory(kernel_open_file_vfs_borrow(file));
                 if (backing) {

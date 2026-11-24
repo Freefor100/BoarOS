@@ -19,6 +19,7 @@
 #include <kernel/mqueue.h>
 #include <kernel/signal_fd.h>
 #include <kernel/heap.h>
+#include <kernel/hugetlb.h>
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
 #include <kernel/page.h>
@@ -38,6 +39,7 @@
 #include <string.h>
 
 #include <arch/context.h>
+#include <arch/mmu.h>
 #include <arch/platform_io.h>
 
 #define KERNEL_FILES_WRITE_STAGING 64U
@@ -320,6 +322,8 @@ static enum kernel_files_status memory_read(
 {
     struct kernel_uaccess_write_cursor output = {0};
     struct kernel_vfs_node *node = kernel_open_file_node(description);
+    struct kernel_hugetlb_map *huge = kernel_vfs_node_hugetlb(node);
+    size_t page_size = huge ? ARCH_MMU_HUGE_SIZE : BOAROS_PAGE_SIZE;
     uint64_t total = 0;
     int error = 0;
     if (offset >= kernel_open_file_size(description)) { *linux_result = 0; return KERNEL_FILES_STATUS_OK; }
@@ -353,12 +357,19 @@ static enum kernel_files_status memory_read(
         }
         uint64_t position=offset+total,size=kernel_open_file_size(description);
         if (position>=size) break;
-        size_t within=position & BOAROS_PAGE_MASK;
-        size_t available=BOAROS_PAGE_SIZE-within;
+        size_t within=position & (page_size-1U);
+        size_t available=page_size-within;
         if (available>size-position) available=(size_t)(size-position);
         if (available>count-total) available=(size_t)(count-total);
         uint64_t physical=0;size_t valid=0;
-        enum kernel_page_cache_status found=kernel_open_file_lookup_page(description,
+        enum kernel_page_cache_status found;
+        if (huge) {
+            enum kernel_hugetlb_status status=kernel_hugetlb_file_find_page(huge,
+                position/ARCH_MMU_HUGE_SIZE,&physical);
+            found=status==KERNEL_HUGETLB_NOT_FOUND ? KERNEL_PAGE_CACHE_STATUS_NOT_FOUND :
+                status ? KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT : KERNEL_PAGE_CACHE_STATUS_OK;
+            valid=page_size;
+        } else found=kernel_open_file_lookup_page(description,
             position>>BOAROS_PAGE_SHIFT,&physical,&valid);
         void *page=NULL;
         if (!found) {
@@ -395,7 +406,8 @@ static enum kernel_files_status memory_read(
             }
             kernel_lock_release(&source);
         }
-        if (physical && physical_page_release(mm->allocator,physical)) __builtin_trap();
+        if (physical && (huge ? physical_page_release_order(mm->allocator,physical,ARCH_MMU_HUGE_ORDER) :
+                physical_page_release(mm->allocator,physical))) __builtin_trap();
         if (copied && advance && kernel_open_file_advance(description,copied) != KERNEL_OPEN_FILE_STATUS_OK)
             __builtin_trap();
         total+=copied;
@@ -721,7 +733,8 @@ static enum kernel_files_status read_file_data(struct kernel_files *files, struc
         kernel_open_file_read_begin(description, position);
         kernel_vfs_file_accessed(&description->file,kernel_open_file_flags(description));
     }
-    if (kernel_open_file_memory_backed(description))
+    if (kernel_open_file_memory_backed(description) ||
+        kernel_vfs_node_hugetlb(kernel_open_file_node(description)))
         return memory_read(files, mm, description, cursor, request, position, 1, linux_result);
     return disk_read(files, mm, description, cursor, request, position, 1, linux_result);
 }
@@ -1298,7 +1311,8 @@ static enum kernel_files_status pread_iov_pinned(
     if (request > file_size - position) {
         request = file_size - position;
     }
-    if (kernel_open_file_memory_backed(description)) {
+    if (kernel_open_file_memory_backed(description) ||
+        kernel_vfs_node_hugetlb(kernel_open_file_node(description))) {
         struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0, 0};
         return memory_read(files, mm, description, &cursor, request, position, 0, linux_result);
     }

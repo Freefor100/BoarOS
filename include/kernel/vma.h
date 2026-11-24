@@ -76,6 +76,7 @@ enum kernel_vma_role {
     KERNEL_VMA_ROLE_HEAP,
     KERNEL_VMA_ROLE_MMAP,
     KERNEL_VMA_ROLE_SYSV_SHM,
+    KERNEL_VMA_ROLE_HUGETLB_FILE,
 };
 
 enum kernel_vma_fault_policy {
@@ -110,7 +111,8 @@ struct kernel_vma {
 
 static inline struct kernel_shm_attachment *kernel_vma_shm_attachment(const struct kernel_vma *vma)
 {
-    if (vma->kind == KERNEL_VMA_KIND_SYSV_SHM || vma->kind == KERNEL_VMA_KIND_HUGETLB_SHARED)
+    if (vma->kind == KERNEL_VMA_KIND_SYSV_SHM ||
+        (vma->kind == KERNEL_VMA_KIND_HUGETLB_SHARED && vma->role == KERNEL_VMA_ROLE_SYSV_SHM))
         return vma->backing_owner;
     return 0;
 }

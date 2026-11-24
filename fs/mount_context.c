@@ -34,7 +34,7 @@ static const struct mount_type {
     {"devtmpfs", false}, {"tmpfs", false}, {"ext4", true}, {"ext3", true}, {"ext2", true},
     {"vfat", true}, {"devpts", false}, {"proc", false}, {"mqueue", false},
     {"bpf", false}, {"tracefs", false}, {"sysfs", false}, {"cgroup2", false},
-    {"overlay", false},
+    {"overlay", false}, {"hugetlbfs", false},
 };
 
 static const struct mount_type *find_mount_type(const char *name)
@@ -191,7 +191,9 @@ int kernel_mount_create(const struct kernel_fs_context *fs,const struct kernel_m
         mount_creation_flags(mount, p->flags);
         return 0;
     }
-    if(strcmp(p->type,"tmpfs") && strcmp(p->type,"devpts") && p->options[0])return -KERNEL_ENOTSUP;
+    bool hugetlbfs = !strcmp(p->type,"hugetlbfs");
+    if (!hugetlbfs && strcmp(p->type,"tmpfs") && strcmp(p->type,"devpts") && p->options[0])
+        return -KERNEL_ENOTSUP;
     if(disk) {
         int reused=kernel_vfs_reuse_block_tree(device,p->type,!!(p->flags&1U),exclusive,
             fs->heap,kernel_fs_context_namespace_id(fs),owner);
@@ -228,6 +230,7 @@ int kernel_mount_create(const struct kernel_fs_context *fs,const struct kernel_m
         !strcmp(p->type,"devpts")?kernel_devpts_create(fs->heap,p->flags&1U,p->options,&mount):
         !strcmp(p->type,"mqueue")?kernel_mqueue_fs_create(fs->heap,p->flags&1U,p->ipc_namespace?p->ipc_namespace:kernel_task_ipc_namespace(),&mount):
         !strcmp(p->type,"tmpfs")?kernel_tmpfs_create(fs->heap,p->flags&1U,p->options,&mount):
+        hugetlbfs?kernel_hugetlbfs_create(fs->heap,p->flags&1U,p->options,&mount):
         kernel_procfs_create_in(fs->heap,p->flags&1U,p->pid_view,&mount);
     kernel_credentials_override(previous);
 
@@ -319,7 +322,8 @@ static int context_parameter(struct mount_context *ctx,const struct kernel_fs_co
     int tmpfs=!strcmp(p->type,"tmpfs") || !strcmp(p->type,"devtmpfs"),devpts=!strcmp(p->type,"devpts");
     const char *scalar=command==0?NULL:value;
     int error=tmpfs?kernel_tmpfs_check_mount_parameter(ctx->heap,key,scalar):
-        devpts?kernel_devpts_check_mount_parameter(key,scalar):-KERNEL_EINVAL;
+        devpts?kernel_devpts_check_mount_parameter(key,scalar):
+        !strcmp(p->type,"hugetlbfs")?kernel_hugetlbfs_check_mount_parameter(key,scalar):-KERNEL_EINVAL;
     if(error)return error;
     int flag=command==0;
     size_t used=0,keylen=strlen(key);

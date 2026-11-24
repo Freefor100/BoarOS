@@ -344,6 +344,9 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(
 enum kernel_mm_status kernel_mm_mmap_hugetlb(struct kernel_mm *,
     uint64_t hint, uint64_t length, uint32_t permissions, uint32_t flags,
     int shared, int noreserve, uint64_t *address);
+enum kernel_mm_status kernel_mm_mmap_hugetlb_file(struct kernel_mm *,
+    struct kernel_open_file_description *, uint64_t hint, uint64_t length,
+    uint64_t offset, uint32_t permissions, uint32_t flags, int noreserve, uint64_t *address);
 
 /* Side-effect-free validation; success does not reserve the chosen range. */
 enum kernel_mm_status kernel_mm_validate_file_private_mapping(
