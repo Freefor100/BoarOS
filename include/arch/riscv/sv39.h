@@ -288,6 +288,11 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
 
 enum riscv_sv39_status riscv_sv39_user_leaf_snapshot(const struct riscv_sv39_user_space *,
     uint64_t, struct kernel_mm_leaf *);
+/* The MM metadata lock keeps the leaf table live until its pages are borrowed. */
+#if BOAROS_MAX_CPUS == 1
+unsigned riscv_sv39_user_readable_pages(const struct riscv_sv39_user_space *,
+    uint64_t first, unsigned count, uint64_t *physical);
+#endif
 enum riscv_sv39_status riscv_sv39_user_leaf_probe(const struct riscv_sv39_user_space *,
     uint64_t, struct kernel_mm_leaf *, unsigned *missing_tables);
 /* Only a mapped base page supplies a slot. Keep the MM metadata writer

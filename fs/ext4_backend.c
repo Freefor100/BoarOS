@@ -1184,15 +1184,15 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
 static uint64_t journal_now(void *context)
 { (void)context; return kernel_time_monotonic_ns(); }
 
-#if BOAROS_MAX_CPUS > 1
 static bool journal_join_pending_metadata(void *context)
 {
     struct lwext4_mount_adapter *adapter = context;
+#if BOAROS_MAX_CPUS > 1
     if (kernel_cpu_get_boot_count() < 2) return false;
+#endif
     TIMESTAMP_SCOPE(times, adapter);
     return adapter->dirty_times_count != 0;
 }
-#endif
 
 static void journal_request(void *context, unsigned work)
 {
@@ -1433,9 +1433,7 @@ static int start_journal_workers(struct kernel_vfs_mount *mount)
         struct ext4_journal_runtime runtime = {
             .context=adapter,.now_ns=journal_now,.request=journal_request,.wait=journal_wait,
             .prewrite_fresh=kernel_cpu_get_boot_count()>1,
-#if BOAROS_MAX_CPUS > 1
             .join_pending_metadata=journal_join_pending_metadata
-#endif
         };
         int result = ext4_journal_group_enable(adapter->mount_point, &runtime, budget);
         if (result != EOK) return lwext4_error(result);

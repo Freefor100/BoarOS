@@ -823,6 +823,27 @@ static void lru_touch_run(struct kernel_page_cache_record *record,
     record->lru_head->lru_previous = tail;
     record->lru_head = head;
 }
+
+struct lru_read_run {
+    struct kernel_page_cache_entry *head, *tail;
+    int cursor_in_run;
+};
+static inline void lru_read_run_add(struct kernel_page_cache_record *record,
+    struct lru_read_run *run, struct kernel_page_cache_entry *entry)
+{
+    if (!run->head || entry->lru_next != run->head) {
+        if (run->head) lru_touch_run(record,run->head,run->tail,run->cursor_in_run);
+        run->tail=entry;
+        run->cursor_in_run=0;
+    }
+    run->head=entry;
+    run->cursor_in_run|=record->reclaim_cursor==entry;
+}
+static inline void lru_read_run_finish(struct kernel_page_cache_record *record,
+    const struct lru_read_run *run)
+{
+    if (run->head) lru_touch_run(record,run->head,run->tail,run->cursor_in_run);
+}
 #endif
 
 static int cleanup_entry(struct kernel_page_cache *cache,
@@ -1968,8 +1989,7 @@ unsigned kernel_page_cache_acquire_ready(struct kernel_page_cache *cache,
     uint64_t last = (size - 1) >> BOAROS_PAGE_SHIFT;
     unsigned acquired = 0, count = 0;
 #if BOAROS_MAX_CPUS == 1
-    struct kernel_page_cache_entry *run_head = NULL, *run_tail = NULL;
-    int cursor_in_run = 0;
+    struct lru_read_run run={0};
 #endif
     struct kernel_page_cache_entry *entry = index_at_or_after(node, first);
     while (entry && count < capacity && entry->page_index - first < KERNEL_PAGE_CACHE_READY_WINDOW) {
@@ -1983,15 +2003,9 @@ unsigned kernel_page_cache_acquire_ready(struct kernel_page_cache *cache,
              * reference excludes clean reclaim until alias publication. */
             if (bindings) bindings[slot].entry = entry;
 #if BOAROS_MAX_CPUS == 1
-            if (KERNEL_PAGE_CACHE_READY_WINDOW > 4) {
-                if (!run_head || entry->lru_next != run_head) {
-                    if (run_head) lru_touch_run(cache->record, run_head, run_tail, cursor_in_run);
-                    run_tail = entry;
-                    cursor_in_run = 0;
-                }
-                run_head = entry;
-                cursor_in_run |= cache->record->reclaim_cursor == entry;
-            } else
+            if (KERNEL_PAGE_CACHE_READY_WINDOW > 4)
+                lru_read_run_add(cache->record,&run,entry);
+            else
 #endif
             note_read_access(cache, entry, 0);
         }
@@ -1999,7 +2013,7 @@ unsigned kernel_page_cache_acquire_ready(struct kernel_page_cache *cache,
         entry = RB_NEXT(kernel_page_cache_tree, &node->cache_pages, entry);
     }
 #if BOAROS_MAX_CPUS == 1
-    if (run_head) lru_touch_run(cache->record, run_head, run_tail, cursor_in_run);
+    lru_read_run_finish(cache->record,&run);
 #endif
     if ((acquired & required) != required) return 0;
     physical_page_acquire_batch(cache->allocator, addresses, count);
@@ -2748,6 +2762,8 @@ static int read_cached_batch(struct cache_read_batch_request *request, bool take
         retry=node->cache_index_closed;
 #else
         CACHE_SCOPE(guard,cache);
+        struct lru_read_run run={0};
+        const bool promote_run=!request->no_reuse && request->count>4;
 #endif
         if (!retry) retry=!read_cache_open(node);
         uint64_t size=retry?0:kernel_vfs_node_size(node);
@@ -2804,6 +2820,11 @@ static int read_cached_batch(struct cache_read_batch_request *request, bool take
                 page->entry=entry;
                 page->physical_address=entry->physical_address;
                 page->valid_bytes=valid;
+#if BOAROS_MAX_CPUS == 1
+                if (promote_run)
+                    lru_read_run_add(cache->record,&run,entry);
+                else
+#endif
                 note_read_access(cache,entry,request->no_reuse);
             }
             page->status=KERNEL_PAGE_CACHE_STATUS_OK;
@@ -2811,6 +2832,7 @@ static int read_cached_batch(struct cache_read_batch_request *request, bool take
         }
         if (hits && !take_physical) entry_borrows_add(cache->record,hits);
 #if BOAROS_MAX_CPUS == 1
+        lru_read_run_finish(cache->record,&run);
         note_read_hits(cache,hits);
 #endif
         if (retry) {
@@ -3148,7 +3170,7 @@ void kernel_page_cache_finish_mapping_write(struct kernel_page_cache *cache,stru
     *reservation=(struct kernel_page_cache_reservation){0};
 }
 
-#if BOAROS_USER_SMP
+#if BOAROS_USER_SMP || BOAROS_MAX_CPUS == 1
 struct cached_write_workspace {
     struct kernel_mm_user_pin pins[KERNEL_MM_USER_READ_BATCH];
     union {
@@ -3293,8 +3315,13 @@ static __attribute__((noinline)) size_t copy_cached_overwrite_batch(
         KERNEL_LOCK_SCOPE(io);
         kernel_vfs_node_lock(node, &io, 1);
         {
+#if BOAROS_MAX_CPUS > 1
             CACHE_INDEX_SCOPE(index, node);
             if (!node->cache_index_closed && read_cache_open(node)) {
+#else
+            CACHE_SCOPE(guard, cache);
+            if (read_cache_open(node)) {
+#endif
                 uint64_t first = offset >> BOAROS_PAGE_SHIFT;
                 struct kernel_page_cache_entry *entry = index_find(node, first);
                 for (; used < count; used++) {
@@ -3342,9 +3369,13 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
     int retried_space=0;
     struct kernel_vfs_write_view view={0};
     struct file_write_reservation *ticket=reservation->reservation;
-#if BOAROS_USER_SMP
+#if BOAROS_USER_SMP || BOAROS_MAX_CPUS == 1
     bool batch_write = true;
+#if BOAROS_MAX_CPUS > 1
     bool batch_overwrite = kernel_cpu_get_boot_count() > 1;
+#else
+    const bool batch_overwrite = true;
+#endif
 #endif
     while (*written<size) {
         if (!ready) {
@@ -3371,7 +3402,7 @@ static int copy_cached_source(struct kernel_page_cache *cache,struct kernel_vfs_
                 continue;
             }
         }
-#if BOAROS_USER_SMP
+#if BOAROS_USER_SMP || BOAROS_MAX_CPUS == 1
         if (batch_write && ready >= 2 * BOAROS_PAGE_SIZE) {
             size_t copied = 0;
             if (offset == kernel_vfs_node_size(node))
@@ -4007,8 +4038,7 @@ static int writeback_run(struct kernel_page_cache *cache,
     struct kernel_page_cache_entry **entries,size_t count,uint64_t limit,size_t *used,
     struct writeback_workspace *workspace,int background)
 {
-    enum { max_pages = BOAROS_MAX_CPUS > 1 ?
-        KERNEL_VFS_GROWTH_WRITEBACK_MAX : BOAROS_PAGE_CACHE_WRITEBACK_PAGES };
+    enum { max_pages = KERNEL_VFS_GROWTH_WRITEBACK_MAX };
     _Static_assert(max_pages <= UINT8_MAX, "span owners must fit in one byte");
     if (!count || count>max_pages) __builtin_trap();
     reclaim_window_memory(cache);
@@ -4427,6 +4457,9 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
     size_t dirty;
     struct kernel_page_cache_entry *single=NULL;
     int multiple=0;
+#if BOAROS_MAX_CPUS == 1
+    bool several_dirty_files;
+#endif
     {
         CACHE_SCOPE(guard,cache);
         struct kernel_page_cache_entry *entry=dirty_at_or_after(node,cursor);
@@ -4437,6 +4470,9 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
         multiple=next && next->page_index<=last;
         first=entry->page_index;
         dirty=kernel_vfs_node_dirty_pages(node)->count;
+#if BOAROS_MAX_CPUS == 1
+        several_dirty_files=r->dirty_head!=r->dirty_tail;
+#endif
         request_borrow(r);
     }
     reclaim_window_memory(cache);
@@ -4447,8 +4483,13 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
     size_t capacity=multiple?BOAROS_PAGE_CACHE_WRITEBACK_PAGES:1;
     bool growth=false;
     bool large=false;
+#if BOAROS_MAX_CPUS == 1
+    bool mapped=several_dirty_files && multiple && end==UINT64_MAX &&
+        node->instance->ops->writeback_mapped;
+#else
     bool mapped=BOAROS_MAX_CPUS > 1 && multiple && end==UINT64_MAX &&
         node->instance->ops->writeback_mapped && kernel_cpu_get_boot_count()>1;
+#endif
     if (mapped && large_capacity > capacity && dirty>=large_capacity &&
         last-first>=large_capacity-1 && node->instance->ops->writeback_growth) {
         {

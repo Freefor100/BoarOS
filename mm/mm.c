@@ -2867,6 +2867,11 @@ unsigned kernel_mm_try_pin_user_read_batch(const struct kernel_mm *mm, uint64_t 
     if (pin_admission_closed(record) == 1) return 0;
     uint64_t pages[KERNEL_MM_USER_READ_BATCH];
     unsigned ready = 0;
+#if defined(__riscv) && BOAROS_MAX_CPUS == 1
+    count=riscv_sv39_user_readable_pages(&record->space,first,count,pages);
+    for (;ready<count;ready++)
+        if (physical_page_map_owned(mm->allocator,pages[ready],&pins[ready].page)) break;
+#else
     for (; ready < count; ready++) {
         struct kernel_mm_mapping mapping;
         if (lookup_user_mapping(record, first + (uint64_t)ready * BOAROS_PAGE_SIZE,
@@ -2874,6 +2879,7 @@ unsigned kernel_mm_try_pin_user_read_batch(const struct kernel_mm *mm, uint64_t 
         pages[ready] = mapping.physical_address & ~BOAROS_PAGE_MASK;
         if (physical_page_map_owned(mm->allocator, pages[ready], &pins[ready].page)) break;
     }
+#endif
     if (!ready) return 0;
     physical_page_acquire_batch(mm->allocator, pages, ready);
     if (pin_count_add(&record->access_pins,ready) > UINT32_MAX-ready) __builtin_trap();

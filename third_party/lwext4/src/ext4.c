@@ -5745,7 +5745,12 @@ Retry:
     }
     struct ext4_direct_write_batch *direct = NULL;
     bool fresh_ordered = journal && journal->grouped && outer && file->delalloc &&
+#if BOAROS_MAX_CPUS == 1
+        (file->mp->journal_runtime.prewrite_fresh || blocks > (128U * 1024U) / block_size) &&
+        source_count &&
+#else
         file->mp->journal_runtime.prewrite_fresh && source_count &&
+#endif
         spans[0].offset >= saved_size && fs->bdev->bdif->bwrite_batch;
     if ((!journal || fresh_ordered) && blocks > 1 && (source_count || synchronous)) {
         direct = ext4_calloc(1, sizeof(*direct));
