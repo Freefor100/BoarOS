@@ -121,8 +121,20 @@ static inline __attribute__((always_inline)) void idle_append_locked(struct ext4
 
 static struct ext4_buf *lookup_locked(struct ext4_bcache *bc, uint64_t lba)
 {
+    struct ext4_buf **slot=&bc->recent[lba%EXT4_BCACHE_RECENT];
+    struct ext4_buf *buf=*slot;
+    if (buf && buf->lba==lba) return buf;
     struct ext4_buf key = {.lba=lba};
-    return RB_FIND(ext4_buf_lba,&bc->lba_root,&key);
+    buf=RB_FIND(ext4_buf_lba,&bc->lba_root,&key);
+    if (buf) *slot=buf;
+    return buf;
+}
+
+static void remove_index_locked(struct ext4_bcache *bc,struct ext4_buf *buf)
+{
+    struct ext4_buf **slot=&bc->recent[buf->lba%EXT4_BCACHE_RECENT];
+    if (*slot==buf) *slot=NULL;
+    RB_REMOVE(ext4_buf_lba,&bc->lba_root,buf);
 }
 static void dirty_remove_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
 {
@@ -155,7 +167,7 @@ static void drop_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
 {
     if (buf->refctr || buf->loading) __builtin_trap();
     idle_remove_locked(bc,buf);
-    RB_REMOVE(ext4_buf_lba,&bc->lba_root,buf);
+    remove_index_locked(bc,buf);
     dirty_remove_locked(bc,buf);
     if (!bc->ref_blocks) __builtin_trap();
     bc->ref_blocks--;
@@ -312,7 +324,7 @@ static void detach_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
 {
     if (ext4_bcache_test_flag(buf,BC_DETACHED)) __builtin_trap();
     if (!buf->refctr) idle_remove_locked(bc,buf);
-    RB_REMOVE(ext4_buf_lba,&bc->lba_root,buf);
+    remove_index_locked(bc,buf);
     dirty_remove_locked(bc,buf);
     ext4_bcache_clear_dirty(buf);
     ext4_bcache_set_flag(buf,BC_DETACHED);

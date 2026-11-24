@@ -260,6 +260,10 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
  */
 /* A modifying caller needs the transaction's writable leaf. Pure lookups
  * retain the accepted/read view, including any already-private transaction view. */
+int ext4_dir_find_entry_from(struct ext4_dir_search_result *result,
+			struct ext4_inode_ref *parent, const char *name,
+			uint32_t name_len, bool write, uint32_t *lookup_block);
+
 int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 			struct ext4_inode_ref *parent, const char *name,
 			uint32_t name_len, bool write);

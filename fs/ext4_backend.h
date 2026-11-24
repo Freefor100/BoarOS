@@ -61,6 +61,7 @@ struct lwext4_directory_mapping {
     } misses[2];
     uint8_t next_miss;
     uint32_t recent_misses;
+    uint32_t lookup_block;
 };
 struct lwext4_node {
     struct kernel_vfs_node node;

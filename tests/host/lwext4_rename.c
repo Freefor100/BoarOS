@@ -202,7 +202,7 @@ static void basic(struct ext4_fs *fs)
     uint32_t old = directory("/old"), new = directory("/new");
     uint32_t source = inode("/old/source"), target = inode("/new/target");
     struct ext4_rename_result out = { .replaced_inode = 123, .changed = true };
-    CHECK(rename_entry(old, "source", new, "target", 2, &out) == EINVAL);
+    CHECK(rename_entry(old, "source", new, "target", EXT4_RENAME_NOREPLACE | EXT4_RENAME_EXCHANGE, &out) == EINVAL);
     CHECK(out.replaced_inode == 123);
     CHECK(rename_entry(old, "missing", new, "target", 0, &out) == ENOENT);
     CHECK(rename_entry(old, "source", new, "target", 1, &out) == EEXIST);

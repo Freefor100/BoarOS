@@ -7594,7 +7594,7 @@ int ext4_fopen_handle(ext4_file *file, const char *mount, uint32_t inode,
 static int lookup_child(struct ext4_mountpoint *mp, uint32_t parent_inode,
                       const char *name, uint32_t name_length,
                       uint32_t *child_inode, uint32_t *child_mode,
-                      struct ext4_inode *snapshot,bool *current)
+                      struct ext4_inode *snapshot,bool *current,uint32_t *lookup_block)
 {
     struct ext4_inode_ref parent, child;
     struct ext4_dir_search_result found;
@@ -7616,7 +7616,7 @@ static int lookup_child(struct ext4_mountpoint *mp, uint32_t parent_inode,
         result = ENOTDIR;
         goto PutParent;
     }
-    result = ext4_dir_find_entry(&found, &parent, name, name_length, false);
+    result = ext4_dir_find_entry_from(&found, &parent, name, name_length, false, lookup_block);
     verified = result == EOK || result == ENOENT;
     if (result == EOK) {
         uint32_t index = ext4_dir_en_get_inode(found.dentry);
@@ -7651,14 +7651,16 @@ Unlock:
 int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,
     const char *name,uint32_t name_length,uint32_t *child_inode,uint32_t *child_mode)
 {
-    return lookup_child(ext4_get_mount(mount_point),parent_inode,name,name_length,child_inode,child_mode,NULL,NULL);
+    return lookup_child(ext4_get_mount(mount_point),parent_inode,name,name_length,child_inode,child_mode,NULL,NULL,NULL);
 }
 
 int ext4_file_lookup_child(const ext4_file *parent,const char *name,uint32_t name_length,
-    uint32_t *child_inode,uint32_t *child_mode,struct ext4_inode *snapshot,bool *current)
+    uint32_t *child_inode,uint32_t *child_mode,struct ext4_inode *snapshot,bool *current,
+    uint32_t *lookup_block)
 {
     if (!parent || !parent->mp || !parent->mp->mounted) return EINVAL;
-    return lookup_child(parent->mp,parent->inode,name,name_length,child_inode,child_mode,snapshot,current);
+    return lookup_child(parent->mp,parent->inode,name,name_length,child_inode,child_mode,
+        snapshot,current,lookup_block);
 }
 
 

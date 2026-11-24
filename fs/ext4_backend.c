@@ -1783,7 +1783,7 @@ static int mount_ext_filesystem(struct kernel_vfs_mount *mount,
      * library's eight-block default. Storage is still allocated on misses;
      * pressure can reclaim idle clean blocks independently of journal owners.
      * This bounds retained payload; buffer/slab overhead is accounted separately. */
-    uint64_t cache_bytes = physical_page_total(heap->page_allocator) * BOAROS_PAGE_SIZE / 256;
+    uint64_t cache_bytes = physical_page_total(heap->page_allocator) * BOAROS_PAGE_SIZE / 64;
     if (cache_bytes < 128 * 1024) cache_bytes = 128 * 1024;
     if (cache_bytes > 8 * 1024 * 1024) cache_bytes = 8 * 1024 * 1024;
     adapter->device.bc->cnt = (uint32_t)(cache_bytes / adapter->device.bc->itemsize);
@@ -2810,6 +2810,40 @@ static int ext4_backend_stat(const struct kernel_vfs_file *file,
     return 0;
 }
 
+static int ext4_backend_stat_inode(struct kernel_vfs_mount *mount,
+    struct kernel_vfs_node *parent,uint64_t number,struct kernel_vfs_node *node,
+    struct kernel_vfs_stat *stat)
+{
+    struct kernel_vfs_instance *instance=parent->instance;
+    struct lwext4_mount_adapter *adapter=lwext4_instance(instance);
+    struct ext4_inode inode;
+    int result=0;
+    struct kernel_vfs_node *late=NULL;
+    if (!node) {
+        ext4_file file={.mp=lwext4_node_file(parent)->mp,.inode=(uint32_t)number};
+        result=ext4_fraw_inode_fill(&file,&inode);
+        /* A different spelling may have opened this inode while the read
+         * waited. The live node owns delayed allocation and current EOF. */
+        late=kernel_vfs_node_pin(instance,number);
+        node=late;
+    }
+    if (node) {
+        struct kernel_vfs_file file={.mount=mount,.private_data=node,.state=VFS_FILE_STATE_LIVE};
+        result=(node->mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG ?
+            ext4_backend_stat(&file,stat) : -KERNEL_ENOTSUP;
+        if (late && kernel_vfs_node_release(&late)) __builtin_trap();
+        return result;
+    }
+    if (result) {
+        if (result==EIO || result==EUCLEAN) report_ext4_error(adapter,result,0,0);
+        return lwext4_error(result);
+    }
+    if (ext4_inode_type(adapter->superblock,&inode)!=EXT4_INODE_MODE_FILE)
+        return -KERNEL_ENOTSUP;
+    fill_stat(mount,adapter->superblock,(uint32_t)number,&inode,stat);
+    return 0;
+}
+
 static int ext4_backend_mkdir(struct kernel_vfs_mount *mount,
                          uint64_t parent_inode, const char *path,
                          uint32_t mode,uint32_t umask)
@@ -3269,6 +3303,7 @@ static void ext4_directory_mapping_reset(struct lwext4_directory_mapping *mappin
     mapping->misses[1].length=0;
     mapping->next_miss=0;
     __atomic_store_n(&mapping->recent_misses,0,__ATOMIC_RELAXED);
+    __atomic_store_n(&mapping->lookup_block,0,__ATOMIC_RELAXED);
 }
 
 static int ext4_backend_lookup(struct kernel_vfs_node *parent,
@@ -3281,10 +3316,11 @@ static int ext4_backend_lookup(struct kernel_vfs_node *parent,
     struct lwext4_node *live=(struct lwext4_node *)parent;
     uint32_t result_inode;
     if (ext4_current_operation(adapter->device.fs)) {
-        error=lwext4_error(ext4_file_lookup_child(directory,name,length,&result_inode,mode,NULL,NULL));
+        error=lwext4_error(ext4_file_lookup_child(directory,name,length,&result_inode,mode,NULL,NULL,NULL));
     } else {
         struct ext4_inode snapshot;
         uint64_t epoch;
+        uint32_t lookup_block=0;
         bool ready;
         struct lwext4_directory_mapping *mapping;
         bool cacheable=!mode && length && length<=sizeof(mapping->misses[0].name);
@@ -3301,10 +3337,15 @@ static int ext4_backend_lookup(struct kernel_vfs_node *parent,
                             return -KERNEL_ENOENT;
                     }
                 snapshot=mapping->inode;
+                lookup_block=__atomic_load_n(&mapping->lookup_block,__ATOMIC_RELAXED);
             }
         }
         bool reused=ready;
-        error=lwext4_error(ext4_file_lookup_child(directory,name,length,&result_inode,mode,&snapshot,&ready));
+        error=lwext4_error(ext4_file_lookup_child(directory,name,length,&result_inode,mode,
+            &snapshot,&ready,&lookup_block));
+        /* A concurrent update only changes the search order. */
+        if (!error && reused)
+            __atomic_store_n(&mapping->lookup_block,lookup_block,__ATOMIC_RELAXED);
         /* The namespace reader covers directory mapping changes. The epoch
          * also rejects snapshots superseded by another metadata publication. */
         bool missing=cacheable && ready && error==-KERNEL_ENOENT;
@@ -3336,6 +3377,8 @@ static int ext4_backend_lookup(struct kernel_vfs_node *parent,
                     if (mapping) {
                         if (mapping->epoch!=epoch)
                             ext4_directory_mapping_reset(mapping,epoch,&snapshot);
+                        if (!error)
+                            __atomic_store_n(&mapping->lookup_block,lookup_block,__ATOMIC_RELAXED);
                         if (missing) {
                             unsigned slot=mapping->next_miss;
                             unsigned other=slot^1U;
@@ -3656,6 +3699,7 @@ static void initialize_backend(void)
     ops->accessed_after_relatime = ext4_backend_accessed_after_relatime;
     ops->modified = ext4_backend_modified;
     ops->stat = ext4_backend_stat;
+    ops->stat_inode = ext4_backend_stat_inode;
     ops->mkdir = ext4_backend_mkdir;
     ops->unlink = ext4_backend_unlink;
     ops->rmdir = ext4_backend_rmdir;

@@ -904,7 +904,8 @@ int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,
  * verified inode snapshot. When false on entry, current can return true after
  * reading and verifying that snapshot. Pass both optional arguments together. */
 int ext4_file_lookup_child(const ext4_file *parent,const char *name,uint32_t name_length,
-    uint32_t *child_inode,uint32_t *child_mode,struct ext4_inode *snapshot,bool *current);
+    uint32_t *child_inode,uint32_t *child_mode,struct ext4_inode *snapshot,bool *current,
+    uint32_t *lookup_block);
 int ext4_readlink_inode(const char *mount_point, uint32_t inode_number,
                         char *buffer, size_t capacity, size_t *bytes_read);
 int ext4_fdir_unlink_dentry(const char *path, uint32_t *out_inode);

@@ -64,15 +64,15 @@ int __wrap_ext4_fs_get_inode_ref_read(struct ext4_fs *fs,uint32_t inode,struct e
     return __real_ext4_fs_get_inode_ref_read(fs,inode,ref);
 }
 int __real_ext4_file_lookup_child(const ext4_file *,const char *,uint32_t,
-    uint32_t *,uint32_t *,struct ext4_inode *,bool *);
+    uint32_t *,uint32_t *,struct ext4_inode *,bool *,uint32_t *);
 int __wrap_ext4_file_lookup_child(const ext4_file *parent,const char *name,uint32_t length,
-    uint32_t *inode,uint32_t *mode,struct ext4_inode *snapshot,bool *current)
+    uint32_t *inode,uint32_t *mode,struct ext4_inode *snapshot,bool *current,uint32_t *lookup_block)
 {
     if (directory_inode_watch && parent->inode==directory_inode_watch) {
         directory_name_lookups++;
         if (directory_name_error) return EIO;
     }
-    return __real_ext4_file_lookup_child(parent,name,length,inode,mode,snapshot,current);
+    return __real_ext4_file_lookup_child(parent,name,length,inode,mode,snapshot,current,lookup_block);
 }
 int __real_ext4_fopen_inode(ext4_file *,const char *,uint32_t,struct ext4_inode *);
 int __wrap_ext4_fopen_inode(ext4_file *file,const char *mount,uint32_t inode,struct ext4_inode *initial)
@@ -214,6 +214,18 @@ static void lookup_attributes_case(struct kernel_vfs_path *root)
     stat_lookup_watch=0;
     assert(stat.ino==inode && (stat.mode&0777)==0640 && !stat.size);
     assert(!stat_lookup_reads && !stat_lookup_opens);
+    struct kernel_vfs_instance *instance=root->file.mount->private_data;
+    (void)kernel_vfs_reclaim_clean(instance->heap->page_allocator,1);
+    assert(!instance->dentry_cache_count);
+    stat_lookup_watch=1;stat_lookup_reads=stat_lookup_opens=stat_lookup_allocations=0;
+    struct kernel_vfs_statx_extra extra={.request=KERNEL_VFS_STATX_MNT_ID};
+    assert(!kernel_vfs_statx_at(root,root,"stat-only",1,&stat,&extra));
+    stat_lookup_watch=0;
+    assert(stat.ino==inode && (stat.mode&0777)==0640 && !stat.size);
+    assert(extra.mount_id==root->file.mount->id &&
+        (stat.attributes_mask&KERNEL_VFS_STATX_ATTR_MOUNT_ROOT) &&
+        !(stat.attributes&KERNEL_VFS_STATX_ATTR_MOUNT_ROOT));
+    assert(!stat_lookup_opens && !stat_lookup_allocations && !instance->dentry_cache_count);
     assert(kernel_vfs_stat_at(root,root,"stat-only/",1,&stat)==-KERNEL_ENOTDIR);
     assert(!kernel_vfs_symlink_at(root,root,"stat-only","stat-link"));
     assert(!kernel_vfs_stat_at(root,root,"stat-link",0,&stat) && (stat.mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFLNK);
@@ -235,7 +247,6 @@ static void lookup_attributes_case(struct kernel_vfs_path *root)
     assert(stat.ino==live.ino && stat.size==8 && stat.blocks==live.blocks &&
         stat.mtime.seconds==live.mtime.seconds && stat.mtime.nanoseconds==live.mtime.nanoseconds);
     assert(!kernel_vfs_path_release(&source) && !kernel_vfs_close(&file));
-    struct kernel_vfs_instance *instance=root->file.mount->private_data;
     struct kernel_vfs_mount *mounted=NULL;
     struct kernel_vfs_path *covered=NULL,*visible=NULL;
     assert(!kernel_vfs_mkdir_at(root,root,"stat-covered",0700,0));

@@ -492,9 +492,9 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 	return r;
 }
 
-int ext4_dir_find_entry(struct ext4_dir_search_result *result,
+int ext4_dir_find_entry_from(struct ext4_dir_search_result *result,
 			struct ext4_inode_ref *parent, const char *name,
-			uint32_t name_len, bool write)
+			uint32_t name_len, bool write, uint32_t *lookup_block)
 {
 	int r;
 	struct ext4_sblock *sb = &parent->fs->sb;
@@ -513,16 +513,15 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 	}
 #endif
 
-	/* Linear algorithm */
-
-	uint32_t iblock;
 	ext4_fsblk_t fblock;
 	uint32_t block_size = ext4_sb_get_block_size(sb);
 	uint64_t inode_size = ext4_inode_get_size(sb, parent->inode);
 	uint32_t total_blocks = (uint32_t)(inode_size / block_size);
 
-	/* Walk through all data blocks */
-	for (iblock = 0; iblock < total_blocks; ++iblock) {
+	/* Start near the previous hit and wrap once over the directory. */
+	uint32_t iblock = lookup_block && *lookup_block < total_blocks ? *lookup_block : 0;
+	for (uint32_t left = total_blocks; left; --left,
+	     iblock = iblock + 1 == total_blocks ? 0 : iblock + 1) {
 		/* Load block address */
 		r = ext4_fs_get_inode_dblk_idx(parent, iblock, &fblock, false);
 		if (r != EOK)
@@ -550,6 +549,8 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 		r = ext4_dir_find_in_block(&b, sb, name_len, name, result);
 		if (r == EOK) {
 			result->block = b;
+			if (lookup_block)
+				*lookup_block = iblock;
 			return EOK;
 		}
 
@@ -560,6 +561,13 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 	}
 
 	return ENOENT;
+}
+
+int ext4_dir_find_entry(struct ext4_dir_search_result *result,
+			struct ext4_inode_ref *parent, const char *name,
+			uint32_t name_len, bool write)
+{
+	return ext4_dir_find_entry_from(result, parent, name, name_len, write, NULL);
 }
 
 int ext4_dir_remove_entry(struct ext4_inode_ref *parent, const char *name,
