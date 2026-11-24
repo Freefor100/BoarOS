@@ -11,6 +11,13 @@
 #include <stdlib.h>
 void kernel_open_file_async_close(struct kernel_open_file_description *file)
 { assert(file && !file->async_io); }
+void kernel_vfs_lease_release(struct kernel_vfs_file *file)
+{ assert(file && !file->lease_owner); }
+void kernel_vfs_notify_close(const struct kernel_vfs_file *file, uint32_t mask,
+    struct kernel_vfs_path **backing)
+{ (void)file; (void)mask; (void)backing; abort(); }
+void kernel_mm_pagemap_put(struct kernel_mm_pagemap *pagemap)
+{ (void)pagemap; abort(); }
 
 _Thread_local uintptr_t sync_test_irq;
 static struct kernel_cpu cpu={.initialized=KERNEL_CPU_INITIALIZED,.logical_id=1};

@@ -54,6 +54,8 @@ enum kernel_pid_role { KERNEL_PID_TID, KERNEL_PID_TGID,
 struct kernel_pid;
 /* Global task identity owners. Number zero selects the current TGID. */
 int kernel_task_identity_get(int32_t number,struct kernel_pid **owner);
+/* Returns a retained identity for the executing thread or its thread group. */
+struct kernel_pid *kernel_task_identity_get_current(enum kernel_pid_role);
 /* Exclusive owner slot and stable task TGID role (current or stopped cleanup
  * owner), outside raw locks. NULL task clears; identical identity does not
  * enter the PID domain. */

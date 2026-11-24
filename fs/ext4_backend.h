@@ -45,6 +45,7 @@ struct lwext4_mount_adapter {
     uint8_t unmount_sync_pending;
     uint8_t recovery_pending;
     uint8_t unmount_prepared;
+    bool forced_read_only; /* Instance reconfiguration protects forced remount state. */
     int mount_error;
     struct kernel_raw_lock journal_control;
     struct kernel_rwlock journal_service; /* Pause live workers only after draining durable work. */

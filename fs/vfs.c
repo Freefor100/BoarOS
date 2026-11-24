@@ -6532,10 +6532,16 @@ observe:
 int kernel_vfs_mount_reconfigure(struct kernel_vfs_path *root,uint64_t flags,uint64_t mask,const char *options)
 {
     if (!kernel_vfs_path_is_mount_root(root)) return -KERNEL_EINVAL;
-    if (options && *options) return -KERNEL_ENOTSUP;
     struct kernel_vfs_mount *mount=root->file.mount;
-    KERNEL_SERVICE_SCOPE(service);
     struct kernel_vfs_instance *instance=mount->private_data;
+    bool abort = options && *options;
+    if (abort) {
+        if (!instance->ops->abort_mount || strcmp(options,"abort") ||
+            (flags & 4096U)) return -KERNEL_ENOTSUP;
+        flags |= 1U;
+        mask |= 1U;
+    }
+    KERNEL_SERVICE_SCOPE(service);
     KERNEL_LOCK_SCOPE(configuration);
     kernel_rwlock_write(&instance->reconfiguration,&configuration);
     if (instance->quiescing) return -KERNEL_EIO;
@@ -6578,6 +6584,7 @@ int kernel_vfs_mount_reconfigure(struct kernel_vfs_path *root,uint64_t flags,uin
             mount->silent=!!(flags&32768U);
         }
     }
+    if (abort) instance->ops->abort_mount(instance);
     return 0;
 }
 

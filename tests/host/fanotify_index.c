@@ -13,11 +13,13 @@ static struct kernel_heap heap;
 static struct kernel_uid_account account;
 static struct kernel_pid sender_a, sender_b;
 static unsigned allocations, wakes;
+static bool fail_heap_allocation;
 static unsigned path_references, reserved, installed, discarded;
-static int fd_error;
+static unsigned pidfd_reserved, pidfd_installed, pidfd_discarded;
+static int fd_error, pidfd_error;
 static uint64_t fault_address;
 static struct kernel_vfs_dentry watched;
-static struct kernel_open_file_description legacy_file, watch_file;
+static struct kernel_open_file_description legacy_file, watch_file, pidfd_file;
 
 void *sync_test_cpu(void) { return &cpu; }
 void *sync_test_current_task(void) { return NULL; }
@@ -34,6 +36,10 @@ void kernel_heap_release(struct kernel_heap *h, void *p)
 enum kernel_heap_status kernel_heap_allocate_nosleep(struct kernel_heap *h, size_t size, void **out)
 {
     assert(h == &heap && !cpu.raw_locks);
+    if (fail_heap_allocation) {
+        *out = NULL;
+        return KERNEL_HEAP_STATUS_EMPTY;
+    }
     *out = calloc(1, size);
     assert(*out);
     allocations++;
@@ -57,6 +63,13 @@ int kernel_task_identity_get(int32_t number, struct kernel_pid **out)
     *out = &sender_a;
     kernel_task_identity_retain(*out);
     return 0;
+}
+struct kernel_pid *kernel_task_identity_get_current(enum kernel_pid_role role)
+{
+    assert(role == KERNEL_PID_TID || role == KERNEL_PID_TGID);
+    struct kernel_pid *id = role == KERNEL_PID_TID ? &sender_b : &sender_a;
+    kernel_task_identity_retain(id);
+    return id;
 }
 kernel_pid_t kernel_task_identity_user_number(const struct kernel_pid *id)
 { return id == &sender_a ? 17 : 18; }
@@ -126,6 +139,32 @@ void kernel_files_cancel_reservation(struct kernel_files_fd_reservation *reserva
     assert(!cpu.raw_locks && reservation->fd == 9 && reserved == 1);
     reserved--;
     reservation->files = NULL;
+}
+int kernel_pidfd_prepare_event(struct kernel_files *files, struct kernel_pid *id,
+                              struct kernel_pidfd_prepared *prepared)
+{
+    assert(!cpu.raw_locks && !prepared->files && !pidfd_reserved && id == &sender_a);
+    if (pidfd_error == -KERNEL_ESRCH) return pidfd_error;
+    pidfd_reserved++;
+    *prepared = (struct kernel_pidfd_prepared){.files = files, .fd = 10};
+    if (!pidfd_error) prepared->file = &pidfd_file;
+    return pidfd_error;
+}
+void kernel_pidfd_cancel_prepared(struct kernel_pidfd_prepared *prepared)
+{
+    if (!prepared->files) return;
+    assert(!cpu.raw_locks && pidfd_reserved == 1 && prepared->fd == 10);
+    pidfd_discarded += !!prepared->file;
+    pidfd_reserved--;
+    *prepared = (struct kernel_pidfd_prepared){0};
+}
+void kernel_pidfd_install_prepared_locked(struct kernel_pidfd_prepared *prepared)
+{
+    assert(kernel_raw_lock_owned(&prepared->files->record->metadata_lock) &&
+           prepared->fd == 10 && prepared->file == &pidfd_file && pidfd_reserved == 1);
+    pidfd_installed++;
+    pidfd_reserved--;
+    *prepared = (struct kernel_pidfd_prepared){0};
 }
 int kernel_files_open_fanotify_event(struct kernel_files *files, struct kernel_vfs_path *path,
     unsigned flags, struct kernel_open_file_description **file)
@@ -347,6 +386,36 @@ static void overflow_and_sender_identity(void)
     assert(!allocations && !sender_a.references && !sender_b.references && !account.fanotify_groups);
 }
 
+static void parent_ignore_and_unlimited_queue(void)
+{
+    struct kernel_vfs_instance instance = {0};
+    struct kernel_vfs_mount mount = {.private_data = &instance};
+    struct kernel_vfs_node directory = {.instance = &instance, .inode = 9, .references = 1};
+    struct kernel_vfs_node child = {.instance = &instance, .inode = 10};
+    struct kernel_vfs_file file = {.private_data = &child, .mount = &mount, .mode = KERNEL_VFS_S_IFREG};
+    struct fan_group *group = group_create();
+    struct fan_key parent = inode_key(&directory);
+    parent.serial = group->serial;
+    assert(!update_mark(group, parent, FAN_MARK_ADD | FAN_MARK_IGNORED_MASK, VFS_NOTIFY_CLOSE_NOWRITE, 42));
+    notify(&file, NULL, &directory, NULL, VFS_NOTIFY_MODIFY);
+    assert(first_mark(parent)->ignored == VFS_NOTIFY_CLOSE_NOWRITE);
+    assert(!update_mark(group, parent, FAN_MARK_ADD | FAN_MARK_IGNORE | FAN_MARK_IGNORED_SURV_MODIFY,
+        FAN_EVENT_ON_CHILD | VFS_NOTIFY_CLOSE_NOWRITE, 42));
+    assert(instance.fanotify_parent_interest & VFS_NOTIFY_CLOSE_NOWRITE);
+    release_group(group);
+
+    group = group_create();
+    group->init_flags = FAN_UNLIMITED_QUEUE;
+    struct fan_event event = {.handle_type = 1, .fsid = 42, .mask = VFS_NOTIFY_OPEN};
+    for (unsigned i = 1; i <= FAN_MAX_EVENTS + 1; i++) {
+        event.handle.inode = i;
+        queue_notification(group, &event);
+    }
+    assert(group->queued == FAN_MAX_EVENTS + 1 && !group->overflow_queued);
+    release_group(group);
+    assert(!allocations && !account.fanotify_groups && !account.fanotify_marks);
+}
+
 static void read_legacy(void)
 {
     struct fan_group *group = group_create();
@@ -394,6 +463,118 @@ static void read_legacy(void)
     assert(!reserved && !path_references && !allocations && !sender_a.references);
 }
 
+static void filesystem_error_records(void)
+{
+    struct kernel_vfs_instance instance = {0};
+    struct fan_group *group = group_create();
+    struct fan_key key = {.instance = &instance, .type = FAN_MARK_FILESYSTEM,
+                          .serial = group->serial};
+    struct kernel_vfs_handle handle = {.inode = 191, .generation = 13};
+    assert(!update_mark(group, key, FAN_MARK_ADD, FAN_FS_ERROR, 42));
+    fail_heap_allocation = true;
+    notify_filesystem_error(&instance, KERNEL_EUCLEAN, &handle, KERNEL_VFS_HANDLE_EXT4);
+    notify_filesystem_error(&instance, KERNEL_ESHUTDOWN, NULL, 0);
+    fail_heap_allocation = false;
+    assert(group->queued == 1 && group->first->mask == FAN_FS_ERROR);
+    struct fan_fid_info *fid = (void *)(group->first + 1);
+    struct fan_error_info *error = (void *)((char *)fid + fid->len);
+    assert(fid->type == FAN_INFO_FID && fid->fsid[0] == 42 &&
+           fid->handle_type == KERNEL_VFS_HANDLE_EXT4 && fid->handle_bytes == sizeof(handle));
+    assert(!memcmp(fid->handle, &handle, sizeof(handle)));
+    assert(error->type == FAN_INFO_ERROR && error->len == sizeof(*error) &&
+           error->error == KERNEL_EUCLEAN && error->count == 2);
+    unsigned char record[128];
+    struct kernel_uaccess_iovec iov = {(uint64_t)(uintptr_t)record, sizeof(record)};
+    struct kernel_uaccess_iov_cursor cursor = {&iov, 1, 0, 0};
+    struct kernel_fanotify_read read = {.group = group};
+    const size_t bytes = sizeof(struct fan_metadata) + fid->len + sizeof(*error);
+    assert(read_records(&read, NULL, &cursor, sizeof(record), LINUX_O_NONBLOCK) == (int)bytes);
+    struct fan_metadata metadata;
+    memcpy(&metadata, record, sizeof(metadata));
+    assert(metadata.fd == FAN_NOFD && metadata.mask == FAN_FS_ERROR &&
+           metadata.event_len == bytes && group->error_reserve_free == UINT32_MAX);
+    release_group(group);
+    assert(!allocations && !sender_a.references && !account.fanotify_groups);
+
+    group = group_create();
+    key.serial = group->serial;
+    assert(!update_mark(group, key, FAN_MARK_ADD, FAN_FS_ERROR, 42));
+    notify_filesystem_error(&instance, KERNEL_ESHUTDOWN, NULL, 0);
+    fid = (void *)(group->first + 1);
+    error = (void *)((char *)fid + fid->len);
+    assert(fid->handle_type == 255 && !fid->handle_bytes &&
+           fid->len == offsetof(struct fan_fid_info, handle));
+    assert(error->error == KERNEL_ESHUTDOWN && error->count == 1);
+    release_group(group);
+    assert(!allocations && !sender_a.references && !account.fanotify_groups);
+}
+
+static void report_sender_identity(void)
+{
+    struct fan_group *group = group_create();
+    struct fan_senders senders = {0};
+    assert(fan_sender(&senders, group) == &sender_a);
+    group->init_flags = FAN_REPORT_TID;
+    assert(fan_sender(&senders, group) == &sender_b);
+    assert(fan_sender(&senders, group) == &sender_b);
+    assert(sender_a.references == 1 && sender_b.references == 1);
+    fan_senders_release(&senders);
+    assert(!sender_a.references && !sender_b.references);
+    release_group(group);
+}
+
+static void read_pidfd(void)
+{
+    struct fan_group *group = group_create();
+    group->init_flags = FAN_REPORT_PIDFD | FAN_REPORT_FID;
+    struct fan_event event = {
+        .sender = &sender_a, .handle_type = 1, .fsid = 42, .mask = VFS_NOTIFY_OPEN,
+    };
+    struct kernel_files_record file_table = {0};
+    kernel_raw_lock_init(&file_table.metadata_lock, KERNEL_RAW_RANK_TASK_FILES);
+    struct kernel_files files = {.record = &file_table, .heap = &heap};
+    struct kernel_fanotify_read read = {.group = group, .files = &files};
+    struct {
+        struct fan_metadata metadata;
+        struct fan_fid_info fid;
+        struct fan_pidfd_info pidfd;
+    } output;
+    const size_t size = sizeof(output.metadata) + sizeof(output.fid) + sizeof(output.pidfd);
+    struct kernel_uaccess_iovec iov = {(uint64_t)(uintptr_t)&output, size};
+    struct kernel_uaccess_iov_cursor cursor = {&iov, 1, 0, 0};
+    queue_notification(group, &event);
+    assert(read_records(&read, NULL, &cursor, size - 1, LINUX_O_NONBLOCK) ==
+           -KERNEL_EINVAL && group->queued == 1 && !pidfd_reserved);
+
+    fault_address = (uint64_t)(uintptr_t)&output.pidfd;
+    assert(read_records(&read, NULL, &cursor, size, LINUX_O_NONBLOCK) == -KERNEL_EFAULT);
+    assert(!group->queued && !pidfd_reserved && !pidfd_installed && pidfd_discarded == 1);
+
+    fault_address = 0;
+    pidfd_error = -KERNEL_ESRCH;
+    queue_notification(group, &event);
+    cursor = (struct kernel_uaccess_iov_cursor){&iov, 1, 0, 0};
+    assert(read_records(&read, NULL, &cursor, size, LINUX_O_NONBLOCK) == (int64_t)size);
+    assert(output.metadata.pid == 17 && output.pidfd.pidfd == FAN_NOPIDFD && !pidfd_installed);
+
+    pidfd_error = -KERNEL_EMFILE;
+    queue_notification(group, &event);
+    cursor = (struct kernel_uaccess_iov_cursor){&iov, 1, 0, 0};
+    assert(read_records(&read, NULL, &cursor, size, LINUX_O_NONBLOCK) == (int64_t)size);
+    assert(output.pidfd.pidfd == FAN_EPIDFD && !pidfd_reserved && !pidfd_installed);
+
+    pidfd_error = 0;
+    queue_notification(group, &event);
+    cursor = (struct kernel_uaccess_iov_cursor){&iov, 1, 0, 0};
+    assert(read_records(&read, NULL, &cursor, size, LINUX_O_NONBLOCK) == (int64_t)size);
+    assert(output.metadata.event_len == size && output.metadata.fd == FAN_NOFD &&
+           output.fid.type == FAN_INFO_FID && output.pidfd.type == FAN_INFO_PIDFD &&
+           output.pidfd.len == sizeof(output.pidfd) && output.pidfd.pidfd == 10);
+    assert(!pidfd_reserved && pidfd_installed == 1);
+    release_group(group);
+    assert(!allocations && !sender_a.references);
+}
+
 int main(void)
 {
     kernel_wait_domain_init();
@@ -401,7 +582,11 @@ int main(void)
     mark_conversion();
     rename_records();
     overflow_and_sender_identity();
+    parent_ignore_and_unlimited_queue();
     read_legacy();
+    report_sender_identity();
+    read_pidfd();
+    filesystem_error_records();
     puts("PASS fanotify: mark scope, merge, overflow, copy faults and descriptor ownership");
     return 0;
 }

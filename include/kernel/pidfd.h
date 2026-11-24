@@ -17,10 +17,12 @@ struct kernel_pidfd_prepared {
 };
 int kernel_pidfd_prepare_clone(struct kernel_task *, struct kernel_pid *, int,
     struct kernel_pidfd_prepared *);
-void kernel_pidfd_cancel_clone(struct kernel_pidfd_prepared *);
-void kernel_pidfd_install_clone(struct kernel_pidfd_prepared *);
+/* The caller retains the event's identity until delivery or cancellation. */
+int kernel_pidfd_prepare_event(struct kernel_files *, struct kernel_pid *,
+    struct kernel_pidfd_prepared *);
+void kernel_pidfd_cancel_prepared(struct kernel_pidfd_prepared *);
 struct kernel_raw_lock *kernel_pidfd_clone_files_lock(struct kernel_pidfd_prepared *);
-void kernel_pidfd_install_clone_locked(struct kernel_pidfd_prepared *);
+void kernel_pidfd_install_prepared_locked(struct kernel_pidfd_prepared *);
 int64_t kernel_pidfd_open(struct kernel_task *, int32_t, uint32_t);
 int64_t kernel_pidfd_getfd(struct kernel_task *, int32_t, int32_t, uint32_t);
 int kernel_pidfd_signal_target(struct kernel_task *,int32_t,uint32_t,struct kernel_pid **,unsigned *);

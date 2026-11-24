@@ -176,6 +176,7 @@ int kernel_vfs_path_resolve(struct kernel_vfs_path *start,
 #define KERNEL_VFS_HANDLE_EXT4 0x4241
 #define KERNEL_VFS_HANDLE_TMPFS 0x4242
 #define KERNEL_VFS_HANDLE_OVERLAY 0x4243
+#define KERNEL_VFS_HANDLE_FAT32 0x4244
 struct kernel_vfs_handle {
     uint64_t inode;
     uint32_t generation, reserved;
