@@ -33,6 +33,8 @@
 #include <kernel/network.h>
 #include <kernel/socket.h>
 #include <kernel/ns16550.h>
+#include <kernel/nvme.h>
+#include <kernel/igb.h>
 
 #define ROOT_DEVICES 8
 static struct {
@@ -44,6 +46,7 @@ static struct {
     struct virtio_pci_rng rng;
     struct virtio_pci_net net;
     struct kernel_network *network;
+    struct kernel_igb_rx *igb;
     struct ns16550_port *uart;
     struct ns16550_statistics uart_statistics;
     unsigned count,detected;
@@ -83,6 +86,14 @@ static int start_network(struct physical_page_allocator *allocator,struct pci_ho
         if(error)return error;
         la_virt_puts("LA PCI net bdf=");la_virt_hex(bdf);
         la_virt_puts(" irq=");la_virt_hex(root.net.pci.irq);la_virt_puts("\n");break;
+    }
+    if (!root.net.device.configured) {
+        int error = kernel_igb_open_optional(&root.igb, host, &root.heap, allocator,
+            la_timer_frequency());
+        if (error) return error;
+        if (root.igb)
+            return kernel_network_igb_start(&root.network, &root.heap, root.igb,
+                la_timer_frequency());
     }
     return kernel_network_start(&root.network,&root.heap,
         root.net.device.configured ? &root.net.device : 0,la_timer_frequency());
@@ -126,6 +137,12 @@ static int release_root(void)
     int had_network=root.network!=0;
     int network_error=kernel_network_stop(&root.network);
     if(network_error)return network_error;
+    if (root.igb) {
+        network_error = kernel_igb_rx_stop(root.igb);
+        if (!network_error) network_error = kernel_igb_rx_destroy(root.igb);
+        if (network_error) return network_error;
+        root.igb = NULL;
+    }
     if(root.net.device.transport.context || root.net.pci.function.host) {
         network_error=virtio_pci_net_stop(&root.net);
         if(network_error)return network_error;
@@ -172,6 +189,8 @@ static int release_root(void)
         if(virtio_pci_block_destroy(device)!=VIRTIO_BLOCK_DRIVER_STATUS_OK) return -KERNEL_EIO;
         root.count--;
     }
+    error = kernel_nvme_bus_stop();
+    if (error) return error;
     if (kernel_hstate_shutdown(root.heap.page_allocator)) return -KERNEL_EBUSY;
     physical_page_drain_faults(root.heap.page_allocator);
     struct kernel_heap_statistics stats; kernel_heap_get_statistics(&root.heap,&stats);
@@ -328,6 +347,7 @@ static int start_root(void)
     if(!error) error=la_virt_uart_start(&root.uart,&root.heap,la_timer_frequency());
     if(!error) error=start_rng(allocator,host);
     if(!error) error=start_network(allocator,host);
+    if (!error) error = kernel_nvme_bus_start(host, &root.heap, allocator, la_timer_frequency());
 #if BOAROS_USER_SMP
     if(!error) error=kernel_socket_start_tcp_owners();
 #endif

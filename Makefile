@@ -226,6 +226,8 @@ DEMAND_PAGE_OOM_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-demand-page-oom-rv
 ROOT_BOOT_CLEANUP_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-root-boot-cleanup-rv
+IGB_RX_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-igb-rx-rv
+IGB_RX_TEST_INIT_RV := $(BUILD_DIR)/tests/user/igb-rx-init-rv
 
 # A build cache may be named by an absolute or repository-relative path.
 # Both target spellings must receive the same generated header dependencies.
@@ -326,6 +328,7 @@ LWIP_SOURCES := \
 CPU_C_SOURCES := kernel/cpu.c kernel/raw_lock.c
 COMMON_C_SOURCES := \
 	$(CPU_C_SOURCES) \
+	kernel/pci.c \
 	kernel/seccomp.c kernel/sched/seccomp.c kernel/bpf/vm.c kernel/bpf/verify.c kernel/bpf/classic.c \
 	kernel/bpf/maps.c kernel/bpf/ringbuf.c kernel/bpf/objects.c \
 	kernel/bpf/syscall.c kernel/bpf/program.c kernel/bpf/runtime.c \
@@ -341,6 +344,8 @@ COMMON_C_SOURCES := \
 	drivers/virtio/mmio.c \
 	drivers/virtio/rng.c \
 	drivers/virtio/net.c \
+	drivers/nvme/pci.c \
+	drivers/net/igb.c \
 	fs/lwext4_port.c \
 	fs/files/table.c \
 	fs/files/locks.c \
@@ -436,6 +441,10 @@ COMMON_C_SOURCES := \
 	kernel/syscall/time.c \
 	kernel/syscall/membarrier.c \
 	kernel/syscall/aio.c \
+	kernel/syscall/io_uring.c \
+	kernel/syscall/io_uring_files.c \
+	kernel/syscall/io_uring_zcrx.c \
+	mm/secretmem.c \
 	kernel/syscall/keys.c \
 	kernel/syscall/uts.c \
 	kernel/syscall/event.c \
@@ -482,6 +491,7 @@ RV_C_SOURCES := \
 	arch/riscv/mm.c \
 	arch/riscv/uaccess.c \
 	arch/riscv/root_boot.c \
+	platform/riscv_pci.c \
 	arch/riscv/sbi.c \
 	arch/riscv/hwprobe.c \
 	arch/riscv/sv39.c \
@@ -664,6 +674,8 @@ DEMAND_PAGE_OOM_TEST_OBJECT_RV := \
 	$(BUILD_DIR)/tests/riscv/demand_page_oom.o
 ROOT_BOOT_CLEANUP_TEST_OBJECT_RV := \
 	$(BUILD_DIR)/tests/riscv/root_boot_cleanup_boot.o
+IGB_RX_TEST_OBJECTS_RV := \
+	$(BUILD_DIR)/tests/riscv/igb_rx_fixture.o
 DEPS := \
 	$(OBJECTS:.o=.d) \
 	$(PAGE_TEST_OBJECTS:.o=.d) \
@@ -685,7 +697,8 @@ DEPS := \
 	$(ROOT_EXEC_STAGE3_OBJECT_RV:.o=.d) \
 	$(ROOT_EXEC_STAGE3_OOM_OBJECT_RV:.o=.d) \
 	$(DEMAND_PAGE_OOM_TEST_OBJECT_RV:.o=.d) \
-	$(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV:.o=.d)
+	$(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV:.o=.d) \
+	$(IGB_RX_TEST_OBJECTS_RV:.o=.d)
 
 .PHONY: all clean \
 	test-root-init-riscv test-demand-page-riscv test-exec-riscv \
@@ -1031,6 +1044,15 @@ $(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV): $(OBJECTS) \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-root-boot-cleanup-rv.map \
 		-o $@ $(OBJECTS) $(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV)
 
+$(IGB_RX_TEST_KERNEL_RV): $(OBJECTS) $(IGB_RX_TEST_OBJECTS_RV) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_nvme_bus_start \
+		-o $@ $(OBJECTS) $(IGB_RX_TEST_OBJECTS_RV)
+
+$(IGB_RX_TEST_INIT_RV): tests/riscv/igb_rx_init.S tests/riscv/user_elf.ld
+	@mkdir -p $(dir $@)
+	$(CC) $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
+		-T tests/riscv/user_elf.ld -Wl,--build-id=none -o $@ $<
+
 $(BUILD_DIR)/%.o: %.c $(BUILD_DIR)/generated/cost-config.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP $(DEP_TARGET_FLAGS) -c $< -o $@
@@ -1314,6 +1336,10 @@ test-demand-page-riscv: test-root-init-riscv \
 		./tests/riscv/root-init.sh
 
 test-exec-riscv: test-root-init-riscv
+
+.PHONY: test-igb-rx-riscv
+test-igb-rx-riscv: $(IGB_RX_TEST_KERNEL_RV) $(IGB_RX_TEST_INIT_RV)
+	python3 tests/userland/igb-rx.py --qemu $(QEMU_RISCV64) --kernel $< --program $(IGB_RX_TEST_INIT_RV)
 
 test-root-boot-cleanup-riscv: $(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV) \
 		$(ROOT_INIT_PROGRAM_RV) $(ROOT_EXEC_STAGE2_RV) \

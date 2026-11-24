@@ -1,3 +1,4 @@
+#include <kernel/io_uring.h>
 #include "private.h"
 #include "../../fs/uaccess_iov_internal.h"
 
@@ -1197,52 +1198,30 @@ out:
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
-enum kernel_syscall_status syscall_handle_socket_operation(
-    struct kernel_task *caller,
-    const struct kernel_syscall_request *request,
-    struct kernel_syscall_result *decoded)
+static enum kernel_syscall_status socket_operation_owned(
+    struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description **file_owner,
+    const struct kernel_syscall_request *request, uint64_t range_size,
+    int force_nonblock, int64_t *output)
 {
     int op = (int)request->number;
-    int local=op==204 || op==205 || op==206 || op==207 || op==208 || op==209;
-    KERNEL_SERVICE_SCOPE_IF(service,!local);
-    struct kernel_files *files;
-    struct kernel_open_file_description *file = 0;
-    struct kernel_socket *socket;
-    struct kernel_mm *mm;
+    int local = (unsigned)op - 204U <= 5U;
+    KERNEL_SERVICE_SCOPE_IF(service, force_nonblock && !local);
+    struct kernel_socket *socket = kernel_open_file_socket(*file_owner);
+    if (!socket) {
+        *output = -KERNEL_ENOTSOCK;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
     struct kernel_socket_address address;
     union linux_sockaddr_storage snapshot = {0};
     struct kernel_socket_address peer_address
         __attribute__((cleanup(kernel_socket_address_release))) = {0};
+    struct kernel_socket_call data_call __attribute__((cleanup(kernel_socket_call_end))) = {0};
     int64_t result = 0;
-    struct kernel_socket_call data_call __attribute__((cleanup(kernel_socket_call_end)))={0};
-
-    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-    /* 这里只验证数值范围；payload缺页必须留在状态检查和接纳预算之后。 */
-    uint64_t range_size = request->arguments[2];
-    if ((op == 206 || op == 207) && range_size > KERNEL_FILES_MAX_RW_COUNT) range_size = KERNEL_FILES_MAX_RW_COUNT;
-    if ((op == 206 || op == 207) && kernel_user_range_check(
-            request->arguments[1], (size_t)range_size) !=
-            KERNEL_UACCESS_STATUS_OK) {
-        decoded->value = -KERNEL_EFAULT;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
-    if (borrow_socket(caller, (int32_t)request->arguments[0],
-                      &files, &file,
-                      op == 242 ? (uint32_t)request->arguments[3] : 0,
-                      &result) != KERNEL_SYSCALL_STATUS_OK)
-        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    if (result != 0) {
-        decoded->value = result;
-        return KERNEL_SYSCALL_STATUS_OK;
-    }
     if (local) {
-        kernel_socket_call_begin(&data_call,files,&file);
-        data_call.address=&peer_address;
+        kernel_socket_call_begin(&data_call, files, file_owner);
+        data_call.address = &peer_address;
     }
-    socket = kernel_open_file_socket(file);
-    if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
-        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-
     switch (op) {
     case 201: /* listen */
         result = kernel_socket_listen(socket, (int32_t)request->arguments[1]);
@@ -1261,16 +1240,17 @@ enum kernel_syscall_status syscall_handle_socket_operation(
                                  kernel_socket_is_unix(socket), &address);
         if (result == 0)
             result = kernel_socket_connect(socket, &address,
-                     (kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) != 0U);
-        if (result == -KERNEL_EINPROGRESS &&
-            (kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) == 0U) {
-            result = wait_ready(file, KERNEL_POLLOUT | KERNEL_POLLERR,
+                     force_nonblock || (kernel_open_file_flags(*file_owner) & LINUX_SOCK_NONBLOCK) != 0U);
+        if (result == -KERNEL_EINPROGRESS && !force_nonblock &&
+            (kernel_open_file_flags(*file_owner) & LINUX_SOCK_NONBLOCK) == 0U) {
+            result = wait_ready(*file_owner, KERNEL_POLLOUT | KERNEL_POLLERR,
                                 kernel_socket_send_timeout(socket), 0U);
             if (result == 0) result = kernel_socket_connection_result(socket);
         }
         break;
     case 206: { /* sendto / send */
         uint32_t flags = (uint32_t)request->arguments[3];
+        if (force_nonblock) flags |= KERNEL_SOCKET_MSG_DONTWAIT;
         uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_NOSIGNAL;
         if (kernel_socket_is_tcp(socket) || kernel_socket_is_udp(socket)) allowed|=KERNEL_SOCKET_MSG_MORE;
         if (kernel_socket_is_seqpacket(socket)) allowed|=KERNEL_SOCKET_MSG_EOR|KERNEL_SOCKET_MSG_MORE;
@@ -1293,15 +1273,16 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         }
         if (kernel_socket_preserves_messages(socket)) {
             const struct kernel_uaccess_iovec iov = {request->arguments[1], range_size};
-            if (kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) flags |= KERNEL_SOCKET_MSG_DONTWAIT;
-            result = kernel_socket_write_datagram(&file, mm, &iov, 1, iov.length, flags, destination, NULL);
-        } else if (kernel_files_socket_io(files, mm, &file, request->arguments[1],
+            if (kernel_open_file_flags(*file_owner) & LINUX_SOCK_NONBLOCK) flags |= KERNEL_SOCKET_MSG_DONTWAIT;
+            result = kernel_socket_write_datagram(file_owner, mm, &iov, 1, iov.length, flags, destination, NULL);
+        } else if (kernel_files_socket_io(files, mm, file_owner, request->arguments[1],
                     range_size, flags, 1, &result) != KERNEL_FILES_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         break;
     }
     case 207: { /* recvfrom / recv */
         uint32_t flags = (uint32_t)request->arguments[3];
+        if (force_nonblock) flags |= KERNEL_SOCKET_MSG_DONTWAIT;
         data_call.message.flags=flags;
         uint32_t allowed=KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_TRUNC | KERNEL_SOCKET_MSG_PEEK;
         if (kernel_socket_is_seqpacket(socket) || kernel_socket_is_tcp(socket)) allowed|=KERNEL_SOCKET_MSG_WAITALL;
@@ -1318,7 +1299,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         }
         const struct kernel_uaccess_iovec iov = {request->arguments[1],range_size};
         uint32_t message_size = 0;
-        if (kernel_files_socket_iov_io(files,mm,&file,&iov,1,iov.length,
+        if (kernel_files_socket_iov_io(files,mm,file_owner,&iov,1,iov.length,
                 flags | KERNEL_SOCKET_IO_MESSAGE,0,
                 request->arguments[4] ? &peer_address : 0,&message_size,&result,
                 (flags & KERNEL_SOCKET_MSG_PEEK)?&data_call.message:NULL) != KERNEL_FILES_STATUS_OK)
@@ -1354,8 +1335,8 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         struct accept_peer_output output = {
             mm, request->arguments[1], request->arguments[2]
         };
-        if (kernel_files_socket_accept(files, file,
-                op == 242 ? (uint32_t)request->arguments[3] : 0U,
+        if (kernel_files_socket_accept_owned(files, *file_owner,
+                op == 242 ? (uint32_t)request->arguments[3] : 0U, force_nonblock,
                 output.address ? copy_accept_peer : 0, &output, &result) !=
             KERNEL_FILES_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -1364,8 +1345,155 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     default:
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
-    if (release_socket(&file) != KERNEL_SYSCALL_STATUS_OK)
-        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    decoded->value = result;
+    *output = result;
     return KERNEL_SYSCALL_STATUS_OK;
+}
+
+enum kernel_syscall_status syscall_handle_socket_operation(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    int op = (int)request->number;
+    int local = (unsigned)op - 204U <= 5U;
+    KERNEL_SERVICE_SCOPE_IF(service, !local);
+    struct kernel_files *files;
+    struct kernel_open_file_description *file = NULL;
+    struct kernel_mm *mm;
+    int64_t result = 0;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    uint64_t count = request->arguments[2];
+    if (op == 206 || op == 207) {
+        if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
+        if (kernel_user_range_check(request->arguments[1], (size_t)count)) {
+            decoded->value = -KERNEL_EFAULT;
+            return KERNEL_SYSCALL_STATUS_OK;
+        }
+    }
+    enum kernel_syscall_status status = borrow_socket(caller, (int32_t)request->arguments[0],
+        &files, &file, op == 242 ? (uint32_t)request->arguments[3] : 0, &result);
+    if (status) return status;
+    if (!result) {
+        if (kernel_task_mm_borrow_mutable(caller, &mm))
+            status = KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        else status = socket_operation_owned(files, mm, &file, request, count, 0, &result);
+        if (release_socket(&file)) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->value = result;
+    return status;
+}
+
+enum {
+    URING_SENDMSG = 9, URING_RECVMSG = 10, URING_ACCEPT = 13, URING_CONNECT = 16,
+    URING_SEND = 26, URING_RECV = 27, URING_SHUTDOWN = 34, URING_SOCKET = 45,
+    URING_BIND = 56, URING_LISTEN = 57,
+};
+
+int kernel_io_uring_socket_supported(unsigned op)
+{
+    return op == URING_SENDMSG || op == URING_RECVMSG || op == URING_ACCEPT ||
+        op == URING_CONNECT || op == URING_SEND || op == URING_RECV ||
+        op == URING_SHUTDOWN || op == URING_SOCKET || op == URING_BIND || op == URING_LISTEN;
+}
+
+int kernel_io_uring_socket_needs_file(unsigned op)
+{
+    return op != URING_SOCKET;
+}
+
+int kernel_io_uring_socket_validate(const struct uring_sqe *sqe)
+{
+    if (sqe->ioprio || (sqe->opcode != URING_SEND && sqe->file_index))
+        return -KERNEL_EOPNOTSUPP;
+    if (sqe->buffer || (sqe->opcode == URING_SEND && sqe->file_index >> 16))
+        return -KERNEL_EINVAL;
+    switch (sqe->opcode) {
+    case URING_SENDMSG: case URING_RECVMSG:
+        return sqe->length != 1 ? -KERNEL_EINVAL : 0;
+    case URING_CONNECT: case URING_BIND:
+        return sqe->length || sqe->op_flags ? -KERNEL_EINVAL : 0;
+    case URING_SHUTDOWN: case URING_LISTEN:
+        return sqe->address || sqe->offset || sqe->op_flags ? -KERNEL_EINVAL : 0;
+    case URING_SOCKET:
+        return sqe->address || sqe->op_flags ? -KERNEL_EINVAL : 0;
+    case URING_ACCEPT:
+        return (sqe->length || (sqe->op_flags & ~(LINUX_SOCK_CLOEXEC | LINUX_SOCK_NONBLOCK))) ?
+            -KERNEL_EINVAL : 0;
+    default:
+        return 0;
+    }
+}
+
+int64_t kernel_io_uring_socket_execute(struct kernel_files *files, struct kernel_mm *mm,
+    const struct uring_sqe *sqe, struct kernel_open_file_description **owner)
+{
+    int64_t result = 0;
+    if (sqe->opcode == URING_SOCKET) {
+        int type = (int32_t)sqe->offset;
+        int error = socket_creation_error(sqe->fd, type, (int32_t)sqe->length);
+        if (error) return error;
+        return kernel_files_socket_create(files, sqe->fd, type & LINUX_SOCK_TYPE_MASK,
+            (int32_t)sqe->length, (uint32_t)type, &result) ? -KERNEL_EIO : result;
+    }
+    struct kernel_socket *socket = kernel_open_file_socket(*owner);
+    if (!socket) return -KERNEL_ENOTSOCK;
+    switch (sqe->opcode) {
+    case URING_BIND: {
+        KERNEL_SERVICE_SCOPE(service);
+        union linux_sockaddr_storage snapshot = {0};
+        struct kernel_socket_address address;
+        int error = copy_address_in(mm, sqe->address, sqe->offset, &snapshot,
+            kernel_socket_is_unix(socket), &address);
+        return error ? error : kernel_socket_bind(socket, &address);
+    }
+    case URING_SENDMSG: case URING_RECVMSG: {
+        struct kernel_socket_call call = {0};
+        kernel_socket_call_begin(&call, files, owner);
+        enum kernel_syscall_status status = socket_message_pinned(files, mm, owner,
+            sqe->address, sqe->op_flags | KERNEL_SOCKET_MSG_DONTWAIT |
+                (sqe->opcode == URING_SENDMSG ? KERNEL_SOCKET_MSG_NOSIGNAL : 0),
+            sqe->opcode == URING_SENDMSG, 0, NULL, &result, &call);
+        kernel_socket_call_end(&call);
+        return status ? -KERNEL_EIO : result;
+    }
+    default:
+        break;
+    }
+    struct kernel_syscall_request request = {0};
+    uint64_t count = 0;
+    switch (sqe->opcode) {
+    case URING_SEND: case URING_RECV:
+        request.number = sqe->opcode == URING_SEND ? 206 : 207;
+        count = sqe->length;
+        if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
+        if (kernel_user_range_check(sqe->address, (size_t)count)) return -KERNEL_EFAULT;
+        request.arguments[1] = sqe->address;
+        request.arguments[2] = count;
+        request.arguments[3] = sqe->op_flags;
+        if (sqe->opcode == URING_SEND) {
+            request.arguments[3] |= KERNEL_SOCKET_MSG_NOSIGNAL;
+            request.arguments[4] = sqe->offset;
+            request.arguments[5] = (uint16_t)sqe->file_index;
+        }
+        break;
+    case URING_CONNECT:
+        request.number = 203;
+        request.arguments[1] = sqe->address;
+        request.arguments[2] = sqe->offset;
+        break;
+    case URING_ACCEPT:
+        request.number = 242;
+        request.arguments[1] = sqe->address;
+        request.arguments[2] = sqe->offset;
+        request.arguments[3] = sqe->op_flags;
+        break;
+    case URING_LISTEN: case URING_SHUTDOWN:
+        request.number = sqe->opcode == URING_LISTEN ? 201 : 210;
+        request.arguments[1] = sqe->length;
+        break;
+    default:
+        return -KERNEL_EINVAL;
+    }
+    return socket_operation_owned(files, mm, owner, &request, count, 1, &result) ?
+        -KERNEL_EIO : result;
 }

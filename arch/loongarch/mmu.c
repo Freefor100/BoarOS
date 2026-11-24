@@ -3,11 +3,14 @@
 #include <arch/task.h>
 #include <arch/loongarch/smp.h>
 #include <platform/loongarch_virt.h>
+#include <kernel/irq.h>
 #include <string.h>
 #define ENTRIES (BOAROS_PAGE_SIZE/8)
 #define PTE_VALID UINT64_C(1)
 #define PTE_DIRTY UINT64_C(2)
+#define PTE_GLOBAL (UINT64_C(1)<<6)
 #define PTE_HUGE (UINT64_C(1)<<6)
+#define PTE_HUGE_GLOBAL (UINT64_C(1)<<12)
 #define HUGE_ORDER 11U
 #define HUGE_SIZE (UINT64_C(1)<<25)
 #define PTE_PRESENT (UINT64_C(1)<<7)
@@ -19,9 +22,13 @@
 #define PTE_NX (UINT64_C(1)<<62)
 #define PTE_ADDRESS UINT64_C(0x0000ffffffffc000)
 extern void la_tlb_refill(void);
+extern uint64_t la_paged_kernel_root[ENTRIES];
+static unsigned direct_map_active;
 void arch_mmu_sync_instructions(void) { __asm__ volatile("ibar 0" ::: "memory"); }
 void arch_mmu_flush_address(uint64_t address)
 { __asm__ volatile("invtlb 0x5, $zero, %0" :: "r"(address) : "memory"); }
+static void flush_kernel_address(uint64_t address)
+{ __asm__ volatile("invtlb 0x6, $zero, %0" :: "r"(address) : "memory"); }
 static void resident_peak(struct arch_mmu_user_space *space)
 {
     uint64_t pages = (uint64_t)space->leaf_pages + space->protected_pages;
@@ -29,16 +36,17 @@ static void resident_peak(struct arch_mmu_user_space *space)
 }
 
 static void flush_all(void) { __asm__ volatile("invtlb 0, $zero, $zero" ::: "memory"); }
+static void flush_user(void) { __asm__ volatile("invtlb 0x3, $zero, $zero" ::: "memory"); }
 void arch_mmu_flush_all(void) { flush_all(); }
 void la_mmu_flush_range(uint64_t address, uint64_t size)
 {
-    if (size == BOAROS_PAGE_SIZE) {
-        arch_mmu_flush_address(address);
+    if (address >= ARCH_MMU_USER_LIMIT) {
+        if (size == BOAROS_PAGE_SIZE) flush_kernel_address(address);
+        else flush_all();
         return;
     }
-    if (!size || size > 16 * BOAROS_PAGE_SIZE || address >= ARCH_MMU_USER_LIMIT ||
-        size > ARCH_MMU_USER_LIMIT - address) {
-        flush_all();
+    if (!size || size > 16 * BOAROS_PAGE_SIZE || size > ARCH_MMU_USER_LIMIT - address) {
+        flush_user();
         return;
     }
     /* A LoongArch translation covers an even/odd pair of base pages. */
@@ -64,19 +72,260 @@ enum arch_mmu_status arch_mmu_switch_context(uint64_t root)
 {
     if (root & BOAROS_PAGE_MASK || root > PTE_ADDRESS) return ARCH_MMU_STATUS_INVALID;
     if (root == arch_mmu_current_context()) return ARCH_MMU_STATUS_OK;
-    __asm__ volatile("dbar 0\ncsrwr %0, 0x19" : "+r"(root) :: "memory");
-    flush_all(); return ARCH_MMU_STATUS_OK;
+    /* PGDH is shared. Keep the global kernel RAM/MMIO translations when a
+     * process changes its low-half page-table root. */
+    __asm__ volatile("dbar 0\ncsrwr %0, 0x19\ninvtlb 0x3, $zero, $zero"
+        : "+r"(root) :: "memory");
+    return ARCH_MMU_STATUS_OK;
 }
 void la_mmu_initialize(void)
 {
     /* 16 KiB 页、每级 11 位索引：页内/叶/中间/根位移为 14/25/36。 */
-    uint64_t low=14 | (UINT64_C(11)<<5) | (UINT64_C(25)<<10) | (UINT64_C(11)<<15);
-    uint64_t high=36 | (UINT64_C(11)<<6), page=14;
+    uint64_t low=LA_PWCL, high=LA_PWCH, page=14;
     uint64_t entry=(uintptr_t)la_tlb_refill-LA_DIRECT_BASE;
     __asm__ volatile("csrwr %0, 0x1c\ncsrwr %1, 0x1d\ncsrwr %2, 0x88\ncsrwr %3, 0x1e"
         : "+r"(low), "+r"(high), "+r"(entry), "+r"(page) :: "memory");
     arch_mmu_switch_context(0);
 }
+
+static inline uint64_t *boot_direct_table(uint64_t physical)
+{ return (void *)(uintptr_t)(LA_BOOT_CACHED_BASE + physical); }
+
+static enum arch_mmu_status boot_allocate_table(
+    struct physical_page_allocator *allocator, uint64_t *physical)
+{
+    enum physical_page_status status = physical_page_allocate(allocator, physical);
+    if (status == PHYSICAL_PAGE_STATUS_EMPTY) return ARCH_MMU_STATUS_NO_MEMORY;
+    if (status || !*physical) return ARCH_MMU_STATUS_STATE;
+    memset(boot_direct_table(*physical), 0, BOAROS_PAGE_SIZE);
+    return ARCH_MMU_STATUS_OK;
+}
+
+static enum arch_mmu_status boot_paged_map(struct physical_page_allocator *allocator,
+    uint64_t window, uint64_t first, uint64_t end, uint64_t attrs)
+{
+    while (first < end) {
+        uint64_t va = window + first;
+        uint64_t *root = &la_paged_kernel_root[(va >> 36U) & (ENTRIES - 1U)];
+        if (!*root) {
+            enum arch_mmu_status status = boot_allocate_table(allocator, root);
+            if (status) return status;
+        }
+        uint64_t *directory = boot_direct_table(*root);
+        uint64_t *parent = &directory[(va >> 25U) & (ENTRIES - 1U)];
+        if (!*parent && !(first & (HUGE_SIZE - 1U)) && end - first >= HUGE_SIZE) {
+            *parent = first | (attrs & ~PTE_GLOBAL) | PTE_HUGE | PTE_HUGE_GLOBAL;
+            first += HUGE_SIZE;
+            continue;
+        }
+        if (*parent & PTE_HUGE) return ARCH_MMU_STATUS_CONFLICT;
+        if (!*parent) {
+            enum arch_mmu_status status = boot_allocate_table(allocator, parent);
+            if (status) return status;
+        }
+        uint64_t *leaves = boot_direct_table(*parent);
+        unsigned slot = (va >> BOAROS_PAGE_SHIFT) & (ENTRIES - 1U);
+        do {
+            if (leaves[slot]) return ARCH_MMU_STATUS_CONFLICT;
+            leaves[slot++] = first | attrs;
+            first += BOAROS_PAGE_SIZE;
+        } while (slot < ENTRIES && first < end);
+    }
+    return ARCH_MMU_STATUS_OK;
+}
+
+enum arch_mmu_status la_mmu_direct_map_initialize(
+    struct physical_page_allocator *allocator, const struct boot_memory_layout *layout)
+{
+    /* Fixed virt apertures used by the interrupt controller, RTC, GED, UART
+     * and PCI host. Only cached RAM uses the RAM window. */
+    static const uint64_t devices[][2] = {
+        {0x10000000, 0x10100000}, {0x1fe00000, 0x1fe04000},
+        {0x20000000, 0x28000000}, {0x40000000, 0x80000000},
+    };
+    const uint64_t writable = PTE_PRESENT | PTE_VALID | PTE_DIRTY | PTE_WRITE | PTE_NX | PTE_GLOBAL;
+    for (unsigned i = 0; i < layout->usable_count; i++) {
+        const struct dtb_memory_range *range = &layout->usable[i];
+        if ((range->base | range->size) & BOAROS_PAGE_MASK ||
+            range->base >= LA_DIRECT_SIZE || range->size > LA_DIRECT_SIZE - range->base)
+            return ARCH_MMU_STATUS_INVALID;
+        uint64_t end = range->base + range->size;
+        for (unsigned j = 0; j < sizeof(devices) / sizeof(devices[0]); j++)
+            if (range->base < devices[j][1] && devices[j][0] < end)
+                return ARCH_MMU_STATUS_CONFLICT;
+        /* The BSP is already executing in the shared low 32 MiB leaf. */
+        uint64_t first = range->base < LA_BOOT_DIRECT_LIMIT ? LA_BOOT_DIRECT_LIMIT : range->base;
+        enum arch_mmu_status status = boot_paged_map(allocator, LA_DIRECT_BASE, first, end,
+                                                    writable | 0x10);
+        if (status) return status;
+    }
+    for (unsigned i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
+        enum arch_mmu_status status = boot_paged_map(allocator, LA_UNCACHED_BASE,
+            devices[i][0], devices[i][1], writable);
+        if (status) return status;
+    }
+    __asm__ volatile("dbar 0" ::: "memory");
+    flush_all();
+    la_virt_use_kernel_mapping();
+    __asm__ volatile("csrwr $zero, 0x180\n\t"
+                     "csrwr $zero, 0x181\n\t"
+                     "csrwr $zero, 0x182\n\t"
+                     "csrwr $zero, 0x183" ::: "memory");
+    flush_all();
+    __atomic_store_n(&direct_map_active, 1, __ATOMIC_RELEASE);
+    return ARCH_MMU_STATUS_OK;
+}
+
+int arch_mmu_secret_page_supported(void)
+{ return __atomic_load_n(&direct_map_active, __ATOMIC_ACQUIRE) != 0; }
+
+#define DIRECT_PAGE_ATTRS (PTE_PRESENT | PTE_VALID | PTE_DIRTY | PTE_WRITE | PTE_GLOBAL | 0x10)
+/* Two software-only bits in each of the first six leaves hold the live
+ * exclusion count. The following leaf distinguishes a split from a boot table. */
+#define DIRECT_COUNT_BITS (PTE_COW | PTE_FILE)
+#define DIRECT_SPLIT_SLOT 6U
+#define DIRECT_SPLIT_TAG PTE_FILE
+_Static_assert(ENTRIES < (1U << (2U * DIRECT_SPLIT_SLOT)), "direct-map exclusion count");
+static struct kernel_raw_lock secret_direct_map_lock = {
+    .rank = KERNEL_RAW_RANK_MM, .initialized = KERNEL_RAW_INITIALIZED,
+};
+/* LDDIR consumes the physical directory address, leaving no software marker
+ * in a published non-leaf. Track incomplete demotions with the lock instead. */
+static unsigned direct_splits_pending;
+
+static unsigned direct_excluded_count(const uint64_t *leaves)
+{
+    unsigned count = 0;
+    for (unsigned i = 0; i < DIRECT_SPLIT_SLOT; i++) {
+        uint64_t bits = leaves[i];
+        unsigned digits = (bits & PTE_COW ? 1U : 0U) | (bits & PTE_FILE ? 2U : 0U);
+        count |= digits << (i * 2U);
+    }
+    return count;
+}
+
+static void direct_set_excluded_count(uint64_t *leaves, unsigned count)
+{
+    for (unsigned i = 0; i < DIRECT_SPLIT_SLOT; i++, count >>= 2U) {
+        uint64_t bits = (count & 1U ? PTE_COW : 0U) | (count & 2U ? PTE_FILE : 0U);
+        uint64_t old = leaves[i];
+        if ((old & DIRECT_COUNT_BITS) != bits)
+            __atomic_store_n(&leaves[i], (old & ~DIRECT_COUNT_BITS) | bits, __ATOMIC_RELAXED);
+    }
+}
+
+static void direct_map_sync(uint64_t address, uint64_t size)
+{
+    __asm__ volatile("dbar 0" ::: "memory");
+#if BOAROS_MAX_CPUS > 1
+    la_smp_sync_kernel(address, size);
+#else
+    la_mmu_flush_range(address, size);
+#endif
+}
+
+static enum arch_mmu_status change_secret_direct_leaf(
+    struct physical_page_allocator *allocator, uint64_t physical, int protect)
+{
+    if (!arch_mmu_secret_page_supported()) return ARCH_MMU_STATUS_STATE;
+    if (!allocator || (physical & BOAROS_PAGE_MASK) || physical >= LA_DIRECT_SIZE)
+        return ARCH_MMU_STATUS_INVALID;
+    uint64_t va = LA_DIRECT_BASE + physical;
+    uint64_t root = la_paged_kernel_root[(va >> 36U) & (ENTRIES - 1U)];
+    if (!root) return ARCH_MMU_STATUS_NOT_MAPPED;
+    uint64_t *parent = (uint64_t *)la_virt_page_access(root) + ((va >> 25U) & (ENTRIES - 1U));
+    unsigned index = (va >> BOAROS_PAGE_SHIFT) & (ENTRIES - 1U);
+    uint64_t candidate = 0, retired = 0;
+    enum arch_mmu_status status = ARCH_MMU_STATUS_OK;
+
+    for (;;) {
+        int prepare = 0, changed_levels = 0, full_fence = 0;
+        uint64_t original = 0;
+        uintptr_t irq = arch_interrupt_save();
+        {
+            KERNEL_RAW_SCOPE(guard, &secret_direct_map_lock);
+            uint64_t entry = *parent;
+            if (!entry) status = ARCH_MMU_STATUS_NOT_MAPPED;
+            else if (entry & PTE_HUGE) {
+                uint64_t base = physical & ~(HUGE_SIZE - 1U);
+                if (!protect || (entry & ~PTE_NX) !=
+                    (base | DIRECT_PAGE_ATTRS | PTE_HUGE | PTE_HUGE_GLOBAL))
+                    status = ARCH_MMU_STATUS_CONFLICT;
+                else if (!candidate) {
+                    original = (entry & ~(PTE_HUGE | PTE_HUGE_GLOBAL)) | PTE_GLOBAL;
+                    prepare = 1;
+                } else {
+                    ++direct_splits_pending;
+                    changed_levels = 1;
+                    __atomic_store_n(parent, candidate, __ATOMIC_RELEASE);
+                    candidate = 0;
+                }
+            } else {
+                uint64_t *leaves = la_virt_page_access(entry);
+                uint64_t *slot = &leaves[index];
+                int split = (leaves[DIRECT_SPLIT_SLOT] & DIRECT_SPLIT_TAG) != 0;
+                uint64_t software = split && index < DIRECT_SPLIT_SLOT ? DIRECT_COUNT_BITS :
+                    split && index == DIRECT_SPLIT_SLOT ? DIRECT_SPLIT_TAG : 0;
+                uint64_t bits = *slot;
+                uint64_t expected = physical | DIRECT_PAGE_ATTRS;
+                if (!protect)
+                    expected = (expected & ~(PTE_PRESENT | PTE_VALID)) | PTE_NONE;
+                uint64_t mask = ~(PTE_NX | software);
+                if ((bits & mask) != (expected & mask)) status = ARCH_MMU_STATUS_CONFLICT;
+                else if (!split) {
+                    __atomic_store_n(slot,bits ^ (PTE_PRESENT | PTE_VALID | PTE_NONE),__ATOMIC_RELEASE);
+                } else {
+                    unsigned count = direct_excluded_count(leaves);
+                    if (!protect && count == 1) {
+                        uint64_t base = physical & ~(HUGE_SIZE - 1U);
+                        ++direct_splits_pending;
+                        changed_levels = 1;
+                        retired = entry;
+                        __atomic_store_n(parent,base | DIRECT_PAGE_ATTRS | PTE_HUGE |
+                            PTE_HUGE_GLOBAL | (bits & PTE_NX),__ATOMIC_RELEASE);
+                    } else {
+                        uint64_t change = (PTE_PRESENT | PTE_VALID | PTE_NONE) & ~software;
+                        __atomic_store_n(slot,bits ^ change,__ATOMIC_RELEASE);
+                        direct_set_excluded_count(leaves,protect ? count + 1 : count - 1);
+                    }
+                }
+            }
+            full_fence = direct_splits_pending != 0;
+        }
+        if (!status && !prepare) {
+            direct_map_sync(va, full_fence ? UINT64_MAX : BOAROS_PAGE_SIZE);
+            if (changed_levels) {
+                KERNEL_RAW_SCOPE(guard, &secret_direct_map_lock);
+                --direct_splits_pending;
+            }
+        }
+        arch_interrupt_restore(irq);
+        if (!prepare) break;
+
+        /* Prepare outside the lock, then compete for the still-large leaf. */
+        enum physical_page_status page_status = physical_page_allocate(allocator, &candidate);
+        if (page_status == PHYSICAL_PAGE_STATUS_EMPTY) return ARCH_MMU_STATUS_NO_MEMORY;
+        if (page_status) return ARCH_MMU_STATUS_STATE;
+        uint64_t *leaves = la_virt_page_access(candidate);
+        for (unsigned i = 0; i < ENTRIES; i++)
+            leaves[i] = original + (uint64_t)i * BOAROS_PAGE_SIZE;
+        leaves[index] ^= PTE_PRESENT | PTE_VALID | PTE_NONE;
+        leaves[DIRECT_SPLIT_SLOT] |= DIRECT_SPLIT_TAG;
+        direct_set_excluded_count(leaves,1);
+    }
+    if (candidate && physical_page_release(allocator,candidate)) __builtin_trap();
+    if (retired && physical_page_release(allocator,retired)) __builtin_trap();
+    return status;
+}
+
+enum arch_mmu_status arch_mmu_secret_page_protect(
+    struct physical_page_allocator *allocator, uint64_t physical)
+{ return change_secret_direct_leaf(allocator, physical, 1); }
+
+enum arch_mmu_status arch_mmu_secret_page_restore(
+    struct physical_page_allocator *allocator, uint64_t physical)
+{ return change_secret_direct_leaf(allocator, physical, 0); }
+
 static struct arch_mmu_user_space kernel_window;
 int arch_mmu_kernel_window_active(void) { return kernel_window.root_address!=0; }
 static uint64_t *table(const struct arch_mmu_user_space *s, uint64_t address)
@@ -102,13 +351,15 @@ enum arch_mmu_status la_mmu_kernel_window_initialize(struct physical_page_alloca
 {
     if(!a)return ARCH_MMU_STATUS_INVALID;
     if(kernel_window.root_address)return ARCH_MMU_STATUS_STATE;
-    struct arch_mmu_user_space candidate={.allocator=a,.state=ARCH_MMU_USER_SPACE_LIVE};
-    enum arch_mmu_status status=allocate_table(&candidate,&candidate.root_address,&candidate.root_entries);
+    struct arch_mmu_user_space candidate = {
+        .allocator = a, .state = ARCH_MMU_USER_SPACE_LIVE, .table_pages = 1,
+        .root_address = (uintptr_t)la_paged_kernel_root - LA_DIRECT_BASE,
+        .root_entries = la_paged_kernel_root,
+    };
     uint64_t middle=0;
     uint64_t *middle_entries;
-    if(status==ARCH_MMU_STATUS_OK)status=allocate_table(&candidate,&middle,&middle_entries);
+    enum arch_mmu_status status=allocate_table(&candidate,&middle,&middle_entries);
     if(status==ARCH_MMU_STATUS_OK) {
-        candidate.root_entries[(ARCH_KERNEL_STACK_WINDOW_BASE>>36)&(ENTRIES-1)]=middle;
         for(uint64_t offset=0;offset<ARCH_KERNEL_STACK_WINDOW_SIZE;offset+=UINT64_C(1)<<25) {
             uint64_t child;
             status=allocate_table(&candidate,&child,NULL);
@@ -123,13 +374,12 @@ enum arch_mmu_status la_mmu_kernel_window_initialize(struct physical_page_alloca
                 (void)physical_page_release(a,entries[i]);
             (void)physical_page_release(a,middle);
         }
-        if(candidate.root_address)(void)physical_page_release(a,candidate.root_address);
         return status;
     }
     /* 骨架属于永久 boot owner；叶只借用任务栈页，不转移物理页引用。 */
+    candidate.root_entries[(ARCH_KERNEL_STACK_WINDOW_BASE>>36)&(ENTRIES-1)] = middle;
     kernel_window=candidate;
-    uint64_t root=candidate.root_address;
-    __asm__ volatile("dbar 0;csrwr %0,0x1a":"+r"(root)::"memory");
+    __asm__ volatile("dbar 0" ::: "memory");
     flush_all();return ARCH_MMU_STATUS_OK;
 }
 static enum arch_mmu_status kernel_slot(struct physical_page_allocator *a,uint64_t v,uint64_t **slot)
@@ -618,9 +868,12 @@ enum arch_mmu_status arch_mmu_user_fork_commit_window(
             parent_slot -= i;
         }
         uint64_t *slot = parent_slot + i;
-        if (!((*slot & PTE_PRESENT) && (parent_order || !(*slot & PTE_HUGE))) ||
-            (*slot & PTE_ADDRESS) != (entry & PTE_ADDRESS))
-            return ARCH_MMU_STATUS_STATE;
+        if (!((*slot & PTE_PRESENT) && (parent_order || !(*slot & PTE_HUGE)))) return ARCH_MMU_STATUS_STATE;
+        /* The MM may already have copied a privately pinned child's leaf. */
+        if ((*slot & PTE_ADDRESS) != (entry & PTE_ADDRESS)) {
+            if (entry & PTE_COW) return ARCH_MMU_STATUS_STATE;
+            continue;
+        }
         if (!(*slot & PTE_COW)) {
             result = mark_cow_leaf(parent, slot, parent_order);
             if (result) return result;

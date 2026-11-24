@@ -1,7 +1,69 @@
 #include <arch/mmu.h>
 #include <platform/loongarch_virt.h>
 #include <arch/task.h>
+#include <kernel/irq.h>
 #include <string.h>
+
+/* Recover after one deliberately faulting kernel load without bypassing the
+ * architecture's ordinary table walk and refill code. */
+extern unsigned char la_secret_test_entry[];
+__asm__(".pushsection .text.la_secret_test_entry, \"ax\", @progbits\n"
+        ".balign 4096\n"
+        "la_secret_test_entry:\n"
+        "csrrd $t1, 0x5\n"
+        "bstrpick.d $t1, $t1, 21, 16\n"
+        "csrrd $t0, 0x6\n"
+        "addi.d $t0, $t0, 4\n"
+        "csrwr $t0, 0x6\n"
+        "ertn\n"
+        ".popsection");
+
+static int secret_load_fault(uintptr_t address)
+{
+    KERNEL_IRQ_SCOPE(irq);
+    uintptr_t entry = (uintptr_t)la_secret_test_entry, saved;
+    unsigned code;
+    __asm__ volatile("csrrd %[saved], 0xc\n\t"
+                     "csrwr %[entry], 0xc\n\t"
+                     "move $t1, $zero\n\t"
+                     "ld.d $zero, %[address], 0\n\t"
+                     "move %[code], $t1\n\t"
+                     "csrwr %[saved], 0xc"
+        : [saved] "=&r"(saved), [entry] "+&r"(entry), [code] "=&r"(code)
+        : [address] "r"(address)
+        : "$t0", "$t1", "memory");
+    return code;
+}
+
+static void secret_direct_map_contract(struct physical_page_allocator *allocator)
+{
+    uint64_t page, first;
+    if (!arch_mmu_secret_page_supported() || physical_page_allocate(allocator, &page) ||
+        physical_page_allocate(allocator, &first))
+        la_virt_fatal("secret page setup");
+    volatile uint64_t *bytes = la_virt_page_access(page);
+    volatile uint64_t *neighbour = la_virt_page_access(first);
+    *bytes = 0x1234;
+    *neighbour = 0x5678;
+    uint64_t available = physical_page_available(allocator);
+    if (secret_load_fault((uintptr_t)bytes) ||
+        !secret_load_fault(LA_BOOT_CACHED_BASE + page) ||
+        !secret_load_fault(LA_BOOT_UNCACHED_BASE + page) ||
+        !secret_load_fault(LA_UNCACHED_BASE + page) ||
+        arch_mmu_secret_page_protect(allocator, page) ||
+        !secret_load_fault((uintptr_t)bytes) || *neighbour != 0x5678)
+        la_virt_fatal("secret page direct aliases");
+    if (arch_mmu_secret_page_protect(allocator, first) ||
+        !secret_load_fault((uintptr_t)neighbour) ||
+        arch_mmu_secret_page_restore(allocator, page) || *bytes != 0x1234 ||
+        !secret_load_fault((uintptr_t)neighbour) ||
+        arch_mmu_secret_page_restore(allocator, first) || *neighbour != 0x5678 ||
+        physical_page_available(allocator) != available ||
+        physical_page_release(allocator, page) || physical_page_release(allocator, first))
+        la_virt_fatal("secret page restore");
+    la_virt_puts("LA secret direct alias withdrawal and restoration passed\n");
+}
+
 void la_stack_window_contract(struct physical_page_allocator *a)
 {
     uint64_t before=physical_page_available(a),first,second;
@@ -224,6 +286,7 @@ static void huge_leaf_contract(struct physical_page_allocator *allocator,
 }
 void la_mmu_contract(struct physical_page_allocator *allocator)
 {
+    secret_direct_map_contract(allocator);
     uint64_t before=physical_page_available(allocator);
     struct arch_mmu_page_table kernel={.allocator=allocator,.state=ARCH_MMU_STATE_ACTIVE};
     huge_leaf_contract(allocator,&kernel);

@@ -1,6 +1,6 @@
 # Linux 系统调用统一分派与通用系统接口
 
-系统调用是用户空间程序向操作系统内核请求服务的唯一受控入口。BoarOS 通过 `kernel/syscall/` 将**架构相关的寄存器约定**与**架构无关的系统调用语义**彻底解耦：RISC-V 64（`ECALL`，`a7` 传号、`a0..a5` 传参）与 LoongArch 64（`SYSCALL`，`$a7`/`regs[11]` 传号）的陷入代码将请求统一封装为 `struct kernel_syscall_request`，交由共享分派器执行，当前共覆盖 **RISC-V 278 个**、**LoongArch 274 个** Linux 系统调用编号。
+系统调用是用户空间程序向操作系统内核请求服务的唯一受控入口。BoarOS 通过 `kernel/syscall/` 将**架构相关的寄存器约定**与**架构无关的系统调用语义**彻底解耦：RISC-V 64（`ECALL`，`a7` 传号、`a0..a5` 传参）与 LoongArch 64（`SYSCALL`，`$a7`/`regs[11]` 传号）的陷入代码将请求统一封装为 `struct kernel_syscall_request`，交由共享分派器执行，当前共覆盖 **RISC-V 282 个**、**LoongArch 278 个** Linux 系统调用编号。
 
 ---
 
@@ -10,6 +10,7 @@
 | :--- | :--- |
 | `include/kernel/syscall.h`、`kernel/syscall/dispatch.c` | 公共请求/结果契约、高频标量快路径（172～178）与全表主分派器 `dispatch_operation()` |
 | `kernel/syscall/{file,mount,memory,process,sched,signal,time,socket,credentials,capability}.c` | 按子系统划分的 Linux ABI 参数导入、校验与业务转发 |
+| `kernel/syscall/io_uring.c`、`kernel/syscall/io_uring_files.c` | 共享提交与完成环、资源登记及请求分派（`io_uring_setup`、`io_uring_enter`、`io_uring_register`） |
 | `kernel/syscall/aio.c` | 原生 Linux 异步输入输出（Asynchronous I/O，AIO：`io_setup` 至 `io_pgetevents`） |
 | `kernel/syscall/membarrier.c` | 跨核内存屏障同步（`membarrier(283)`） |
 | `kernel/syscall/process_vm.c`、`kernel/seccomp.c` | 跨进程向量内存读写（`process_vm_readv/writev`）与 `seccomp` 系统调用过滤 |
@@ -34,13 +35,13 @@ flowchart LR
 - **高频标量快路径（编号 172～178）**：`getpid`、`getppid`、`gettid`、`getuid`、`geteuid`、`getgid`、`getegid` 这 7 个极高频无副作用查询在 `kernel_syscall_dispatch()` 中直接读取当前任务身份或不可变凭据指针返回，跳过大型主分派表路由。
 - **线程控制与用户返回**。`prctl` 经过系统调用过滤和入口追踪后直接进入线程控制分派。RISC-V 对当前线程的定时器宽限查询和设置提供简化入口，启用过滤或追踪时使用完整系统调用分派。返回用户空间时，调度器先处理退役资源和需要重新调度的任务，再从待处理位判断是否进入信号交付。同步系统调用持续计入内核执行时间，只有中断处理需要保存并恢复前一记账状态。
 - **架构解耦的动作返回机制（`enum kernel_syscall_action`）**：分派器不直接操作底层寄存器帧，而是返回明确的动作码指导架构陷入层完成收尾——包括 `RETURN`（普通写回返回值）、`RETURN_FINAL`、`EXIT` / `EXIT_GROUP`（终止线程或进程组）、`EXEC`（装载新地址空间且不推进旧程序计数器）、`CLONE` / `CLONE3`（传递完整寄存器快照构造子任务）、`WAIT4` / `WAITID`、`YIELD` 与 `SIGNAL_RETURN`。
-- **双架构差异的 4 个系统调用**：RISC-V 额外提供 `163`（`getrlimit`）、`164`（`setrlimit`）、`258`（`riscv_hwprobe`）与 `259`（`riscv_flush_icache`）；其余 274 个编号两架构完全共享（LoongArch 统一使用现代 `prlimit64` 查询和修改资源限额）。
+- **双架构差异的 4 个系统调用**：RISC-V 额外提供 `163`（`getrlimit`）、`164`（`setrlimit`）、`258`（`riscv_hwprobe`）与 `259`（`riscv_flush_icache`）；其余 278 个编号两架构完全共享（LoongArch 统一使用现代 `prlimit64` 查询和修改资源限额）。
 
 ---
 
 ## 二、原生异步 I/O（AIO）、跨核内存屏障与硬件探测
 
-除分派至调度、内存、文件、网络和 eBPF 子系统的常规接口外，系统调用层还直接实现了三项关键的现代 Linux 机制：
+除分派至调度、内存、文件、网络和 eBPF 子系统的常规接口外，系统调用层还提供以下通用 Linux 接口：
 
 ### 2.1 原生异步输入输出（`io_setup` ～ `io_pgetevents`）
 
@@ -49,13 +50,23 @@ flowchart LR
 - **支持的操作与后台执行**：支持 `IOCB_CMD_PREAD`、`PWRITE`、`PREADV`、`PWRITEV`、`FSYNC`、`FDSYNC` 与 `POLL`，并支持通过 `eventfd`（`resfd`）向 `epoll` 推送完成通知。满足扇区对齐且单次不超过 `64 KiB` 的普通文件直接读写交由懒启动的后台工作线程异步推进；其余需要特殊标志或额外页缓存借用的请求沿提交路径安全完成。
 - **原子信号掩码等待（`io_pgetevents(292)`）**：等待完成事件期间原子替换临时信号掩码；被信号打断时优先返回已交付的完成事件，若尚无事件且未执行用户信号处理函数，则通过 `NOHAND` 重启机制恢复掩码后自动重试。
 
-### 2.2 跨核内存屏障（`membarrier(283)`）
+### 2.2 共享提交与完成环（`io_uring`）
+
+`io_uring_setup(425)` 创建环文件。应用程序可以通过 `mmap` 取得提交环、完成环和提交条目数组，也可以设置 `IORING_SETUP_NO_MMAP` 并提供已分配的页。提交条目（Submission Queue Entry，SQE）描述一次操作。应用程序写完条目后发布尾索引，内核取得条目时读取尾索引并保存内核快照。内核完成操作后写入完成条目（Completion Queue Entry，CQE），再发布完成环尾索引。两边使用获取和释放内存序核对索引与条目内容的可见性。
+
+- **提交与完成。** `io_uring_enter(426)` 导入请求，也可等待指定数量的完成条目。空操作在一次完成环保护中处理至多 16 条，避免逐条分配。普通文件读写沿已有输入输出入口推进，轮询和定时器由按需创建的执行线程推进。完成环满时保留待发布的结果，应用释放槽位后继续交付。文件描述符或映射仍在使用时，共享环页保留原引用。
+- **注册与取消。** `io_uring_register(427)` 支持查询操作能力、固定文件、固定缓冲区、事件通知描述符、提交身份和限制规则。固定文件保留已打开文件本身。固定缓冲区提前取得物理页引用并计入锁页额度，修改映射后原注册仍指向同一组页，私有映射派生时为子进程保持写时复制隔离。退出清理归还尚未完成条目的文件、缓冲区与完成记录。
+- **操作范围。** 包括普通文件的标量和向量读写、范围同步、部分路径和元数据操作、可用套接字的立即发送和接收，以及配套的定时、取消和就绪通知。设备命令 `IORING_OP_URING_CMD` 可向高速非易失性存储设备（Non-Volatile Memory Express，NVMe）命名空间和控制器提交相应命令，内核检查身份、操作范围及传输缓冲区。固定文件表支持稀疏登记、选择空槽以及从固定槽安装普通文件描述符。
+- **专用网络接收。** 应用程序可登记 Intel 82576 的独立接收队列及其缓冲区，使用 `IORING_OP_RECV_ZC` 收取传输控制协议（Transmission Control Protocol，TCP）载荷。网卡直接将载荷写入登记的用户页，完成条目交付偏移和长度。应用回填后，页也要等协议栈归还引用才能重新提交给网卡。队列的地址隔离与配置见[网络模块说明](kernel-network.md)。
+- **接口边界。** 提交队列轮询（`IORING_SETUP_SQPOLL`）、直接输入输出完成轮询（`IORING_SETUP_IOPOLL`）、`IOSQE_IO_DRAIN` 和通用阻塞请求的异步执行仍待补齐。套接字发送、接收和接纳在当次没有进展时返回非阻塞结果。常规套接字多次完成、现代缓冲区环、向网卡零复制发送及设备状态转移操作仍待补齐。
+
+### 2.3 跨核内存屏障（`membarrier(283)`）
 
 在无锁数据结构（如 RCU 读侧）中，写者极少执行，但读者每次读取都插入昂贵的硬件全内存屏障代价过高。`membarrier(283)`（`kernel/syscall/membarrier.c`）允许写者显式向其他正在运行相关线程的处理器核发送核间中断（`KERNEL_IPI_MEMBARRIER`），迫使远端核执行串行化内存屏障，从而让高频读侧只需廉价的编译器屏障即可保证跨核内存可见性。
 - 支持命令：`GLOBAL`、`GLOBAL_EXPEDITED`、`REGISTER_GLOBAL_EXPEDITED`、`PRIVATE_EXPEDITED`（按活动地址空间筛选目标核）、`REGISTER_PRIVATE_EXPEDITED` 与 `GET_REGISTRATIONS`。
 - 多核下通过每核邮箱 `mailboxes[BOAROS_MAX_CPUS]` 发起 `rendezvous()` 同步握手，并在等待期间持续响应其他核发来的屏障请求，防止双核同时调用 `membarrier` 形成互等死锁。
 
-### 2.3 RISC-V 硬件能力探测（`riscv_hwprobe(258)`）
+### 2.4 RISC-V 硬件能力探测（`riscv_hwprobe(258)`）
 
 `arch/riscv/hwprobe.c` 为用户态动态库（如 `glibc` 的字符串/向量多版本函数分发 `IFUNC`）提供标准硬件特性查询：
 - 返回 OpenSBI 厂商/架构/实现标识（Key `0`～`2`）、基础指令集 `IMA`（Key `3`）、扩展特性位掩码（`F/D`、`C`、`V` 向量、`Zba`/`Zbb`/`Zbs` 位操作与受 `senvcfg` 门控的 `Zicboz` 零块指令，Key `4`）、`Zicboz` 块大小 `64` 字节（Key `6`）、最高用户虚拟地址（Key `7`）与时钟频率（Key `8`）；
@@ -68,8 +79,8 @@ flowchart LR
 | 功能域 | 代表性系统调用 | 所属子系统文档 |
 | :--- | :--- | :--- |
 | **进程、线程与调度** | `clone` / `clone3` / `execve` / `wait4` / `waitid` / `sched_setattr` / `setpriority` / `futex` / `futex_waitv` / `ptrace` | [调度与同步](kernel-scheduler.md) · [映像替换](kernel-exec.md) · [进程跟踪](kernel-ptrace.md) |
-| **虚拟内存** | `brk` / `mmap` / `munmap` / `mprotect` / `mremap` / `mlock*` / `madvise` / `msync` / `mincore` / `process_vm_readv/writev` / `userfaultfd` | [虚拟内存管理](kernel-mm.md) · [原生大页](hugepages.md) |
-| **文件、路径与挂载** | `openat` / `openat2` / `readv` / `writev` / `sendfile` / `splice` / `copy_file_range` / `fallocate` / `statx` / `fsopen`～`move_mount` / `pivot_root` | [VFS 与 ext4](vfs-ext4.md) · [文件资源与 I/O](kernel-files.md) |
+| **虚拟内存** | `brk` / `mmap` / `munmap` / `mprotect` / `mremap` / `mlock*` / `madvise` / `msync` / `mincore` / `process_vm_readv/writev` / `userfaultfd` / `memfd_secret` | [虚拟内存管理](kernel-mm.md) · [原生大页](hugepages.md) |
+| **文件、路径与挂载** | `openat` / `openat2` / `readv` / `writev` / `sendfile` / `splice` / `copy_file_range` / `fallocate` / `io_uring_*` / `statx` / `fsopen`～`move_mount` / `pivot_root` | [VFS 与 ext4](vfs-ext4.md) · [文件资源与 I/O](kernel-files.md) |
 | **事件、锁与通知** | `epoll_*` / `ppoll` / `pselect6` / `pipe2` / `eventfd2` / `timerfd_*` / `signalfd4` / `inotify_*` / `fanotify_*` / `flock` / `fcntl` | [文件资源与 I/O](kernel-files.md) |
 | **网络与套接字** | `socket` / `socketpair` / `bind` / `listen` / `accept4` / `connect` / `sendmsg` / `sendmmsg` / `recvmmsg` / `setsockopt` | [多核网络协议栈](kernel-network.md) · [rtnetlink](../network-rtnetlink.md) |
 | **信号、时钟与 IPC** | `rt_sigaction` / `rt_sigprocmask` / `rt_sigreturn` / `sigaltstack` / `clock_gettime` / `clock_nanosleep` / `timer_*` / `adjtimex` / SysV & POSIX IPC | [信号](kernel-signal.md) · [时钟与定时器](kernel-time.md) |

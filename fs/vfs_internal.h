@@ -12,6 +12,13 @@
 extern struct kernel_raw_lock kernel_vfs_state_lock;
 struct kernel_fs_context;
 struct kernel_vfs_path;
+struct kernel_vfs_file;
+struct kernel_vfs_size_limit;
+struct kernel_vfs_user_write_result;
+struct kernel_mm_long_pin;
+int kernel_vfs_write_long_pins(struct kernel_vfs_file *, const struct kernel_mm_long_pin *,
+    size_t first, size_t count, uint64_t position, int append, int direct,
+    struct kernel_vfs_size_limit *, struct kernel_vfs_user_write_result *);
 struct kernel_credentials;
 struct kernel_vfs_mount;
 struct kernel_heap;

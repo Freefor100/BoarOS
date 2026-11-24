@@ -9,6 +9,7 @@
 #include <kernel/procfs.h>
 #include <kernel/proc_task.h>
 #include <kernel/ipc_namespace.h>
+#include <kernel/io_uring.h>
 #include "block_file_internal.h"
 #include "record_lock.h"
 #include "pipe_internal.h"
@@ -288,6 +289,7 @@ struct kernel_flock_identity *kernel_open_file_flock_identity(
     case KERNEL_OPEN_FILE_KIND_INOTIFY:
     case KERNEL_OPEN_FILE_KIND_FANOTIFY:
     case KERNEL_OPEN_FILE_KIND_USERFAULTFD:
+    case KERNEL_OPEN_FILE_KIND_IO_URING:
     case KERNEL_OPEN_FILE_KIND_SIGNALFD: return kernel_flock_anonymous_identity();
     case KERNEL_OPEN_FILE_KIND_PIDFD: return kernel_pidfd_flock_identity(file);
     case KERNEL_OPEN_FILE_KIND_CONSOLE: return kernel_flock_bootstrap_console_identity();
@@ -887,6 +889,16 @@ int kernel_open_file_pseudo_stat(
             .ino=file->proc_identity,.blksize=BOAROS_PAGE_SIZE};
         return 0;
     }
+    if (file->kind == KERNEL_OPEN_FILE_KIND_SECRETMEM) {
+        *stat = (struct kernel_vfs_stat){.mode = KERNEL_VFS_S_IFREG | 0600U,
+            .ino = file->proc_identity, .blksize = BOAROS_PAGE_SIZE,
+            .size = __atomic_load_n(&file->file.size, __ATOMIC_ACQUIRE)};
+        if (file->credentials) {
+            stat->uid = file->credentials->fsuid;
+            stat->gid = file->credentials->fsgid;
+        }
+        return 0;
+    }
     uint32_t mode;
     uint64_t rdev = 0U;
     if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE)
@@ -900,6 +912,7 @@ int kernel_open_file_pseudo_stat(
     else if (file->kind == KERNEL_OPEN_FILE_KIND_BPF || file->kind == KERNEL_OPEN_FILE_KIND_INOTIFY ||
              file->kind == KERNEL_OPEN_FILE_KIND_FANOTIFY || file->kind == KERNEL_OPEN_FILE_KIND_EPOLL ||
              file->kind == KERNEL_OPEN_FILE_KIND_USERFAULTFD ||
+             file->kind == KERNEL_OPEN_FILE_KIND_IO_URING ||
              file->kind == KERNEL_OPEN_FILE_KIND_EVENTFD || file->kind == KERNEL_OPEN_FILE_KIND_TIMERFD ||
              file->kind == KERNEL_OPEN_FILE_KIND_SIGNALFD)
         mode = 0600U;
@@ -991,6 +1004,7 @@ int kernel_open_file_supports_epoll(
     case KERNEL_OPEN_FILE_KIND_INOTIFY:
     case KERNEL_OPEN_FILE_KIND_FANOTIFY:
     case KERNEL_OPEN_FILE_KIND_USERFAULTFD:
+    case KERNEL_OPEN_FILE_KIND_IO_URING:
     case KERNEL_OPEN_FILE_KIND_PIDFD:
     case KERNEL_OPEN_FILE_KIND_SIGNALFD:
     case KERNEL_OPEN_FILE_KIND_TIMERFD:
@@ -1038,6 +1052,7 @@ static void close_cpu0(void *argument)
 
 static int close_is_local(const struct kernel_open_file_description *file)
 {
+    if (file->kind == KERNEL_OPEN_FILE_KIND_SECRETMEM) return !file->ep_items;
     if(file->mount_tree || file->ipc_proc_namespace || (file->kind==KERNEL_OPEN_FILE_KIND_NAMESPACE &&
         kernel_namespace_file(file)->type!=KERNEL_NS_UTS))return 0;
     if(file->kind==KERNEL_OPEN_FILE_KIND_NAMESPACE)return !file->ep_items;
@@ -1107,9 +1122,17 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
             if (file->file.private_data && kernel_vfs_close(&file->file))
                 return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
             file->vfs_closed = 1U;
-        } else if (file->kind==KERNEL_OPEN_FILE_KIND_INOTIFY ||
+        }
+#if defined(__riscv) || defined(BOAROS_ARCH_LOONGARCH)
+        else if (file->kind == KERNEL_OPEN_FILE_KIND_IO_URING) {
+            if (kernel_io_uring_release_file(file)) return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
+            file->vfs_closed = 1;
+        }
+#endif
+        else if (file->kind==KERNEL_OPEN_FILE_KIND_INOTIFY ||
                    file->kind==KERNEL_OPEN_FILE_KIND_FANOTIFY || file->kind==KERNEL_OPEN_FILE_KIND_BPF ||
-                   file->kind==KERNEL_OPEN_FILE_KIND_USERFAULTFD) {
+                   file->kind==KERNEL_OPEN_FILE_KIND_USERFAULTFD ||
+                   file->kind==KERNEL_OPEN_FILE_KIND_SECRETMEM) {
             file->device->release(file->device_instance);
             file->device_instance=NULL;file->vfs_closed=1;
         } else if(file->kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
@@ -1323,6 +1346,8 @@ int kernel_open_file_readable(
     case KERNEL_OPEN_FILE_KIND_INOTIFY:
     case KERNEL_OPEN_FILE_KIND_FANOTIFY:
     case KERNEL_OPEN_FILE_KIND_USERFAULTFD:
+    case KERNEL_OPEN_FILE_KIND_IO_URING:
+    case KERNEL_OPEN_FILE_KIND_SECRETMEM:
     case KERNEL_OPEN_FILE_KIND_MQUEUE:
     case KERNEL_OPEN_FILE_KIND_BLOCK:
     case KERNEL_OPEN_FILE_KIND_GENERATED:

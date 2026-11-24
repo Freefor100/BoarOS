@@ -20,6 +20,17 @@ void scheduler_task_get_locked(struct kernel_task *task)
     task->storage_borrows++;
 }
 
+void kernel_task_storage_get(struct kernel_task *task)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    scheduler_task_get_locked(task);
+}
+
+void kernel_task_storage_put(struct kernel_task *task)
+{
+    scheduler_task_put(task);
+}
+
 struct kernel_task *scheduler_task_lookup_in_locked(struct kernel_pid_registry *view,
     kernel_pid_t number, enum kernel_pid_role role, uint64_t generation)
 {

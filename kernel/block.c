@@ -3,10 +3,13 @@
 #include <kernel/cpu.h>
 #include <kernel/errno.h>
 #include <kernel/time.h>
+#include <kernel/nvme.h>
 #include <arch/context.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+
+extern __attribute__((weak)) int kernel_nvme_block_name(uint64_t, char name[32]);
 
 static struct kernel_block_device *physical(struct kernel_block_device *device)
 { return device->parent ? device->parent : device; }
@@ -99,7 +102,9 @@ int kernel_block_device_name(uint64_t number, char name[32])
         *out++ = 'v'; *out++ = 'd';
         while (length) *out++ = reversed[--length];
         if (minor % 16) out = append_number(out, minor % 16);
-    } else return 0;
+    } else {
+        return major == 259 && kernel_nvme_block_name && kernel_nvme_block_name(number, name);
+    }
     *out = '\0';
     return 1;
 }

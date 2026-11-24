@@ -4,6 +4,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/vma.h>
 #include <kernel/page_cache.h>
+#include <kernel/avl.h>
 
 #include <stdint.h>
 
@@ -250,6 +251,16 @@ struct kernel_mm_pagemap {
     struct physical_page_allocator *allocator;
     uint64_t record_page;
 };
+/* The I/O owner may outlive the originating virtual mapping. This token
+ * retains the actual page and, for private memory, its fork index. */
+struct kernel_mm_long_pin {
+    struct kernel_mm_pagemap owner;
+    struct kernel_avl_node index;
+    void *page;
+    uint64_t physical;
+};
+int kernel_mm_long_pin_acquire(struct kernel_mm *, uint64_t, struct kernel_mm_long_pin *);
+void kernel_mm_long_pin_release(struct kernel_mm_long_pin *);
 #define KERNEL_MM_PAGEMAP_BATCH 16U
 void kernel_mm_pagemap_hold(const struct kernel_mm *, struct kernel_mm_pagemap *);
 void kernel_mm_pagemap_put(struct kernel_mm_pagemap *);
@@ -351,6 +362,7 @@ struct kernel_mm_mapped_object {
         int writable, uint64_t *physical);
     uint64_t *mapping_bytes;
     int may_write;
+    int secret;
 };
 
 /* The caller retains its own file reference through admission-lock release. */

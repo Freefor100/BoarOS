@@ -1,0 +1,13 @@
+#ifndef BOAROS_PLATFORM_RISCV_PCI_H
+#define BOAROS_PLATFORM_RISCV_PCI_H
+
+#include <kernel/pci.h>
+
+#define RISCV_VIRT_PCI_ECAM_BASE UINT64_C(0x30000000)
+#define RISCV_VIRT_PCI_ECAM_SIZE UINT64_C(0x10000000)
+#define RISCV_VIRT_PCI_MEMORY_BASE UINT64_C(0x40000000)
+#define RISCV_VIRT_PCI_MEMORY_SIZE UINT64_C(0x40000000)
+
+struct pci_host *riscv_virt_pci_host(void);
+
+#endif

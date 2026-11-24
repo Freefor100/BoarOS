@@ -1,3 +1,4 @@
+#include <kernel/io_uring_zcrx.h>
 #include <kernel/bpf.h>
 #include <kernel/network.h>
 #include <kernel/async_io.h>
@@ -4253,6 +4254,37 @@ static uint32_t packet_available(const struct socket_packet *packet)
     return (packet->payload && !packet->length?packet->payload->tot_len:packet->length)-packet->consumed;
 }
 
+int kernel_socket_zcrx_receive(struct kernel_open_file_description **owner,
+    struct kernel_io_uring_zcrx *area, uint32_t count, uint64_t *offset)
+{
+    struct kernel_socket *socket = kernel_open_file_socket(*owner);
+    if (!socket) return -KERNEL_ENOTSOCK;
+    if (!kernel_socket_is_tcp(socket)) return -KERNEL_EPROTONOSUPPORT;
+    struct kernel_socket_read_request request = {0};
+    int ready = kernel_socket_reserve_read(socket, kernel_task_current(), &request,
+        owner, count, 1, NULL);
+    if (ready <= 0) return ready;
+
+    const struct socket_packet *packet = request.packet;
+    const struct pbuf *segment = packet->payload;
+    unsigned skip = packet->consumed;
+    while (segment && skip >= segment->len) {
+        skip -= segment->len;
+        segment = segment->next;
+    }
+    unsigned take = segment ? segment->len - skip : 0;
+    if (take > (unsigned)ready) take = (unsigned)ready;
+    int result = take ? kernel_io_uring_zcrx_capture(area, segment, skip, take, offset) :
+        -KERNEL_EXDEV;
+    if (result) {
+        kernel_socket_finish_read(&request, 1);
+        return result == -KERNEL_EAGAIN ? -KERNEL_ENOBUFS : result;
+    }
+    request.bytes = request.completed_bytes = take;
+    kernel_socket_finish_read(&request, 0);
+    return (int)take;
+}
+
 int kernel_socket_reserve_read(struct kernel_socket *socket,
                               struct kernel_task *task,
                               struct kernel_socket_read_request *request,
@@ -6636,14 +6668,20 @@ int kernel_socket_get_option(struct kernel_socket *socket,
     return result;
 }
 
+static const char *network_interface_name(const struct netif *interface)
+{
+    if (interface->name[0] == 'l' && interface->name[1] == 'o') return "lo";
+    if (interface->name[0] == 'i' && interface->name[1] == 'z') return "eth1";
+    return "eth0";
+}
+
 int kernel_socket_set_bound_device(struct kernel_socket *socket,const char *name)
 {
     struct kernel_socket_protocol_scope base;kernel_socket_protocol_enter(&base);
     struct netif *chosen=NULL;
     if(name[0]) {
         for(struct netif *n=netif_list;n;n=n->next) {
-            int loop=n->name[0]=='l' && n->name[1]=='o';
-            if(!__builtin_strcmp(name,loop?"lo":"eth0")) {chosen=n;break;}
+            if (!strcmp(name, network_interface_name(n))) {chosen=n;break;}
         }
         if(!chosen) {kernel_socket_protocol_leave(&base);return -KERNEL_ENODEV;}
     }
@@ -6687,8 +6725,10 @@ int kernel_socket_get_bound_device(struct kernel_socket *socket,char name[16],ui
     struct netif *interface=netif_get_by_index((u8_t)index);
     int result=-KERNEL_ENODEV;
     if(interface) {
-        int loop=interface->name[0]=='l' && interface->name[1]=='o';
-        *length=loop?3:5;__builtin_memcpy(name,loop?"lo":"eth0",*length);result=0;
+        const char *device = network_interface_name(interface);
+        *length = strlen(device) + 1;
+        memcpy(name, device, *length);
+        result = 0;
     }
     kernel_socket_protocol_leave(&scope);return result;
 }
@@ -7852,7 +7892,8 @@ static void interface_snapshot(struct netif *n, struct kernel_socket_interface *
 {
     *s = (struct kernel_socket_interface){0};
     int loop = n->name[0] == 'l' && n->name[1] == 'o';
-    __builtin_memcpy(s->name, loop ? "lo" : "eth0", loop ? 3 : 5);
+    const char *name = network_interface_name(n);
+    memcpy(s->name, name, strlen(name) + 1);
     s->index = netif_get_index(n); s->address = netif_ip4_addr(n)->addr;
     /* loopif的0表示不受L2 MTU限制；Linux逻辑MTU容纳完整IPv4长度范围。 */
     s->netmask = netif_ip4_netmask(n)->addr; s->mtu = loop && n->mtu == 0 ? 65536U : n->mtu;
@@ -7926,8 +7967,7 @@ int kernel_socket_interface_get(const char name[16], struct kernel_socket_interf
 {
     struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     for (struct netif *n = netif_list; n; n = n->next) {
-        int loop = n->name[0] == 'l' && n->name[1] == 'o';
-        if (!__builtin_memcmp(name, loop ? "lo" : "eth0", loop ? 3 : 5)) {
+        if (!strcmp(name, network_interface_name(n))) {
             interface_snapshot(n, s); kernel_socket_protocol_leave(&irq); return 0;
         }
     }
@@ -7950,8 +7990,7 @@ int kernel_socket_interface_set_flags(const char name[16], uint16_t flags)
 {
     struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);
     for (struct netif *n = netif_list; n; n = n->next) {
-        int loop = n->name[0] == 'l' && n->name[1] == 'o';
-        if (!__builtin_memcmp(name, loop ? "lo" : "eth0", loop ? 3 : 5)) {
+        if (!strcmp(name, network_interface_name(n))) {
             socket_set_interface_up(n,flags & 1);
             kernel_socket_protocol_leave(&irq); return 0;
         }
@@ -7963,8 +8002,7 @@ int kernel_socket_interface_set_ipv4(const char name[16], uint32_t command, uint
     struct kernel_socket_protocol_scope scope; kernel_socket_protocol_enter(&scope);
     int result = -KERNEL_ENODEV;
     for (struct netif *n = netif_list; n; n = n->next) {
-        int loop = n->name[0] == 'l' && n->name[1] == 'o';
-        if (__builtin_memcmp(name, loop ? "lo" : "eth0", loop ? 3 : 5)) continue;
+        if (strcmp(name, network_interface_name(n))) continue;
         ip4_addr_t address = {value};
         uint32_t host = lwip_ntohl(value);
         result = 0;
@@ -8016,7 +8054,7 @@ int kernel_socket_interface_set_mtu(const char name[16], int32_t mtu)
     int result = -KERNEL_ENODEV;
     for (struct netif *n = netif_list; n; n = n->next) {
         int loop = n->name[0] == 'l' && n->name[1] == 'o';
-        if (__builtin_memcmp(name, loop ? "lo" : "eth0", loop ? 3 : 5)) continue;
+        if (strcmp(name, network_interface_name(n))) continue;
         if (mtu < 68 || mtu > (loop ? 65536 : 1500)) result = -KERNEL_EINVAL;
         else {
             uint16_t next=mtu==65536?0:(uint16_t)mtu;
@@ -8072,8 +8110,7 @@ int kernel_socket_default_route(const char *name, uint32_t gateway, int remove)
     if (remove && !name && !gateway) chosen = netif_default;
     for (struct netif *n = netif_list; n; n = n->next) {
         if (chosen) break;
-        int loop = n->name[0] == 'l' && n->name[1] == 'o';
-        if (name && __builtin_memcmp(name, loop ? "lo" : "eth0", loop ? 3 : 5)) continue;
+        if (name && strcmp(name, network_interface_name(n))) continue;
         if (!name && gateway && !ip4_addr_net_eq(&address, netif_ip4_addr(n), netif_ip4_netmask(n)))
             continue;
         chosen = n;

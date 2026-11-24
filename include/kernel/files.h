@@ -355,6 +355,9 @@ enum kernel_files_status kernel_files_splice(struct kernel_files *,struct kernel
     int64_t in_fd,uint64_t in_offset,int64_t out_fd,uint64_t out_offset,uint64_t count,uint32_t flags,int64_t *);
 enum kernel_files_status kernel_files_tee(struct kernel_files *,int64_t in_fd,int64_t out_fd,
     uint64_t count,uint32_t flags,int64_t *);
+int64_t kernel_files_uring_splice(struct kernel_files *, int is_tee,
+    struct kernel_open_file_description **input, int64_t in,
+    struct kernel_open_file_description **output, int64_t out, uint64_t count, uint32_t flags);
 enum kernel_files_status kernel_files_vmsplice(struct kernel_files *,struct kernel_mm *,
     int64_t fd,uint64_t iov,uint64_t count,uint32_t flags,int64_t *);
 
@@ -568,6 +571,12 @@ enum kernel_files_status kernel_files_socket_accept(
     void *context,
     int64_t *linux_result);
 
+enum kernel_files_status kernel_files_socket_accept_owned(
+    struct kernel_files *, struct kernel_open_file_description *,
+    uint32_t flags, int force_nonblock,
+    int (*copy_peer)(void *, const struct kernel_socket_address *), void *,
+    int64_t *linux_result);
+
 /* fd_flags accepts only Linux FD_CLOEXEC (1). Copy one int32 FD before sharing
  * the acquired OFD; success consumes owner. Failure preserves owner and cancels
  * only this reservation, leaving any previously received descriptors installed.
@@ -673,4 +682,22 @@ struct kernel_files_xattr_request {
 };
 enum kernel_files_status kernel_files_xattr(struct kernel_files *,const struct kernel_fs_context *,
     struct kernel_mm *,const struct kernel_files_xattr_request *,int64_t *);
+int64_t kernel_files_sync_range_owned(struct kernel_open_file_description *,
+    int64_t offset, int64_t length, unsigned flags);
+int64_t kernel_files_fsync_range_owned(struct kernel_open_file_description *,
+    uint64_t start, uint64_t end, int data_only);
+int64_t kernel_files_fallocate_owned(struct kernel_open_file_description *,
+    unsigned mode, int64_t offset, int64_t length);
+enum kernel_files_status kernel_files_truncate_owned(
+    struct kernel_open_file_description *, uint64_t length, int64_t *linux_result);
+enum kernel_files_status kernel_files_xattr_owned(struct kernel_files *,
+    const struct kernel_fs_context *, struct kernel_mm *,
+    const struct kernel_files_xattr_request *, struct kernel_open_file_description *,
+    int64_t *linux_result);
+enum kernel_files_status kernel_files_uring_close(
+    struct kernel_files *, int64_t fd, int64_t *linux_result);
+enum kernel_files_status kernel_files_uring_open(struct kernel_files *,
+    const struct kernel_fs_context *, struct kernel_mm *, int32_t dirfd,
+    uint64_t user_path, const uint64_t how[3], int strict,
+    struct kernel_open_file_description **, int64_t *linux_result);
 #endif

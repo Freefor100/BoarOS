@@ -3454,7 +3454,7 @@ PrepareTarget:
             if (entry) {
                 { CACHE_SCOPE(guard,cache); entry_return(entry); }
             }
-            return 0;
+            return source->staging_error;
         }
         if (candidate && whole && view.size<count) {
             /* 第二来源页尚不可用时仍须接纳真实前缀；私有完整覆盖候选

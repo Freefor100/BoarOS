@@ -42,6 +42,7 @@ struct kernel_uid_account {
     uint64_t references, pending, processes;
     uint64_t unix_inflight; /* AF_UNIX queued descriptors, protected by socket state lock. */
     uint64_t shm_locked_pages; /* SHM_LOCK quota, protected by kernel_wait_domain. */
+    uint64_t pinned_io_pages; /* Long-lived I/O memory, protected by kernel_wait_domain. */
     uint32_t uid;
     unsigned inotify_groups, inotify_marks; /* Protected by the notification index. */
     unsigned fanotify_groups, fanotify_marks; /* Protected by the fanotify mark index. */
@@ -92,6 +93,8 @@ void kernel_uid_account_put(struct kernel_uid_account *);
 /* A successful queue charge owns one account reference until uncharge. */
 int kernel_uid_account_mqueue_charge(struct kernel_uid_account *,uint64_t bytes,uint64_t limit);
 void kernel_uid_account_mqueue_uncharge(struct kernel_uid_account *,uint64_t bytes);
+int kernel_uid_account_pin_charge(struct kernel_uid_account *,uint64_t pages,uint64_t limit);
+void kernel_uid_account_pin_uncharge(struct kernel_uid_account *,uint64_t pages);
 /* Pipe already owns its creator account; returns usage after this delta. */
 uint64_t kernel_uid_account_pipe_pages(struct kernel_uid_account *,uint64_t old_pages,uint64_t new_pages);
 /* A successful charge owns one account reference until SHM_UNLOCK/destruction.

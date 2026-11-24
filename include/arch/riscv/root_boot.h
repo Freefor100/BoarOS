@@ -66,6 +66,7 @@ struct riscv_root_boot {
     struct riscv_uart_statistics uart_statistics;
     struct riscv_virtio_mmio_rng rng;
     struct kernel_network *network;
+    struct kernel_igb_rx *igb;
     struct virtio_net_device net_device;
     struct kernel_heap heap;
     struct kernel_page_cache page_cache;

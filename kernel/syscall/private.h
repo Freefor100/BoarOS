@@ -1,6 +1,16 @@
 #ifndef BOAROS_KERNEL_SYSCALL_PRIVATE_H
 #define BOAROS_KERNEL_SYSCALL_PRIVATE_H
 #include <kernel/syscall.h>
+struct kernel_mm;
+int syscall_copy_open_how(struct kernel_mm *, uint64_t user, uint64_t size, uint64_t how[3]);
+struct uring_sqe;
+struct kernel_files;
+struct kernel_open_file_description;
+int kernel_io_uring_socket_supported(unsigned);
+int kernel_io_uring_socket_needs_file(unsigned);
+int kernel_io_uring_socket_validate(const struct uring_sqe *);
+int64_t kernel_io_uring_socket_execute(struct kernel_files *, struct kernel_mm *,
+    const struct uring_sqe *, struct kernel_open_file_description **);
 enum kernel_syscall_status syscall_handle_keys(struct kernel_task *,
     const struct kernel_syscall_request *, struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_personality(struct kernel_task *,const struct kernel_syscall_request *,struct kernel_syscall_result *);

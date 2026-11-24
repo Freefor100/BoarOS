@@ -5,6 +5,14 @@
 #include <kernel/uaccess.h>
 #include <kernel/cost.h>
 
+int kernel_mm_local_secret_address(struct kernel_mm *,uint64_t address);
+
+#if defined(__loongarch__)
+enum kernel_secret_copy { SECRET_COPY_IN, SECRET_COPY_OUT, SECRET_COPY_STRING };
+enum kernel_mm_status kernel_mm_copy_local_secret(struct kernel_mm *,uint64_t address,
+    void *buffer,size_t length,enum kernel_secret_copy,size_t *copied);
+#endif
+
 /* Share fault/retry preparation while allowing GUP-style callers to retain
  * ENOMEM. Ordinary copy callers still translate a failed pin to EFAULT. */
 static inline enum kernel_mm_status kernel_uaccess_pin_resolved(

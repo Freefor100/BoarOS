@@ -1,5 +1,6 @@
 #include <kernel/posix_timer.h>
 #include <kernel/event_fd.h>
+#include <kernel/io_uring.h>
 #include <kernel/credentials.h>
 #include <kernel/sync.h>
 #include <kernel/accounting.h>
@@ -255,6 +256,7 @@ static int clock_step(uint64_t ns)
     if (error) return error;
     kernel_timer_fd_clock_changed();
     kernel_posix_timer_clock_changed();
+    kernel_io_uring_clock_changed();
     return 0;
 }
 enum kernel_syscall_status syscall_handle_settime(struct kernel_task *caller,
@@ -339,6 +341,7 @@ enum kernel_syscall_status syscall_handle_adjtimex(struct kernel_task *caller,
             if (change & (KERNEL_CLOCK_RATE | KERNEL_CLOCK_STEP)) {
                 kernel_timer_fd_reindex(!!(change & KERNEL_CLOCK_STEP));
                 kernel_posix_timer_clock_changed();
+                kernel_io_uring_clock_changed();
             } else if (change & KERNEL_CLOCK_TAI_OFFSET) {
                 kernel_posix_timer_tai_changed();
             }

@@ -218,10 +218,10 @@ static enum kernel_fs_context_status copy_path_start(
 static enum kernel_files_status finish_open(struct kernel_files *files,
     struct kernel_open_file_description *description, uint64_t flags,
     struct kernel_files_fd_reservation *reservation, uint32_t fd_flags,
-    int created, int special_link, int64_t *linux_result)
+    int created, int special_link, struct kernel_open_file_description **direct,
+    int64_t *linux_result)
 {
     KERNEL_SERVICE_SCOPE_IF(service, 0);
-    uint32_t fd = reservation->fd;
     uint32_t object_type = kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT;
     if (!(flags & LINUX_O_PATH) && !special_link) {
         int error = kernel_vfs_fanotify_permission(&description->file, VFS_NOTIFY_OPEN_PERM,
@@ -354,6 +354,12 @@ Finish_open:
         description->notify_opened=1;
         kernel_vfs_notify_open(&description->file,&description->notify_backing,VFS_NOTIFY_OPEN);
     }
+    if (direct) {
+        *direct = description;
+        *linux_result = 0;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    uint32_t fd = reservation->fd;
     enum kernel_files_status files_status = kernel_files_install_new_owned_at(files,
                                                      fd,
                                                      fd_flags,
@@ -389,6 +395,7 @@ static enum kernel_files_status files_open(
     uint64_t user_path,
     uint64_t flags,
     uint64_t mode, uint64_t resolve, int strict,
+    struct kernel_open_file_description **direct,
     int64_t *linux_result)
 {
     struct kernel_task_io_buffer path_buffer __attribute__((cleanup(path_buffer_release)))={0};
@@ -397,7 +404,8 @@ static enum kernel_files_status files_open(
     KERNEL_FILES_PATH_SCOPE(start_owner);
     struct kernel_vfs_path *start=NULL;
     char *path;
-    uint32_t fd;
+    struct kernel_files_fd_reservation reservation
+        __attribute__((cleanup(kernel_files_cancel_reservation))) = {0};
     uint32_t fd_flags = 0U;
     int result;
     enum kernel_open_file_status open_status;
@@ -421,16 +429,21 @@ static enum kernel_files_status files_open(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    files_status = kernel_files_find_free_fd(files, &fd, &result);
-    if (files_status != KERNEL_FILES_STATUS_OK) {
-        return files_status;
-    }
-    if (result != 0) {
-        KERNEL_FILES_NOTE(files, open_failures, 1);
-        *linux_result = result;
+    if (!direct) {
+        uint32_t fd;
+        files_status = kernel_files_find_free_fd(files, &fd, &result);
+        if (files_status != KERNEL_FILES_STATUS_OK)
+            return files_status;
+        if (result != 0) {
+            KERNEL_FILES_NOTE(files, open_failures, 1);
+            *linux_result = result;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        reservation = (struct kernel_files_fd_reservation){files, fd};
+    } else if (fd_flags) {
+        *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
-    struct kernel_files_fd_reservation reservation __attribute__((cleanup(kernel_files_cancel_reservation))) = {files, fd};
     enum kernel_task_status storage=kernel_task_io_buffer_acquire(&path_buffer,mm->allocator);
     if (storage == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
         KERNEL_FILES_NOTE(files, open_failures, 1);
@@ -512,7 +525,7 @@ static enum kernel_files_status files_open(
         return KERNEL_FILES_STATUS_OK;
     }
     return finish_open(files, description, flags, &reservation, fd_flags,
-        opened.created, special_link, linux_result);
+        opened.created, special_link, direct, linux_result);
 }
 
 /* The Linux header precedes the filesystem-specific opaque payload. */
@@ -661,7 +674,7 @@ int kernel_files_open_by_handle(struct kernel_files *files, const struct kernel_
     if (result) return result;
     int64_t fd_result;
     return finish_open(files, description, flags, &reservation, fd_flags,
-        temporary, 0, &fd_result) == KERNEL_FILES_STATUS_OK ? (int)fd_result : -KERNEL_EIO;
+        temporary, 0, NULL, &fd_result) == KERNEL_FILES_STATUS_OK ? (int)fd_result : -KERNEL_EIO;
 }
 
 enum kernel_files_status kernel_files_openat(
@@ -669,7 +682,7 @@ enum kernel_files_status kernel_files_openat(
     struct kernel_mm *mm, int64_t dirfd, uint64_t user_path, uint64_t flags,
     uint64_t mode, int64_t *linux_result)
 {
-    return files_open(files,fs,mm,dirfd,user_path,flags,mode,0,0,linux_result);
+    return files_open(files,fs,mm,dirfd,user_path,flags,mode,0,0,NULL,linux_result);
 }
 
 enum kernel_files_status kernel_files_openat2(
@@ -677,7 +690,16 @@ enum kernel_files_status kernel_files_openat2(
     struct kernel_mm *mm, int32_t dirfd, uint64_t user_path, uint64_t flags,
     uint64_t mode, uint64_t resolve, int64_t *linux_result)
 {
-    return files_open(files,fs,mm,dirfd,user_path,flags,mode,resolve,1,linux_result);
+    return files_open(files,fs,mm,dirfd,user_path,flags,mode,resolve,1,NULL,linux_result);
+}
+
+enum kernel_files_status kernel_files_uring_open(struct kernel_files *files,
+    const struct kernel_fs_context *fs, struct kernel_mm *mm, int32_t dirfd,
+    uint64_t user_path, const uint64_t how[3], int strict,
+    struct kernel_open_file_description **direct, int64_t *result)
+{
+    return files_open(files, fs, mm, dirfd, user_path, how[0], how[1], how[2], strict,
+        direct, result);
 }
 
 enum kernel_files_status kernel_files_symlinkat(

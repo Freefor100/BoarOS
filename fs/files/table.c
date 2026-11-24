@@ -1,3 +1,4 @@
+#include <kernel/bitops.h>
 #include <kernel/scheduler.h>
 #include <kernel/async_io.h>
 #include "private.h"
@@ -175,22 +176,6 @@ static enum kernel_heap_status allocate_fd_bitmap(struct kernel_heap *heap,
         (void **)bitmap);
 }
 
-static uint32_t first_fd_bit(uint64_t bits)
-{
-#if defined(__riscv) && !defined(__riscv_zbb)
-    /* 基础 RV64 的编译器内建操作会调用外部运行库。 */
-    uint32_t bit = 0;
-    if (!(bits & UINT32_MAX)) { bits >>= 32U; bit += 32U; }
-    if (!(bits & UINT16_MAX)) { bits >>= 16U; bit += 16U; }
-    if (!(bits & UINT8_MAX)) { bits >>= 8U; bit += 8U; }
-    if (!(bits & 0xFU)) { bits >>= 4U; bit += 4U; }
-    if (!(bits & 0x3U)) { bits >>= 2U; bit += 2U; }
-    return bit + !(bits & 1U);
-#else
-    return (uint32_t)__builtin_ctzll(bits);
-#endif
-}
-
 static uint32_t find_empty_locked(const struct kernel_files_record *record,
     uint32_t minimum, uint32_t upper)
 {
@@ -202,7 +187,7 @@ static uint32_t find_empty_locked(const struct kernel_files_record *record,
         if (minimum >= upper) return upper;
         empty = ~record->occupied[word];
     }
-    uint32_t fd = minimum + ((empty & 1U) ? 0U : first_fd_bit(empty));
+    uint32_t fd = minimum + ((empty & 1U) ? 0U : kernel_first_set_u64(empty));
     return fd < upper ? fd : upper;
 }
 
@@ -733,7 +718,7 @@ int kernel_files_scan_select(struct kernel_files *files,unsigned nfds,const uint
          * for this live slot. Stateful targets still need their own references. */
         KERNEL_FILES_SCOPE(guard,files);
         while (pending) {
-            unsigned bit=first_fd_bit(pending);
+            unsigned bit=kernel_first_set_u64(pending);
             uint64_t mask=UINT64_C(1)<<bit;
             struct kernel_open_file_description *file=lookup_locked(files,first+bit);
             if (!file) return -KERNEL_EBADF;
@@ -1306,8 +1291,8 @@ enum kernel_files_status kernel_files_fcntl(
     return KERNEL_FILES_STATUS_OK;
 }
 
-enum kernel_files_status kernel_files_close(
-    struct kernel_files *files, int64_t fd, int64_t *linux_result)
+static enum kernel_files_status close_fd(
+    struct kernel_files *files, int64_t fd, int allow_ring, int64_t *linux_result)
 {
     if (!kernel_files_is_live(files) || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
@@ -1316,7 +1301,7 @@ enum kernel_files_status kernel_files_close(
         KERNEL_FILES_SCOPE(guard, files);
         KERNEL_FILES_NOTE(files, close_calls, 1);
         description = lookup_locked(files, fd);
-        if (!description) {
+        if (!description || (!allow_ring && description->kind == KERNEL_OPEN_FILE_KIND_IO_URING)) {
             KERNEL_FILES_NOTE(files, close_failures, 1);
             *linux_result = -KERNEL_EBADF;
             return KERNEL_FILES_STATUS_OK;
@@ -1325,6 +1310,18 @@ enum kernel_files_status kernel_files_close(
     }
     *linux_result = 0;
     return release_detached(files, description, 1, kernel_task_current());
+}
+
+enum kernel_files_status kernel_files_close(
+    struct kernel_files *files, int64_t fd, int64_t *linux_result)
+{
+    return close_fd(files, fd, 1, linux_result);
+}
+
+enum kernel_files_status kernel_files_uring_close(
+    struct kernel_files *files, int64_t fd, int64_t *linux_result)
+{
+    return close_fd(files, fd, 0, linux_result);
 }
 
 /* 一段最多16槽；取得的OFD owner覆盖锁外释放。 */

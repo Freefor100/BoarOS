@@ -23,7 +23,7 @@
 | **文件系统与存储** | 挂载用户身份映射（ID-mapped mounts）、同步挂载属性、延迟时间戳更新（`lazytime`）、强制卸载（`MNT_FORCE`）、叠加文件系统（OverlayFS）的多下层配置与跨层重命名、`fanotify` 文件范围预访问通知，以及非阻塞缓冲读取标志（`RWF_NOWAIT`）。 |
 | **内存与容器隔离** | 交换空间（Swap）、透明大页（Transparent Huge Pages，THP）、用户命名空间（User Namespace）、网络命名空间（Network Namespace）以及控制组第二版（cgroup v2）的完整资源控制器。 |
 | **网络与 eBPF 扩展** | IPv6 报文分片重组、组播侦听发现协议第二版（Multicast Listener Discovery version 2，MLDv2）、通过 `rtnetlink` 动态修改路由与多地址配置；eBPF 的更多挂载点（如 `kprobe`、`uprobe`、`XDP`/`TC`）以及双架构即时编译（Just-In-Time，JIT）后端。 |
-| **异步 I/O 深化** | 扩展原生异步输入输出（Asynchronous I/O，AIO）对更多后端与取消路径的覆盖，结合真实用户态异步消费者进行端到端验收。 |
+| **异步 I/O 深化** | 补齐共享输入输出环的通用异步执行、提交轮询、直接输入输出完成轮询和常规套接字的多次完成。扩展独立接收队列之外的网卡与分流方式。 |
 
 ---
 

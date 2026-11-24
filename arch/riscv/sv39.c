@@ -3,6 +3,7 @@
 #include <arch/riscv/smp.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/mmu_context.h>
+#include <arch/riscv/memory_layout.h>
 #include <kernel/page.h>
 
 #include <stdint.h>
@@ -552,7 +553,6 @@ static enum riscv_sv39_status kernel_window_allocate_level0(
         (void)physical_page_release(allocator, *address);
         return status;
     }
-    clear_runtime_table(*entries);
     return RISCV_SV39_STATUS_OK;
 }
 
@@ -564,6 +564,179 @@ static void kernel_window_sync(uint64_t address, uint64_t size)
     riscv_mmu_flush_kernel_range(address, size);
 #endif
 }
+
+/* Supervisor software bits distinguish excluded leaves and runtime-owned
+ * tables. Boot-created fine tables have no split ownership. */
+#define RISCV_DIRECT_SECRET RISCV_SV39_PTE_COW
+#define RISCV_DIRECT_PENDING RISCV_SV39_PTE_COW
+#define RISCV_DIRECT_SPLIT RISCV_SV39_PTE_PROTECTED
+static uint64_t secret_kernel_root;
+static struct kernel_raw_lock secret_direct_map_lock = {
+    .rank = KERNEL_RAW_RANK_MM, .initialized = KERNEL_RAW_INITIALIZED,
+};
+
+enum riscv_sv39_status riscv_sv39_secret_direct_map_enable(
+    const struct riscv_sv39_page_table *table)
+{
+    if (!table || table->state != RISCV_SV39_STATE_ACTIVE ||
+        riscv_sv39_current_satp() !=
+            (RISCV_SV39_SATP_MODE | (table->root_address >> BOAROS_PAGE_SHIFT)))
+        return RISCV_SV39_STATUS_INVALID;
+    if (__atomic_load_n(&secret_kernel_root, __ATOMIC_RELAXED))
+        return RISCV_SV39_STATUS_STATE;
+    __atomic_store_n(&secret_kernel_root, table->root_address, __ATOMIC_RELEASE);
+    return RISCV_SV39_STATUS_OK;
+}
+
+int riscv_sv39_secret_page_supported(void)
+{
+    return __atomic_load_n(&secret_kernel_root, __ATOMIC_ACQUIRE) != 0;
+}
+
+/* Runtime direct-map roots already share this level-one directory across all
+ * address spaces. Only the published leaf or its child table changes here. */
+static enum riscv_sv39_status direct_map_parent(
+    const struct physical_page_allocator *allocator, uint64_t va, uint64_t **parent)
+{
+    uint64_t physical = __atomic_load_n(&secret_kernel_root, __ATOMIC_ACQUIRE);
+    if (!physical) return RISCV_SV39_STATUS_STATE;
+    uint64_t *root, *directory;
+    enum riscv_sv39_status status = resolve_runtime_table(allocator, physical, &root);
+    if (status) return status;
+    uint64_t root_entry = root[(va >> 30U) & RISCV_SV39_INDEX_MASK];
+    if ((root_entry & RISCV_SV39_PTE_FLAGS_MASK) != RISCV_SV39_PTE_VALID)
+        return RISCV_SV39_STATUS_NOT_MAPPED;
+    status = resolve_runtime_table(allocator, (root_entry >> 10U) << 12U, &directory);
+    if (status) return status;
+    *parent = &directory[(va >> 21U) & RISCV_SV39_INDEX_MASK];
+    return RISCV_SV39_STATUS_OK;
+}
+
+/* A split contains 512 leaves. Five pairs of supervisor software bits
+ * record its live exclusions without touching physical or permission bits. */
+#define RISCV_DIRECT_COUNT_WORDS 5U
+#define RISCV_DIRECT_COUNT_MASK (RISCV_DIRECT_PENDING | RISCV_DIRECT_SPLIT)
+static unsigned direct_exclusions(const uint64_t *leaves)
+{
+    unsigned count = 0;
+    for (unsigned i = 0; i < RISCV_DIRECT_COUNT_WORDS; i++)
+        count |= (unsigned)((leaves[i] & RISCV_DIRECT_COUNT_MASK) >> 8) << (2 * i);
+    return count;
+}
+
+static void direct_set_exclusions(uint64_t *leaves, unsigned count)
+{
+    for (unsigned i = 0; i < RISCV_DIRECT_COUNT_WORDS; i++) {
+        uint64_t old = leaves[i];
+        uint64_t bits = (uint64_t)(count & 3U) << 8;
+        if ((old & RISCV_DIRECT_COUNT_MASK) != bits)
+            __atomic_store_n(&leaves[i], (old & ~RISCV_DIRECT_COUNT_MASK) | bits, __ATOMIC_RELEASE);
+        count >>= 2;
+    }
+}
+
+static enum riscv_sv39_status change_secret_direct_leaf(
+    struct physical_page_allocator *allocator, uint64_t physical, int protect)
+{
+    if (!allocator || (physical & BOAROS_PAGE_MASK) || physical >= RISCV_DIRECT_MAP_SIZE)
+        return RISCV_SV39_STATUS_INVALID;
+    const uint64_t va = RISCV_DIRECT_MAP_BASE + physical;
+    const unsigned leaf_index = (va >> BOAROS_PAGE_SHIFT) & RISCV_SV39_INDEX_MASK;
+    const uint32_t permissions = RISCV_SV39_READ | RISCV_SV39_WRITE;
+    const uint64_t original = leaf_entry(physical, permissions);
+    const uint64_t excluded = (original & ~RISCV_SV39_PTE_VALID) | RISCV_DIRECT_SECRET;
+    const uint64_t base = physical & ~(RISCV_SV39_PAGE_SIZE_2M - 1U);
+    const uint64_t large = leaf_entry(base, permissions);
+    const uint64_t nonleaf_flags = RISCV_SV39_PTE_FLAGS_MASK &
+        ~(RISCV_DIRECT_PENDING | RISCV_DIRECT_SPLIT);
+    uint64_t *parent;
+    enum riscv_sv39_status status = direct_map_parent(allocator, va, &parent);
+    if (status) return status;
+    uint64_t candidate = 0;
+    uint64_t *children = NULL;
+
+    for (;;) {
+        uint64_t entry, retired = 0;
+        int prepare = 0, split = 0;
+        uintptr_t irq = arch_interrupt_save();
+        {
+            KERNEL_RAW_SCOPE(guard, &secret_direct_map_lock);
+            entry = *parent;
+            if (entry == large) {
+                if (!protect) status = RISCV_SV39_STATUS_CONFLICT;
+                else if (!candidate) prepare = 1;
+                else {
+                    entry = table_entry(candidate) | RISCV_DIRECT_SPLIT | RISCV_DIRECT_PENDING;
+                    __atomic_store_n(parent, entry, __ATOMIC_RELEASE);
+                    candidate = 0;
+                    split = 1;
+                }
+            } else if ((entry & nonleaf_flags) != RISCV_SV39_PTE_VALID) {
+                status = RISCV_SV39_STATUS_NOT_MAPPED;
+            } else {
+                uint64_t table = (entry >> 10U) << BOAROS_PAGE_SHIFT;
+                uint64_t *leaves;
+                status = resolve_runtime_table(allocator, table, &leaves);
+                if (!status) {
+                    uint64_t *slot = &leaves[leaf_index];
+                    int owned = (entry & RISCV_DIRECT_SPLIT) != 0;
+                    uint64_t mask = owned ? RISCV_DIRECT_COUNT_MASK : 0;
+                    uint64_t invalid = excluded & ~mask;
+                    if ((*slot & ~mask) != (protect ? original : invalid))
+                        status = RISCV_SV39_STATUS_CONFLICT;
+                    else {
+                        uint64_t replacement = (protect ? invalid : original) | (*slot & mask);
+                        __atomic_store_n(slot, replacement, __ATOMIC_RELEASE);
+                        if (owned) {
+                            unsigned count = direct_exclusions(leaves);
+                            if ((!protect && !count) || (protect && count > RISCV_SV39_INDEX_MASK))
+                                __builtin_trap();
+                            count = protect ? count + 1 : count - 1;
+                            if (!count) {
+                                if (entry & RISCV_DIRECT_PENDING) __builtin_trap();
+                                __atomic_store_n(parent, large, __ATOMIC_RELEASE);
+                                retired = table;
+                            } else direct_set_exclusions(leaves, count);
+                        }
+                    }
+                }
+            }
+        }
+        if (!status && !prepare) {
+            if ((entry & RISCV_DIRECT_PENDING) || retired)
+                kernel_window_sync(0, UINT64_MAX);
+            else
+                kernel_window_sync(va, BOAROS_PAGE_SIZE);
+            if (split) {
+                /* The first excluded page stays private to this call until
+                 * confirmation, keeping the table alive during the fence. */
+                KERNEL_RAW_SCOPE(confirm, &secret_direct_map_lock);
+                __atomic_store_n(parent, entry & ~RISCV_DIRECT_PENDING, __ATOMIC_RELEASE);
+            }
+        }
+        arch_interrupt_restore(irq);
+        if (retired && physical_page_release(allocator, retired)) __builtin_trap();
+        if (!prepare) break;
+        /* Prepare the whole replacement privately. A concurrent split can
+         * win; this path never allocates under the page-table lock. */
+        status = kernel_window_allocate_level0(allocator, &candidate, &children);
+        if (status) return status;
+        for (unsigned i = 0; i <= RISCV_SV39_INDEX_MASK; i++)
+            children[i] = leaf_entry(base + (uint64_t)i * BOAROS_PAGE_SIZE, permissions);
+        children[leaf_index] = excluded & ~RISCV_DIRECT_COUNT_MASK;
+        direct_set_exclusions(children, 1);
+    }
+    if (candidate && physical_page_release(allocator, candidate)) __builtin_trap();
+    return status;
+}
+
+enum riscv_sv39_status riscv_sv39_secret_page_protect(
+    struct physical_page_allocator *allocator, uint64_t physical)
+{ return change_secret_direct_leaf(allocator, physical, 1); }
+
+enum riscv_sv39_status riscv_sv39_secret_page_restore(
+    struct physical_page_allocator *allocator, uint64_t physical)
+{ return change_secret_direct_leaf(allocator, physical, 0); }
 
 static int kernel_window_valid(uint64_t address, unsigned pages)
 {
@@ -650,6 +823,7 @@ enum riscv_sv39_status riscv_sv39_kernel_window_map_pages(
         status = kernel_window_allocate_level0(allocator, &candidates[missing],
                                                 &candidate_data[missing]);
         if (status != RISCV_SV39_STATUS_OK) break;
+        clear_runtime_table(candidate_data[missing]);
     }
     for (unsigned i = 0; i < tables; i++) if (candidates[i])
         physical_page_release(allocator, candidates[i]);
@@ -1913,9 +2087,12 @@ enum riscv_sv39_status riscv_sv39_user_fork_commit_window(
             parent_slot -= i;
         }
         uint64_t *slot = parent_slot + i;
-        if (!(valid_user_leaf_entry(*slot) || valid_protected_entry(*slot)) ||
-            entry_address(*slot) != entry_address(entry))
-            return RISCV_SV39_STATUS_STATE;
+        if (!(valid_user_leaf_entry(*slot) || valid_protected_entry(*slot))) return RISCV_SV39_STATUS_STATE;
+        /* The MM may already have copied a privately pinned child's leaf. */
+        if (entry_address(*slot) != entry_address(entry)) {
+            if (present_cow_entry(entry) || protected_cow_entry(entry)) return RISCV_SV39_STATUS_STATE;
+            continue;
+        }
         if (!(present_cow_entry(*slot) || protected_cow_entry(*slot))) {
             result = mark_cow_leaf(parent, slot, parent_order);
             if (result) return result;

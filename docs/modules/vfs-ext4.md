@@ -15,6 +15,15 @@ BoarOS 的虚拟文件系统（Virtual File System，VFS）屏蔽了不同存储
 | `fs/ext4_backend.c`、`fs/lwext4_port.c` | ext4 适配层、JBD2 多核日志调度、延迟分配、多核目录级并行锁、ACL 与扩展属性 |
 | `third_party/lwext4/` | 磁盘格式解析、区段树（Extent Tree）、块组索引节点表位置缓存与分组日志实现 |
 | `fs/overlay.c` | 可写叠加文件系统（下层/上层/工作目录合并、写时复制提升、删除标记与不透明目录） |
+| `kernel/block.c`、`drivers/nvme/pci.c` | 块设备注册、分区与传输保护，以及原生 NVMe 数据传输和命令完成 |
+
+### 原生 NVMe 块设备
+
+RISC-V 和 LoongArch 的 QEMU 虚拟机可在 VirtIO 根盘之外挂接非易失性存储器高速接口（Non-Volatile Memory Express，NVMe）控制器。驱动通过外围组件互连高速总线（Peripheral Component Interconnect Express，PCIe）发现控制器及其命名空间，按实际逻辑块大小注册为 `/dev/nvme0n1` 等设备。普通文件的读写、文件系统写回和持久化请求继续通过共同的块层。
+
+驱动分别维护管理和数据提交队列。块层批量传入请求时，驱动先准备各请求的直接内存访问（Direct Memory Access，DMA）缓冲区，再批量写入描述符，共用一次设备通知。完成队列返回实际命令状态后才能重用缓冲区。超时触发设备停用，已发布的缓冲区保留到硬件确认安全。控制器重置失败时，驱动继续持有可能仍被设备访问的内存。
+
+`/dev/nvme0` 和 `/dev/ng0n1` 分别提供控制器和命名空间命令。通过 `io_uring` 的 128 字节提交项和 32 字节完成项，可以执行控制器识别、读取日志、查询特性，以及命名空间读、写、比较和刷新。接口接受连续缓冲区和向量，用户复制在设备队列保护之外完成，访问权限在命令发布前核对。
 
 ---
 

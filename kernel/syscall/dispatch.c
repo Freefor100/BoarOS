@@ -7,6 +7,8 @@
 #include <kernel/process_acct.h>
 #include <kernel/seccomp.h>
 #include <kernel/task_state.h>
+#include <kernel/secretmem.h>
+#include <kernel/io_uring.h>
 #include <kernel/errno.h>
 #include <kernel/pidfd.h>
 #include <kernel/kcmp.h>
@@ -887,6 +889,9 @@ static enum kernel_syscall_status __attribute__((noinline)) dispatch_operation(
     } else if (request->number == 171U || request->number == 266U) {
         if (syscall_handle_adjtimex(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 447U) {
+        if (syscall_handle_memfd_secret(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number <= 4U || request->number == 292U) {
         if (syscall_handle_native_aio(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -960,5 +965,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     }
     if (request->number == LINUX_SYSCALL_PRCTL)
         return syscall_handle_prctl(caller, request, result);
+    if (request->number - 425U <= 2U)
+        return syscall_handle_io_uring(caller, request, result);
     return dispatch_operation(caller,request,result);
 }

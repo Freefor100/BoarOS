@@ -22,6 +22,7 @@
 #include <kernel/socket.h>
 #include <kernel/tick.h>
 #include <kernel/time.h>
+#include <platform/riscv_pci.h>
 
 #include <stdint.h>
 
@@ -535,6 +536,14 @@ static enum riscv_sv39_status build_kernel_page_table(
     }
     status = map_mmio_alias(&kernel_page_table, boot_irq.plic.base, boot_irq.plic.size);
     if (status != RISCV_SV39_STATUS_OK) return status;
+    if (info->qemu_virt_pci) {
+        status = map_mmio_alias(&kernel_page_table, RISCV_VIRT_PCI_ECAM_BASE,
+            RISCV_VIRT_PCI_ECAM_SIZE);
+        if (status == RISCV_SV39_STATUS_OK)
+            status = map_mmio_alias(&kernel_page_table, RISCV_VIRT_PCI_MEMORY_BASE,
+                RISCV_VIRT_PCI_MEMORY_SIZE);
+        if (status != RISCV_SV39_STATUS_OK) return status;
+    }
     for (index = 0U; index < info->virtio_mmio_count; index++) {
         status = map_mmio_alias(&kernel_page_table,
                                 info->virtio_mmio[index].base,
@@ -933,6 +942,10 @@ static void kernel_main_high(void)
     virt_uart_putc('\n');
     kernel_page_table.allocator = &page_allocator;
     verify_direct_map_runtime();
+    sv39_status = riscv_sv39_secret_direct_map_enable(&kernel_page_table);
+    if (sv39_status != RISCV_SV39_STATUS_OK) {
+        shutdown_for_sv39_error(sv39_status);
+    }
 
     scheduler_status = kernel_scheduler_init(
         &page_allocator,

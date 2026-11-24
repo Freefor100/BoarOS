@@ -1,4 +1,6 @@
 #include "private.h"
+#include <kernel/io_uring.h>
+#include <kernel/secretmem.h>
 #include <arch/mmu.h>
 
 #include <kernel/errno.h>
@@ -232,7 +234,10 @@ enum kernel_syscall_status syscall_handle_mmap(
             enum kernel_open_file_kind kind=kernel_open_file_kind(file);
             int packet_mapping=kind==KERNEL_OPEN_FILE_KIND_SOCKET &&
                 kernel_socket_family(kernel_open_file_socket(file))==KERNEL_SOCKET_AF_PACKET;
-            int object_mapping=kind==KERNEL_OPEN_FILE_KIND_BPF || packet_mapping;
+            int secret_mapping = kind == KERNEL_OPEN_FILE_KIND_SECRETMEM;
+            int uring_mapping = kind == KERNEL_OPEN_FILE_KIND_IO_URING;
+            int object_mapping = kind == KERNEL_OPEN_FILE_KIND_BPF || packet_mapping ||
+                secret_mapping || uring_mapping;
             if ((protections & LINUX_PROT_READ) &&
                 (caller->personality & KERNEL_PERSONALITY_READ_IMPLIES_EXEC) &&
                 !packet_mapping && !(source->mount && source->mount->noexec))
@@ -248,7 +253,7 @@ enum kernel_syscall_status syscall_handle_mmap(
                 error=-KERNEL_EPERM;
             else if (object_mapping) {
                 if (!(mm_flags & KERNEL_MM_MAP_SHARED)) error=-KERNEL_EINVAL;
-                else if (protections & LINUX_PROT_EXEC) error=-KERNEL_EPERM;
+                else if (!secret_mapping && (protections & LINUX_PROT_EXEC)) error=-KERNEL_EPERM;
             } else if (kind!=KERNEL_OPEN_FILE_KIND_REGULAR)
                 error=-KERNEL_ENODEV;
             if (error) {
@@ -265,7 +270,15 @@ enum kernel_syscall_status syscall_handle_mmap(
                 KERNEL_LOCK_SCOPE(mapping);
                 uint64_t length=(request->arguments[1]+BOAROS_PAGE_MASK)&~BOAROS_PAGE_MASK;
                 struct kernel_mm_mapped_object object={0};
-                if (kind==KERNEL_OPEN_FILE_KIND_BPF) {
+                if (secret_mapping) {
+                    object.acquire_page = kernel_secretmem_acquire_page;
+                    object.may_write = 1;
+                    object.secret = 1;
+                } else if (uring_mapping) {
+                    object.acquire_page = kernel_io_uring_mmap_page;
+                    object.may_write = 1;
+                    error = kernel_io_uring_mmap_begin(file, request->arguments[5], length);
+                } else if (kind==KERNEL_OPEN_FILE_KIND_BPF) {
                     object.acquire_page=kernel_bpf_mmap_page;
                     object.may_write=!!(protections & LINUX_PROT_WRITE);
                     error=kernel_bpf_mmap_begin(file,request->arguments[5],length,

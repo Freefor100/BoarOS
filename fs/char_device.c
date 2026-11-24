@@ -15,8 +15,11 @@
 #include <kernel/uaccess.h>
 #include <kernel/tty.h>
 #include <kernel/loop.h>
+#include <kernel/nvme.h>
 
 #include <string.h>
+
+extern __attribute__((weak)) const struct kernel_char_device *kernel_nvme_char_device_lookup(uint64_t);
 
 static int empty_read(void *instance, struct kernel_task *caller, uint32_t flags, void *buffer, size_t size,
                       size_t *bytes_read)
@@ -219,6 +222,8 @@ const struct kernel_char_device *kernel_char_device_lookup(uint64_t rdev)
     if (rdev == kernel_loop_control_device.rdev) return &kernel_loop_control_device;
     for (size_t i = 0U; i < sizeof(devices) / sizeof(devices[0]); i++)
         if (devices[i].rdev == rdev) return &devices[i];
+    if (((rdev >> 8) & 0xfff) == 240 && kernel_nvme_char_device_lookup)
+        return kernel_nvme_char_device_lookup(rdev);
     return 0;
 }
 

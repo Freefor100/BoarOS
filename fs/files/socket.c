@@ -121,9 +121,9 @@ enum kernel_files_status kernel_files_socket_create(
     return status;
 }
 
-enum kernel_files_status kernel_files_socket_accept(
+enum kernel_files_status kernel_files_socket_accept_owned(
     struct kernel_files *files, struct kernel_open_file_description *listener,
-    uint32_t flags,
+    uint32_t flags, int force_nonblock,
     int (*copy_peer)(void *context, const struct kernel_socket_address *address),
     void *context,
     int64_t *linux_result)
@@ -159,7 +159,7 @@ enum kernel_files_status kernel_files_socket_accept(
         *linux_result = -KERNEL_ENOMEM;
         return KERNEL_FILES_STATUS_OK;
     }
-    uint32_t wait_flags = kernel_open_file_flags(listener) & LINUX_SOCK_NONBLOCK
+    uint32_t wait_flags = (force_nonblock || (kernel_open_file_flags(listener) & LINUX_SOCK_NONBLOCK))
         ? KERNEL_SOCKET_MSG_DONTWAIT : 0;
     uint64_t target = 0;
     uint64_t timeout = kernel_socket_receive_timeout(socket);
@@ -186,6 +186,16 @@ enum kernel_files_status kernel_files_socket_accept(
     status=install_socket(files,&ofd,fd,flags,copy_peer,context,linux_result);
     if (!status && *linux_result>=0) reservation.files=0;
     return status;
+}
+
+enum kernel_files_status kernel_files_socket_accept(
+    struct kernel_files *files, struct kernel_open_file_description *listener,
+    uint32_t flags,
+    int (*copy_peer)(void *context, const struct kernel_socket_address *address),
+    void *context, int64_t *linux_result)
+{
+    return kernel_files_socket_accept_owned(files, listener, flags, 0, copy_peer,
+        context, linux_result);
 }
 
 enum kernel_files_status kernel_files_socketpair_create(
