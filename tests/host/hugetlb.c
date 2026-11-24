@@ -76,7 +76,7 @@ static void check_file_slots(struct kernel_hstate *h)
     struct kernel_hugetlb_reservation reserve={0};
     struct kernel_hugetlb_claim one={0},two={0};
     uint64_t physical;
-    assert(!kernel_hugetlb_file_create(h,&file));
+    assert(!kernel_hugetlb_file_create(h,NULL,&file));
     assert(kernel_hugetlb_file_find_page(file,first,&physical)==KERNEL_HUGETLB_NOT_FOUND);
     assert(!kernel_hugetlb_file_reserve_begin(file,first,first+2,&reserve));
     assert(snapshot(h).reserved==2);
@@ -124,6 +124,32 @@ static void check_file_slots(struct kernel_hstate *h)
     assert(!snapshot(h).maps && snapshot(h).free==3);
 }
 
+static void check_subpool(struct kernel_hstate *h)
+{
+    struct kernel_hugetlb_subpool *pool=NULL;
+    struct kernel_hugetlb_map *file=NULL,*private=NULL;
+    struct kernel_hugetlb_reservation reservation={0};
+    uint64_t maximum,available,hold;
+    assert(!kernel_hugetlb_subpool_create(h,2,1,&pool));
+    assert(!kernel_hugetlb_file_create(h,pool,&file));
+    assert(kernel_hugetlb_file_reserve_begin(file,0,3,&reservation)==KERNEL_HUGETLB_NO_MEMORY);
+    kernel_hugetlb_subpool_capacity(pool,&maximum,&available);
+    assert(maximum==2 && available==2 && snapshot(h).reserved==1);
+    assert(!kernel_hugetlb_file_reserve_begin(file,0,1,&reservation));
+    kernel_hugetlb_file_reserve_finish(&reservation,1);
+    assert(!kernel_hugetlb_file_private_create(file,1,0,&private));
+    hold=instantiate(file,0);
+    kernel_hugetlb_file_punch(file,0,1);
+    kernel_hugetlb_subpool_capacity(pool,&maximum,&available);
+    assert(available==0 && snapshot(h).reserved==1);
+    kernel_hugetlb_map_release(&private);
+    kernel_hugetlb_map_release(&file);
+    kernel_hugetlb_subpool_put(pool);
+    assert(snapshot(h).reserved==0 && snapshot(h).free==2);
+    assert(!physical_page_release_order(&allocator,hold,order));
+    assert(snapshot(h).reserved==0 && snapshot(h).free==3);
+}
+
 int main(void)
 {
     mm_test_attach(0);order=BOAROS_PAGE_SHIFT==12?9:11;huge_size=(size_t)BOAROS_PAGE_SIZE<<order;
@@ -142,6 +168,7 @@ int main(void)
     assert(kernel_hstate_destroy(&h)==KERNEL_HUGETLB_BUSY);
     kernel_hstate_put(borrow);
     assert(!kernel_hstate_resize(h,3));assert(snapshot(h).free==3);
+    check_subpool(h);
     struct kernel_hugetlb_map *owner=NULL,*nr=NULL,*child=NULL;
     assert(!kernel_hugetlb_map_create(h,2,KERNEL_HUGETLB_PRIVATE,0,&owner));
     assert(snapshot(h).reserved==2);

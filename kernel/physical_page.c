@@ -345,6 +345,7 @@ enum physical_page_status physical_page_allocator_init(
     result.compound_recycler = (struct physical_page_compound_recycler){0};
     result.lazy_reclaim = 0;
     result.shared_anon_pages = 0;
+    result.transparent_huge_pages = 0;
     result.buffer_bytes = 0;
     result.buffer_context = 0;
     result.total_pages = 0U;
@@ -763,7 +764,11 @@ static int head_valid(const struct physical_page_allocator *a, const struct budd
 
 /* Linux's stable /proc/kpageflags bit positions. The cache owns the mutable
  * bits; allocator state is sampled independently under its existing lock. */
-enum { PAGE_FLAG_DIRTY = 1U << 4, PAGE_FLAG_WRITEBACK = 1U << 8, PAGE_FLAG_BUDDY = 1U << 10 };
+enum {
+    PAGE_FLAG_DIRTY = 1U << 4, PAGE_FLAG_WRITEBACK = 1U << 8, PAGE_FLAG_BUDDY = 1U << 10,
+    PAGE_STATE_THP = 1U << 15, PAGE_FLAG_COMPOUND_HEAD = 1U << 15,
+    PAGE_FLAG_COMPOUND_TAIL = 1U << 16, PAGE_FLAG_THP = 1U << 22,
+};
 
 void physical_page_publish_cache_state(struct physical_page_allocator *allocator,
     uint64_t address, int dirty, int writeback)
@@ -797,16 +802,15 @@ unsigned physical_page_flags_snapshot(struct physical_page_allocator *allocator,
         if (!root) continue;
         uint32_t index=root->first_page_index+(uint32_t)((address-root->address)>>BOAROS_PAGE_SHIFT);
         const struct physical_page_metadata *page=&allocator->metadata[index];
-        if (page->state==PHYSICAL_PAGE_STATE_ALLOCATED_HEAD && !page->order) {
-            struct buddy_owner owner;
-            if (!owner_walk(allocator,root,index,&owner,NULL)) __builtin_trap();
-            if (owner.state==BUDDY_ALLOCATED && owner.first==index && !owner.order)
-                output[i]=__atomic_load_n(&page->cache_state,__ATOMIC_RELAXED);
-        } else if (page->state==PHYSICAL_PAGE_STATE_FREE_HEAD) {
-            struct buddy_owner owner;
-            if (!owner_walk(allocator,root,index,&owner,NULL)) __builtin_trap();
-            if (owner.state==BUDDY_FREE && owner.first==index) output[i]=PAGE_FLAG_BUDDY;
-        }
+        struct buddy_owner owner;
+        if (!owner_walk(allocator,root,index,&owner,NULL)) __builtin_trap();
+        if (owner.state==BUDDY_ALLOCATED) {
+            uint16_t flags=__atomic_load_n(&allocator->metadata[owner.first].cache_state,__ATOMIC_RELAXED);
+            if (!owner.order && owner.first==index) output[i]=flags;
+            else if (flags&PAGE_STATE_THP) output[i]=PAGE_FLAG_THP |
+                (owner.first==index ? PAGE_FLAG_COMPOUND_HEAD : PAGE_FLAG_COMPOUND_TAIL);
+        } else if (owner.state==BUDDY_FREE && owner.first==index &&
+            page->state==PHYSICAL_PAGE_STATE_FREE_HEAD) output[i]=PAGE_FLAG_BUDDY;
     }
     return count;
 }
@@ -1385,6 +1389,59 @@ static void split_allocated_pages(struct physical_page_allocator *a,
         page+(uint32_t)order_page_count(order-1), order-1, work);
 }
 
+void physical_page_mark_thp(struct physical_page_allocator *a,uint64_t address)
+{
+    PAGE_METADATA_SCOPE(work,a);
+    uint32_t index;
+    if (!page_lookup_work(a,address,0,&index,&work) || !a->metadata[index].order ||
+        a->metadata[index].state!=PHYSICAL_PAGE_STATE_ALLOCATED_HEAD || a->metadata[index].cache_state)
+        __builtin_trap();
+    a->metadata[index].cache_state=PAGE_STATE_THP;
+    __atomic_fetch_add(&a->transparent_huge_pages,order_page_count(a->metadata[index].order),__ATOMIC_RELAXED);
+}
+
+uint64_t physical_page_thp_pages(const struct physical_page_allocator *a)
+{ return __atomic_load_n(&a->transparent_huge_pages,__ATOMIC_RELAXED); }
+
+int physical_page_is_thp(const struct physical_page_allocator *a,uint64_t head)
+{
+    uint32_t index;
+    if (!page_lookup(a,head,NULL,&index)) __builtin_trap();
+    return (__atomic_load_n(&a->metadata[index].cache_state,__ATOMIC_RELAXED)&PAGE_STATE_THP)!=0;
+}
+
+void physical_page_split_thp(struct physical_page_allocator *a,uint64_t address,uint32_t order)
+{
+    const unsigned group_order=4;
+    const uint64_t pages=order_page_count(order);
+    for (uint64_t offset=0;offset<pages;offset+=order_page_count(group_order)) {
+        PAGE_METADATA_SCOPE(work,a);
+        uint32_t index;
+        struct buddy_owner owner;
+        if (!page_lookup_work(a,address+offset*BOAROS_PAGE_SIZE,0,&index,&work) ||
+            !owner_find(a,index,&owner,&work) || owner.first!=index ||
+            owner.state!=BUDDY_ALLOCATED || a->metadata[index].reference_count!=1 ||
+            (offset==0 && (owner.order!=order || a->metadata[index].cache_state!=PAGE_STATE_THP)))
+            __builtin_trap();
+        if (!offset) __atomic_fetch_sub(&a->transparent_huge_pages,pages,__ATOMIC_RELAXED);
+        /* Both subtrees remain valid, independently owned allocations at
+         * every unlock. Work on at most sixteen base pages per critical section. */
+        while (owner.order>group_order) {
+            uint64_t left=2*owner.node+1;
+            uint32_t next_order=owner.order-1;
+            uint32_t right_page=index+(uint32_t)order_page_count(next_order);
+            tree_set(a,owner.root,owner.node,BUDDY_SPLIT,&work);
+            tree_set(a,owner.root,left,BUDDY_ALLOCATED,&work);
+            tree_set(a,owner.root,left+1,BUDDY_ALLOCATED,&work);
+            mark_head(a,index,next_order,PHYSICAL_PAGE_STATE_ALLOCATED_HEAD,&work);
+            mark_head(a,right_page,next_order,PHYSICAL_PAGE_STATE_ALLOCATED_HEAD,&work);
+            owner.node=left;
+            owner.order=next_order;
+        }
+        split_allocated_pages(a,owner.root,owner.node,index,owner.order,&work);
+    }
+}
+
 static unsigned allocate_base_batch_locked(struct physical_page_allocator *a,
     uint64_t *addresses, unsigned count, struct page_work *work, int drain_reserves)
 {
@@ -1625,6 +1682,8 @@ static __attribute__((noinline)) uint32_t physical_page_release_owner(struct phy
         if (retained) return order;
     }
     uint64_t pages = order_page_count(order);
+    if (order && (a->metadata[page].cache_state&PAGE_STATE_THP))
+        __atomic_fetch_sub(&a->transparent_huge_pages,pages,__ATOMIC_RELAXED);
     if (a->available_pages > a->total_pages ||
         pages > a->total_pages - a->available_pages)
         physical_page_release_fatal(a, address, order, "available-count", address);

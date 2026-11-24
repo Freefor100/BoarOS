@@ -151,6 +151,8 @@ int kernel_mm_remote_transfer(struct kernel_mm *, uint64_t address, void *buffer
  * existing remote writer; subsequent ptrace/process_vm writes are rejected. */
 unsigned kernel_mm_coredump_filter_get(const struct kernel_mm *);
 void kernel_mm_coredump_filter_set(struct kernel_mm *, unsigned);
+unsigned kernel_mm_thp_disable_get(const struct kernel_mm *);
+void kernel_mm_thp_disable_set(struct kernel_mm *, unsigned);
 int kernel_mm_core_begin(struct kernel_mm *);
 void kernel_mm_core_end(struct kernel_mm *);
 /* Pair around a process_vm request while its independent MM owner lives.
@@ -228,9 +230,11 @@ enum kernel_mm_advice {
     KERNEL_MM_ADVICE_FREE = 8,
     KERNEL_MM_ADVICE_REMOVE = 9,
     KERNEL_MM_ADVICE_DONTFORK = 10, KERNEL_MM_ADVICE_DOFORK = 11,
+    KERNEL_MM_ADVICE_HUGEPAGE = 14, KERNEL_MM_ADVICE_NOHUGEPAGE = 15,
     KERNEL_MM_ADVICE_DONTDUMP = 16, KERNEL_MM_ADVICE_DODUMP = 17,
     KERNEL_MM_ADVICE_WIPEONFORK = 18, KERNEL_MM_ADVICE_KEEPONFORK = 19,
     KERNEL_MM_ADVICE_POPULATE_READ = 22, KERNEL_MM_ADVICE_POPULATE_WRITE = 23,
+    KERNEL_MM_ADVICE_COLLAPSE = 25,
 };
 int kernel_mm_madvise(struct kernel_mm *, uint64_t, uint64_t, int32_t advice);
 /* Existing mapping; access=0 selects mmap population rather than strict READ/WRITE. */

@@ -1819,9 +1819,9 @@ static enum riscv_sv39_status install_prepared_leaf(struct riscv_sv39_user_space
     return RISCV_SV39_STATUS_OK;
 }
 enum riscv_sv39_status riscv_sv39_user_prepare_move(struct riscv_sv39_user_space *s,
-    uint64_t address, struct kernel_mm_leaf_preparation *prepared)
+    uint64_t address, uint32_t order, struct kernel_mm_leaf_preparation *prepared)
 {
-    return install_prepared_leaf(s, address, 0, 0, prepared);
+    return install_prepared_leaf(s, address, 0, order, prepared);
 }
 enum riscv_sv39_status riscv_sv39_user_map_prepared_order(struct riscv_sv39_user_space *s,
     uint64_t address, uint64_t physical, uint32_t permissions, int flags, uint32_t order,
@@ -1852,22 +1852,42 @@ enum riscv_sv39_status riscv_sv39_user_map_prepared_page(struct riscv_sv39_user_
     struct kernel_mm_leaf_preparation *prepared)
 { return riscv_sv39_user_map_prepared_order(s,address,physical,permissions,flags,0,prepared); }
 enum riscv_sv39_status riscv_sv39_user_move_leaf(struct riscv_sv39_user_space *s,
-    uint64_t from, uint64_t to)
+    uint64_t from, uint64_t to, uint32_t order)
 {
     uint64_t *source, *target = 0;
-    if (((from | to) & BOAROS_PAGE_MASK) || from == to)
+    if ((order!=0 && order!=9) || ((from|to)&(((uint64_t)BOAROS_PAGE_SIZE<<order)-1)) || from==to)
         return RISCV_SV39_STATUS_INVALID;
-    enum riscv_sv39_status status = resolve_existing_user_leaf(s, from, &source, 0);
+    uint32_t found;
+    enum riscv_sv39_status status=resolve_leaf_order(s,from,&source,&found,NULL);
     if (status) return status;
-    status = resolve_existing_user_leaf(s, to, &target, 0);
+    if (found!=order) return RISCV_SV39_STATUS_STATE;
+    status=resolve_leaf_order(s,to,&target,&found,NULL);
     if (status != RISCV_SV39_STATUS_NOT_MAPPED)
         return status ? status : RISCV_SV39_STATUS_CONFLICT;
-    if (!target) return RISCV_SV39_STATUS_STATE;
-    if (!valid_user_leaf_entry(*source) && !valid_protected_entry(*source))
-        return RISCV_SV39_STATUS_NOT_MAPPED;
+    if (found!=order) return RISCV_SV39_STATUS_STATE;
     uint64_t entry = __atomic_exchange_n(source, 0, __ATOMIC_ACQ_REL);
     __atomic_store_n(target, entry, __ATOMIC_RELEASE);
     return RISCV_SV39_STATUS_OK;
+}
+
+uint64_t riscv_sv39_user_thp_base_entry(uint64_t physical,const struct kernel_mm_leaf *leaf)
+{
+    return encode_user_entry(physical,leaf->permissions&~RISCV_SV39_USER,
+        leaf->cow ? KERNEL_MM_LEAF_COW : 0);
+}
+
+void riscv_sv39_user_thp_install_split(struct riscv_sv39_user_space *s,
+    const struct kernel_mm_leaf *leaf,uint64_t table)
+{
+    uint64_t *slot;
+    uint32_t order;
+    if (resolve_leaf_order(s,leaf->virtual_address,&slot,&order,NULL) || order!=9 ||
+        !valid_protected_entry(*slot) || entry_address(*slot)!=leaf->physical_address)
+        __builtin_trap();
+    __atomic_store_n(slot,table_entry(table),__ATOMIC_RELEASE);
+    s->table_pages++;
+    if (leaf->permissions) { s->protected_pages-=1U<<order;s->leaf_pages+=1U<<order; }
+    resident_peak(s);
 }
 /* The caller keeps MM metadata stable through inspecting or replacing this
  * leaf. Return that actual slot so commit does not repeat the same walk. */

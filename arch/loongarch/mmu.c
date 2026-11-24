@@ -570,7 +570,7 @@ enum arch_mmu_status arch_mmu_user_leaf_missing_order(struct arch_mmu_user_space
     if (!directory_entry(middle)) return ARCH_MMU_STATUS_STATE;
     uint64_t leaf = table(s, middle)[(v >> 25) & (ENTRIES - 1)];
     if (order) {
-        if (leaf && !(leaf & PTE_HUGE)) return ARCH_MMU_STATUS_CONFLICT;
+        if (leaf) return ARCH_MMU_STATUS_CONFLICT;
         *mask = 0;
     } else {
         if (leaf && !directory_entry(leaf)) return ARCH_MMU_STATUS_CONFLICT;
@@ -634,8 +634,8 @@ static enum arch_mmu_status install_prepared_leaf(struct arch_mmu_user_space *s,
     return ARCH_MMU_STATUS_OK;
 }
 enum arch_mmu_status arch_mmu_user_prepare_move(struct arch_mmu_user_space *s,
-    uint64_t v, struct kernel_mm_leaf_preparation *prepared)
-{ return install_prepared_leaf(s, v, 0, 0, prepared); }
+    uint64_t v, uint32_t order, struct kernel_mm_leaf_preparation *prepared)
+{ return install_prepared_leaf(s, v, 0, order, prepared); }
 enum arch_mmu_status arch_mmu_user_map_prepared_order(struct arch_mmu_user_space *s,
     uint64_t v, uint64_t physical, uint32_t permissions, int flags, uint32_t order,
     struct kernel_mm_leaf_preparation *prepared)
@@ -662,19 +662,38 @@ enum arch_mmu_status arch_mmu_user_map_prepared_page(struct arch_mmu_user_space 
     uint64_t v, uint64_t p, uint32_t permissions, int flags, struct kernel_mm_leaf_preparation *prepared)
 { return arch_mmu_user_map_prepared_order(s, v, p, permissions, flags, 0, prepared); }
 enum arch_mmu_status arch_mmu_user_move_leaf(struct arch_mmu_user_space *s,
-    uint64_t from, uint64_t to)
+    uint64_t from, uint64_t to, uint32_t order)
 {
     uint64_t *source, *target;
     if (((from | to) & BOAROS_PAGE_MASK) || from == to) return ARCH_MMU_STATUS_INVALID;
-    enum arch_mmu_status status = walk(s, from, 0, &source);
+    enum arch_mmu_status status=walk_order(s,from,order,0,&source);
     if (status) return status;
-    status = walk(s, to, 0, &target);
+    status=walk_order(s,to,order,0,&target);
     if (status) return status;
     if (*target) return ARCH_MMU_STATUS_CONFLICT;
     if (!(*source & PTE_PRESENT)) return ARCH_MMU_STATUS_NOT_MAPPED;
     uint64_t entry = __atomic_exchange_n(source, 0, __ATOMIC_ACQ_REL);
     __atomic_store_n(target, entry, __ATOMIC_RELEASE);
     return ARCH_MMU_STATUS_OK;
+}
+
+uint64_t arch_mmu_user_thp_base_entry(uint64_t physical,const struct kernel_mm_leaf *leaf)
+{
+    return encode(physical,leaf->permissions&7U,leaf->cow ? KERNEL_MM_LEAF_COW : 0);
+}
+
+void arch_mmu_user_thp_install_split(struct arch_mmu_user_space *s,
+    const struct kernel_mm_leaf *leaf,uint64_t table_address)
+{
+    uint64_t *slot;
+    uint32_t order;
+    if (walk_leaf(s,leaf->virtual_address,&slot,&order) || order!=HUGE_ORDER ||
+        !(*slot&PTE_NONE) || (*slot&PTE_ADDRESS)!=leaf->physical_address)
+        __builtin_trap();
+    __atomic_store_n(slot,table_address,__ATOMIC_RELEASE);
+    s->table_pages++;
+    if (leaf->permissions) { s->protected_pages-=1U<<order;s->leaf_pages+=1U<<order; }
+    resident_peak(s);
 }
 enum arch_mmu_status arch_mmu_user_cow_snapshot(struct arch_mmu_user_space *s,
     uint64_t v, uint64_t *cookie, uint64_t *physical)
