@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include <kernel/avl.h>
 #include <kernel/ipc.h>
 
 #define KERNEL_SHM_HUGETLB 04000
@@ -26,6 +27,7 @@
 
 #define KERNEL_SHMMIN 1ULL
 #define KERNEL_SHMMNI 128U
+#define KERNEL_SHMMNI_MAX 32768U
 #define KERNEL_SHMMAX (1024ULL * 1024ULL * 1024ULL) /* 1 GiB */
 #define KERNEL_SHMALL (KERNEL_SHMMAX >> 12)
 
@@ -78,6 +80,7 @@ struct kernel_uid_account;
 struct kernel_shm_segment {
     struct kernel_namespace *namespace;
     struct kernel_shm_table *table;
+    struct kernel_avl_node key_index;
     int32_t shmid;
     uint16_t seq;
     int32_t key;

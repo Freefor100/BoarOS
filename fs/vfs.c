@@ -9,6 +9,7 @@
 
 #include <kernel/accounting.h>
 #include <kernel/block.h>
+#include <kernel/bpf.h>
 #include <kernel/credentials.h>
 #include <kernel/io_context.h>
 #include <kernel/irq.h>
@@ -19,6 +20,8 @@
 #pragma weak kernel_process_acct_lock
 #pragma weak kernel_process_acct_has_mount
 #pragma weak kernel_process_acct_unmount
+#pragma weak kernel_bpf_filesystem_type
+#pragma weak kernel_devtmpfs_is_mount
 #include <kernel/file_mapping.h>
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
@@ -841,7 +844,7 @@ uint64_t kernel_vfs_allocate_mount_id(void)
     static uint64_t next = 1;
     kernel_task_lock_guard irq = {0};
     kernel_task_lock_acquire(&kernel_vfs_state_lock, &irq);
-    if (next == UINT64_MAX) __builtin_trap();
+    if (next >= UINT64_MAX-KERNEL_VFS_MOUNT_UNIQUE_ID_BASE) __builtin_trap();
     uint64_t id = next++;
     kernel_task_lock_release(&irq);
     return id;
@@ -993,6 +996,29 @@ void kernel_vfs_mount_initialize(struct kernel_vfs_mount *mount)
         instance->owner_storage=mount;instance->release_storage=mount->release_owner;
     }
 }
+/* Creation has not yet published any view of this instance. Bind mounts and
+ * namespace clones borrow the same source for their whole lifetime. */
+int kernel_vfs_mount_set_source(struct kernel_vfs_mount *mount,const char *source)
+{
+    if (!*source) return 0;
+    struct kernel_vfs_instance *instance=mount->private_data;
+    size_t bytes=strlen(source)+1;
+    char *name;
+    if (kernel_heap_allocate(instance->heap,bytes,(void **)&name)) return -KERNEL_ENOMEM;
+    memcpy(name,source,bytes);
+    instance->owned_source_name=name;
+    instance->backend_mount.source_name=mount->source_name=name;
+    return 0;
+}
+
+const char *kernel_vfs_mount_type(const struct kernel_vfs_mount *mount)
+{
+    const char *bpf=kernel_bpf_filesystem_type?kernel_bpf_filesystem_type(mount):NULL;
+    if (bpf) return bpf;
+    if (kernel_devtmpfs_is_mount && kernel_devtmpfs_is_mount(mount)) return "devtmpfs";
+    return ((const struct kernel_vfs_instance *)mount->private_data)->ops->type;
+}
+
 static void unqueue_instance(struct kernel_vfs_instance *instance)
 {
     if (!instance->cleanup_queued) return;
@@ -1277,8 +1303,14 @@ static int release_instance_owned(struct kernel_vfs_instance *instance)
     if (notify) notify->unmount(instance);
     const struct kernel_fanotify_ops *fanotify = fanotify_ops(instance);
     if (fanotify) fanotify->retire_instance(instance);
+    struct kernel_heap *heap=instance->heap;
+    char *source=instance->owned_source_name;
     int result=instance->ops->unmount(&instance->backend_mount);
-    if (!result) {if (release) release(storage);return 0;}
+    if (!result) {
+        if (source) kernel_heap_release(heap,source);
+        if (release) release(storage);
+        return 0;
+    }
     {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         if (retry) {retry->private_data=instance;retry->state=VFS_MOUNT_STATE_CLEANUP;retry->retired=1;}
@@ -1595,6 +1627,20 @@ int kernel_vfs_mount_reachable(struct kernel_vfs_mount *mount,const struct kerne
         if(!mount->covered_path || !mount->parent)return 0;
         entry=mount->covered_path->dentry;mount=mount->parent;
     }
+}
+
+uint64_t kernel_vfs_mount_dominating_group(const struct kernel_vfs_mount *mount,
+    const struct kernel_vfs_path *root)
+{
+    for (struct kernel_vfs_mount *master=mount->master;master;master=master->master) {
+        if (!master->propagation_group) continue;
+        struct kernel_vfs_mount *peer=master;
+        do {
+            if (kernel_vfs_mount_reachable(peer,root)) return master->propagation_group;
+            peer=peer->peer_next;
+        } while (peer!=master);
+    }
+    return 0;
 }
 
 /* All peer/master links are weak and belong to the topology qualification.
@@ -3842,6 +3888,16 @@ int kernel_vfs_path_string(const struct kernel_vfs_path *path,
 int kernel_vfs_path_filesystem_string(const struct kernel_vfs_path *path,char *buffer,size_t capacity)
 { return path_string(path,path,buffer,capacity,1,0,1); }
 
+int kernel_vfs_mount_root_string(const struct kernel_vfs_mount *mount,
+    const struct kernel_vfs_path *root,char *buffer,size_t capacity)
+{
+    struct kernel_vfs_path path={
+        .file.mount=(struct kernel_vfs_mount *)mount,
+        .dentry=mount->root_dentry,
+    };
+    return path_string(&path,root?root:&path,buffer,capacity,0,0,!root);
+}
+
 int kernel_vfs_path_cwd_string(const struct kernel_vfs_path *path,
                                const struct kernel_vfs_path *root,
                                char *buffer,size_t capacity)
@@ -4576,7 +4632,8 @@ void kernel_vfs_statx_extra(const struct kernel_vfs_file *file, const struct ker
     if (!path && file) path = file->path;
     if (path) file = &path->file;
     struct kernel_vfs_mount *mount = file ? file->mount : NULL;
-    if (mount) extra->mount_id = mount->id;
+    if (mount) extra->mount_id = extra->request & KERNEL_VFS_STATX_MNT_ID_UNIQUE ?
+        kernel_vfs_unique_mount_id(mount->id) : mount->id;
     stat->attributes_mask |= KERNEL_VFS_STATX_ATTR_MOUNT_ROOT;
     if (kernel_vfs_path_is_mount_root(path))
         stat->attributes |= KERNEL_VFS_STATX_ATTR_MOUNT_ROOT;
@@ -5944,7 +6001,7 @@ static int vfs_rename_at(struct kernel_vfs_path *old_start,
         goto Finish;
     }
     struct kernel_vfs_instance *adapter = source_parent->file.mount->private_data;
-    if (exchange && strcmp(adapter->ops->type,"ext4")) {
+    if (exchange && strcmp(adapter->ops->type,"ext4") && strcmp(adapter->ops->type,"ext3")) {
         result=-KERNEL_EOPNOTSUPP;goto Finish;
     }
     if (old_special) { result = -KERNEL_EBUSY; goto Finish; }
@@ -7537,7 +7594,7 @@ int kernel_vfs_file_is_control(const struct kernel_vfs_file *file,int write)
     return node && (node->generated_control & (write ? KERNEL_VFS_CONTROL_WRITE : KERNEL_VFS_CONTROL_READ));
 }
 
-int kernel_vfs_file_control(const struct kernel_vfs_file *file, int write,
+int kernel_vfs_file_control(const struct kernel_vfs_file *file, void *open_context, int write,
     uint64_t *offset, char *buffer, size_t size, size_t *count)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
@@ -7552,7 +7609,7 @@ int kernel_vfs_file_control(const struct kernel_vfs_file *file, int write,
      * write to the control file itself has been authorized. */
     if (node->generated_control&KERNEL_VFS_CONTROL_SYSTEM)
         kernel_lock_scope_release(&mutation);
-    return instance->ops->control(node, write, offset, buffer, size, count);
+    return instance->ops->control(node, open_context, write, offset, buffer, size, count);
 }
 
 int kernel_vfs_file_control_open_credentials(const struct kernel_vfs_file *file)

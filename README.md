@@ -19,7 +19,7 @@
 
 **BoarOS** 是一个从零编写的、面向 **RISC-V 64** 与 **龙芯 LoongArch 64** 双架构的宏内核操作系统，以完整兼容 **Linux 应用二进制接口（Application Binary Interface，ABI）** 为设计目标。内核主体采用 GNU C11 编写，仅在启动引导、异常陷入与上下文切换等紧贴硬件的边界使用精简汇编，目前核心代码规模约 **14.6 万行**。
 
-BoarOS 在 QEMU `virt` 虚拟平台上支持 **1～8 核对称多处理（Symmetric Multiprocessing，SMP）**，实现了 **278 个（RISC-V）/ 274 个（LoongArch）** Linux 系统调用。内核无需修改用户态源码，即可直接运行基于 `musl` 或 `glibc` 的静态与动态链接可执行文件（Executable and Linkable Format，ELF），已跑通 **BusyBox、SQLite、Lua、`strace`、原版 `bpftool`/`bpftrace`**，并支持在 BoarOS 客体机内完成**离线 C 语言预处理、编译、汇编、链接与执行**全流程。
+BoarOS 在 QEMU `virt` 虚拟平台上支持 **1～8 核对称多处理（Symmetric Multiprocessing，SMP）**，接入 **284 个（RISC-V）／280 个（LoongArch）** Linux 系统调用编号。内核无需修改用户态源码，即可直接运行基于 `musl` 或 `glibc` 的静态与动态链接可执行文件（Executable and Linkable Format，ELF），已跑通 **BusyBox、SQLite、Lua、`strace`、原版 `bpftool`/`bpftrace`**，并支持在 BoarOS 客体机内完成**离线 C 语言预处理、编译、汇编、链接与执行**全流程。
 
 > [!NOTE]
 > **推荐阅读路线**
@@ -72,7 +72,7 @@ BoarOS 在 QEMU `virt` 虚拟平台上支持 **1～8 核对称多处理（Symmet
 ### 4. 虚拟文件系统（VFS）与存储持久化
 - **清晰的对象分层**：VFS 严格分离目录项（dentry，负责路径名称）、索引节点（inode，负责文件元数据与数据本体）以及打开文件描述（Open File Description，OFD，负责读写偏移与打开状态）。因此文件被重命名或删除后，已打开的描述符仍可正常读写；通过 `dup` 或 `fork` 继承的描述符共享同一读写偏移。
 - **高并发 ext4 与持久化保障**：文件读写与内存映射共用统一页缓存（Page Cache）；启用日志（JBD2）的 ext4 在写入文件空洞时采用延迟分配（先预留磁盘空间与元数据额度，写回时连续分配物理块以减少碎片）；多核下支持目录级并行读写锁，日志提交与检查点线程按挂载与在线核数选核执行；显式同步（`fsync`）严格等待对应事务与块设备 `FLUSH` 屏障落盘。
-- **丰富的文件系统生态与现代接口**：支持同时挂载 **ext4 / ext2、可写叠加文件系统（OverlayFS）、FAT32/VFAT、内存文件系统（tmpfs）、进程信息文件系统（procfs）、系统属性文件系统（sysfs）、伪终端（devpts）、跟踪文件系统（tracefs）与 BPF 文件系统（bpffs）**；支持 POSIX 访问控制列表（Access Control List，ACL）、扩展属性（xattr）、文件句柄重打开（`name_to_handle_at` / `open_by_handle_at`）、文件访问监控（`fanotify`）以及现代挂载配置接口（`fsopen` / `fsconfig` / `fsmount`）。
+- **文件系统与挂载接口**。支持挂载 **ext4、ext3、ext2、可写叠加文件系统（OverlayFS）、FAT32/VFAT、内存文件系统（tmpfs）、进程信息文件系统（procfs）、系统属性文件系统（sysfs）、伪终端（devpts）、跟踪文件系统（tracefs）与 BPF 文件系统（bpffs）**。支持 POSIX 访问控制列表（Access Control List，ACL）、扩展属性（xattr）、按句柄打开文件（`name_to_handle_at`／`open_by_handle_at`）及文件访问监控（`fanotify`）。应用可用 `fsopen`／`fsconfig`／`fsmount` 创建挂载，也可用 `statmount`／`listmount` 查询挂载视图。
 - **共享输入输出环**：`io_uring` 支持批量提交和收取结果、登记文件和缓冲区，以及文件读写、轮询和定时器等操作。高速非易失性存储设备（Non-Volatile Memory Express，NVMe）可通过该接口接收设备命令。支持范围见[系统调用模块说明](docs/modules/kernel-syscall.md)。
 
 ### 5. 多核网络协议栈、eBPF 与可观测性
@@ -194,7 +194,7 @@ BoarOS/
 │   ├── syscall/     # Linux 系统调用统一分发与各接口族处理
 │   └── bpf/         # eBPF/cBPF 校验器、解释器、Map、BTF 与 tracepoint 跟踪
 ├── mm/              # 虚拟地址空间、VMA、区间并发协调、缺页处理、原生大页与内核 Slab 堆
-├── fs/              # 虚拟文件系统（VFS、页缓存、ext4/ext2、OverlayFS、FAT32、tmpfs、procfs 等）
+├── fs/              # 虚拟文件系统（VFS、页缓存、ext4/ext3/ext2、OverlayFS、FAT32、tmpfs、procfs 等）
 ├── net/             # 网络子系统（多核 TCP 分片、Socket 端点、TPACKET_V3、rtnetlink、lwIP 适配）
 ├── drivers/         # 外设与总线驱动（VirtIO 块设备 / 网卡 / RNG、PCI 总线、16550A 串口）
 ├── platform/        # 平台级硬件初始化与中断路由（RISC-V virt、LoongArch virt）

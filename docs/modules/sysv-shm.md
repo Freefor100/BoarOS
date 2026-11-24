@@ -28,7 +28,7 @@ flowchart LR
     Attach["逻辑附加对象 (struct kernel_shm_attachment)"]
     VMA["进程 VMA 片段 (禁止相邻合并)"]
 
-    NSTable -- "128 槽位 + 代次 seq" --> Seg
+    NSTable -- "按需分配的槽位分块 + 代次 seq" --> Seg
     Seg -- "唯一段表所有权" --> Backing
     Attach -- "持有后备引用与原始起止地址" --> Backing
     VMA -- "open/close 维护 nattch" --> Attach
@@ -37,7 +37,7 @@ flowchart LR
 ### 2.1 三层所有权设计
 
 1. **段表与后备存储**：
-   - 每个 IPC 命名空间在首次创建共享段时按需分配一张 `struct kernel_shm_table`，固定包含 `KERNEL_SHMMNI`（128）个段槽位。
+   - 每个 IPC 命名空间在首次成功创建共享段时建立段表。槽位每 128 个成一块，首次使用时分配。分块地址保持稳定，附加对象可以保留原段指针直到最后一次解除映射。每块记录被占用的槽位，段表记录非空块和已满块，用于查找空位和枚举。命名段另以平衡树按键值定位。
    - **普通页段**使用 `struct kernel_memory_object` 作为稀疏物理页后备；**大页段**（`SHM_HUGETLB`）使用 `struct kernel_hugetlb_map` 的共享后备，直接复用真实高阶物理页与页中间目录（Page Middle Directory，PMD）大页表项，两者均按需缺页分配物理页。
 2. **逻辑附加对象（`struct kernel_shm_attachment`）与 VMA 片段**：
    - 进程每次调用 `shmat` 成功时，会创建一个稳定的逻辑附加对象，记录该次附加的原始起止虚拟地址（`start`、`end`）、固定 `shmid`、所属命名空间以及后备对象引用。
@@ -45,7 +45,7 @@ flowchart LR
    - `shm_nattch` 严格统计**已提交的 VMA 片段数**（而不是进程数）：每次 VMA 插入、分裂或 `fork` 继承时调用 `kernel_shm_attachment_open()` 递增 `nattch`；每次 `shmdt`、`munmap`、进程退出或 `execve` 撤销 VMA 时调用 `kernel_shm_attachment_close_for_task()` 递减 `nattch`。临时筹备中的附加对象只递增 `segment->attachments` 以保住段槽位，不虚增用户可见的 `nattch`。
 3. **代次隔离与防悬空引用**：
    - 每个槽位维护单调递增的 16 位代次 `seq`（初值为 1，回绕时跳过 0），公开给用户态的标识符编码为：
-     `shmid = slot_idx + seq * KERNEL_SHMMNI`
+     `shmid = slot_idx + seq × 32768`
    - 当共享段彻底销毁时递增该槽位的 `seq`，避免旧进程手持的历史 `shmid` 误命中之后复用的同一槽位。
 
 ---
@@ -53,11 +53,11 @@ flowchart LR
 ## 三、完整生命周期与延迟销毁（`IPC_RMID`）
 
 - **创建与按需查找（`shmget`）**：
-  - `key == IPC_PRIVATE`（0）直接创建全新的私有段；命名键值先扫描活跃且未标记删除的段——若命中则依次校验 `IPC_CREAT | IPC_EXCL` 冲突、请求大小不超过原段（`size == 0` 合法，可用于仅查找已有段）以及读写执行权限位。
-  - 若命名键值不存在且未指定 `IPC_CREAT` 返回 `-ENOENT`；新建段时校验长度位于 `[KERNEL_SHMMIN, KERNEL_SHMMAX]`（1 字节 ～ 1 GiB），并受限于所属命名空间的页数总额度 `KERNEL_SHMALL`（按 4 KiB 基页计 262,144 页，计费时将用户请求长度向上取整到架构基页）。
+  - `key == IPC_PRIVATE`（0）直接创建全新的私有段。命名段先按键查索引，命中时依次检查 `IPC_CREAT | IPC_EXCL` 冲突、请求大小是否超过原段，以及读写执行权限。`size == 0` 可查询已有段。
+  - 命名键值不存在且未指定 `IPC_CREAT` 时返回 `ENOENT`。新建段长度低于 1 字节或超过当前 `shmmax` 时返回 `EINVAL`，超过段数或基础页面总额时返回 `ENOSPC`。段表、分块和后备对象在关中断的发布区外准备。发布前重新检查键值与额度，失败时归还尚未发布的对象。
 - **延迟销毁语义（`shmctl(IPC_RMID)`）**：
   - 仅允许段所有者（`uid`）、创建者（`cuid`）或具备 `CAP_SYS_ADMIN` 能力的进程删除。
-  - 若此时 `nattch == 0` 且 `attachments == 0`，内核立即释放后备物理页、归还锁页配额与 `SHMALL` 统计并递增 `seq` 复位槽位。
+  - 若此时 `nattch == 0` 且 `attachments == 0`，内核立即释放后备物理页、归还锁页配额、段数和 `shmall` 额度并递增 `seq` 复位槽位。
   - 若仍有进程映射着该段，内核仅置位 `marked_for_deletion = 1` 并将段键重置为 `IPC_PRIVATE`：后续 `shmget` 无法再按原键值找到它，但已存在的映射保持有效；在段彻底释放前，按完整 `shmid` 的 `shmat` 仍允许重新附加，`IPC_STAT` 与 `/proc/sysvipc/shm` 也在 `mode` 中携带 `SHM_DEST`（`01000`）标志位。直至最后一个 VMA 片段与临时附加持有者释放时，才触发彻底销毁。
 - **解除附加（`shmdt`）与部分映射保护**：
   - `shmdt(shmaddr)` 按原始附加起始地址查找对应的 `kernel_shm_attachment`，即使该次附加的首段 VMA 已被 `munmap` 挖空，仍能精准移除同一逻辑附加遗留的全部片段，且不会误伤空洞内后来被匿名映射、文件映射或其他 SHM 附加占据的新 VMA。
@@ -72,11 +72,23 @@ flowchart LR
 - **预留与按需缺页**：后备容量向上取整到原生大页边界，而 `IPC_STAT.shm_segsz` 保持用户原始请求字节数。`shmget` 阶段即从大页池一次性预留所需大页（不足返回 `-ENOMEM`），后续 `shmat` 与 `fork` 不重复预留；指定 `SHM_NORESERVE` 时跳过预留，但实际缺页时若池已耗尽则向进程投递 `SIGBUS`。
 - **对齐与控制边界**：`SHM_RND` 按架构基页向下取整，固定地址附加和大页 `mprotect`/`munmap` 均要求满足大页边界对齐。大页本身不可换出，因此 `SHM_LOCK`/`SHM_UNLOCK` 校验权限与 `RLIMIT_MEMLOCK` 后直接返回成功，不占用用户锁页配额也不设置 `SHM_LOCKED`。
 
-### 4.2 权限、控制命令与观测
+### 4.2 运行时限额
+
+| 配置文件 | 默认值 | 约束 |
+| --- | ---: | --- |
+| `/proc/sys/kernel/shmmax` | 1 GiB | 单个新共享段的请求字节数 |
+| `/proc/sys/kernel/shmall` | 262144 | 全部段的请求长度按架构基础页面向上取整后累加，包括仍有映射的待删除段 |
+| `/proc/sys/kernel/shmmni` | 128 | 共享段数量，可设置为 0～32768 |
+
+每个 IPC 命名空间独立维护三项配置，新的命名空间从默认值开始。有效用户标识为 0 的调用者可以写入。下调限额保留已有段和映射，后续创建按新值接纳。`shmctl(IPC_INFO)` 使用同一份配置。
+
+配置文件的打开描述绑定打开时的命名空间。切换命名空间后，已打开的描述符继续访问原配置。描述符只持有配置记录，原命名空间的最后一个实际引用归还后，描述符读取和写入返回 `ENOENT`。
+
+### 4.3 权限、控制命令与观测
 
 | 命令 | 权限要求 | 语义说明 |
 | :--- | :--- | :--- |
-| `IPC_STAT` / `SHM_STAT` / `SHM_STAT_ANY` | 前两者要求读权限或 `CAP_IPC_OWNER`；`SHM_STAT_ANY` 允许全局枚举 | `IPC_STAT` 按完整 `shmid` 查询；`SHM_STAT*` 按槽索引查询并返回带代次的完整 `shmid` |
+| `IPC_STAT` / `SHM_STAT` / `SHM_STAT_ANY` | 前两者要求读权限或 `CAP_IPC_OWNER`；`SHM_STAT_ANY` 允许全局枚举 | `IPC_STAT` 按完整 `shmid` 查询；`SHM_STAT*` 用参数低 15 位选槽，返回该槽当前完整 `shmid` |
 | `IPC_SET` | 所有者、创建者或 `CAP_SYS_ADMIN` | 先完整从用户态导入 `shmid64_ds`，再更新 `uid`/`gid`/`mode`（已标记删除返回 `-EIDRM`） |
 | `IPC_INFO` / `SHM_INFO` | 无额外权限要求 | 分别返回配置上限（`shminfo64`）与实时统计（活跃段数、请求总页数、已驻留页数），返回值为最高活跃槽号（空表为 0） |
 | `SHM_LOCK` / `SHM_UNLOCK` | 所有者、创建者或 `CAP_IPC_LOCK` | 普通段按真实用户标识（UID）账户计入 `RLIMIT_MEMLOCK` 锁页额度并在 `mode` 中设置 `SHM_LOCKED`（`02000`），销毁时自动归还 |
@@ -99,7 +111,7 @@ flowchart LR
 ### 定向验证入口
 
 - **宿主大页与锁页回归**：`tests/host/shm-hugetlb.sh`（覆盖高阶物理页、多附加、`SHM_REMAP`、`fork`、`IPC_RMID`、只读权限、`SHM_NORESERVE` 与配额回收）、`tests/host/shm-lock.sh`。
-- **用户态大页与查询测试**：`tests/userland/hugetlb.py`、`tests/workloads/resource/shm_query.c`。
+- **用户态大页与查询测试**：`tests/userland/hugetlb.py`、`tests/workloads/resource/shm_query.c`。配置限额、描述符寿命和跨块分配使用 `tests/userland/api8.py --program shm_limits`。
 - **Linux 差分 ABI 与真实用户态验证**：`make test-diff-abi-riscv`（`tests/diff-abi/shm.c`）、`make test-userland-riscv`（`tests/userland/sysv_shm.h`）、`make test-stack-usage`。
 
 </details>

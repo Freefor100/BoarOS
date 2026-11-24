@@ -68,6 +68,11 @@ struct kernel_fs_mounts {
 };
 struct kernel_fs_mounts kernel_fs_context_mounts_snapshot(const struct kernel_fs_context *);
 void kernel_fs_mounts_release(struct kernel_fs_mounts *);
+/* Caller holds mount topology stable. Use the opened namespace's tree. */
+int kernel_mount_namespace_top_pin(struct kernel_mount_namespace *,struct kernel_vfs_path **);
+/* Query a view reached through an open file, even across namespace boundaries.
+ * A detached tree has no owning namespace. */
+uint64_t kernel_mount_namespace_of_view(struct kernel_vfs_mount *,struct kernel_vfs_path **);
 struct kernel_vfs_mount *kernel_fs_context_mount_root(const struct kernel_fs_context *);
 /* Prepare all fallible path/allocation work before publishing a combined
  * namespace change. Commit consumes the live candidate and cannot fail. */

@@ -1127,7 +1127,7 @@ static int ext4_unlink(struct ext4_mountpoint *mp,
 /****************************************************************************/
 
 static int ext4_mount_format(const char *dev_name, const char *mount_point,
-	       bool read_only, bool ext2_format)
+	       bool read_only, enum ext4_disk_format format)
 {
 	int r;
 	uint32_t bsize;
@@ -1180,7 +1180,7 @@ static int ext4_mount_format(const char *dev_name, const char *mount_point,
 	r = ext4_block_init(bd);
 	if (r != EOK) { { KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock); mp->reserved = false; } return r; }
 
-	r = ext4_fs_init(&mp->fs, bd, read_only, ext2_format);
+	r = ext4_fs_init(&mp->fs, bd, read_only, format);
 	if (r != EOK) {
 		ext4_block_fini(bd);
 		{ KERNEL_TASK_LOCK_SCOPE(index, &mount_index_lock); mp->reserved = false; }
@@ -1207,7 +1207,7 @@ static int ext4_mount_format(const char *dev_name, const char *mount_point,
 
 	/*Bind block cache to block device*/
 	r = ext4_block_bind_bcache(bd, bc);
-	if (r == EOK && ext2_format && !read_only) {
+	if (r == EOK && format == EXT4_DISK_EXT2 && !read_only) {
 		struct ext4_sblock *sb = ext4_fs_super(&mp->fs);
 		/* Publish a durable dirty marker before allowing namespace changes. */
 		ext4_set16(sb, mount_count, ext4_get16(sb, mount_count) + 1);
@@ -1232,10 +1232,13 @@ static int ext4_mount_format(const char *dev_name, const char *mount_point,
 }
 
 int ext4_mount(const char *dev_name, const char *mount_point, bool read_only)
-{ return ext4_mount_format(dev_name, mount_point, read_only, false); }
+{ return ext4_mount_format(dev_name, mount_point, read_only, EXT4_DISK_EXT4); }
 
 int ext4_mount_ext2(const char *dev_name, const char *mount_point, bool read_only)
-{ return ext4_mount_format(dev_name, mount_point, read_only, true); }
+{ return ext4_mount_format(dev_name, mount_point, read_only, EXT4_DISK_EXT2); }
+
+int ext4_mount_ext3(const char *dev_name, const char *mount_point, bool read_only)
+{ return ext4_mount_format(dev_name, mount_point, read_only, EXT4_DISK_EXT3); }
 
 
 static struct ext4_mountpoint *ext4_get_mount(const char *path);

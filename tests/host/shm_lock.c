@@ -19,7 +19,7 @@
 void mm_test_attach(unsigned);
 static struct kernel_task *identity_caller;
 struct kernel_task *__wrap_kernel_task_current(void) {return identity_caller;}
-static unsigned char pool[16*1024*1024] __attribute__((aligned(16384)));
+static unsigned char pool[64*1024*1024] __attribute__((aligned(16384)));
 static struct physical_page_allocator pages;
 static struct kernel_heap heap;
 static uint64_t memlock_limit=UINT64_MAX;
@@ -27,11 +27,19 @@ static unsigned fail_allocation;
 static int copy_remove_id=-1;
 static int copy_short;
 static struct kernel_memory_object *created_object;
+static struct kernel_shm_limits *cancel_admission;
 enum kernel_memory_object_status __real_kernel_memory_object_create(struct kernel_heap *,struct physical_page_allocator *,struct kernel_memory_object **);
 enum kernel_memory_object_status __wrap_kernel_memory_object_create(struct kernel_heap *h,struct physical_page_allocator *p,struct kernel_memory_object **out)
 {
     enum kernel_memory_object_status status=__real_kernel_memory_object_create(h,p,out);
-    if(!status)created_object=*out;
+    if (!status) {
+        created_object = *out;
+        if (cancel_admission) {
+            assert(arch_interrupt_is_enabled());
+            assert(!kernel_ipc_shm_limit_set(cancel_admission, KERNEL_SHM_LIMIT_MNI, 0));
+            cancel_admission = NULL;
+        }
+    }
     return status;
 }
 enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,size_t,size_t,void **);
@@ -160,11 +168,13 @@ static void queries(void)
     if(result==ids[0])QUERY_CHECK(!memcmp(&expected,&actual,sizeof(actual)));
     result=-1;QUERY_CHECK(!query(0,15,&actual,&result)&&result==ids[0]);
     if(result==ids[0])QUERY_CHECK(!memcmp(&expected,&actual,sizeof(actual)));
-    /* Slot selectors ignore a generation; IPC_STAT rejects the stale full ID. */
+    /* SHM_STAT_ANY accepts a slot index, while IPC_STAT requires the full ID. */
     int stale=ids[1];assert(!ctl(stale,KERNEL_IPC_RMID,0));
     result=-1;QUERY_CHECK(query(1,15,&actual,&result)==-KERNEL_EINVAL&&result==-1);
     ids[1]=segment(1);QUERY_CHECK(ids[1]!=stale);
-    result=-1;QUERY_CHECK(!query(stale,15,&actual,&result)&&result==ids[1]);
+    result=-1;QUERY_CHECK(query(129,15,&actual,&result)==-KERNEL_EINVAL&&result==-1);
+    result=-1;QUERY_CHECK(!query(1,15,&actual,&result)&&result==ids[1]);
+    QUERY_CHECK(!query(stale,KERNEL_SHM_STAT_ANY,&actual,&result)&&result==ids[1]);
     QUERY_CHECK(query(stale,KERNEL_IPC_STAT,&actual,&result)==-KERNEL_EINVAL);
     QUERY_CHECK(query(0,KERNEL_IPC_STAT,&actual,&result)==-KERNEL_EINVAL);
     assert(!ctl(ids[2],KERNEL_IPC_RMID,0));information(2,3,1,1);
@@ -244,6 +254,69 @@ static void namespace_lifetime(void)
     kernel_heap_get_statistics(&heap,&after);assert(before.live_allocations==after.live_allocations);
     puts("SHM namespace isolation, RMID reattach and old attachment/fork identity PASS");
 }
+static void configured_capacity(void)
+{
+    struct kernel_heap_statistics before, after;
+    kernel_heap_get_statistics(&heap, &before);
+    struct kernel_namespace *tiny = NULL;
+    assert(!kernel_ipc_namespace_create(&heap, &tiny));
+    host_ipc_namespace = tiny;
+    struct kernel_shm_limits *limits = NULL;
+    assert(!kernel_ipc_shm_limits_open(tiny, &limits));
+    assert(!kernel_ipc_namespace_state(tiny)->shm);
+    assert(kernel_ipc_shm_limit_set(limits, KERNEL_SHM_LIMIT_MNI, KERNEL_SHMMNI_MAX + 1U) == -KERNEL_EINVAL);
+    assert(!kernel_ipc_shm_limit_set(limits, KERNEL_SHM_LIMIT_MNI, KERNEL_SHMMNI_MAX));
+    assert(!kernel_ipc_shm_limit_set(limits, KERNEL_SHM_LIMIT_ALL, UINT64_MAX));
+    assert(!kernel_ipc_shm_limit_set(limits, KERNEL_SHM_LIMIT_MAX, UINT64_MAX));
+    int32_t id = -1;
+    assert(kernel_shm_get(NULL, KERNEL_IPC_PRIVATE, UINT64_MAX, 0600, &id) == -KERNEL_ENOSPC && id == -1);
+    assert(kernel_shm_get(NULL, KERNEL_IPC_PRIVATE, UINT64_C(1) << 63, 0600, &id) == -KERNEL_EINVAL);
+    cancel_admission = limits;
+    assert(kernel_shm_get(NULL, KERNEL_IPC_PRIVATE, 1, 0600, &id) == -KERNEL_ENOSPC);
+    assert(!cancel_admission && id == -1 && !kernel_ipc_namespace_state(tiny)->shm);
+    assert(!kernel_ipc_shm_limit_set(limits, KERNEL_SHM_LIMIT_MNI, KERNEL_SHMMNI_MAX));
+    for (unsigned fail = 1; fail <= 3; fail++) {
+        struct kernel_heap_statistics no_segment, attempted;
+        kernel_heap_get_statistics(&heap, &no_segment);
+        fail_allocation = fail;
+        assert(kernel_shm_get(NULL, KERNEL_IPC_PRIVATE, 1, 0600, &id) == -KERNEL_ENOMEM);
+        assert(!fail_allocation && id == -1 && !kernel_ipc_namespace_state(tiny)->shm);
+        kernel_heap_get_statistics(&heap, &attempted);
+        assert(no_segment.live_allocations == attempted.live_allocations);
+    }
+    for (uint32_t slot = 0; slot < KERNEL_SHMMNI_MAX; slot++) {
+        assert(!kernel_shm_get(NULL, (int32_t)(100 + slot), 1, KERNEL_IPC_CREAT | 0600, &id));
+        assert(((uint32_t)id & (KERNEL_SHMMNI_MAX - 1U)) == slot);
+    }
+    int32_t last = id;
+    assert(kernel_shm_get(NULL, KERNEL_IPC_PRIVATE, 1, 0600, &id) == -KERNEL_ENOSPC);
+    assert(!kernel_shm_get(NULL, KERNEL_SHMMNI_MAX - 1U + 100, 0, 0, &id) && id == last);
+    struct shm_info_abi usage;
+    int64_t result;
+    assert(!query(0, KERNEL_SHM_INFO, &usage, &result) && result == KERNEL_SHMMNI_MAX - 1U);
+    assert(usage.used_ids == KERNEL_SHMMNI_MAX && usage.shm_tot == KERNEL_SHMMNI_MAX && !usage.shm_rss);
+    assert(!kernel_ipc_shm_limit_set(limits, KERNEL_SHM_LIMIT_MNI, 0));
+    uint32_t cursor = KERNEL_SHMMNI_MAX - 1U;
+    uint64_t rss;
+    struct kernel_shmid64_ds row;
+    assert(kernel_shm_proc_next(tiny, NULL, &cursor, &id, &row, &rss) && id == last);
+    assert(!kernel_shm_proc_next(tiny, NULL, &cursor, &id, &row, &rss));
+    assert(!ctl(last, KERNEL_IPC_RMID, NULL));
+    assert(kernel_shm_get(NULL, KERNEL_IPC_PRIVATE, 1, 0600, &id) == -KERNEL_ENOSPC);
+    assert(!kernel_ipc_shm_limit_set(limits, KERNEL_SHM_LIMIT_MNI, KERNEL_SHMMNI_MAX));
+    id = segment(1);
+    assert(id != last && ((uint32_t)id & (KERNEL_SHMMNI_MAX - 1U)) == KERNEL_SHMMNI_MAX - 1U);
+    assert(ctl(last, KERNEL_IPC_STAT, &row) == -KERNEL_EINVAL);
+    host_ipc_namespace = NULL;
+    kernel_namespace_put(tiny);
+    uint64_t value;
+    assert(kernel_ipc_shm_limit_read(limits, KERNEL_SHM_LIMIT_MNI, &value) == -KERNEL_ENOENT);
+    assert(kernel_ipc_shm_limit_set(limits, KERNEL_SHM_LIMIT_MNI, 1) == -KERNEL_ENOENT);
+    kernel_ipc_shm_limits_put(limits);
+    kernel_heap_get_statistics(&heap, &after);
+    assert(before.live_allocations == after.live_allocations);
+    puts("SHM limits 32768 slots, sparse indices, OOM, stale descriptor and owner retirement PASS");
+}
 static void pid_views(void)
 {
     struct kernel_task actors[4];memset(actors,0,sizeof(actors));
@@ -316,6 +389,7 @@ int main(void)
     queries();
     lifecycle();
     namespace_lifetime();
+    configured_capacity();
     assert(!kernel_ipc_initial_shutdown());
     struct kernel_heap_statistics stats;kernel_heap_get_statistics(&heap,&stats);
     assert(!stats.live_allocations&&!stats.current_pages&&!pages.shared_anon_pages&&!physical_page_allocator_audit(&pages));

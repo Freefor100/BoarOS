@@ -784,6 +784,16 @@ static void mount_tree_api(struct kernel_vfs_mount *mount)
     assert(!kernel_vfs_path_release(&root)&&!kernel_vfs_reap_mounts());
     puts("PASS mount-api: detached OFD owners, clone and attribute OOM rollback, view attributes and attach/close cleanup");
 }
+static void check_mount_namespace(struct kernel_vfs_mount *mount,uint64_t id,struct kernel_vfs_path *top)
+{
+    struct kernel_vfs_path *observed=NULL;
+    KERNEL_LOCK_SCOPE(topology);
+    kernel_vfs_mount_topology_lock(&topology);
+    assert(kernel_mount_namespace_of_view(mount,&observed)==id && observed==top);
+    kernel_lock_scope_release(&topology);
+    if (observed) assert(!kernel_vfs_path_release(&observed));
+}
+
 static void mount_pivot_owner(void)
 {
     struct kernel_vfs_mount *boot=NULL,*next=NULL;
@@ -797,12 +807,21 @@ static void mount_pivot_owner(void)
     assert(!kernel_vfs_path_resolve(old,old,"new",1,&new_root));
     assert(!kernel_vfs_mkdir_at(new_root,old,"old",0755,0));
     assert(!kernel_vfs_path_resolve(new_root,old,"old",1,&put_old));
+    uint64_t ns=kernel_fs_context_namespace_id(&fs);
+    check_mount_namespace(boot,ns,old);
+    check_mount_namespace(next,ns,old);
     assert(!kernel_vfs_pivot_root(&fs,new_root,put_old));
+    check_mount_namespace(boot,ns,new_root);
+    check_mount_namespace(next,ns,new_root);
     assert(!kernel_vfs_path_release(&put_old)&&!kernel_vfs_path_release(&old));
     assert(!kernel_vfs_path_resolve(new_root,new_root,"old",1,&old));
-    assert(!kernel_vfs_umount(old,0)&&!kernel_vfs_path_release(&old));
+    assert(!kernel_vfs_umount(old,0));
+    check_mount_namespace(boot,0,NULL);
+    assert(!kernel_vfs_path_release(&old));
     assert(!kernel_vfs_unmount(boot));
-    assert(!kernel_vfs_path_release(&new_root)&&!kernel_fs_context_release(&fs)&&!kernel_vfs_reap_mounts());
+    assert(!kernel_fs_context_release(&fs));
+    check_mount_namespace(next,0,NULL);
+    assert(!kernel_vfs_path_release(&new_root)&&!kernel_vfs_reap_mounts());
     puts("PASS pivot-root: independent boot owner does not make an idle old root busy; namespace and external owners drain");
 }
 static void atime_policy(struct kernel_vfs_mount *mount,struct kernel_vfs_file *file)

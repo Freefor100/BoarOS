@@ -1,3 +1,4 @@
+#include <kernel/bitops.h>
 #include <kernel/credentials.h>
 #include <kernel/hugetlb.h>
 #include <kernel/mm_backend.h>
@@ -20,40 +21,131 @@
 
 #define SHM_DEST 01000
 
+#define SHM_CHUNK_SLOTS 128U
+#define SHM_CHUNKS (KERNEL_SHMMNI_MAX / SHM_CHUNK_SLOTS)
+#define SHM_SLOT_MASK (KERNEL_SHMMNI_MAX - 1U)
+#define SHM_CHUNK_WORDS (SHM_CHUNKS / 64U)
+
+struct shm_chunk {
+    uint64_t occupied[SHM_CHUNK_SLOTS / 64U];
+    struct kernel_shm_segment segments[SHM_CHUNK_SLOTS];
+};
+
 struct kernel_shm_table {
-    struct kernel_shm_segment segments[KERNEL_SHMMNI];
     struct kernel_heap *heap;
-    struct physical_page_allocator *allocator;
-    struct kernel_namespace *namespace;
+    struct kernel_avl_node *keys;
     uint64_t total_pages;
-    int initialized;
+    uint32_t used_ids;
+    uint64_t occupied_chunks[SHM_CHUNK_WORDS];
+    uint64_t full_chunks[SHM_CHUNK_WORDS];
+    struct shm_chunk *chunks[SHM_CHUNKS];
 };
 
 static struct kernel_heap *shm_heap;
 static struct physical_page_allocator *shm_allocator;
-static struct kernel_shm_table empty_shm_table={.initialized=1};
 static uint64_t next_shm_file_identity = 1;
 
-static struct kernel_shm_table *shm_namespace_table(struct kernel_namespace *base,int create)
+static struct kernel_shm_segment *shm_slot(const struct kernel_shm_table *table, uint32_t slot)
 {
-    struct kernel_ipc_namespace *ns=kernel_ipc_namespace_state(base);
-    struct kernel_shm_table *table=__atomic_load_n(&ns->shm,__ATOMIC_ACQUIRE);
-    if(table||!create)return table;
-    struct kernel_shm_table *candidate=0;
-    enum kernel_heap_status status=kernel_heap_allocate_zeroed(base->heap,1,sizeof(*candidate),(void **)&candidate);
-    if(status)return 0;
-    candidate->heap=base->heap;candidate->allocator=shm_allocator;
-    candidate->namespace=base;candidate->initialized=1;
-    for(uint32_t i=0;i<KERNEL_SHMMNI;i++){
-        candidate->segments[i].shmid=-1;candidate->segments[i].seq=1;
-        candidate->segments[i].namespace=base;candidate->segments[i].table=candidate;
-    }
-    {KERNEL_RAW_SCOPE(g,&ns->lock);
-     if(!ns->shm)__atomic_store_n(&ns->shm,candidate,__ATOMIC_RELEASE);
-     table=ns->shm;}
-    if(table!=candidate)kernel_heap_release(base->heap,candidate);
-    return table;
+    if (!table || slot >= KERNEL_SHMMNI_MAX) return NULL;
+    struct shm_chunk *chunk = table->chunks[slot / SHM_CHUNK_SLOTS];
+    return chunk ? &chunk->segments[slot % SHM_CHUNK_SLOTS] : NULL;
 }
+
+/* Bitmap sizes are multiples of 64 and callers may start at the end. */
+static uint32_t shm_next_bit(const uint64_t *words, uint32_t bits, uint32_t start)
+{
+    if (start >= bits) return bits;
+    uint32_t word = start / 64U;
+    uint64_t matches = words[word] & (UINT64_MAX << (start % 64U));
+    while (!matches && ++word < bits / 64U) matches = words[word];
+    return matches ? word * 64U + kernel_first_set_u64(matches) : bits;
+}
+
+static uint32_t shm_next_slot(const struct kernel_shm_table *table, uint32_t cursor)
+{
+    if (!table) return KERNEL_SHMMNI_MAX;
+    uint32_t chunk = cursor / SHM_CHUNK_SLOTS;
+    uint32_t offset = cursor % SHM_CHUNK_SLOTS;
+    for (uint32_t next = shm_next_bit(table->occupied_chunks, SHM_CHUNKS, chunk);
+         next < SHM_CHUNKS; next = shm_next_bit(table->occupied_chunks, SHM_CHUNKS, next + 1U)) {
+        uint32_t local = shm_next_bit(table->chunks[next]->occupied, SHM_CHUNK_SLOTS,
+            next == chunk ? offset : 0);
+        if (local < SHM_CHUNK_SLOTS) return next * SHM_CHUNK_SLOTS + local;
+    }
+    return KERNEL_SHMMNI_MAX;
+}
+
+static uint32_t shm_free_slot(const struct kernel_shm_table *table)
+{
+    if (!table) return 0;
+    for (uint32_t word = 0; word < SHM_CHUNK_WORDS; word++) {
+        if (table->full_chunks[word] == UINT64_MAX) continue;
+        uint32_t n = word * 64U + kernel_first_set_u64(~table->full_chunks[word]);
+        const struct shm_chunk *chunk = table->chunks[n];
+        uint32_t slot = n * SHM_CHUNK_SLOTS;
+        if (!chunk) return slot;
+        if (chunk->occupied[0] != UINT64_MAX)
+            return slot + kernel_first_set_u64(~chunk->occupied[0]);
+        return slot + 64U + kernel_first_set_u64(~chunk->occupied[1]);
+    }
+    return KERNEL_SHMMNI_MAX;
+}
+
+static uint32_t shm_highest_slot(const struct kernel_shm_table *table)
+{
+    if (!table || !table->used_ids) return 0;
+    for (uint32_t i = SHM_CHUNK_WORDS; i > 0; i--) {
+        uint64_t word = table->occupied_chunks[i - 1U];
+        if (!word) continue;
+        uint32_t n = (i - 1U) * 64U + kernel_last_set_u64(word);
+        const struct shm_chunk *chunk = table->chunks[n];
+        uint32_t half = chunk->occupied[1] ? 1U : 0U;
+        return n * SHM_CHUNK_SLOTS + half * 64U + kernel_last_set_u64(chunk->occupied[half]);
+    }
+    __builtin_trap();
+}
+
+static void shm_slot_set_occupied(struct kernel_shm_table *table, uint32_t slot, int occupied)
+{
+    uint32_t n = slot / SHM_CHUNK_SLOTS;
+    struct shm_chunk *chunk = table->chunks[n];
+    uint64_t chunk_bit = UINT64_C(1) << (n % 64U);
+    uint32_t word = n / 64U;
+    uint64_t slot_bit = UINT64_C(1) << (slot % 64U);
+    uint64_t *slots = &chunk->occupied[(slot % SHM_CHUNK_SLOTS) / 64U];
+    if (occupied) {
+        *slots |= slot_bit;
+        table->occupied_chunks[word] |= chunk_bit;
+        if ((chunk->occupied[0] & chunk->occupied[1]) == UINT64_MAX)
+            table->full_chunks[word] |= chunk_bit;
+        table->used_ids++;
+    } else {
+        *slots &= ~slot_bit;
+        table->full_chunks[word] &= ~chunk_bit;
+        if (!(chunk->occupied[0] | chunk->occupied[1]))
+            table->occupied_chunks[word] &= ~chunk_bit;
+        table->used_ids--;
+    }
+}
+
+static struct kernel_shm_segment *shm_find_key(struct kernel_shm_table *table, int32_t key)
+{
+    if (!table || key == KERNEL_IPC_PRIVATE) return NULL;
+    struct kernel_avl_node *node = table->keys;
+    uint64_t search = (uint32_t)key;
+    while (node && node->key != search) node = search < node->key ? node->left : node->right;
+    return node ? (struct kernel_shm_segment *)((char *)node -
+        offsetof(struct kernel_shm_segment, key_index)) : NULL;
+}
+
+static void shm_remove_key(struct kernel_shm_segment *seg)
+{
+    if (seg->key == KERNEL_IPC_PRIVATE) return;
+    seg->table->keys = kernel_avl_remove_node(seg->table->keys, &seg->key_index);
+    seg->key = KERNEL_IPC_PRIVATE;
+}
+
 static void shm_descriptor(const struct kernel_shm_segment *seg, struct kernel_shmid64_ds *ds,struct kernel_pid_registry *view)
 {
     *ds = (struct kernel_shmid64_ds){
@@ -77,20 +169,21 @@ static uint64_t shm_resident_pages(const struct kernel_shm_segment *seg)
 int kernel_shm_proc_next(struct kernel_namespace *ns,struct kernel_pid_registry *view, uint32_t *cursor, int32_t *id,
                          struct kernel_shmid64_ds *row, uint64_t *rss)
 {
-    struct kernel_shm_table *table=shm_namespace_table(ns,0);
-    if(!table)return 0;
+    struct kernel_ipc_namespace *ipc = kernel_ipc_namespace_state(ns);
     uintptr_t irq = arch_interrupt_save();
-    while (*cursor < KERNEL_SHMMNI) {
-        const struct kernel_shm_segment *seg = &table->segments[(*cursor)++];
-        if (!seg->active) continue;
-        *id = seg->shmid;
-        shm_descriptor(seg, row,view);
-        *rss = shm_resident_pages(seg) * BOAROS_PAGE_SIZE;
+    const struct kernel_shm_table *table = __atomic_load_n(&ipc->shm, __ATOMIC_ACQUIRE);
+    uint32_t slot = shm_next_slot(table, *cursor);
+    if (slot == KERNEL_SHMMNI_MAX) {
         arch_interrupt_restore(irq);
-        return 1;
+        return 0;
     }
+    const struct kernel_shm_segment *seg = shm_slot(table, slot);
+    *cursor = slot + 1U;
+    *id = seg->shmid;
+    shm_descriptor(seg, row, view);
+    *rss = shm_resident_pages(seg) * BOAROS_PAGE_SIZE;
     arch_interrupt_restore(irq);
-    return 0;
+    return 1;
 }
 
 static int shm_permission(const struct kernel_shm_segment *seg,unsigned requested)
@@ -123,6 +216,8 @@ static void kernel_shm_destroy_segment_locked(struct kernel_shm_segment *seg)
         return;
     }
     seg->table->total_pages -= (seg->size + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
+    shm_remove_key(seg);
+    shm_slot_set_occupied(seg->table, (uint32_t)seg->shmid & SHM_SLOT_MASK, 0);
     shm_unlock(seg);
     if (seg->hugetlb) kernel_hugetlb_map_release(&seg->hugetlb);
     if (seg->memory != 0) {
@@ -157,140 +252,157 @@ enum kernel_shm_status kernel_shm_init(
     return KERNEL_SHM_STATUS_OK;
 }
 
-int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
-                   int32_t shmflg, int32_t *out_shmid)
+struct shm_creation {
+    struct shm_chunk *chunk;
+    struct kernel_shm_table *table;
+    struct kernel_memory_object *memory;
+    struct kernel_hugetlb_map *hugetlb;
+};
+
+static void shm_creation_discard(struct shm_creation *creation)
 {
-    if (out_shmid == 0) {
-        return -KERNEL_EFAULT;
-    }
-    if(!shm_heap||!shm_allocator)return -KERNEL_ENOSPC;
-    struct kernel_shm_table *table=shm_namespace_table(kernel_task_ipc_namespace(),
-        key==KERNEL_IPC_PRIVATE || (shmflg&KERNEL_IPC_CREAT));
-    if(!table)return key!=KERNEL_IPC_PRIVATE && !(shmflg&KERNEL_IPC_CREAT)?-KERNEL_ENOENT:-KERNEL_ENOMEM;
+    if (creation->memory) kernel_memory_object_release(&creation->memory);
+    if (creation->hugetlb) kernel_hugetlb_map_release(&creation->hugetlb);
+    if (creation->chunk) kernel_heap_release(shm_heap, creation->chunk);
+    if (creation->table) kernel_heap_release(shm_heap, creation->table);
+}
 
-    uintptr_t irq = arch_interrupt_save();
-    if (!table->initialized || table->heap == 0 || table->allocator == 0) {
-        arch_interrupt_restore(irq);
+static int shm_find_existing(struct kernel_shm_segment *seg, uint64_t size,
+    int32_t flags, int32_t *id)
+{
+    if ((flags & (KERNEL_IPC_CREAT | KERNEL_IPC_EXCL)) ==
+            (KERNEL_IPC_CREAT | KERNEL_IPC_EXCL)) return -KERNEL_EEXIST;
+    if (size > seg->size) return -KERNEL_EINVAL;
+    unsigned access = (unsigned)flags & 0777U;
+    int result = shm_permission(seg, (access | (access >> 3) | (access >> 6)) & 7U);
+    if (!result) *id = seg->shmid;
+    return result;
+}
+
+static int shm_check_limits(const struct kernel_ipc_namespace *ns,
+    const struct kernel_shm_table *table, uint64_t size, uint64_t pages, int32_t flags)
+{
+    if (size < KERNEL_SHMMIN || size > kernel_ipc_shm_limit(ns, KERNEL_SHM_LIMIT_MAX))
+        return -KERNEL_EINVAL;
+    uint64_t used = table ? table->total_pages : 0;
+    uint64_t maximum = kernel_ipc_shm_limit(ns, KERNEL_SHM_LIMIT_ALL);
+    if (size > UINT64_MAX - BOAROS_PAGE_MASK || used > maximum || pages > maximum - used)
         return -KERNEL_ENOSPC;
-    }
+    if (!(flags & KERNEL_SHM_HUGETLB) && size > INT64_MAX) return -KERNEL_EINVAL;
+    return (table ? table->used_ids : 0) >= kernel_ipc_shm_limit(ns, KERNEL_SHM_LIMIT_MNI) ?
+        -KERNEL_ENOSPC : 0;
+}
 
-    if (key != KERNEL_IPC_PRIVATE) {
-        for (uint32_t i = 0U; i < KERNEL_SHMMNI; i++) {
-            struct kernel_shm_segment *seg = &table->segments[i];
-            if (seg->active && !seg->marked_for_deletion && seg->key == key) {
-                if ((shmflg & (KERNEL_IPC_CREAT | KERNEL_IPC_EXCL)) ==
-                    (KERNEL_IPC_CREAT | KERNEL_IPC_EXCL)) {
-                    arch_interrupt_restore(irq);
-                    return -KERNEL_EEXIST;
-                }
-                if (size > seg->size) {
-                    arch_interrupt_restore(irq);
-                    return -KERNEL_EINVAL;
-                }
-                unsigned access=(unsigned)shmflg&0777;
-                access=(access|(access>>3)|(access>>6))&7;
-                int permission=shm_permission(seg,access);
-                if(permission){arch_interrupt_restore(irq);return permission;}
-                *out_shmid = seg->shmid;
-                arch_interrupt_restore(irq);
-                return 0;
-            }
+static int shm_prepare_backing(struct shm_creation *creation, uint64_t size, int32_t flags,
+    uint64_t *aligned)
+{
+    if (flags & KERNEL_SHM_HUGETLB) {
+        unsigned shift = ((uint32_t)flags >> KERNEL_SHM_HUGE_SHIFT) & KERNEL_SHM_HUGE_MASK;
+        if (shift && shift != BOAROS_PAGE_SHIFT + ARCH_MMU_HUGE_ORDER) return -KERNEL_EINVAL;
+        const struct kernel_credentials *cred = kernel_credentials_current();
+        if (!kernel_credentials_capable(cred, KERNEL_CAP_IPC_LOCK) &&
+            !kernel_credentials_in_group(cred, 0)) return -KERNEL_EPERM;
+        if (size > UINT64_MAX - (ARCH_MMU_HUGE_SIZE - 1U)) return -KERNEL_ENOSPC;
+        *aligned = (size + ARCH_MMU_HUGE_SIZE - 1U) & ~(ARCH_MMU_HUGE_SIZE - 1U);
+        struct kernel_hstate *h = NULL;
+        enum kernel_hugetlb_status status = kernel_hstate_get_or_create(shm_heap,
+            shm_allocator, ARCH_MMU_HUGE_ORDER, &h);
+        if (!status) status = kernel_hugetlb_map_create(h, *aligned / ARCH_MMU_HUGE_SIZE,
+            KERNEL_HUGETLB_SHARED, !!(flags & KERNEL_SHM_NORESERVE), &creation->hugetlb);
+        if (h) kernel_hstate_put(h);
+        return status ? -KERNEL_ENOMEM : 0;
+    }
+    enum kernel_memory_object_status status =
+        kernel_memory_object_create(shm_heap, shm_allocator, &creation->memory);
+    if (status) return status == KERNEL_MEMORY_OBJECT_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_ENOSPC;
+    kernel_memory_object_set_mapping_size(creation->memory, *aligned);
+    return 0;
+}
+
+int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
+    int32_t shmflg, int32_t *out_shmid)
+{
+    if (!out_shmid) return -KERNEL_EFAULT;
+    if (!shm_heap || !shm_allocator) return -KERNEL_ENOSPC;
+    struct kernel_namespace *base = kernel_task_ipc_namespace();
+    struct kernel_ipc_namespace *ns = kernel_ipc_namespace_state(base);
+    uint64_t aligned = (size + BOAROS_PAGE_MASK) & ~(uint64_t)BOAROS_PAGE_MASK;
+    uint64_t pages = aligned >> BOAROS_PAGE_SHIFT;
+    struct shm_creation creation __attribute__((cleanup(shm_creation_discard))) = {0};
+
+    for (;;) {
+        uintptr_t irq = arch_interrupt_save();
+        struct kernel_shm_table *table = ns->shm;
+        struct kernel_shm_segment *seg = shm_find_key(table, key);
+        if (seg) {
+            int result = shm_find_existing(seg, size, shmflg, out_shmid);
+            arch_interrupt_restore(irq);
+            return result;
         }
-        if ((shmflg & KERNEL_IPC_CREAT) == 0) {
+        if (key != KERNEL_IPC_PRIVATE && !(shmflg & KERNEL_IPC_CREAT)) {
             arch_interrupt_restore(irq);
             return -KERNEL_ENOENT;
         }
-    }
-
-    /* 已有 key 的 size=0 是查找；创建下限只约束新段。 */
-    if (size < KERNEL_SHMMIN || size > KERNEL_SHMMAX) {
-        arch_interrupt_restore(irq);
-        return -KERNEL_EINVAL;
-    }
-    uint64_t aligned_size = (size + BOAROS_PAGE_SIZE - 1U) & ~BOAROS_PAGE_MASK;
-
-    uint64_t charged_pages = aligned_size >> BOAROS_PAGE_SHIFT;
-    if (charged_pages > KERNEL_SHMALL - table->total_pages) {
-        arch_interrupt_restore(irq);
-        return -KERNEL_ENOSPC;
-    }
-    if (shmflg & KERNEL_SHM_HUGETLB) {
-        unsigned shift = ((uint32_t)shmflg >> KERNEL_SHM_HUGE_SHIFT) & KERNEL_SHM_HUGE_MASK;
-        if (shift && shift != BOAROS_PAGE_SHIFT + ARCH_MMU_HUGE_ORDER) {
-            arch_interrupt_restore(irq);return -KERNEL_EINVAL;
-        }
-        const struct kernel_credentials *cred = kernel_credentials_current();
-        /* Initial hugetlb_shm_group is root; no mutable sysctl yet. */
-        if (!kernel_credentials_capable(cred, KERNEL_CAP_IPC_LOCK) &&
-            !kernel_credentials_in_group(cred, 0)) {
-            arch_interrupt_restore(irq);return -KERNEL_EPERM;
-        }
-        aligned_size = (size + ARCH_MMU_HUGE_SIZE - 1) & ~(ARCH_MMU_HUGE_SIZE - 1);
-    }
-
-    /* Allocate new slot */
-    int slot_idx = -1;
-    for (uint32_t i = 0U; i < KERNEL_SHMMNI; i++) {
-        if (!table->segments[i].active) {
-            slot_idx = (int)i;
-            break;
-        }
-    }
-    if (slot_idx < 0) {
-        arch_interrupt_restore(irq);
-        return -KERNEL_ENOSPC;
-    }
-
-    struct kernel_shm_segment *new_seg = &table->segments[slot_idx];
-    struct kernel_memory_object *mem = 0;
-    struct kernel_hugetlb_map *hugetlb = 0;
-    if (shmflg & KERNEL_SHM_HUGETLB) {
-        struct kernel_hstate *h = 0;
-        enum kernel_hugetlb_status status = kernel_hstate_get_or_create(table->heap,
-            table->allocator, ARCH_MMU_HUGE_ORDER, &h);
-        if (!status) status = kernel_hugetlb_map_create(h,
-            aligned_size / ARCH_MMU_HUGE_SIZE, KERNEL_HUGETLB_SHARED,
-            !!(shmflg & KERNEL_SHM_NORESERVE), &hugetlb);
-        if (h) kernel_hstate_put(h);
-        if (status) {
-            arch_interrupt_restore(irq);return -KERNEL_ENOMEM;
-        }
-    } else {
-        enum kernel_memory_object_status status =
-            kernel_memory_object_create(table->heap, table->allocator, &mem);
-        if (status != KERNEL_MEMORY_OBJECT_OK) {
+        int result = shm_check_limits(ns, table, size, pages, shmflg);
+        if (result) {
             arch_interrupt_restore(irq);
-            return status == KERNEL_MEMORY_OBJECT_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_ENOSPC;
+            return result;
         }
-        kernel_memory_object_set_mapping_size(mem, aligned_size);
+        uint32_t slot = shm_free_slot(table);
+        uint32_t n = slot / SHM_CHUNK_SLOTS;
+        int need_table = !table && !creation.table;
+        int need_chunk = (!table || !table->chunks[n]) && !creation.chunk;
+        if (need_table || need_chunk || (!creation.memory && !creation.hugetlb)) {
+            /* Allocation may run reclaim. Treat the inspected slot and limits
+             * as hints until the complete segment can be published. */
+            arch_interrupt_restore(irq);
+            if (need_table && kernel_heap_allocate_zeroed(shm_heap, 1,
+                    sizeof(*creation.table), (void **)&creation.table)) return -KERNEL_ENOMEM;
+            if (need_chunk && kernel_heap_allocate_zeroed(shm_heap, 1,
+                    sizeof(*creation.chunk), (void **)&creation.chunk)) return -KERNEL_ENOMEM;
+            if (!creation.memory && !creation.hugetlb) {
+                result = shm_prepare_backing(&creation, size, shmflg, &aligned);
+                if (result) return result;
+            }
+            continue;
+        }
+
+        int publish_table = !table;
+        if (publish_table) {
+            table = creation.table;
+            creation.table = NULL;
+            table->heap = shm_heap;
+        }
+        if (!table->chunks[n]) {
+            table->chunks[n] = creation.chunk;
+            creation.chunk = NULL;
+        }
+        seg = shm_slot(table, slot);
+        const struct kernel_credentials *cred = kernel_credentials_current();
+        uint16_t sequence = seg->seq ? seg->seq : 1U;
+        *seg = (struct kernel_shm_segment){
+            .namespace = base, .table = table, .seq = sequence,
+            .shmid = (int32_t)((uint32_t)sequence * KERNEL_SHMMNI_MAX + slot), .key = key,
+            .size = size, .aligned_size = aligned, .memory = creation.memory,
+            .hugetlb = creation.hugetlb, .ctime = current_time_seconds(),
+            .mode = (uint32_t)shmflg & 0777U,
+            .uid = cred->euid, .cuid = cred->euid, .gid = cred->egid, .cgid = cred->egid,
+            .active = 1,
+        };
+        creation.memory = NULL;
+        creation.hugetlb = NULL;
+        kernel_task_identity_replace_tgid(&seg->cpid, caller ? caller : kernel_task_current());
+        if (key != KERNEL_IPC_PRIVATE) {
+            seg->key_index = (struct kernel_avl_node){.key = (uint32_t)key, .height = 1};
+            table->keys = kernel_avl_insert_node(table->keys, &seg->key_index);
+        }
+        table->total_pages += pages;
+        shm_slot_set_occupied(table, slot, 1);
+        if (publish_table) __atomic_store_n(&ns->shm, table, __ATOMIC_RELEASE);
+        *out_shmid = seg->shmid;
+        arch_interrupt_restore(irq);
+        return 0;
     }
-
-    int32_t shmid = slot_idx + (int32_t)new_seg->seq * (int32_t)KERNEL_SHMMNI;
-    new_seg->shmid = shmid;
-    new_seg->key = key;
-    new_seg->size = size;
-    new_seg->aligned_size = aligned_size;
-    new_seg->memory = mem;
-    new_seg->hugetlb = hugetlb;
-    table->total_pages += charged_pages;
-    new_seg->lock_account = 0;
-    new_seg->nattch = 0;
-    new_seg->attachments = 0;
-    new_seg->atime = 0;
-    new_seg->dtime = 0;
-    new_seg->ctime = current_time_seconds();
-    kernel_task_identity_replace_tgid(&new_seg->cpid,caller?caller:kernel_task_current());
-    new_seg->lpid = 0;
-    new_seg->mode = (uint32_t)(shmflg & 0777);
-    const struct kernel_credentials *cred=kernel_credentials_current();
-    new_seg->uid = new_seg->cuid = cred->euid;
-    new_seg->gid = new_seg->cgid = cred->egid;
-    new_seg->marked_for_deletion = 0;
-    new_seg->active = 1;
-
-    *out_shmid = shmid;
-    arch_interrupt_restore(irq);
-    return 0;
 }
 
 int kernel_shm_at_mm(struct kernel_mm *mm, struct kernel_task *caller, int32_t shmid, uint64_t shmaddr,
@@ -302,17 +414,10 @@ int kernel_shm_at_mm(struct kernel_mm *mm, struct kernel_task *caller, int32_t s
     if (shmid < 0) {
         return -KERNEL_EINVAL;
     }
-    uint32_t slot_idx = (uint32_t)shmid % KERNEL_SHMMNI;
-    struct kernel_shm_table *table=shm_namespace_table(kernel_task_ipc_namespace(),0);
-    if(!table)return -KERNEL_EINVAL;
-
+    struct kernel_ipc_namespace *ns = kernel_ipc_namespace_state(kernel_task_ipc_namespace());
     uintptr_t irq = arch_interrupt_save();
-    if (!table->initialized) {
-        arch_interrupt_restore(irq);
-        return -KERNEL_EINVAL;
-    }
-    struct kernel_shm_segment *seg = &table->segments[slot_idx];
-    if (!seg->active || seg->shmid != shmid) {
+    struct kernel_shm_segment *seg = shm_slot(ns->shm, (uint32_t)shmid & SHM_SLOT_MASK);
+    if (!seg || !seg->active || seg->shmid != shmid) {
         arch_interrupt_restore(irq);
         return -KERNEL_EINVAL;
     }
@@ -509,13 +614,9 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
         }
     }
 
-    struct kernel_shm_table *table=shm_namespace_table(kernel_task_ipc_namespace(),0);
-    if(!table)table=&empty_shm_table;
+    struct kernel_ipc_namespace *ns = kernel_ipc_namespace_state(kernel_task_ipc_namespace());
     uintptr_t irq = arch_interrupt_save();
-    if (!table->initialized) {
-        arch_interrupt_restore(irq);
-        return -KERNEL_EINVAL;
-    }
+    const struct kernel_shm_table *table = ns->shm;
 
     if (pure_cmd == KERNEL_IPC_INFO || pure_cmd == KERNEL_SHM_INFO ||
         pure_cmd == KERNEL_IPC_STAT || pure_cmd == KERNEL_SHM_STAT ||
@@ -527,32 +628,29 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
         } snapshot = {0};
         size_t size;
         int64_t result = 0;
-        if (pure_cmd == KERNEL_IPC_INFO || pure_cmd == KERNEL_SHM_INFO) {
-            /* CPU0 段表保护覆盖槽身份和 memory owner；驻留页数由对象原子读取。 */
-            for (uint32_t i = 0; i < KERNEL_SHMMNI; i++) {
-                const struct kernel_shm_segment *seg = &table->segments[i];
-                if (!seg->active) continue;
-                result = i;
-                if (pure_cmd == KERNEL_SHM_INFO) {
-                    snapshot.usage.used_ids++;
-                    snapshot.usage.shm_tot += (seg->size + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
-                    snapshot.usage.shm_rss += shm_resident_pages(seg);
-                }
+        if (pure_cmd == KERNEL_IPC_INFO) {
+            snapshot.limits = (struct kernel_shminfo64){
+                .shmmax = kernel_ipc_shm_limit(ns, KERNEL_SHM_LIMIT_MAX), .shmmin = KERNEL_SHMMIN,
+                .shmmni = kernel_ipc_shm_limit(ns, KERNEL_SHM_LIMIT_MNI),
+                .shmall = kernel_ipc_shm_limit(ns, KERNEL_SHM_LIMIT_ALL),
+            };
+            snapshot.limits.shmseg = snapshot.limits.shmmni;
+            result = shm_highest_slot(table);
+            size = sizeof(snapshot.limits);
+        } else if (pure_cmd == KERNEL_SHM_INFO) {
+            if (table) {
+                snapshot.usage.used_ids = (int32_t)table->used_ids;
+                snapshot.usage.shm_tot = table->total_pages;
+                for (uint32_t slot = shm_next_slot(table, 0); slot < KERNEL_SHMMNI_MAX;
+                     slot = shm_next_slot(table, slot + 1U))
+                    snapshot.usage.shm_rss += shm_resident_pages(shm_slot(table, slot));
+                result = shm_highest_slot(table);
             }
-            if (pure_cmd == KERNEL_IPC_INFO) {
-                snapshot.limits = (struct kernel_shminfo64){
-                    .shmmax = KERNEL_SHMMAX, .shmmin = KERNEL_SHMMIN,
-                    .shmmni = KERNEL_SHMMNI, .shmseg = KERNEL_SHMMNI,
-                    .shmall = KERNEL_SHMALL,
-                };
-                size = sizeof(snapshot.limits);
-            } else {
-                size = sizeof(snapshot.usage);
-            }
+            size = sizeof(snapshot.usage);
         } else {
-            struct kernel_shm_segment *seg = &table->segments[(uint32_t)shmid % KERNEL_SHMMNI];
-            /* SHM_STAT* 按槽枚举并返回当前完整 ID；IPC_STAT 还校验代次。 */
-            if (!seg->active || (pure_cmd == KERNEL_IPC_STAT && seg->shmid != shmid)) {
+            uint32_t slot = (uint32_t)shmid & SHM_SLOT_MASK;
+            struct kernel_shm_segment *seg = shm_slot(table, slot);
+            if (!seg || !seg->active || (pure_cmd == KERNEL_IPC_STAT && seg->shmid != shmid)) {
                 arch_interrupt_restore(irq);
                 return -KERNEL_EINVAL;
             }
@@ -578,9 +676,8 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
         return 0;
     }
 
-    uint32_t slot_idx = (uint32_t)shmid % KERNEL_SHMMNI;
-    struct kernel_shm_segment *seg = &table->segments[slot_idx];
-    if (!seg->active || seg->shmid != shmid) {
+    struct kernel_shm_segment *seg = shm_slot(table, (uint32_t)shmid & SHM_SLOT_MASK);
+    if (!seg || !seg->active || seg->shmid != shmid) {
         arch_interrupt_restore(irq);
         return -KERNEL_EINVAL;
     }
@@ -621,7 +718,7 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
             kernel_shm_destroy_segment_locked(seg);
         } else {
             seg->marked_for_deletion = 1;
-            seg->key = KERNEL_IPC_PRIVATE;
+            shm_remove_key(seg);
             seg->ctime = current_time_seconds();
         }
         *out_result = 0;
@@ -664,11 +761,14 @@ int kernel_shm_ctl(struct kernel_task *caller, int32_t shmid, int32_t cmd,
 
 void kernel_shm_namespace_destroy(struct kernel_shm_table *table)
 {
-    if(!table)return;
-    for(uint32_t i=0;i<KERNEL_SHMMNI;i++){
-        struct kernel_shm_segment *seg=&table->segments[i];
-        if(seg->attachments||seg->nattch)__builtin_trap();
+    if (!table) return;
+    for (uint32_t slot = shm_next_slot(table, 0); slot < KERNEL_SHMMNI_MAX;
+         slot = shm_next_slot(table, slot + 1U)) {
+        struct kernel_shm_segment *seg = shm_slot(table, slot);
+        if (seg->attachments || seg->nattch) __builtin_trap();
         kernel_shm_destroy_segment_locked(seg);
     }
-    kernel_heap_release(table->heap,table);
+    for (uint32_t i = 0; i < SHM_CHUNKS; i++)
+        if (table->chunks[i]) kernel_heap_release(table->heap, table->chunks[i]);
+    kernel_heap_release(table->heap, table);
 }

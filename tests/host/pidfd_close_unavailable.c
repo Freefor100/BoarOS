@@ -13,6 +13,8 @@ EXCLUDED(kernel_pipe_release_endpoint)
 #ifndef IPC_PROC_OWNER_CASE
 EXCLUDED(kernel_vfs_close)
 EXCLUDED(kernel_proc_view_release)
+struct kernel_shm_limits;
+void kernel_ipc_shm_limits_put(struct kernel_shm_limits *limits) { if (limits) unopened(); }
 #endif
 EXCLUDED(kernel_vfs_notify_file)
 EXCLUDED(kernel_event_fd_close)

@@ -14,6 +14,10 @@ struct kernel_block_device;
 struct kernel_async_io;
 struct kernel_namespace;
 struct kernel_mm_pagemap;
+struct kernel_shm_limits;
+int kernel_open_file_control_permission(const struct kernel_open_file_description *, int write);
+int kernel_open_file_control(const struct kernel_open_file_description *, int write,
+    uint64_t *offset, char *buffer, size_t size, size_t *count);
 int kernel_open_file_try_seek_regular(struct kernel_open_file_description *, uint64_t);
 enum kernel_proc_page_stream {
     KERNEL_PROC_PAGE_STREAM_NONE,
@@ -69,6 +73,7 @@ struct kernel_open_file_description {
     uint8_t proc_page_stream;
     const struct kernel_credentials *credentials;
     struct kernel_namespace *ipc_proc_namespace; /* /proc/sysvipc discovery owner from open. */
+    struct kernel_shm_limits *proc_shm_limits;
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
     uint64_t read_end,readahead_cookie,readahead_end; /* Last field is a page boundary. */
     unsigned readahead_pages;

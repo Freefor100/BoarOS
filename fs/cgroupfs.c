@@ -249,8 +249,9 @@ static int parse_pid(const char *text,size_t length,int32_t *pid)
     if(negative && value)return -KERNEL_EINVAL;
     *pid=(int32_t)value;return 0;
 }
-static int control(struct kernel_vfs_node *n,int write,uint64_t *offset,char *bytes,size_t size,size_t *count)
+static int control(struct kernel_vfs_node *n,void *context,int write,uint64_t *offset,char *bytes,size_t size,size_t *count)
 {
+    (void)context;
     struct kernel_cgroup *g=n->backend_data;unsigned k=kind(n->inode);*count=0;
     {KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);if(!g->linked)return -KERNEL_ENODEV;}
     if(write) {
@@ -281,7 +282,7 @@ static int snapshot(struct kernel_vfs_node *n,struct kernel_heap *heap,
 static int no_truncate(struct kernel_vfs_node *n,uint64_t s,uint64_t *a,int *changed)
 {(void)n;(void)s;(void)a;*changed=0;return -KERNEL_EINVAL;}
 static int pread_inode(struct kernel_vfs_node *n,uint64_t o,void *b,size_t s,size_t *c)
-{if(!kind(n->inode))return -KERNEL_EISDIR;return control(n,0,&o,b,s,c);}
+{if(!kind(n->inode))return -KERNEL_EISDIR;return control(n,NULL,0,&o,b,s,c);}
 static void accessed(struct kernel_vfs_file *f){(void)f;}
 static int modified(struct kernel_vfs_file *f,uint64_t o,int a){(void)f;(void)o;(void)a;return -KERNEL_EINVAL;}
 static void release_unlinked(struct kernel_vfs_node *n){(void)n;}

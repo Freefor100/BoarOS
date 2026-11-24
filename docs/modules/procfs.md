@@ -18,6 +18,7 @@
 | `/proc/sysvipc/{shm,sem,msg}` | 只读快照（`0444`） | 打开时捕获当前 IPC 与 PID 命名空间，按槽位枚举共享内存、信号量与消息队列元数据 |
 | `/proc/net/route` | 只读快照（`0444`） | 当前网络接口的默认路由与直连子网路由表 |
 | `/proc/sys/kernel/*` | 控制文件（`0644`；`pid_max` 为 `0444`） | `sched_rt_period_us`、`sched_rt_runtime_us`、`sched_rr_timeslice_ms`、`pid_max`、`unprivileged_bpf_disabled`、`hostname`、`domainname` |
+| `/proc/sys/kernel/{shmmax,shmall,shmmni}` | 控制文件（`0644`） | 当前进程间通信命名空间的 System V 共享内存单段字节数、总基础页面数与段数上限。打开的文件描述符保留原配置，命名空间销毁后访问返回 `ENOENT`。 |
 | `/proc/sys/kernel/keys/{maxkeys,maxbytes,root_maxkeys,root_maxbytes}` | 控制文件（`0644`） | 按真实用户标识执行的密钥数量和计费字节上限，分别配置普通用户和用户标识为 0 的账户。 |
 | `/proc/sys/vm/*` | 控制文件（`0644`；`drop_caches` 为 `0200`） | `nr_hugepages`、`drop_caches`（1 回收干净页缓存、2 回收目录项与后端元数据、3 两者皆回收）、`vfs_cache_pressure`（默认 100，设为 0 停用自动元数据回收） |
 | `/proc/sys/fs/*` | 控制文件（`aio-nr` `0444`、`aio-max-nr` `0644`） | 异步 I/O 全局在途请求计数与上限控制 |

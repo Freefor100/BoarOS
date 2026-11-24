@@ -35,6 +35,10 @@ static void mount_namespace_destroy(struct kernel_namespace *base)
 {
     struct kernel_mount_namespace *ns=(struct kernel_mount_namespace *)base;
     struct kernel_vfs_mount *top=kernel_vfs_path_mount(ns->top);
+    {
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        if (top->namespace_owner==ns) top->namespace_owner=NULL;
+    }
     if (kernel_vfs_path_release(&ns->top)) __builtin_trap();
     if (ns->copied_tree) kernel_vfs_retire_mount_tree(top);
     kernel_heap_release(base->heap,ns);
@@ -148,6 +152,8 @@ static enum kernel_fs_context_status create_context(
         mount_namespace_get_locked(ns);
     }
     KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
+    struct kernel_vfs_mount *top=kernel_vfs_path_mount(ns->top);
+    if (!top->namespace_owner) top->namespace_owner=ns;
     record->next=contexts;record->previous=&contexts;
     if(contexts)contexts->previous=&record->next;
     contexts=record;
@@ -344,6 +350,9 @@ size_t kernel_fs_context_pivot_publish(const struct kernel_fs_context *fs,
             mount->external_owner=1;ns->copied_tree=1;
         }
         if(kernel_vfs_path_acquire(next))__builtin_trap();
+        struct kernel_vfs_mount *old_mount=kernel_vfs_path_mount(old);
+        if (old_mount->namespace_owner==ns) old_mount->namespace_owner=NULL;
+        kernel_vfs_path_mount(next)->namespace_owner=ns;
         ns->top=next;count++;
     }
     return count;
@@ -378,7 +387,12 @@ int kernel_mount_namespace_take_tree(struct kernel_vfs_path **owner,struct kerne
     struct kernel_mount_namespace *ns=mount_namespace_create(heap);
     if(!ns)return -KERNEL_ENOMEM;
     ns->top=*owner;ns->copied_tree=1;*owner=NULL;
-    kernel_vfs_path_mount(ns->top)->detached_tree=0;
+    {
+        KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+        struct kernel_vfs_mount *top=kernel_vfs_path_mount(ns->top);
+        top->namespace_owner=ns;
+        top->detached_tree=0;
+    }
     int error=kernel_namespace_open(&ns->base,heap,0,file);
     mount_namespace_put(ns);return error;
 }
@@ -407,6 +421,30 @@ struct kernel_fs_mounts kernel_fs_context_mounts_snapshot(const struct kernel_fs
         if (kernel_vfs_path_acquire(mounts.root) || kernel_vfs_path_acquire(mounts.top)) __builtin_trap();
     }
     return mounts;
+}
+
+int kernel_mount_namespace_top_pin(struct kernel_mount_namespace *ns,struct kernel_vfs_path **owner)
+{
+    KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+    int result=kernel_vfs_path_acquire(ns->top);
+    if (!result) *owner=ns->top;
+    return result;
+}
+
+uint64_t kernel_mount_namespace_of_view(struct kernel_vfs_mount *mount,struct kernel_vfs_path **root)
+{
+    KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+    for (;mount;mount=mount->parent) {
+        if (mount->retired || mount->detached_tree ||
+            __atomic_load_n(&mount->namespace_retiring,__ATOMIC_ACQUIRE))
+            break;
+        struct kernel_mount_namespace *ns=mount->namespace_owner;
+        if (!ns) continue;
+        if (kernel_vfs_path_acquire(ns->top)) __builtin_trap();
+        *root=ns->top;
+        return ns->base.id;
+    }
+    return 0;
 }
 
 void kernel_fs_mounts_release(struct kernel_fs_mounts *mounts)

@@ -36,6 +36,7 @@
 #include <kernel/socket.h>
 #include <kernel/bpf.h>
 #include <kernel/shm.h>
+#include <kernel/ipc_namespace.h>
 #include <kernel/sem.h>
 #include <kernel/msg.h>
 #include <kernel/namespace.h>
@@ -83,6 +84,7 @@
 #define PROC_CPUINFO_INODE UINT64_C(37)
 #define PROC_KEYS_INODE UINT64_C(38)
 #define PROC_KEY_QUOTA_FIRST_INODE UINT64_C(39)
+#define PROC_SHM_LIMIT_FIRST_INODE (PROC_KEY_QUOTA_FIRST_INODE + KERNEL_KEY_QUOTA_COUNT)
 
 static const char *const proc_key_quota_names[KERNEL_KEY_QUOTA_COUNT] = {
     [KERNEL_KEY_QUOTA_MAXKEYS] = "maxkeys",
@@ -94,6 +96,17 @@ static const char *const proc_key_quota_names[KERNEL_KEY_QUOTA_COUNT] = {
 static int proc_is_key_quota(uint64_t inode)
 {
     return inode - PROC_KEY_QUOTA_FIRST_INODE < KERNEL_KEY_QUOTA_COUNT;
+}
+
+static const char *const proc_shm_limit_names[KERNEL_SHM_LIMIT_COUNT] = {
+    [KERNEL_SHM_LIMIT_MAX] = "shmmax",
+    [KERNEL_SHM_LIMIT_ALL] = "shmall",
+    [KERNEL_SHM_LIMIT_MNI] = "shmmni",
+};
+
+static int proc_is_shm_limit(uint64_t inode)
+{
+    return inode - PROC_SHM_LIMIT_FIRST_INODE < KERNEL_SHM_LIMIT_COUNT;
 }
 
 static const struct proc_root_entry {
@@ -426,6 +439,13 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
             *mode = KERNEL_VFS_S_IFDIR | 0555U;
             return 0;
         }
+        for (unsigned i = 0; i < KERNEL_SHM_LIMIT_COUNT; i++) {
+            if (length == 6U && !memcmp(name, proc_shm_limit_names[i], 6U)) {
+                *inode = PROC_SHM_LIMIT_FIRST_INODE + i;
+                *mode = KERNEL_VFS_S_IFREG | 0644U;
+                return 0;
+            }
+        }
         if (length == 18U && !memcmp(name, "sched_rt_period_us", 18U))
             *inode = PROC_RT_PERIOD_INODE;
         else if (length == 19U && !memcmp(name, "sched_rt_runtime_us", 19U))
@@ -669,7 +689,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
          inode != PROC_FS_INODE && inode != PROC_AIO_NR_INODE && inode != PROC_AIO_MAX_NR_INODE &&
          inode != PROC_LEASE_BREAK_TIME_INODE && inode != PROC_PIPE_MAX_SIZE_INODE &&
          inode != PROC_KERNEL_INODE && inode != PROC_VM_INODE &&
-         inode != PROC_KEYS_INODE && !proc_is_key_quota(inode) &&
+         inode != PROC_KEYS_INODE && !proc_is_key_quota(inode) && !proc_is_shm_limit(inode) &&
          inode != PROC_NR_HUGEPAGES_INODE && inode != PROC_RT_PERIOD_INODE &&
          inode != PROC_RT_RUNTIME_INODE && inode != PROC_RR_TIMESLICE_INODE && inode != PROC_PID_MAX_INODE &&
          inode != PROC_UNPRIVILEGED_BPF_INODE &&
@@ -725,7 +745,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
           inode == PROC_PID_MAX_INODE || inode == PROC_NR_HUGEPAGES_INODE || inode == PROC_SYSVIPC_SHM_INODE ||
           inode == PROC_SYSVIPC_SEM_INODE || inode == PROC_SYSVIPC_MSG_INODE ||
           inode == PROC_NET_ROUTE_INODE || inode == PROC_HOSTNAME_INODE ||
-          inode == PROC_DOMAINNAME_INODE || proc_is_key_quota(inode)) &&
+          inode == PROC_DOMAINNAME_INODE || proc_is_key_quota(inode) || proc_is_shm_limit(inode)) &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG))
         return -KERNEL_EINVAL;
     if (inode >= (UINT64_C(1) << 30U)) {
@@ -749,7 +769,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
                               inode==PROC_UNPRIVILEGED_BPF_INODE || inode==PROC_NR_HUGEPAGES_INODE || inode==PROC_AIO_MAX_NR_INODE ||
                               inode==PROC_LEASE_BREAK_TIME_INODE || inode==PROC_PIPE_MAX_SIZE_INODE ||
                               inode == PROC_HOSTNAME_INODE || inode == PROC_DOMAINNAME_INODE ||
-                              proc_is_key_quota(inode))
+                              proc_is_key_quota(inode) || proc_is_shm_limit(inode))
         ? KERNEL_VFS_CONTROL_READ | KERNEL_VFS_CONTROL_WRITE : 0;
     if (inode==PROC_AIO_NR_INODE) node->generated_control=KERNEL_VFS_CONTROL_READ;
     if (inode==PROC_DROP_CACHES_INODE)
@@ -796,7 +816,8 @@ static int proc_permission(struct kernel_vfs_node *node,const struct kernel_cred
         node->inode == PROC_NR_HUGEPAGES_INODE || node->inode == PROC_AIO_MAX_NR_INODE ||
         node->inode == PROC_AIO_NR_INODE || node->inode == PROC_CACHE_PRESSURE_INODE ||
         node->inode == PROC_LEASE_BREAK_TIME_INODE || node->inode == PROC_PIPE_MAX_SIZE_INODE ||
-        node->inode == PROC_DROP_CACHES_INODE || proc_is_key_quota(node->inode)) {
+        node->inode == PROC_DROP_CACHES_INODE || proc_is_key_quota(node->inode) ||
+        proc_is_shm_limit(node->inode)) {
         /* sysctl table permissions use effective UID and grant no DAC bypass. */
         if (node->inode==PROC_DROP_CACHES_INODE)
             return mask & ~(cred->euid==0 ? 2U : 0U) & 7U ? -KERNEL_EACCES : 0;
@@ -926,22 +947,23 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
         return 1;
     }
     if (directory == PROC_KERNEL_INODE) {
-        if (position > 9U) return 0;
-        const char *entry = position == 0 ? "." : position == 1 ? ".." : position == 2 ?
-            "sched_rt_period_us" : position == 3 ? "sched_rt_runtime_us" :
-            position == 4 ? "pid_max" : position == 5 ? "unprivileged_bpf_disabled" :
-            position == 6 ? "hostname" : position == 7 ? "domainname" :
-            position == 8 ? "sched_rr_timeslice_ms" : "keys";
+        static const struct proc_root_entry entries[] = {
+            {".", PROC_KERNEL_INODE, 4}, {"..", PROC_SYS_INODE, 4},
+            {"sched_rt_period_us", PROC_RT_PERIOD_INODE, 8},
+            {"sched_rt_runtime_us", PROC_RT_RUNTIME_INODE, 8},
+            {"pid_max", PROC_PID_MAX_INODE, 8}, {"unprivileged_bpf_disabled", PROC_UNPRIVILEGED_BPF_INODE, 8},
+            {"hostname", PROC_HOSTNAME_INODE, 8}, {"domainname", PROC_DOMAINNAME_INODE, 8},
+            {"sched_rr_timeslice_ms", PROC_RR_TIMESLICE_INODE, 8}, {"keys", PROC_KEYS_INODE, 4},
+        };
+        const uint64_t fixed = sizeof(entries) / sizeof(entries[0]);
+        if (position >= fixed + KERNEL_SHM_LIMIT_COUNT) return 0;
+        const char *entry = position < fixed ? entries[position].name : proc_shm_limit_names[position - fixed];
         size_t length = strlen(entry) + 1U;
         if (name_size < length) return -KERNEL_ERANGE;
         memcpy(name, entry, length);
         *next_position = position + 1U;
-        *inode = position == 0 ? directory : position == 1 ? PROC_SYS_INODE : position == 2 ?
-            PROC_RT_PERIOD_INODE : position == 3 ? PROC_RT_RUNTIME_INODE :
-            position == 4 ? PROC_PID_MAX_INODE : position == 5 ? PROC_UNPRIVILEGED_BPF_INODE :
-            position == 6 ? PROC_HOSTNAME_INODE : position == 7 ? PROC_DOMAINNAME_INODE :
-            position == 8 ? PROC_RR_TIMESLICE_INODE : PROC_KEYS_INODE;
-        *type = position < 2 || position == 9 ? 4U : 8U;
+        *inode = position < fixed ? entries[position].inode : PROC_SHM_LIMIT_FIRST_INODE + position - fixed;
+        *type = position < fixed ? entries[position].type : 8U;
         return 1;
     }
     if (directory == PROC_KEYS_INODE) {
@@ -1431,7 +1453,7 @@ static int proc_parse_unsigned(const char *buffer, size_t size, unsigned base,
     return 0;
 }
 
-static int proc_control(struct kernel_vfs_node *node, int write,
+static int proc_control(struct kernel_vfs_node *node, void *open_context, int write,
     uint64_t *offset, char *buffer, size_t size, size_t *count)
 {
     if (proc_inode_kind(node->inode) == PROC_PID_TIMERSLACK_KIND) {
@@ -1520,8 +1542,23 @@ static int proc_control(struct kernel_vfs_node *node, int write,
         }
         return 0;
     }
+    int shm_limit = proc_is_shm_limit(node->inode);
     if (!write) {
         if (*offset) return 0;
+        if (shm_limit) {
+            uint64_t value;
+            int result = kernel_ipc_shm_limit_read(open_context,
+                node->inode - PROC_SHM_LIMIT_FIRST_INODE, &value);
+            if (result) return result;
+            char text[21];
+            size_t length = decimal(text, value);
+            text[length++] = '\n';
+            if (size < length) length = size;
+            memcpy(buffer, text, length);
+            *count = length;
+            *offset += length;
+            return 0;
+        }
         int64_t value;
         if (node->inode==PROC_AIO_NR_INODE || node->inode==PROC_AIO_MAX_NR_INODE) {
             char text[24];
@@ -1596,7 +1633,7 @@ static int proc_control(struct kernel_vfs_node *node, int write,
     if (position < limit && buffer[position] != ' ' &&
         buffer[position] != '\t' && buffer[position] != '\n') return -KERNEL_EINVAL;
     if (node->inode!=PROC_NR_HUGEPAGES_INODE && node->inode!=PROC_AIO_MAX_NR_INODE &&
-        node->inode!=PROC_PIPE_MAX_SIZE_INODE &&
+        node->inode!=PROC_PIPE_MAX_SIZE_INODE && !shm_limit &&
         value > (negative ? UINT64_C(2147483648) : INT32_MAX)) return -KERNEL_EINVAL;
     int result;
     if (node->inode==PROC_DROP_CACHES_INODE) {
@@ -1612,6 +1649,9 @@ static int proc_control(struct kernel_vfs_node *node, int write,
         result=0;
     } else if (node->inode==PROC_PIPE_MAX_SIZE_INODE) {
         result=negative ? -KERNEL_EINVAL : kernel_pipe_set_max_size(value);
+    } else if (shm_limit) {
+        result = negative ? -KERNEL_EINVAL : kernel_ipc_shm_limit_set(open_context,
+            node->inode - PROC_SHM_LIMIT_FIRST_INODE, value);
     } else if (proc_is_key_quota(node->inode)) {
         result = negative ? -KERNEL_EINVAL :
             kernel_keys_quota_set(node->inode - PROC_KEY_QUOTA_FIRST_INODE, (unsigned)value);
@@ -1736,8 +1776,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
             struct proc_mount_entry *e=&entries[captured++];
             e->path=path;e->mount_root=mount_root;e->source=it->source_name;
             struct kernel_vfs_instance *instance=it->private_data;
-            e->bpf_type=kernel_bpf_filesystem_type(it);
-            if(!e->bpf_type)e->bpf_type=kernel_devtmpfs_is_mount(it) ? "devtmpfs" : instance->ops->type;
+            e->bpf_type=kernel_vfs_mount_type(it);
             e->is_proc=kernel_procfs_is_mount(it);e->is_tmpfs=kernel_tmpfs_is_mount(it);e->is_devpts=kernel_devpts_is_mount(it);
             e->nosuid=it->nosuid;e->nodev=it->nodev;e->noexec=it->noexec;e->atime_policy=it->atime_policy;
             e->nosymfollow=it->nosymfollow;
@@ -1745,13 +1784,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
             e->id=it->id;e->parent=it->parent?it->parent->id:it->id;e->device=instance->device_id;
             e->shared=it->propagation_group;e->master=it->master?it->master->propagation_group:0;
             e->unbindable=it->unbindable;
-            for(struct kernel_vfs_mount *master=it->master;master && !e->dominating;master=master->master) {
-                struct kernel_vfs_mount *peer=master;
-                do {
-                    if(kernel_vfs_mount_reachable(peer,root_path))e->dominating=master->propagation_group;
-                    peer=peer->propagation_group?peer->peer_next:master;
-                }while(peer!=master && !e->dominating);
-            }
+            e->dominating=kernel_vfs_mount_dominating_group(it,root_path);
             result=kernel_vfs_path_string(path,root_path,path_text,KERNEL_FS_PATH_MAX);
             if(result==-KERNEL_ENOENT){result=0;continue;}
             if(result)goto Finish;
@@ -2715,6 +2748,14 @@ int kernel_procfs_ipc_file(const struct kernel_vfs_file *file)
     const struct kernel_vfs_node *node=file->private_data;
     return node && (node->inode==PROC_SYSVIPC_SHM_INODE ||
         node->inode==PROC_SYSVIPC_SEM_INODE || node->inode==PROC_SYSVIPC_MSG_INODE);
+}
+
+int kernel_procfs_shm_limits_open(const struct kernel_vfs_file *file, struct kernel_shm_limits **owner)
+{
+    if (!file || !kernel_procfs_is_mount(file->mount)) return 0;
+    const struct kernel_vfs_node *node = file->private_data;
+    return node && proc_is_shm_limit(node->inode) ?
+        kernel_ipc_shm_limits_open(kernel_task_ipc_namespace(), owner) : 0;
 }
 
 int kernel_procfs_kpageflags_file(const struct kernel_vfs_file *file)

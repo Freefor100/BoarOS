@@ -792,8 +792,8 @@ static int read_transfer_page(struct kernel_open_file_description *file,struct k
     if (file->block || file->kind==KERNEL_OPEN_FILE_KIND_REGULAR)
         error=kernel_open_file_pread_mode(file,position,*page,wanted,status_flags,done);
     else if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED && kernel_vfs_file_is_control(&file->file,0)) {
-        error=kernel_vfs_file_control_permission(&file->file,0);
-        if (!error) error=kernel_vfs_file_control(&file->file,0,&position,*page,wanted,done);
+        error=kernel_open_file_control_permission(file,0);
+        if (!error) error=kernel_open_file_control(file,0,&position,*page,wanted,done);
     }
     else if (file->kind==KERNEL_OPEN_FILE_KIND_GENERATED) {
         error=kernel_open_file_generate(file);

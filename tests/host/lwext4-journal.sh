@@ -13,6 +13,23 @@ cc=${HOST_CC:-cc}
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_journal.c" \
     "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
+if [ "${JOURNAL_TEST_CASE:-}" = ext3-recovery ]; then
+    printf 'Old data' > "$work/data"
+    for block in 1024 4096; do
+        truncate -s 32M "$work/ext3-base.img"
+        mke2fs -q -F -t ext3 -b "$block" "$work/ext3-base.img"
+        debugfs -w -R "write $work/data /probe" "$work/ext3-base.img" >/dev/null 2>&1
+        for operation in recover-readonly recover-write-error recover-flush-error; do
+            cp "$work/ext3-base.img" "$work/ext3-replay.img"
+            JOURNAL_EXT3=1 timeout 30 "$work/probe" "$work/ext3-replay.img" commit
+            JOURNAL_EXT3=1 timeout 30 "$work/probe" "$work/ext3-replay.img" "$operation"
+            JOURNAL_EXT3=1 timeout 30 "$work/probe" "$work/ext3-replay.img" recover-crash 78
+            e2fsck -fn "$work/ext3-replay.img" > "$work/ext3-fsck.log" 2>&1
+        done
+    done
+    printf '%s\n' 'PASS: ext3 durable replay, read-only refusal and recovery retry'
+    exit 0
+fi
 truncate -s 32M "$work/base.img"
 mkfs.ext4 -q -F -b 1024 "$work/base.img"
 printf 'Old data' > "$work/data"

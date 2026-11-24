@@ -50,6 +50,10 @@ enum kernel_syscall_status syscall_handle_mount(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded, int unmount);
+enum kernel_syscall_status syscall_handle_statmount(struct kernel_task *,
+    const struct kernel_syscall_request *,struct kernel_syscall_result *);
+enum kernel_syscall_status syscall_handle_listmount(struct kernel_task *,
+    const struct kernel_syscall_request *,struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_unshare(struct kernel_task *,
     const struct kernel_syscall_request *,struct kernel_syscall_result *);
 enum kernel_syscall_status syscall_handle_setns(struct kernel_task *,

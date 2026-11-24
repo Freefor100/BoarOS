@@ -1,6 +1,7 @@
 #include "../../../kernel/sched/private.h"
 #include "../../../fs/open_file_internal.h"
 #include <kernel/time.h>
+#include <kernel/ipc_namespace.h>
 #include <assert.h>
 #include <sched.h>
 #include <pthread.h>
@@ -12,6 +13,14 @@ __attribute__((weak)) void kernel_proc_view_release(struct kernel_pid_registry *
 { (void)view;assert(!"PID view is outside this fixture"); }
 __attribute__((weak)) int kernel_procfs_ipc_file(const struct kernel_vfs_file *file)
 { (void)file;return 0; }
+__attribute__((weak)) int kernel_procfs_shm_limits_open(const struct kernel_vfs_file *file,
+    struct kernel_shm_limits **owner)
+{ (void)file; (void)owner; return 0; }
+__attribute__((weak)) void kernel_ipc_shm_limits_put(struct kernel_shm_limits *limits)
+{ assert(!limits); }
+__attribute__((weak)) int kernel_ipc_shm_limit_read(const struct kernel_shm_limits *limits,
+    enum kernel_shm_limit which, uint64_t *value)
+{ (void)limits; (void)which; (void)value; assert(!"SHM limits are outside this fixture"); return 0; }
 __attribute__((weak)) int kernel_procfs_kpageflags_file(const struct kernel_vfs_file *file)
 { (void)file;return 0; }
 __attribute__((weak)) int kernel_procfs_pagemap_open(const struct kernel_vfs_file *file,

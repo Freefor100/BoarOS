@@ -5,6 +5,7 @@
 struct kernel_sem_table;
 struct kernel_msg_table;
 struct kernel_shm_table;
+struct kernel_shm_limits;
 struct kernel_mqueue_tree;
 /* Namespace owns discovery, never a task or file. Objects that can outlive
  * discovery retain their original table/tree instead of consulting current. */
@@ -14,6 +15,7 @@ struct kernel_ipc_namespace {
     struct kernel_sem_table *sem;
     struct kernel_msg_table *msg;
     struct kernel_shm_table *shm;
+    struct kernel_shm_limits *shm_limits;
     struct kernel_mqueue_tree *mq;
 };
 struct kernel_namespace *kernel_ipc_initial(void);
@@ -23,6 +25,18 @@ struct kernel_ipc_namespace *kernel_ipc_namespace_state(struct kernel_namespace 
 int kernel_ipc_namespace_boot(struct kernel_heap *);
 /* After task/file/mount teardown; retain the permanent initial identity. */
 int kernel_ipc_initial_shutdown(void);
+
+enum kernel_shm_limit {
+    KERNEL_SHM_LIMIT_MAX, KERNEL_SHM_LIMIT_ALL, KERNEL_SHM_LIMIT_MNI,
+    KERNEL_SHM_LIMIT_COUNT,
+};
+int kernel_ipc_shm_limits_open(struct kernel_namespace *, struct kernel_shm_limits **);
+void kernel_ipc_shm_limits_put(struct kernel_shm_limits *);
+int kernel_ipc_shm_limit_read(const struct kernel_shm_limits *, enum kernel_shm_limit, uint64_t *);
+/* Live namespace admission and writes run in the CPU0 service domain. */
+int kernel_ipc_shm_limit_set(struct kernel_shm_limits *, enum kernel_shm_limit, uint64_t);
+uint64_t kernel_ipc_shm_limit(const struct kernel_ipc_namespace *, enum kernel_shm_limit);
+
 void kernel_sem_namespace_destroy(struct kernel_sem_table *);
 void kernel_msg_namespace_destroy(struct kernel_msg_table *);
 void kernel_shm_namespace_destroy(struct kernel_shm_table *);

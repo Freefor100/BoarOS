@@ -343,6 +343,8 @@ static int initialize_generated_path(struct kernel_open_file_description *file, 
 {
     if (file->kind != KERNEL_OPEN_FILE_KIND_PATH && kernel_vfs_file_generated(&file->file)) {
         file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
+        int error = kernel_procfs_shm_limits_open(&file->file, &file->proc_shm_limits);
+        if (error || file->proc_shm_limits) return error;
         if (kernel_procfs_kpageflags_file(&file->file))
             file->proc_page_stream = KERNEL_PROC_PAGE_STREAM_FLAGS;
         else {
@@ -1167,6 +1169,7 @@ static enum kernel_open_file_status finish_close(struct kernel_open_file_descrip
     }
     if(file->ipc_proc_namespace)kernel_proc_view_release(file->ipc_proc_pid_view);
     kernel_namespace_put(file->ipc_proc_namespace);
+    kernel_ipc_shm_limits_put(file->proc_shm_limits);
     if (file->proc_page_stream == KERNEL_PROC_PAGE_STREAM_PAGEMAP) {
         kernel_mm_pagemap_put(file->proc_pagemap);
         kernel_heap_release(file->heap, file->proc_pagemap);
@@ -1255,6 +1258,22 @@ uint64_t kernel_open_file_size(
     if (open_file_live(file) && file->kind == KERNEL_OPEN_FILE_KIND_GENERATED)
         return file->generated_ready ? file->generated_length : 0U;
     return open_file_live(file) ? kernel_vfs_file_size(&file->file) : 0U;
+}
+
+int kernel_open_file_control_permission(const struct kernel_open_file_description *file, int write)
+{
+    if (file->proc_shm_limits) {
+        uint64_t ignored;
+        int result = kernel_ipc_shm_limit_read(file->proc_shm_limits, KERNEL_SHM_LIMIT_MAX, &ignored);
+        if (result) return result;
+    }
+    return kernel_vfs_file_control_permission(&file->file, write);
+}
+
+int kernel_open_file_control(const struct kernel_open_file_description *file, int write,
+    uint64_t *offset, char *buffer, size_t size, size_t *count)
+{
+    return kernel_vfs_file_control(&file->file, file->proc_shm_limits, write, offset, buffer, size, count);
 }
 
 int kernel_open_file_generate(struct kernel_open_file_description *file)

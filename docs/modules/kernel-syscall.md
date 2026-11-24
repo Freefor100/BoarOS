@@ -1,6 +1,6 @@
 # Linux 系统调用统一分派与通用系统接口
 
-系统调用是用户空间程序向操作系统内核请求服务的唯一受控入口。BoarOS 通过 `kernel/syscall/` 将**架构相关的寄存器约定**与**架构无关的系统调用语义**彻底解耦：RISC-V 64（`ECALL`，`a7` 传号、`a0..a5` 传参）与 LoongArch 64（`SYSCALL`，`$a7`/`regs[11]` 传号）的陷入代码将请求统一封装为 `struct kernel_syscall_request`，交由共享分派器执行，当前共覆盖 **RISC-V 282 个**、**LoongArch 278 个** Linux 系统调用编号。
+系统调用是用户空间程序向操作系统内核请求服务的受控入口。RISC-V 64 的 `ECALL` 使用 `a7` 传递调用号、`a0..a5` 传递参数，LoongArch 64 的 `SYSCALL` 使用 `$a7`（`regs[11]`）传递调用号。两种架构的陷入入口将请求封装为 `struct kernel_syscall_request`，交给 `kernel/syscall/` 的共享分派器处理。当前接入 **RISC-V 284 个**、**LoongArch 280 个** Linux 系统调用编号。
 
 ---
 
@@ -35,7 +35,7 @@ flowchart LR
 - **高频标量快路径（编号 172～178）**：`getpid`、`getppid`、`gettid`、`getuid`、`geteuid`、`getgid`、`getegid` 这 7 个极高频无副作用查询在 `kernel_syscall_dispatch()` 中直接读取当前任务身份或不可变凭据指针返回，跳过大型主分派表路由。
 - **线程控制与用户返回**。`prctl` 经过系统调用过滤和入口追踪后直接进入线程控制分派。RISC-V 对当前线程的定时器宽限查询和设置提供简化入口，启用过滤或追踪时使用完整系统调用分派。返回用户空间时，调度器先处理退役资源和需要重新调度的任务，再从待处理位判断是否进入信号交付。同步系统调用持续计入内核执行时间，只有中断处理需要保存并恢复前一记账状态。
 - **架构解耦的动作返回机制（`enum kernel_syscall_action`）**：分派器不直接操作底层寄存器帧，而是返回明确的动作码指导架构陷入层完成收尾——包括 `RETURN`（普通写回返回值）、`RETURN_FINAL`、`EXIT` / `EXIT_GROUP`（终止线程或进程组）、`EXEC`（装载新地址空间且不推进旧程序计数器）、`CLONE` / `CLONE3`（传递完整寄存器快照构造子任务）、`WAIT4` / `WAITID`、`YIELD` 与 `SIGNAL_RETURN`。
-- **双架构差异的 4 个系统调用**：RISC-V 额外提供 `163`（`getrlimit`）、`164`（`setrlimit`）、`258`（`riscv_hwprobe`）与 `259`（`riscv_flush_icache`）；其余 278 个编号两架构完全共享（LoongArch 统一使用现代 `prlimit64` 查询和修改资源限额）。
+- **双架构共用 280 个系统调用编号**。RISC-V 另提供 `163`（`getrlimit`）、`164`（`setrlimit`）、`258`（`riscv_hwprobe`）和 `259`（`riscv_flush_icache`）。LoongArch 通过 `prlimit64` 查询和修改资源限额。
 
 ---
 
@@ -80,7 +80,7 @@ flowchart LR
 | :--- | :--- | :--- |
 | **进程、线程与调度** | `clone` / `clone3` / `execve` / `wait4` / `waitid` / `sched_setattr` / `setpriority` / `futex` / `futex_waitv` / `ptrace` | [调度与同步](kernel-scheduler.md) · [映像替换](kernel-exec.md) · [进程跟踪](kernel-ptrace.md) |
 | **虚拟内存** | `brk` / `mmap` / `munmap` / `mprotect` / `mremap` / `mlock*` / `madvise` / `msync` / `mincore` / `process_vm_readv/writev` / `userfaultfd` / `memfd_secret` | [虚拟内存管理](kernel-mm.md) · [原生大页](hugepages.md) |
-| **文件、路径与挂载** | `openat` / `openat2` / `readv` / `writev` / `sendfile` / `splice` / `copy_file_range` / `fallocate` / `io_uring_*` / `statx` / `fsopen`～`move_mount` / `pivot_root` | [VFS 与 ext4](vfs-ext4.md) · [文件资源与 I/O](kernel-files.md) |
+| **文件、路径与挂载** | `openat` / `openat2` / `readv` / `writev` / `sendfile` / `splice` / `copy_file_range` / `fallocate` / `io_uring_*` / `statx` / `fsopen`～`move_mount` / `pivot_root` / `statmount` / `listmount` | [VFS 与 ext4](vfs-ext4.md) · [文件资源与 I/O](kernel-files.md) |
 | **事件、锁与通知** | `epoll_*` / `ppoll` / `pselect6` / `pipe2` / `eventfd2` / `timerfd_*` / `signalfd4` / `inotify_*` / `fanotify_*` / `flock` / `fcntl` | [文件资源与 I/O](kernel-files.md) |
 | **网络与套接字** | `socket` / `socketpair` / `bind` / `listen` / `accept4` / `connect` / `sendmsg` / `sendmmsg` / `recvmmsg` / `setsockopt` | [多核网络协议栈](kernel-network.md) · [rtnetlink](../network-rtnetlink.md) |
 | **信号、时钟与 IPC** | `rt_sigaction` / `rt_sigprocmask` / `rt_sigreturn` / `sigaltstack` / `clock_gettime` / `clock_nanosleep` / `timer_*` / `adjtimex` / SysV & POSIX IPC | [信号](kernel-signal.md) · [时钟与定时器](kernel-time.md) |
