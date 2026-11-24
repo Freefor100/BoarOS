@@ -3617,9 +3617,9 @@ struct writeback_lane {
     size_t count;
 };
 #endif
-static int writeback_workspace_init(struct kernel_page_cache *cache,struct writeback_workspace *work)
+static int writeback_workspace_init(struct kernel_page_cache *cache,struct writeback_workspace *work,
+    size_t count)
 {
-    size_t count=BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
     size_t bytes=count*(sizeof(*work->prepared)+sizeof(*work->spans)+sizeof(*work->selected));
     if (kernel_heap_allocate(cache->heap,bytes,(void **)&work->prepared)) return -KERNEL_ENOMEM;
     work->spans=(void *)(work->prepared+count);
@@ -3976,7 +3976,9 @@ static void capture_writeback(struct kernel_page_cache *cache,
     }
     /* 整批资格已发布；选择时取得的借用覆盖锁外通知及后续提交。 */
     for (size_t i=first;i<count;i++)
-        if (prepared[i].version) cache_wake(&entries[i]->ready);
+        if (prepared[i].version &&
+            __atomic_load_n(&entries[i]->ready.registrations,__ATOMIC_ACQUIRE))
+            cache_wake(&entries[i]->ready);
 }
 
 static int submit_writeback_spans(struct kernel_vfs_node *node,struct file_write_span *spans,
@@ -4005,7 +4007,10 @@ static int writeback_run(struct kernel_page_cache *cache,
     struct kernel_page_cache_entry **entries,size_t count,uint64_t limit,size_t *used,
     struct writeback_workspace *workspace,int background)
 {
-    if (!count || count>BOAROS_PAGE_CACHE_WRITEBACK_PAGES) __builtin_trap();
+    enum { max_pages = BOAROS_MAX_CPUS > 1 ?
+        KERNEL_VFS_GROWTH_WRITEBACK_MAX : BOAROS_PAGE_CACHE_WRITEBACK_PAGES };
+    _Static_assert(max_pages <= UINT8_MAX, "span owners must fit in one byte");
+    if (!count || count>max_pages) __builtin_trap();
     reclaim_window_memory(cache);
     /* Progress I/O (including loop) is exempt from admission throttling, but
      * that says nothing about ownership of this cache worker's workspace. */
@@ -4014,7 +4019,8 @@ static int writeback_run(struct kernel_page_cache *cache,
         if (count>cache->record->writeback_capacity) count=cache->record->writeback_capacity;
     }
     size_t span_capacity=workspace?BOAROS_PAGE_CACHE_WRITEBACK_PAGES:1;
-    uint8_t span_owners[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
+    if (span_capacity<count) span_capacity=count;
+    uint8_t span_owners[max_pages];
     struct prepared_writeback single_prepared;
     struct file_write_span single_span;
     struct writeback_workspace local={.prepared=&single_prepared,.spans=&single_span};
@@ -4341,6 +4347,7 @@ static void writeback_window(void *argument)
     if (!count) { request->done=1; return; }
     int result = -KERNEL_EOPNOTSUPP;
     unsigned submitted = 0;
+    unsigned mapped_windows = request->capacity > BOAROS_PAGE_CACHE_WRITEBACK_PAGES ? 1U : 4U;
     while (mapped && count) {
         struct file_write_span *spans = request->workspace->spans;
         for (size_t i = 0; i < count; i++) {
@@ -4374,7 +4381,7 @@ static void writeback_window(void *argument)
             }
             /* Finish the current batch and qualify the next with one
              * acquisition. Keep the inode borrow bounded to four batches. */
-            if (!result && ++submitted < 4 && request->cursor <= request->last) {
+            if (!result && ++submitted < mapped_windows && request->cursor <= request->last) {
                 count = select_writeback_window(request, &mapped);
                 if (count && !mapped) result = -KERNEL_EOPNOTSUPP;
                 if (!count) request->done = 1;
@@ -4384,8 +4391,18 @@ static void writeback_window(void *argument)
     }
     kernel_lock_scope_release(&io);
     if (result == -KERNEL_EOPNOTSUPP) {
+        size_t limit = count;
+        if (request->mapped_candidate) {
+            limit = BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
+            request->capacity = limit;
+        }
         request->mapped_candidate = false;
-        result=writeback_run(cache,request->selected,count,request->end,&used,request->workspace,0);
+        result = 0;
+        for (size_t first = 0; first < count && !result; first += limit) {
+            size_t window = count - first;
+            if (window > limit) window = limit;
+            result=writeback_run(cache,request->selected+first,window,request->end,&used,request->workspace,0);
+        }
         {
             CACHE_SCOPE(guard,cache);
             for (size_t i=0;i<count;i++) entry_return(request->selected[i]);
@@ -4406,6 +4423,8 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
     if (kernel_lock_held(&node->io_lock,0)) __builtin_trap();
     struct kernel_page_cache_record *r=cache->record;
     uint64_t cursor=start>>BOAROS_PAGE_SHIFT,last=(end-1)>>BOAROS_PAGE_SHIFT;
+    uint64_t first;
+    size_t dirty;
     struct kernel_page_cache_entry *single=NULL;
     int multiple=0;
     {
@@ -4416,22 +4435,45 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
         if (last>tail->page_index) last=tail->page_index;
         struct kernel_page_cache_entry *next=RB_NEXT(kernel_page_cache_dirty_tree,&kernel_vfs_node_dirty_pages(node)->tree,entry);
         multiple=next && next->page_index<=last;
+        first=entry->page_index;
+        dirty=kernel_vfs_node_dirty_pages(node)->count;
         request_borrow(r);
     }
     reclaim_window_memory(cache);
-    union foreground_workspace *lease=multiple?foreground_workspace_take(cache):NULL;
-    if (multiple && !lease) {
-        request_return(r);
-        return -KERNEL_ENOMEM;
+    const size_t large_capacity=(512U * 1024U) / BOAROS_PAGE_SIZE;
+    _Static_assert((512U * 1024U) / BOAROS_PAGE_SIZE <= KERNEL_VFS_GROWTH_WRITEBACK_MAX,
+        "a growth window must fit the backend span array");
+    struct writeback_workspace work={0};
+    size_t capacity=multiple?BOAROS_PAGE_CACHE_WRITEBACK_PAGES:1;
+    bool growth=false;
+    bool large=false;
+    bool mapped=BOAROS_MAX_CPUS > 1 && multiple && end==UINT64_MAX &&
+        node->instance->ops->writeback_mapped && kernel_cpu_get_boot_count()>1;
+    if (mapped && large_capacity > capacity && dirty>=large_capacity &&
+        last-first>=large_capacity-1 && node->instance->ops->writeback_growth) {
+        {
+            KERNEL_LOCK_SCOPE(io);
+            kernel_vfs_node_lock(node,&io,0);
+            growth=node->instance->ops->writeback_growth(node,first<<BOAROS_PAGE_SHIFT);
+        }
+        if (growth || node->instance->writeback_block_size==BOAROS_PAGE_SIZE)
+            large=!writeback_workspace_init(cache,&work,large_capacity);
+        if (large) capacity=large_capacity;
     }
-    struct writeback_workspace work=multiple?(struct writeback_workspace){
-        .prepared=lease->writeback.prepared,.spans=lease->writeback.spans,
-        .selected=lease->writeback.selected}:(struct writeback_workspace){0};
+    union foreground_workspace *lease=NULL;
+    if (multiple && !large) {
+        lease=foreground_workspace_take(cache);
+        if (!lease) {
+            request_return(r);
+            return -KERNEL_ENOMEM;
+        }
+        work=(struct writeback_workspace){.prepared=lease->writeback.prepared,
+            .spans=lease->writeback.spans,.selected=lease->writeback.selected};
+    }
     struct foreground_writeback request={.cache=cache,.node=node,.cursor=cursor,.last=last,
         .end=end,.selected=multiple?work.selected:&single,.workspace=multiple?&work:NULL,
-        .capacity=multiple?BOAROS_PAGE_CACHE_WRITEBACK_PAGES:1,
-        .mapped_candidate=BOAROS_MAX_CPUS > 1 && multiple && end==UINT64_MAX &&
-            node->instance->ops->writeback_mapped && kernel_cpu_get_boot_count() > 1};
+        .capacity=capacity,
+        .mapped_candidate=mapped && !growth};
     /* 前台批次使用调用者的描述符和稳定版本，可与同一 cache 上另一设备的
      * 后台写回并行。只在后端要求 CPU0 时借用执行队列。 */
     int dispatch=node->instance->ops->file_operation_execution==KERNEL_VFS_EXECUTION_CPU0 &&
@@ -4453,6 +4495,7 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
         }
     }
     if (lease) foreground_workspace_put(cache,lease);
+    if (large) writeback_workspace_release(cache,&work);
     request_return(r);
     return request.result;
 }
@@ -5324,7 +5367,7 @@ int kernel_page_cache_start_executor(struct kernel_page_cache *cache)
     struct kernel_page_cache_record *r = cache->record;
     if (kernel_heap_allocate(cache->heap,sizeof(*r->writeback_workspace),
         (void **)&r->writeback_workspace)) return -KERNEL_ENOMEM;
-    if (writeback_workspace_init(cache,r->writeback_workspace)) {
+    if (writeback_workspace_init(cache,r->writeback_workspace,BOAROS_PAGE_CACHE_WRITEBACK_PAGES)) {
         kernel_heap_release(cache->heap,r->writeback_workspace);
         r->writeback_workspace=NULL; return -KERNEL_ENOMEM;
     }
@@ -5383,7 +5426,7 @@ int kernel_page_cache_start_background(struct kernel_page_cache *cache)
         if (r->lane) return -KERNEL_EINVAL;
         struct writeback_lane *lane=NULL;
         if (kernel_heap_allocate_zeroed(cache->heap,1,sizeof(*lane),(void **)&lane) ||
-            writeback_workspace_init(cache,&lane->workspace)) {
+            writeback_workspace_init(cache,&lane->workspace,BOAROS_PAGE_CACHE_WRITEBACK_PAGES)) {
             if (lane) kernel_heap_release(cache->heap,lane);
             kernel_page_cache_stop_worker(cache);
             return -KERNEL_ENOMEM;

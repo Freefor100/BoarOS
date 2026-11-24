@@ -1432,6 +1432,7 @@ static int start_journal_workers(struct kernel_vfs_mount *mount)
         if (budget > 16 * 1024 * 1024) budget = 16 * 1024 * 1024;
         struct ext4_journal_runtime runtime = {
             .context=adapter,.now_ns=journal_now,.request=journal_request,.wait=journal_wait,
+            .prewrite_fresh=kernel_cpu_get_boot_count()>1,
 #if BOAROS_MAX_CPUS > 1
             .join_pending_metadata=journal_join_pending_metadata
 #endif
@@ -3067,15 +3068,26 @@ static int ext4_backend_writeback_mapped(struct kernel_vfs_node *node,
 static int ext4_backend_writeback(struct kernel_vfs_node *node,
     struct file_write_span *spans, size_t count)
 {
-    _Static_assert(KERNEL_VFS_WRITEBACK_MAX <= EXT4_BLOCK_BATCH_MAX,
+    _Static_assert(KERNEL_VFS_GROWTH_WRITEBACK_MAX <= EXT4_FILE_WRITEBACK_MAX,
         "VFS writeback batches must fit ext4");
-    if (count > KERNEL_VFS_WRITEBACK_MAX) __builtin_trap();
+    if (count > KERNEL_VFS_GROWTH_WRITEBACK_MAX) __builtin_trap();
     for (size_t i = 0; i < count; i++) COST_ADD(BACKEND_REQUESTED, spans[i].size);
     int result = ext4_fpwrite_batch(lwext4_node_file(node), spans, count);
     for (size_t i = 0; i < count; i++) {
         COST_ADD(BACKEND_ACCEPTED, spans[i].written);
     }
     return lwext4_error(result);
+}
+
+static bool ext4_backend_writeback_growth(struct kernel_vfs_node *node, uint64_t start)
+{
+    struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
+    struct jbd_journal *journal = adapter->device.fs->jbd_journal;
+    if (!journal || !journal->grouped || !adapter->interface.bwrite_batch) return false;
+    boaros_lwext4_state_read_lock(&adapter->backend_lock);
+    uint64_t stored = ext4_fsize(lwext4_node_file(node));
+    boaros_lwext4_state_unlock(&adapter->backend_lock);
+    return start >= stored;
 }
 
 static int ext4_backend_complete_data_range(struct kernel_vfs_node *node, uint64_t start, uint64_t end)
@@ -3536,6 +3548,7 @@ static void initialize_backend(void)
     ops->pread = ext4_backend_pread;
     ops->writeback = ext4_backend_writeback;
     ops->writeback_mapped = ext4_backend_writeback_mapped;
+    ops->writeback_growth = ext4_backend_writeback_growth;
     ops->direct_io = ext4_backend_direct_io;
     ops->direct_alignment = ext4_backend_direct_alignment;
     ops->seek_sparse = ext4_backend_seek_sparse;
