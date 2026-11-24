@@ -683,15 +683,13 @@ enum kernel_syscall_status syscall_handle_pread64(
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    task_status = kernel_task_files_borrow(caller, &files);
+    task_status = kernel_task_file_io_borrow(caller, &files, &mm);
     if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
         decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
         decoded->value = -KERNEL_EBADF;
         return KERNEL_SYSCALL_STATUS_OK;
     }
     if (task_status != KERNEL_TASK_STATUS_OK ||
-        kernel_task_mm_borrow_mutable(caller, &mm) !=
-            KERNEL_TASK_STATUS_OK ||
         kernel_files_pread(files,
                            mm,
                            (int64_t)request->arguments[0],
