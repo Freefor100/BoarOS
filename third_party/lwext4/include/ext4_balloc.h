@@ -79,6 +79,16 @@ void ext4_balloc_set_bitmap_csum(struct ext4_sblock *sb,
 				 void *bitmap);
 bool ext4_balloc_verify_bitmap_csum(struct ext4_sblock *, struct ext4_bgroup *, void *);
 
+/* One exclusively owned allocation group within a small-file transaction. */
+struct ext4_block_allocation {
+    struct ext4_block_group_ref group;
+    struct ext4_block bitmap;
+    uint32_t allocated;
+};
+
+struct ext4_block_allocation *ext4_small_writeback_allocation(struct ext4_small_writeback *);
+int ext4_balloc_finish_allocation(struct ext4_block_allocation *, int error);
+
 /**@brief   Free block from inode.
  * @param   inode_ref inode reference
  * @param   baddr block address

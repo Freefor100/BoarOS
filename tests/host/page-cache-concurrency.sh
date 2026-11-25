@@ -50,7 +50,12 @@ for shift in ${CACHE_HOST_SHIFTS:-12 14}; do
         fi
         if [ "${1:-all}" = parallel-writeback ] || [ "${1:-all}" = metadata-pressure ] || [ "${1:-all}" = read-borrow-retire ] || [ "${1:-all}" = snapshot-copy ] || [ "${1:-all}" = small-files-sync ] || [ "${1:-all}" = admission-credit ] || [ "${1:-all}" = same-disk-admission ] || [ "${1:-all}" = read-batch ] || [ "${1:-all}" = allocation-claims ] || [ "${1:-all}" = dirty-age ] || [ "${1:-all}" = progress-owners ] || [ "${1:-all}" = version-pool ] || [ "${1:-all}" = append-snapshot ]; then
             image="$build_dir/$1-$shift-$block.img"
-            truncate -s 32M "$image"; mkfs.ext4 -q -F -b "$block" "$image"
+            truncate -s 32M "$image"
+            if [ "$1" = small-files-sync ]; then
+                mkfs.ext4 -q -F -b "$block" -g 1024 "$image"
+            else
+                mkfs.ext4 -q -F -b "$block" "$image"
+            fi
             timeout 20s "$build_dir/concurrency-$shift" "$image" "$1"
             e2fsck -fn "$image" > "$build_dir/fsck-$1-$shift-$block.log" 2>&1
             continue

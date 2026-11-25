@@ -2225,15 +2225,6 @@ bool jbd_trans_first_tree_copy_checked(struct jbd_trans *trans,
         __atomic_load_n(&jb->block.payload->tree_verified, __ATOMIC_ACQUIRE) == key;
 }
 
-const struct ext4_block_payload *jbd_trans_checked_payload(struct jbd_trans *trans,
-    ext4_fsblk_t lba,uint64_t key)
-{
-    struct jbd_buf *jb=key?jbd_trans_find_buf(trans,lba):NULL;
-    if (!jb || !jb->private_access || jb->checked_tree!=key) return NULL;
-    const struct ext4_block_payload *payload=&jb->after->payload;
-    return __atomic_load_n(&payload->references,__ATOMIC_ACQUIRE)==1?payload:NULL;
-}
-
 static const uint8_t *jbd_before_data(const struct jbd_buf *jb)
 { return jb->before ? jb->before->data : jb->block.payload->data; }
 
