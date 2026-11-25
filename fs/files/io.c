@@ -606,6 +606,12 @@ static enum kernel_files_status disk_read(
         if (count > KERNEL_PAGE_CACHE_READ_BATCH_MAX) count = KERNEL_PAGE_CACHE_READ_BATCH_MAX;
         struct kernel_page_cache_read_page pages[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
         enum kernel_page_cache_status loaded;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES && BOAROS_PAGE_SIZE > 4096
+        if (advance && count==1 && backing==&description->file &&
+            kernel_open_file_read_forward_window(description,position))
+            loaded=kernel_page_cache_get_forward_page(cache,backing,position>>BOAROS_PAGE_SHIFT,pages);
+        else
+#endif
         loaded = kernel_page_cache_get_batch(
             cache, backing,
             position >> BOAROS_PAGE_SHIFT, pages, count, no_reuse);
@@ -2629,7 +2635,7 @@ static enum kernel_files_status lseek_pinned(
         description->generated_read_offset = (uint64_t)target;
     }
     enum kernel_open_file_status seek = BOAROS_PAGE_CACHE_READAHEAD_PAGES &&
-        BOAROS_PAGE_SIZE==4096U && whence==KERNEL_FILES_SEEK_CUR ?
+        whence==KERNEL_FILES_SEEK_CUR ?
         kernel_open_file_seek_relative(description,(uint64_t)target) :
         kernel_open_file_seek(description,(uint64_t)target);
     if (seek != KERNEL_OPEN_FILE_STATUS_OK) {

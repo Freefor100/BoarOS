@@ -193,6 +193,12 @@ struct kernel_page_cache_read_page {
 enum kernel_page_cache_status kernel_page_cache_get_batch(
     struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t first,
     struct kernel_page_cache_read_page *pages, size_t count, int no_reuse);
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES && BOAROS_PAGE_SIZE > 4096
+/* Borrow only the demand page. Optional neighbours share its disk submission. */
+enum kernel_page_cache_status kernel_page_cache_get_forward_page(
+    struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t,
+    struct kernel_page_cache_read_page *);
+#endif
 void kernel_page_cache_put_batch(
     struct kernel_page_cache *cache,
     struct kernel_page_cache_read_page *pages,

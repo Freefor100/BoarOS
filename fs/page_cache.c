@@ -3162,6 +3162,13 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
     struct kernel_page_cache_read_page *pages,size_t count,int no_reuse)
 { return get_batch(cache,file,first,pages,count,no_reuse,0,false); }
 
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES && BOAROS_PAGE_SIZE > 4096
+enum kernel_page_cache_status kernel_page_cache_get_forward_page(
+    struct kernel_page_cache *cache,const struct kernel_vfs_file *file,uint64_t first,
+    struct kernel_page_cache_read_page *page)
+{ return get_batch(cache,file,first,page,1,0,KERNEL_PAGE_CACHE_FAULT_READ_AHEAD,false); }
+#endif
+
 static void resize_apply(struct kernel_page_cache_resize *,uint64_t);
 static int write_admission(struct kernel_page_cache *cache,struct kernel_vfs_node *node,int space_pressure);
 /* 已发布entry的借用覆盖其数据页，不再另加物理引用；完整冷覆盖只准备私有候选，
