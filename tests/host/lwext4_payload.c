@@ -57,7 +57,7 @@ static int write_device(struct ext4_blockdev *dev,const void *bytes,uint64_t lba
     if(publish_during_write) {
         struct ext4_buf *buf=publish_during_write;publish_during_write=NULL;
         assert(((const unsigned char *)bytes)[0]==0x61);
-        ext4_bcache_publish(buf,replacement);
+        ext4_bcache_publish(buf,replacement,0);
         assert(((const unsigned char *)bytes)[0]==0x61);
     }
     memcpy(disk+lba*512,bytes,(size_t)count*512);return EOK;
@@ -71,10 +71,10 @@ static void publication(struct ext4_blockdev *dev)
     struct ext4_block old=EXT4_BLOCK_ZERO(),second=EXT4_BLOCK_ZERO(),latest=EXT4_BLOCK_ZERO(),borrowed=EXT4_BLOCK_ZERO();
     assert(ext4_block_get(dev,&old,1)==EOK);check_bytes(old.data,size,0x31);
     struct ext4_block_payload *new=image(0x42,size);
-    ext4_bcache_publish(old.buf,new);ext4_block_payload_put(new);
+    ext4_bcache_publish(old.buf,new,0);ext4_block_payload_put(new);
     assert(ext4_block_get(dev,&second,1)==EOK);
     assert(old.payload!=second.payload);check_bytes(old.data,size,0x31);check_bytes(second.data,size,0x42);
-    new=image(0x53,size);ext4_bcache_publish(old.buf,new);ext4_block_payload_put(new);
+    new=image(0x53,size);ext4_bcache_publish(old.buf,new,0);ext4_block_payload_put(new);
     assert(ext4_block_get(dev,&latest,1)==EOK);check_bytes(latest.data,size,0x53);
     struct ext4_block_payload *private=image(0x84,size);
     uint32_t refs=second.buf->refctr,accepted_refs=latest.payload->references;
@@ -138,7 +138,7 @@ static void parallel_publication(struct ext4_blockdev *dev)
     pthread_t reader;assert(!pthread_create(&reader,NULL,read_old_publication,dev));publication_meet();
     assert(ext4_block_get(dev,&held,12)==EOK);
     struct ext4_block_payload *new=image(0xa6,dev->lg_bsize);
-    ext4_bcache_publish(held.buf,new);ext4_block_payload_put(new);
+    ext4_bcache_publish(held.buf,new,0);ext4_block_payload_put(new);
     struct ext4_block accepted=EXT4_BLOCK_ZERO();new=image(0xb8,dev->lg_bsize);
     ext4_bcache_prepare_private(&held,&accepted,new);ext4_block_payload_put(new);
     check_bytes(held.data,dev->lg_bsize,0xb8);check_bytes(accepted.data,dev->lg_bsize,0xa6);
@@ -168,7 +168,7 @@ static void flush_snapshot(struct ext4_blockdev *dev)
     unsigned size=dev->lg_bsize,start=releases;
     struct ext4_block block=EXT4_BLOCK_ZERO();assert(ext4_block_get(dev,&block,5)==EOK);
     struct ext4_block_payload *old=image(0x61,size);replacement=image(0x72,size);
-    ext4_bcache_publish(block.buf,old);ext4_block_payload_put(old);
+    ext4_bcache_publish(block.buf,old,0);ext4_block_payload_put(old);
     ext4_bcache_set_dirty(block.buf);publish_during_write=block.buf;
     assert(ext4_block_flush_buf(dev,block.buf)==EOK && !publish_during_write);
     check_bytes(disk+5*size,size,0x61);check_bytes(block.buf->data,size,0x72);
@@ -186,11 +186,11 @@ static void scope_and_eviction(struct ext4_blockdev *dev)
     struct ext4_block block=EXT4_BLOCK_ZERO();assert(ext4_block_get(dev,&block,10)==EOK);
     ext4_bcache_set_dirty(block.buf);
     struct ext4_block_payload *new=image(0xb7,dev->lg_bsize);
-    ext4_bcache_publish(block.buf,new);ext4_block_payload_put(new);
+    ext4_bcache_publish(block.buf,new,0);ext4_block_payload_put(new);
     assert(ext4_block_set(dev,&block)==EOK && ext4_bcache_scope_end(dev->bc,&scope)==EOK);
     ext4_bcache_cleanup(dev->bc);assert(releases==start+1 && !allocations);
     assert(ext4_block_get(dev,&block,10)==EOK);
-    new=image(0xc8,dev->lg_bsize);ext4_bcache_publish(block.buf,new);ext4_block_payload_put(new);
+    new=image(0xc8,dev->lg_bsize);ext4_bcache_publish(block.buf,new,0);ext4_block_payload_put(new);
     assert(ext4_block_set(dev,&block)==EOK);
     assert(ext4_block_get(dev,&block,11)==EOK && ext4_block_set(dev,&block)==EOK);
     assert(ext4_bcache_shake(dev->bc)==EOK && releases==start+2);
@@ -210,10 +210,10 @@ static void owned_payload_loan(struct ext4_blockdev *dev)
     check_bytes(loan.data,size,0x64);
     assert(ext4_block_set(dev,&loan)==EOK && owner.buf->refctr==1 && private->references==1);
     struct ext4_block_payload *current=image(0x75,size);
-    ext4_bcache_publish(owner.buf,current);ext4_block_payload_put(current);
+    ext4_bcache_publish(owner.buf,current,0);ext4_block_payload_put(current);
     struct ext4_block_payload *snapshot=ext4_bcache_borrow_owned(&owner,private,true,&loan);
     assert(snapshot==current && snapshot->references==2 && owner.buf->refctr==2);
-    current=image(0x86,size);ext4_bcache_publish(owner.buf,current);ext4_block_payload_put(current);
+    current=image(0x86,size);ext4_bcache_publish(owner.buf,current,0);ext4_block_payload_put(current);
     assert(ext4_block_set(dev,&owner)==EOK);
     ext4_block_payload_put(private);
     assert(ext4_bcache_shake(dev->bc)==EOK);
@@ -230,7 +230,7 @@ static void invalidation_keeps_readers(struct ext4_blockdev *dev)
     struct ext4_block old=EXT4_BLOCK_ZERO(),fresh=EXT4_BLOCK_ZERO();
     assert(ext4_block_get(dev,&old,13)==EOK);
     struct ext4_block_payload *accepted=image(0xd9,size);
-    ext4_bcache_publish(old.buf,accepted);ext4_block_payload_put(accepted);
+    ext4_bcache_publish(old.buf,accepted,0);ext4_block_payload_put(accepted);
     assert(ext4_block_set(dev,&old)==EOK && ext4_block_get(dev,&old,13)==EOK);
     ext4_bcache_set_dirty(old.buf);
     ext4_bcache_invalidate_lba(dev->bc,13,1);
@@ -266,7 +266,7 @@ static void verified_inode_copy(struct ext4_blockdev *dev)
 
     assert(ext4_block_get(dev,&ref,15)==EOK);
     struct ext4_block_payload *accepted=image(0xe1,dev->lg_bsize);
-    ext4_bcache_publish(ref.buf,accepted);
+    ext4_bcache_publish(ref.buf,accepted,0);
     ext4_block_payload_put(accepted);
     assert(ext4_block_set(dev,&ref)==EOK);
     assert(!ext4_bcache_copy_record(dev->bc,15,256,schema,1,inode,sizeof(inode),NULL));
@@ -279,7 +279,7 @@ static void verified_inode_copy(struct ext4_blockdev *dev)
     uint64_t old_version=check.version;
     assert(ext4_block_get(dev,&ref,15)==EOK);
     accepted=image(0xab,dev->lg_bsize);
-    ext4_bcache_publish(ref.buf,accepted);
+    ext4_bcache_publish(ref.buf,accepted,0);
     ext4_block_payload_put(accepted);
     assert(ext4_block_set(dev,&ref)==EOK);
     ext4_bcache_record_verified(dev->bc,15,schema,1,old_version);

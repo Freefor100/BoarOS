@@ -452,13 +452,13 @@ int ext4_dir_dx_init(struct ext4_inode_ref *dir, struct ext4_inode_ref *parent)
 		ext4_dir_en_set_name_len(sb, be, 0);
 		ext4_dir_en_set_inode_type(sb, be, EXT4_DE_UNKNOWN);
 		ext4_dir_init_entry_tail(EXT4_DIRENT_TAIL(be, block_size));
-		ext4_dir_set_csum(dir, be);
 	} else {
 		ext4_dir_en_set_entry_len(be, block_size);
 	}
 
-	ext4_trans_set_block_dirty(new_block.buf);
-	rc = ext4_block_set(dir->fs->bdev, &new_block);
+	rc = ext4_dir_mark_dirty(dir, &new_block);
+	int release = ext4_block_set(dir->fs->bdev, &new_block);
+	if (rc == EOK) rc = release;
 	if (rc != EOK) {
 		ext4_block_set(dir->fs->bdev, &block);
 		return rc;
@@ -774,16 +774,9 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 		if (rc != EOK)
 			goto cleanup;
 
-		rc = write ? ext4_trans_block_get(fs->bdev, &b, leaf_block_addr) :
-            ext4_block_get(fs->bdev, &b, leaf_block_addr);
+		rc = ext4_dir_leaf_get(inode_ref, &b, leaf_block_addr, write);
 		if (rc != EOK)
 			goto cleanup;
-
-		if (!ext4_dir_block_csum_verify(inode_ref, &b)) {
-			ext4_block_set(fs->bdev, &b);
-			rc = EUCLEAN;
-			goto cleanup;
-		}
 
 		/* Linear search inside block */
 		rc = ext4_dir_find_in_block(&b, &fs->sb, name_len, name, result);
@@ -1048,13 +1041,15 @@ static int ext4_dir_dx_split_data(struct ext4_inode_ref *inode_ref,
 		t = EXT4_DIRENT_TAIL(new_data_block_tmp.data, block_size);
 		ext4_dir_init_entry_tail(t);
 	}
-	ext4_dir_set_csum(inode_ref, (void *)old_data_block->data);
-	ext4_dir_set_csum(inode_ref, (void *)new_data_block_tmp.data);
-	ext4_trans_set_block_dirty(old_data_block->buf);
-	ext4_trans_set_block_dirty(new_data_block_tmp.buf);
+	rc = ext4_dir_mark_dirty(inode_ref, old_data_block);
+	if (rc == EOK) rc = ext4_dir_mark_dirty(inode_ref, &new_data_block_tmp);
 
 	ext4_free(sort);
 	ext4_free(entry_buffer);
+	if (rc != EOK) {
+		ext4_block_set(inode_ref->fs->bdev, &new_data_block_tmp);
+		return rc;
+	}
 
 	ext4_dir_dx_insert_entry(inode_ref, index_block, new_hash + continued,
 				new_iblock);
@@ -1281,14 +1276,9 @@ int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
 		goto release_index;
 
 	struct ext4_block target_block;
-	r = ext4_trans_block_get(fs->bdev, &target_block, leaf_block_addr);
+	r = ext4_dir_leaf_get(parent, &target_block, leaf_block_addr, true);
 	if (r != EOK)
 		goto release_index;
-
-	if (!ext4_dir_block_csum_verify(parent, &target_block)) {
-		r = EUCLEAN;
-		goto release_target_index;
-	}
 
 	/* Check if insert operation passed */
 	r = ext4_dir_try_insert_entry(&fs->sb, parent, &target_block, child,
@@ -1493,10 +1483,12 @@ int ext4_dir_reparent(struct ext4_inode_ref *dir, uint32_t expected_parent,
     if (ext4_dir_en_get_inode(entry) != expected_parent) r = EUCLEAN;
     if (r == EOK) {
         ext4_dir_en_set_inode(entry, new_parent);
-        if (ext4_inode_has_flag(dir->inode, EXT4_INODE_FLAG_INDEX))
+        if (ext4_inode_has_flag(dir->inode, EXT4_INODE_FLAG_INDEX)) {
             ext4_dir_set_dx_csum(dir, (void *)block.data);
-        else ext4_dir_set_csum(dir, (void *)block.data);
-        r = ext4_trans_set_block_dirty(block.buf);
+            r = ext4_trans_set_block_dirty(block.buf);
+        } else {
+            r = ext4_dir_mark_dirty(dir, &block);
+        }
     }
     int release = ext4_block_set(dir->fs->bdev, &block);
     return r != EOK ? r : release;

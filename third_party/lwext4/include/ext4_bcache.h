@@ -277,7 +277,8 @@ struct ext4_block_payload *ext4_bcache_borrow_owned(const struct ext4_block *own
 /* Rebind keeps the buffer reference; publication retains its own payload loan.
  * Both return the old payload outside the cache metadata short lock. */
 void ext4_block_rebind(struct ext4_block *, struct ext4_block_payload *);
-void ext4_bcache_publish(struct ext4_buf *, struct ext4_block_payload *);
+/* A nonzero tree key certifies the exact, complete replacement bytes. */
+void ext4_bcache_publish(struct ext4_buf *, struct ext4_block_payload *, uint64_t tree_key);
 void ext4_bcache_insert_dirty_node(struct ext4_bcache *, struct ext4_buf *);
 void ext4_bcache_remove_dirty_node(struct ext4_bcache *, struct ext4_buf *);
 /* Select and detach clean victims atomically, flushing only in a write context. */

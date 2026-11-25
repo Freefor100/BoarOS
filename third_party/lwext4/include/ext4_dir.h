@@ -319,8 +319,9 @@ int ext4_dir_find_in_block(struct ext4_block *block, struct ext4_sblock *sb,
 int ext4_dir_destroy_result(struct ext4_inode_ref *parent,
 			    struct ext4_dir_search_result *result);
 
-void ext4_dir_set_csum(struct ext4_inode_ref *inode_ref,
-		       struct ext4_dir_en *dirent);
+int ext4_dir_mark_dirty(struct ext4_inode_ref *inode_ref, struct ext4_block *block);
+int ext4_dir_leaf_get(struct ext4_inode_ref *, struct ext4_block *, ext4_fsblk_t lba,
+    bool write);
 
 
 void ext4_dir_init_entry_tail(struct ext4_dir_entry_tail *t);

@@ -348,8 +348,8 @@ static void serial_refs(struct ext4_fs *fs)
         CHECK(!serial_read_refs && !serial_write_upgrades);
         printf("rename source leaf: full_lookups=%u operation_leaf_crcs=%u\n",
             source_search.lookups,source_search.leaf_crcs);
-        CHECK(source_search.lookups==1 && source_search.leaf_crcs==
-            5U*(unsigned)ext4_sb_feature_ro_com(&fs->sb,EXT4_FRO_COM_METADATA_CSUM));
+        CHECK(source_search.lookups==1 && source_search.leaf_crcs<=
+            4U*(unsigned)ext4_sb_feature_ro_com(&fs->sb,EXT4_FRO_COM_METADATA_CSUM));
     }
     /* Existing checks cover replacement, directories, ancestry and rollback;
      * their legitimate ancestor READ references are not optimization failures. */
@@ -472,7 +472,7 @@ static void damage(struct ext4_fs *fs, const char *kind)
         struct ext4_dir_search_result found;
         CHECK(ext4_dir_find_entry(&found, &ref, "source", 6, true) == EOK);
         ext4_dir_en_set_entry_len(found.dentry, 4);
-        ext4_dir_set_csum(&ref, (void *)found.block.data);
+        CHECK(ext4_dir_mark_dirty(&ref, &found.block) == EOK);
         CHECK(ext4_blocks_set_direct(fs->bdev, found.block.data, found.block.lb_id, 1) == EOK);
         CHECK(ext4_dir_destroy_result(&ref, &found) == EOK);
     } else {

@@ -2178,15 +2178,18 @@ static void jbd_range_fill(uint64_t *ranges, uint32_t first, uint32_t end)
     }
 }
 
-int jbd_trans_set_block_dirty_range(struct jbd_trans *trans,
-    struct ext4_block *block, uint32_t offset, uint32_t length)
+static int jbd_mark_dirty(struct jbd_trans *trans, struct ext4_block *block,
+    uint32_t offset, uint32_t length, uint64_t tree_key)
 {
     uint32_t size = trans->journal->block_size;
     if (offset > size || length > size - offset || (offset & 31) || (length & 31)) return EINVAL;
     struct jbd_buf *private;
     TAILQ_FOREACH(private, &trans->buf_queue, buf_node) {
         if (!private->private_access || private->block.lb_id != block->lb_id) continue;
+        if (tree_key && block->payload != &private->after->payload) return EINVAL;
         private->modified = true;
+        private->checked_tree = tree_key;
+        private->fresh_full_copy = false;
         uint64_t *initialized = jbd_initialized_ranges(private);
         uint32_t first = offset / 32, end = (offset + length) / 32;
         if (!(jbd_range_test(initialized, first, end) & JBD_RANGE_ALL)) __builtin_trap();
@@ -2197,9 +2200,16 @@ int jbd_trans_set_block_dirty_range(struct jbd_trans *trans,
     return EINVAL; /* Writable metadata must first belong to this operation. */
 }
 
+int jbd_trans_set_block_dirty_range(struct jbd_trans *trans,
+    struct ext4_block *block, uint32_t offset, uint32_t length)
+{ return jbd_mark_dirty(trans, block, offset, length, 0); }
 
 int jbd_trans_set_block_dirty(struct jbd_trans *trans, struct ext4_block *block)
 { return jbd_trans_set_block_dirty_range(trans, block, 0, trans->journal->block_size); }
+
+int jbd_trans_set_tree_dirty(struct jbd_trans *trans,
+    struct ext4_block *block, uint64_t tree_key)
+{ return jbd_mark_dirty(trans, block, 0, trans->journal->block_size, tree_key); }
 
 static struct jbd_buf *jbd_trans_find_buf(struct jbd_trans *trans, ext4_fsblk_t lba)
 {
@@ -2207,6 +2217,16 @@ static struct jbd_buf *jbd_trans_find_buf(struct jbd_trans *trans, ext4_fsblk_t 
     TAILQ_FOREACH(buf, &trans->buf_queue, buf_node)
         if (buf->block.lb_id == lba) return buf;
     return NULL;
+}
+
+bool jbd_trans_first_tree_copy_checked(struct jbd_trans *trans,
+    const struct ext4_block *block, uint64_t key)
+{
+    struct jbd_buf *jb = jbd_trans_find_buf(trans, block->lb_id);
+    /* This proof belongs to the accepted source. Only the immediate caller
+     * of the first full write grant can still rely on that exact copy. */
+    return jb && jb->fresh_full_copy && block->payload == &jb->after->payload &&
+        __atomic_load_n(&jb->block.payload->tree_verified, __ATOMIC_ACQUIRE) == key;
 }
 
 static const uint8_t *jbd_before_data(const struct jbd_buf *jb)
@@ -2331,6 +2351,10 @@ int jbd_trans_borrow_private(struct jbd_trans *trans, struct ext4_block *block,
         offset, length, !newer) : EOK;
     if (newer) ext4_block_payload_put(newer);
     if (result) ext4_bcache_free_read(block->buf->bc, block);
+    else {
+        jb->fresh_full_copy = false;
+        if (access == EXT4_BLOCK_WRITE) jb->checked_tree = 0;
+    }
     return result;
 }
 
@@ -2343,7 +2367,14 @@ int jbd_trans_get_write_access_range(struct jbd_trans *trans,
         return EINVAL;
     if (jbd_journal_error(journal) || trans->error) return jbd_journal_error(journal) ? jbd_journal_error(journal) : trans->error;
     struct jbd_buf *jb = jbd_trans_find_buf(trans, block->lb_id);
-    if (jb) return jbd_rebind_private_range(jb, block, offset, length);
+    if (jb) {
+        int result = jbd_rebind_private_range(jb, block, offset, length);
+        if (!result) {
+            jb->checked_tree = 0;
+            jb->fresh_full_copy = false;
+        }
+        return result;
+    }
     /* The home cache stays at its accepted version. All writable references
      * within this operation share one private replacement. */
     jb = jbd_alloc(journal, sizeof(*jb) +
@@ -2356,6 +2387,7 @@ int jbd_trans_get_write_access_range(struct jbd_trans *trans,
     jb->trans = trans;
     ext4_bcache_prepare_private(block, &jb->block, &jb->after->payload);
     jb->private_access = true;
+    jb->fresh_full_copy = length == journal->block_size;
     if (jbd_initialize_range(jb, jb->block.payload, offset, length, true)) __builtin_trap();
     TAILQ_INSERT_HEAD(&trans->buf_queue, jb, buf_node);
     trans->data_cnt++;
@@ -2520,7 +2552,7 @@ static int jbd_publish_private(struct jbd_trans *trans, struct jbd_trans *runnin
              * pin. Replace its image without publishing a second record. */
             buf->end_write = jbd_trans_end_write;
             buf->end_write_arg = old;
-            ext4_bcache_publish(buf, &jb->after->payload);
+            ext4_bcache_publish(buf, &jb->after->payload, jb->checked_tree);
             ext4_block_rebind(&old->block, &jb->after->payload);
             jbd_image_free(old->after);
             old->after = jb->after;
@@ -2540,7 +2572,7 @@ static int jbd_publish_private(struct jbd_trans *trans, struct jbd_trans *runnin
         TAILQ_INSERT_TAIL(&rec->dirty_buf_queue, jb, dirty_buf_node);
         buf->end_write = jbd_trans_end_write;
         buf->end_write_arg = jb;
-        ext4_bcache_publish(buf, &jb->after->payload);
+        ext4_bcache_publish(buf, &jb->after->payload, jb->checked_tree);
         ext4_block_rebind(&jb->block, &jb->after->payload);
         jb->private_access = false;
         ext4_bcache_set_dirty(buf);

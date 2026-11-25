@@ -3508,8 +3508,7 @@ static int ext4_rename_replace_found(struct ext4_inode_ref *parent,
 	if (ext4_dir_en_get_inode(found->dentry) != victim) return EUCLEAN;
 	ext4_dir_write_entry(ext4_fs_super(parent->fs), found->dentry,
 	    ext4_dir_en_get_entry_len(found->dentry), source, name, length);
-	ext4_dir_set_csum(parent, (void *)found->block.data);
-	return ext4_trans_set_block_dirty(found->block.buf);
+	return ext4_dir_mark_dirty(parent, &found->block);
 }
 
 static int ext4_rename_replace(struct ext4_inode_ref *parent, const char *name,
