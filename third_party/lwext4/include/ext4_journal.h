@@ -238,6 +238,8 @@ int jbd_trans_set_tree_dirty(struct jbd_trans *trans,
     struct ext4_block *block, uint64_t tree_key);
 bool jbd_trans_first_tree_copy_checked(struct jbd_trans *,
     const struct ext4_block *, uint64_t tree_key);
+const struct ext4_block_payload *jbd_trans_checked_payload(struct jbd_trans *,
+    ext4_fsblk_t lba, uint64_t tree_key);
 /* Obtain a private replacement before changing a buffer. */
 int jbd_trans_get_write_access(struct jbd_trans *trans,
 			       struct ext4_block *block);

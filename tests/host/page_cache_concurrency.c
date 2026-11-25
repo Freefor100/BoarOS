@@ -472,8 +472,13 @@ int __wrap_ext4_file_sync_metadata_mode(ext4_file *file,bool data_only)
     }
     return __real_ext4_file_sync_metadata_mode(file,data_only);
 }
+static ext4_file *small_files_scalar_failure;
 int __wrap_ext4_fpwrite_batch(ext4_file *file,struct file_write_span *spans,unsigned count)
 {
+    if (file==small_files_scalar_failure) {
+        for (unsigned i=0;i<count;i++) spans[i].written=0;
+        return KERNEL_EIO;
+    }
     if(write_counts) {
         if((const void *)spans!=(const void *)write_counts->spans)
             fprintf(stderr,"writeback descriptors copied: VFS=%p ext4=%p\n",(const void *)write_counts->spans,(void *)spans);
@@ -522,10 +527,26 @@ bool __wrap_ext4_balloc_verify_bitmap_csum(struct ext4_sblock *sb,struct ext4_bg
 }
 int __real_ext4_trans_write_data(struct ext4_blockdev *,uint64_t,uint32_t,
     const void *,uint32_t,bool,const struct file_data_source *);
+static unsigned small_files_watch,small_files_active,small_files_fault;
+static unsigned small_files_committed,small_files_aborted;
+int __real_ext4_fpwrite_small_files(ext4_file *const *,struct file_write_span *,unsigned);
+int __wrap_ext4_fpwrite_small_files(ext4_file *const *files,struct file_write_span *spans,unsigned count)
+{
+    small_files_active=small_files_watch;
+    int result=__real_ext4_fpwrite_small_files(files,spans,count);
+    small_files_active=0;
+    if (small_files_watch && result==KERNEL_EIO) {
+        for (unsigned i=0;i<count;i++) assert(!ext4_fsize(files[i]) && !spans[i].written);
+        small_files_aborted++;
+    } else if (small_files_watch && !result) small_files_committed+=count;
+    return result;
+}
 int __wrap_ext4_trans_write_data(struct ext4_blockdev *bdev,uint64_t lba,uint32_t offset,
     const void *data,uint32_t length,bool initialize,const struct file_data_source *source)
 {
     int result=__real_ext4_trans_write_data(bdev,lba,offset,data,length,initialize,source);
+    if (!result && small_files_active && small_files_fault && !--small_files_fault)
+        return KERNEL_EIO;
     struct claim_actor *actor=claim_actor;
     if (!result && actor && source && source->retain) {
         assert(initialize);
@@ -1031,6 +1052,58 @@ static void read_borrow_retirement(struct kernel_page_cache *cache,const char *p
     assert(!kernel_page_cache_destroy(cache) && !close(image_fd));current_cache=NULL;
     puts("PASS retired read borrow: truncate/regrowth keeps old contents alive, last batch put cleans once and returns owners");
 }
+static uint64_t small_files_now(void *context)
+{ (void)context;return 1; }
+
+static void small_files_sync_case(struct kernel_page_cache *cache,const char *path)
+{
+    image_fd=open(path,O_RDWR);assert(image_fd>=0);
+    struct stat st;assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));
+    struct lwext4_mount_adapter *adapter=mount.private_data;
+    const struct ext4_journal_runtime runtime={.now_ns=small_files_now};
+    assert(!ext4_journal_group_enable(adapter->mount_point,&runtime,8*1024*1024));
+    for (unsigned fault=0;fault<3;fault++) {
+        struct kernel_vfs_file files[4]={{0}};
+        char name[32];
+        for (unsigned i=0;i<4;i++) {
+            snprintf(name,sizeof(name),"/small-%u-%u",fault,i);
+            assert(!kernel_vfs_create(&mount,name,0600,&files[i]));
+            unsigned char bytes[512];memset(bytes,0x55+i,sizeof(bytes));
+            size_t done=0;
+            assert(!kernel_vfs_pwrite(&files[i],0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+        }
+        small_files_committed=small_files_aborted=0;
+        small_files_watch=1;small_files_fault=fault?2:0;
+        if (fault==2) small_files_scalar_failure=lwext4_node_file(files[1].private_data);
+        int result=kernel_vfs_sync_mount(&mount,NULL);
+        small_files_watch=0;
+        if (fault==2) {
+            assert(result==-KERNEL_EIO);
+            for (unsigned i=0;i<4;i++) {
+                ext4_file *file=lwext4_node_file(files[i].private_data);
+                assert(ext4_fsize(file)==(i==1?0:512));
+            }
+            small_files_scalar_failure=NULL;
+            assert(!kernel_vfs_sync_mount(&mount,NULL));
+        } else assert(!result);
+        if (fault) assert(small_files_aborted==1 && !small_files_fault);
+        else assert(small_files_committed==4 && !small_files_aborted);
+        for (unsigned i=0;i<4;i++) {
+            assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&files[i])));
+            unsigned char bytes[512];size_t done=0;
+            assert(!kernel_vfs_pread(&files[i],0,bytes,sizeof(bytes),&done,NULL) && done==sizeof(bytes));
+            for (size_t j=0;j<done;j++) assert(bytes[j]==0x55+i);
+            assert(!kernel_vfs_close(&files[i]));
+        }
+    }
+    assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(cache) && !close(image_fd));
+    puts("PASS mount writeback: grouped acceptance, private abort, independent retry errors and durable contents");
+}
+
 static void snapshot_copy_case(struct kernel_page_cache *cache,const char *path)
 {
     image_fd=open(path,O_RDWR);assert(image_fd>=0);struct stat st;assert(!fstat(image_fd,&st));
@@ -4179,6 +4252,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[2],"writeback-wake")) {writeback_registration_wake(&cache);goto owners;}
         if (!strcmp(argv[2],"read-borrow-retire")) {read_borrow_retirement(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"snapshot-copy")) {snapshot_copy_case(&cache,argv[1]);goto owners;}
+        if (!strcmp(argv[2],"small-files-sync")) {small_files_sync_case(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"admission-credit")) {admission_credit_case(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"same-disk-admission")) {same_disk_admission(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"append-snapshot")) {append_snapshot(&cache,argv[1]);goto owners;}

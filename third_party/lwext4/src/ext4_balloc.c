@@ -442,10 +442,18 @@ int ext4_balloc_alloc_blocks(struct ext4_inode_ref *inode_ref,
             continue;
         }
         struct ext4_block bitmap;
-        r = ext4_trans_block_get(fs->bdev, &bitmap,
-            ext4_bg_get_block_bitmap(bg.block_group, sb));
+        ext4_fsblk_t bitmap_lba=ext4_bg_get_block_bitmap(bg.block_group,sb);
+        const struct ext4_block_payload *checked=NULL;
+        if (!shared && fs->jbd_journal) {
+            struct ext4_operation *operation=ext4_current_operation(fs);
+            if (operation && operation->small_writeback)
+                /* The previous file already verified and released this
+                 * private bitmap. The next writable borrow ends the proof. */
+                checked=jbd_trans_checked_payload(operation->trans,bitmap_lba,block_bitmap_key(&bg));
+        }
+        r = ext4_trans_block_get(fs->bdev,&bitmap,bitmap_lba);
         if (r) { ext4_fs_put_block_group_ref(&bg); return r; }
-        if (!shared && !block_bitmap_checked(&bg,&bitmap)) {
+        if (!shared && (!checked || bitmap.payload!=checked) && !block_bitmap_checked(&bg,&bitmap)) {
             ext4_block_set(fs->bdev, &bitmap);
             ext4_fs_put_block_group_ref(&bg);
             return EUCLEAN;
