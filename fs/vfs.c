@@ -896,6 +896,8 @@ static int dentry_acquire(struct kernel_vfs_dentry *);
 static void dentry_release(struct kernel_vfs_dentry **);
 static void dentry_cache_trim(struct kernel_vfs_instance *,size_t);
 static void dentry_cache_trim_bounded(struct kernel_vfs_instance *,size_t,size_t);
+static struct kernel_vfs_path *reuse_path_locked(struct kernel_vfs_mount *,
+    struct kernel_vfs_dentry *);
 static int path_wrap(struct kernel_vfs_mount *,struct kernel_vfs_dentry *,struct kernel_vfs_path **);
 static int path_wrap_new(struct kernel_vfs_mount *,struct kernel_vfs_dentry **,
     struct kernel_vfs_path **,bool,bool *);
@@ -2745,10 +2747,16 @@ static void dentry_cache_trim_bounded(struct kernel_vfs_instance *instance,size_
 {
     KERNEL_SERVICE_SCOPE_IF(service,kernel_vfs_namespace_requires_cpu0(&instance->backend_mount));
     size_t remaining;
+    struct kernel_vfs_path *idle = NULL;
     {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
         remaining=instance->dentry_cache_count>keep ? instance->dentry_cache_count-keep : 0;
+        if (!keep) {
+            idle = instance->idle_path;
+            instance->idle_path = NULL;
+        }
     }
+    if (idle) kernel_heap_release(instance->heap, idle);
     if (remaining>budget) remaining=budget;
     /* Cache hits only flag recency. Bound how many second chances each
      * trim can spend without giving up its eviction target. */
@@ -3052,7 +3060,7 @@ struct path_component_span { size_t begin,end,next; };
  * protects the weak dentries until the final directory reference is taken. */
 static struct kernel_vfs_dentry *cached_path_prefix(struct vfs_path_walk *walk,
     struct kernel_vfs_path *start,const char *path,size_t length,
-    struct path_component_span *part,bool *existing_directory)
+    struct path_component_span *part,bool *existing_directory,struct kernel_vfs_path **leaf)
 {
     struct kernel_vfs_mount *mount=start->file.mount;
     struct kernel_vfs_instance *instance=mount->private_data;
@@ -3122,6 +3130,24 @@ static struct kernel_vfs_dentry *cached_path_prefix(struct vfs_path_walk *walk,
         memcpy(recent_stat_prefix.name,path+first,begin-first);
     }
 Found:
+    if (!walk->final_write && !walk->terminal && end==length && end>begin && end-begin<=255U) {
+        struct kernel_vfs_node *node=parent->file.private_data;
+        if (!node->unlinked && instance->ops->search_cached(node,cred)) {
+            struct kernel_vfs_dentry *child=find_child_name(parent,path+begin,end-begin);
+            if (child && (child->file.mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG &&
+                child!=mount->root_dentry && child!=walk->root->dentry &&
+                !__atomic_load_n(&child->mountpoint_seen,__ATOMIC_ACQUIRE)) {
+                struct kernel_vfs_path *location=find_location(mount,child);
+                if (!location) location=reuse_path_locked(mount,child);
+                else if (kernel_vfs_path_acquire(location)) location=NULL;
+                if (location) {
+                    __atomic_store_n(&child->recently_used,1,__ATOMIC_RELAXED);
+                    *leaf=location;
+                    return NULL;
+                }
+            }
+        }
+    }
     if (walk->mkdir && cursor==length && end>begin && end-begin<=255U) {
         struct kernel_vfs_node *node=parent->file.private_data;
         if (!node->unlinked && instance->ops->search_cached(node,cred)) {
@@ -3177,7 +3203,10 @@ static int lookup_named_child(struct kernel_vfs_mount *mount,struct kernel_vfs_d
                     if (walk->component->references) __builtin_trap();
                     path_bind_component(walk, mount, entry);
                     *owner = walk->component;
-                } else if (dentry_acquire(entry)) __builtin_trap();
+                } else {
+                    *owner = reuse_path_locked(mount, entry);
+                    if (!*owner && dentry_acquire(entry)) __builtin_trap();
+                }
             } else miss=parent->names_published;
         }
         if (entry) {
@@ -3453,7 +3482,18 @@ static int resolve_object(struct kernel_vfs_path *start,
             struct path_component_span part={begin,end,cursor};
             bool existing_directory=false;
             struct kernel_vfs_dentry *prefix=cached_path_prefix(walk,current,pending,length,&part,
-                &existing_directory);
+                &existing_directory,&next);
+            if (next) {
+                struct kernel_vfs_mount *mount=next->file.mount;
+                struct kernel_vfs_instance *instance=mount->private_data;
+                result=instance->ops->error ? instance->ops->error(instance) : 0;
+                if (result) (void)kernel_vfs_path_release(&next);
+                else {
+                    clear_mount_expiry(mount);
+                    *owner=next;
+                }
+                goto Finish;
+            }
             if (existing_directory) {
                 result=-KERNEL_EEXIST;
                 goto Finish;
@@ -3842,6 +3882,39 @@ static int path_walk_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentr
     path_bind_component(walk,mount,entry);*owner=walk->component;
     return 0;
 }
+
+static void bind_indexed_path_locked(struct kernel_vfs_path *path,
+    struct kernel_vfs_mount *mount, struct kernel_vfs_dentry *entry)
+{
+    if (kernel_vfs_mount_view_acquire_locked(mount)) __builtin_trap();
+    path_init(path, mount, entry, false, false);
+    path->next = mount->paths;
+    path->previous = &mount->paths;
+    if (path->next) path->next->previous = &path->next;
+    mount->paths = path;
+}
+
+/* The name match and absence from the location index are already protected.
+ * An idle allocation has no owners in either the directory or the mount. */
+static struct kernel_vfs_path *reuse_path_locked(struct kernel_vfs_mount *mount,
+    struct kernel_vfs_dentry *entry)
+{
+    struct kernel_vfs_instance *instance = mount->private_data;
+    struct kernel_vfs_path *path = instance->idle_path;
+    if (!path || (entry->file.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG ||
+        (mount->root_path &&
+         (__atomic_load_n(&mount->root_path->references, __ATOMIC_ACQUIRE) & VFS_PATH_CLOSING)))
+        return NULL;
+    instance->idle_path = NULL;
+    if (dentry_acquire(entry)) __builtin_trap();
+    path->dentry = entry;
+    struct kernel_vfs_path *existing = NULL;
+    mount->path_index = location_index_insert(mount->path_index, path, &existing);
+    if (existing) __builtin_trap();
+    bind_indexed_path_locked(path, mount, entry);
+    return path;
+}
+
 static int path_wrap_new(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry **entry_owner,
     struct kernel_vfs_path **owner,bool nosleep,bool *covered)
 {
@@ -3864,12 +3937,8 @@ static int path_wrap_new(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry
                 result=kernel_vfs_path_acquire(existing);
                 if (!result && covered) *covered=existing->mounted_here!=NULL;
             } else {
-                if (kernel_vfs_mount_view_acquire_locked(mount)) __builtin_trap();
-                path_init(path,mount,*entry_owner,false,false);
+                bind_indexed_path_locked(path,mount,*entry_owner);
                 *entry_owner=NULL;
-                path->next=mount->paths;path->previous=&mount->paths;
-                if (path->next) path->next->previous=&path->next;
-                mount->paths=path;
                 if (covered) *covered=false;
             }
         }
@@ -3893,6 +3962,8 @@ static int path_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *en
         if(mount->root_path && (__atomic_load_n(&mount->root_path->references,__ATOMIC_ACQUIRE)&VFS_PATH_CLOSING))return -KERNEL_EBUSY;
         struct kernel_vfs_path *existing=find_location(mount,entry);
         if (existing) {int result=kernel_vfs_path_acquire(existing);if (!result) *owner=existing;return result;}
+        struct kernel_vfs_path *reused = reuse_path_locked(mount, entry);
+        if (reused) { *owner = reused; return 0; }
     }
     return path_wrap_borrowed(mount,entry,owner,false);
 }
@@ -3987,6 +4058,10 @@ static int path_release(struct kernel_vfs_path **owner, bool keep_location, bool
     struct kernel_vfs_path *path=*owner;*owner=NULL;
     if (keep_location && (path->transient || path->borrow_mount)) __builtin_trap();
     struct kernel_vfs_mount *mount=path->file.mount;
+    struct kernel_heap *heap = path->heap;
+    struct kernel_vfs_dentry *entry = path->dentry;
+    bool borrow_mount = path->borrow_mount;
+    struct kernel_vfs_path *retire = NULL;
     /* Clear the mark before dropping the reference that makes expiry busy. */
     if (!preserve_expiry) clear_mount_expiry(mount);
     if (path->transient) {
@@ -4010,12 +4085,17 @@ static int path_release(struct kernel_vfs_path **owner, bool keep_location, bool
         path->file.mount->path_index=location_index_remove(path->file.mount->path_index,path);
         *path->previous=path->next;
         if (path->next) path->next->previous=path->previous;
+        struct kernel_vfs_instance *instance = mount->private_data;
+        if (!instance->idle_path && !instance->quiescing && instance->ops->owns_dentry_names &&
+            (path->file.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
+            /* Subsequent opens may already be using this storage while
+             * the current caller returns its original references. */
+            instance->idle_path = path;
+        } else retire = path;
     }
     KERNEL_SERVICE_SCOPE_IF(service,kernel_vfs_namespace_requires_cpu0(mount));
-    struct kernel_vfs_dentry *entry=path->dentry;
-    bool borrow_mount=path->borrow_mount;
     dentry_release(&entry);
-    if (!path->transient) kernel_heap_release(path->heap,path);
+    if (retire) kernel_heap_release(heap,retire);
     if (!borrow_mount && !keep_location) (void)mount_put(mount);
     return 0;
 }
