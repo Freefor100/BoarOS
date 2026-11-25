@@ -1105,17 +1105,25 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 	uint32_t byte_offset_in_group = offset_in_group * inode_size;
 
 	/* Compute block address */
-	ext4_fsblk_t block_id =
-	    table_start + (byte_offset_in_group / block_size);
+	uint32_t block_in_table = byte_offset_in_group / block_size;
+	ext4_fsblk_t block_id = table_start + block_in_table;
 
 	uint32_t offset_in_block = byte_offset_in_group % block_size;
 	if (write && initialized && ext4_current_trans(fs)) {
 		rc = ext4_operation_require_resource(fs, EXT4_RESOURCE_INODE, index + 1);
 		if (rc != EOK) return rc;
 	}
-	rc = write ? ext4_trans_block_get_range(fs->bdev, &ref->block, block_id,
-        offset_in_block, inode_size) : ext4_block_get_range(fs->bdev, &ref->block,
-        block_id, offset_in_block, inode_size, EXT4_BLOCK_READ);
+	if (write)
+		rc = ext4_trans_block_get_range(fs->bdev, &ref->block, block_id,
+			offset_in_block, inode_size);
+	else if (initialized && fs->inode_table_starts &&
+		 fs->table_group_inodes==inodes_per_group && fs->table_inode_size==inode_size) {
+		uint32_t remaining = (inodes_per_group >> fs->table_block_shift) - block_in_table;
+		rc = ext4_block_get_inode_range(fs->bdev, &ref->block, block_id,
+			offset_in_block, inode_size, remaining);
+	} else
+		rc = ext4_block_get_range(fs->bdev, &ref->block, block_id,
+			offset_in_block, inode_size, EXT4_BLOCK_READ);
 	if (rc != EOK) {
 		return rc;
 	}

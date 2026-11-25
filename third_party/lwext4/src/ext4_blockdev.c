@@ -375,7 +375,7 @@ static int ext4_block_wait_loaded(struct ext4_blockdev *bdev, struct ext4_buf *b
     }
 }
 static __attribute__((noinline)) int block_load_read_ahead(struct ext4_blockdev *bdev,
-    struct ext4_block *demand, unsigned count)
+    struct ext4_block *demand, unsigned count, unsigned *loaded)
 {
     uint64_t lba=demand->lb_id;
     uint32_t size=bdev->lg_bsize;
@@ -408,7 +408,12 @@ static __attribute__((noinline)) int block_load_read_ahead(struct ext4_blockdev 
             ext4_block_loaded(bdev,neighbors[i-1].buf,spans[i].status);
             ext4_bcache_free_read(bdev->bc,&neighbors[i-1]);
         }
-        if (!spans[0].status) return EOK;
+        if (!spans[0].status) {
+            if (loaded) {
+                while (*loaded<pending && !spans[*loaded].status) (*loaded)++;
+            }
+            return EOK;
+        }
         /* A speculative successor can fail the combined request. Recover
          * the demand alone before reporting any error to the iterator. */
     }
@@ -417,7 +422,7 @@ static __attribute__((noinline)) int block_load_read_ahead(struct ext4_blockdev 
 
 static inline int block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
     uint64_t lba, uint32_t offset, uint32_t length, enum ext4_block_access access,
-    unsigned read_count)
+    unsigned read_count, bool inode_table)
 {
     if (offset > bdev->lg_bsize || !length || length > bdev->lg_bsize - offset) return EINVAL;
     enum ext4_bcache_read_state read;
@@ -426,8 +431,15 @@ static inline int block_get_range(struct ext4_blockdev *bdev, struct ext4_block 
     if (r) return r;
     if (private) return EOK;
     if (read==EXT4_BCACHE_READ_LOAD) {
-        r=read_count>1 ? block_load_read_ahead(bdev,b,read_count) :
+        bool track=inode_table && bdev->bdif->bread_batch &&
+            (!bdev->fs || !ext4_current_operation(bdev->fs));
+        if (inode_table && (!track ||
+            __atomic_load_n(&bdev->inode_read_next,__ATOMIC_RELAXED)!=lba))
+            read_count=1;
+        unsigned loaded=1;
+        r=read_count>1 ? block_load_read_ahead(bdev,b,read_count,track ? &loaded : NULL) :
             ext4_blocks_get_direct(bdev,b->data,lba,1);
+        if (track) __atomic_store_n(&bdev->inode_read_next,r ? 0 : lba+loaded,__ATOMIC_RELAXED);
         ext4_block_loaded(bdev,b->buf,r);
     } else if (read==EXT4_BCACHE_READ_WAIT) r=ext4_block_wait_loaded(bdev,b->buf);
     if (r) {
@@ -446,7 +458,14 @@ static inline int block_get_range(struct ext4_blockdev *bdev, struct ext4_block 
 }
 int ext4_block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
     uint64_t lba, uint32_t offset, uint32_t length, enum ext4_block_access access)
-{ return block_get_range(bdev,b,lba,offset,length,access,1); }
+{ return block_get_range(bdev,b,lba,offset,length,access,1,false); }
+
+int ext4_block_get_inode_range(struct ext4_blockdev *bdev,struct ext4_block *b,
+    uint64_t lba,uint32_t offset,uint32_t length,unsigned remaining)
+{
+    unsigned count=remaining<EXT4_BLOCK_READ_AHEAD_MAX ? remaining : EXT4_BLOCK_READ_AHEAD_MAX;
+    return block_get_range(bdev,b,lba,offset,length,EXT4_BLOCK_READ,count,true);
+}
 
 int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b, uint64_t lba)
 { return ext4_block_get_range(bdev,b,lba,0,bdev->lg_bsize,EXT4_BLOCK_READ); }
@@ -455,7 +474,7 @@ int ext4_block_get_read_ahead(struct ext4_blockdev *bdev,struct ext4_block *b,
     uint64_t lba,unsigned count)
 {
     if (!count || count>EXT4_BLOCK_READ_AHEAD_MAX) return EINVAL;
-    return block_get_range(bdev,b,lba,0,bdev->lg_bsize,EXT4_BLOCK_READ,count);
+    return block_get_range(bdev,b,lba,0,bdev->lg_bsize,EXT4_BLOCK_READ,count,false);
 }
 
 static void ext4_bread_completed(void *context, unsigned index, const struct block_read_span *span)

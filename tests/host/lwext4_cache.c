@@ -183,6 +183,42 @@ static int dev_read_batch(struct ext4_blockdev *dev, struct block_read_span *s, 
     return first;
 }
 #endif
+static void inode_read_ahead(void)
+{
+#ifdef EXT4_CACHED_READ_BATCH
+    struct ext4_bcache cache;
+    struct ext4_blockdev dev;
+    struct ext4_blockdev_iface iface;
+    struct ext4_block block={0};
+    init(&cache,&dev,&iface,16);
+    iface.bread_batch=dev_read_batch;
+    batch_calls=batch_width=0;
+    batch_failure=0;
+    CHECK(ext4_block_get_inode_range(&dev,&block,16,256,256,4)==EOK);
+    CHECK(block.data[0]==16 && !batch_calls && reads==1);
+    CHECK(ext4_block_set(&dev,&block)==EOK);
+    CHECK(ext4_block_get_inode_range(&dev,&block,17,256,256,4)==EOK);
+    CHECK(block.data[0]==17 && batch_calls==1 && batch_width==4 && reads==5);
+    CHECK(ext4_block_set(&dev,&block)==EOK);
+    warm(&dev,20);
+    CHECK(reads==5);
+    CHECK(ext4_block_get_inode_range(&dev,&block,21,256,256,2)==EOK);
+    CHECK(batch_calls==2 && reads==7);
+    CHECK(ext4_block_set(&dev,&block)==EOK);
+    CHECK(ext4_block_get_inode_range(&dev,&block,71,256,256,4)==EOK);
+    CHECK(batch_calls==2 && reads==8);
+    CHECK(ext4_block_set(&dev,&block)==EOK);
+    batch_failure=1;
+    CHECK(ext4_block_get_inode_range(&dev,&block,72,256,256,4)==EOK);
+    CHECK(block.data[0]==72 && batch_calls==3 && reads==11);
+    CHECK(ext4_block_set(&dev,&block)==EOK);
+    batch_failure=0;
+    warm(&dev,74);
+    CHECK(reads==12);
+    finish(&cache);
+    puts("PASS sequential inode table read-ahead: bounded groups, random skips and failed neighbors");
+#endif
+}
 static void batch_wait(void *key)
 {
     /* 本批的新读已发布并完成，才允许等待外部批次，避免加载环。 */
@@ -354,4 +390,4 @@ static void pressure_reclaim(void)
     finish(&cache);
     puts("cache pressure releases clean idle metadata, retaining loans/dirty/journal owners");
 }
-int main(void) { pressure_reclaim();ready_read_work();idle_order();competing_allocation();concurrent_load();cycle(8,0,7,100);cycle(8,0,8,100);cycle(8,8,1,100);cycle(8,8,2,100);cycle(8,8,8,100);cycle(64,8,1,100);contracts();batch_contracts();invalid_physical_batch();return 0; }
+int main(void) { pressure_reclaim();ready_read_work();idle_order();competing_allocation();concurrent_load();cycle(8,0,7,100);cycle(8,0,8,100);cycle(8,8,1,100);cycle(8,8,2,100);cycle(8,8,8,100);cycle(64,8,1,100);contracts();batch_contracts();inode_read_ahead();invalid_physical_batch();return 0; }
