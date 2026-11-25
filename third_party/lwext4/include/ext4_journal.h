@@ -68,15 +68,17 @@ struct jbd_image {
 };
 
 struct jbd_buf {
-	bool private_access;
+	uint64_t checked_tree;
 	struct jbd_block_rec *reserved_rec;
-	bool escaped;
-	bool modified;
 	/* Materialized only when a record's baseline differs from block.payload. */
 	struct jbd_image *before;
 	struct jbd_image *after;
 	struct ext4_block_write home_io;
 	uint32_t jbd_lba;
+	bool private_access;
+	bool escaped;
+	bool modified;
+	bool fresh_full_copy;
 	struct ext4_block block;
 	struct jbd_trans *trans;
 	/* Prepare borrows the index identity; accepted access is queued in it. */
@@ -227,6 +229,10 @@ int jbd_journal_stop(struct jbd_journal *journal);
 int jbd_journal_new_trans(struct jbd_journal *journal, struct jbd_trans **out);
 int jbd_trans_set_block_dirty(struct jbd_trans *trans,
 			      struct ext4_block *block);
+int jbd_trans_set_tree_dirty(struct jbd_trans *trans,
+    struct ext4_block *block, uint64_t tree_key);
+bool jbd_trans_first_tree_copy_checked(struct jbd_trans *,
+    const struct ext4_block *, uint64_t tree_key);
 /* Obtain a private replacement before changing a buffer. */
 int jbd_trans_get_write_access(struct jbd_trans *trans,
 			       struct ext4_block *block);

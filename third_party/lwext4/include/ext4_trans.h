@@ -50,6 +50,7 @@ extern "C" {
  * @return  standard error code*/
 int ext4_trans_set_block_dirty(struct ext4_buf *buf);
 int ext4_trans_set_block_dirty_range(struct ext4_block *block, uint32_t offset, uint32_t length);
+int ext4_trans_set_tree_dirty(struct ext4_block *block, uint64_t tree_key);
 
 /**@brief   Block get function (through cache, don't read).
  *          jbd_trans_get_access would be called in order to

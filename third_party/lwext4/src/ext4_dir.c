@@ -53,6 +53,7 @@
 #include <ext4_crc32.h>
 #include <ext4_inode.h>
 #include <ext4_fs.h>
+#include <ext4_journal.h>
 
 #include <string.h>
 
@@ -139,6 +140,27 @@ bool ext4_dir_block_csum_verify(struct ext4_inode_ref *inode, const struct ext4_
     return true;
 }
 
+int ext4_dir_leaf_get(struct ext4_inode_ref *dir, struct ext4_block *block,
+    ext4_fsblk_t lba, bool write)
+{
+    struct ext4_blockdev *dev = dir->fs->bdev;
+    int result = write ? ext4_trans_block_get(dev, block, lba) : ext4_block_get(dev, block, lba);
+    if (result) return result;
+#if CONFIG_JOURNALING_ENABLE
+    if (write) {
+        struct jbd_trans *trans = ext4_current_trans(dir->fs);
+        uint64_t key = ext4_fs_tree_check_key(dir, EXT4_TREE_DIRECTORY_LEAF);
+        if (trans && key && jbd_trans_first_tree_copy_checked(trans, block, key))
+            return EOK;
+    }
+#endif
+    if (ext4_dir_block_csum_verify(dir, block)) return EOK;
+    ext4_dbg(DEBUG_DIR, DBG_WARN "Leaf block checksum failed. Inode: %" PRIu32
+        ", physical block: %" PRIu64 "\n", dir->index, (uint64_t)lba);
+    ext4_block_set(dev, block);
+    return EUCLEAN;
+}
+
 void ext4_dir_init_entry_tail(struct ext4_dir_entry_tail *t)
 {
 	memset(t, 0, sizeof(struct ext4_dir_entry_tail));
@@ -146,24 +168,23 @@ void ext4_dir_init_entry_tail(struct ext4_dir_entry_tail *t)
 	t->reserved_ft = EXT4_DIRENTRY_DIR_CSUM;
 }
 
-void ext4_dir_set_csum(struct ext4_inode_ref *inode_ref,
-			   struct ext4_dir_en *dirent)
+int ext4_dir_mark_dirty(struct ext4_inode_ref *inode_ref, struct ext4_block *block)
 {
-	struct ext4_dir_entry_tail *t;
+	struct ext4_dir_en *dirent = (void *)block->data;
 	struct ext4_sblock *sb = &inode_ref->fs->sb;
+	uint64_t key = 0;
 
-	/* Compute the checksum only if the filesystem supports it */
 	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) {
-		t = ext4_dir_get_tail(inode_ref, dirent);
-		if (!t) {
-			/* There is no space to hold the checksum */
-			return;
+		struct ext4_dir_entry_tail *t = ext4_dir_get_tail(inode_ref, dirent);
+		if (t) {
+			ptrdiff_t __unused length = (char *)t - (char *)dirent;
+			t->checksum = to_le32(ext4_dir_csum(inode_ref, dirent, length));
+#if CONFIG_META_CSUM_ENABLE
+			key = ext4_fs_tree_check_key(inode_ref, EXT4_TREE_DIRECTORY_LEAF);
+#endif
 		}
-
-		ptrdiff_t __unused diff = (char *)t - (char *)dirent;
-		uint32_t csum = ext4_dir_csum(inode_ref, dirent, diff);
-		t->checksum = to_le32(csum);
 	}
+	return ext4_trans_set_tree_dirty(block, key);
 }
 
 /**@brief Do some checks before returning iterator.
@@ -420,39 +441,23 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 	uint32_t total_blocks = (uint32_t)(inode_size / block_size);
 
 	/* Find block, where is space for new entry and try to add */
-	bool success = false;
 	for (iblock = 0; iblock < total_blocks; ++iblock) {
 		r = ext4_fs_get_inode_dblk_idx(parent, iblock, &fblock, false);
 		if (r != EOK)
 			return r;
 
 		struct ext4_block block;
-		r = ext4_trans_block_get(fs->bdev, &block, fblock);
+		r = ext4_dir_leaf_get(parent, &block, fblock, true);
 		if (r != EOK)
 			return r;
-
-		if (!ext4_dir_block_csum_verify(parent, &block)) {
-			ext4_dbg(DEBUG_DIR,
-				 DBG_WARN "Leaf block checksum failed."
-				 "Inode: %" PRIu32", "
-				 "Block: %" PRIu32"\n",
-				 parent->index,
-				 iblock);
-			ext4_block_set(fs->bdev, &block);
-			return EUCLEAN;
-		}
 
 		/* If adding is successful, function can finish */
 		r = ext4_dir_try_insert_entry(sb, parent, &block, child,
 						name, name_len);
+		int release = ext4_block_set(fs->bdev, &block);
+		if (r != EOK && r != ENOSPC) return r;
+		if (release != EOK) return release;
 		if (r == EOK)
-			success = true;
-
-		r = ext4_block_set(fs->bdev, &block);
-		if (r != EOK)
-			return r;
-
-		if (success)
 			return EOK;
 	}
 
@@ -485,11 +490,9 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 				name_len);
 	}
 
-	ext4_dir_set_csum(parent, (void *)b.data);
-	ext4_trans_set_block_dirty(b.buf);
-	r = ext4_block_set(fs->bdev, &b);
-
-	return r;
+	r = ext4_dir_mark_dirty(parent, &b);
+	int release = ext4_block_set(fs->bdev, &b);
+	return r ? r : release;
 }
 
 int ext4_dir_find_entry_from(struct ext4_dir_search_result *result,
@@ -529,21 +532,9 @@ int ext4_dir_find_entry_from(struct ext4_dir_search_result *result,
 
 		/* Load data block */
 		struct ext4_block b;
-		r = write ? ext4_trans_block_get(parent->fs->bdev, &b, fblock) :
-            ext4_block_get(parent->fs->bdev, &b, fblock);
+		r = ext4_dir_leaf_get(parent, &b, fblock, write);
 		if (r != EOK)
 			return r;
-
-		if (!ext4_dir_block_csum_verify(parent, &b)) {
-			ext4_dbg(DEBUG_DIR,
-				 DBG_WARN "Leaf block checksum failed."
-				 "Inode: %" PRIu32", "
-				 "Block: %" PRIu32"\n",
-				 parent->index,
-				 iblock);
-			ext4_block_set(parent->fs->bdev, &b);
-			return EUCLEAN;
-		}
 
 		/* Try to find entry in block */
 		r = ext4_dir_find_in_block(&b, sb, name_len, name, result);
@@ -601,9 +592,7 @@ int ext4_dir_remove_found(struct ext4_inode_ref *parent,
 		ext4_dir_en_set_entry_len(result->previous, length + removed);
 	}
 
-	ext4_dir_set_csum(parent,
-			(struct ext4_dir_en *)result->block.data);
-	return ext4_trans_set_block_dirty(result->block.buf);
+	return ext4_dir_mark_dirty(parent, &result->block);
 }
 
 int ext4_dir_try_insert_entry(struct ext4_sblock *sb,
@@ -637,10 +626,7 @@ int ext4_dir_try_insert_entry(struct ext4_sblock *sb,
 		    (rec_len >= required_len)) {
 			ext4_dir_write_entry(sb, start, rec_len, child, name,
 					     name_len);
-			ext4_dir_set_csum(inode_ref, (void *)dst_blk->data);
-			ext4_trans_set_block_dirty(dst_blk->buf);
-
-			return EOK;
+			return ext4_dir_mark_dirty(inode_ref, dst_blk);
 		}
 
 		/* Valid entry, try to split it */
@@ -665,10 +651,7 @@ int ext4_dir_try_insert_entry(struct ext4_sblock *sb,
 				ext4_dir_write_entry(sb, new_entry, free_space,
 						     child, name, name_len);
 
-				ext4_dir_set_csum(inode_ref,
-						  (void *)dst_blk->data);
-				ext4_trans_set_block_dirty(dst_blk->buf);
-				return EOK;
+				return ext4_dir_mark_dirty(inode_ref, dst_blk);
 			}
 		}
 

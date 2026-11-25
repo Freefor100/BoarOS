@@ -65,7 +65,8 @@ static void advance_version(struct ext4_buf *buf)
     if (!(buf->version=++buf->bc->next_version)) __builtin_trap();
 }
 
-void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payload)
+void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payload,
+    uint64_t tree_key)
 {
     struct ext4_block_payload *old;
     if (!buf || !payload || !payload->data) __builtin_trap();
@@ -78,7 +79,7 @@ void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payloa
         for (unsigned i = 0; i < 4; i++)
             __atomic_store_n(&payload->verified[i], 0, __ATOMIC_RELAXED);
         __atomic_store_n(&payload->metadata_schema, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&payload->tree_verified, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&payload->tree_verified, tree_key, __ATOMIC_RELAXED);
         __atomic_store_n(&payload->directory_layout, 0, __ATOMIC_RELAXED);
         ext4_block_payload_get(payload);old=buf->current_payload;
         buf->current_payload=payload;buf->data=payload->data;

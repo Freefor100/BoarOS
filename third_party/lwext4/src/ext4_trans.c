@@ -60,27 +60,27 @@ static int trans_error(struct ext4_blockdev *bdev, int r)
 	return r;
 }
 
-int ext4_trans_set_block_dirty(struct ext4_buf *buf)
+int ext4_trans_set_tree_dirty(struct ext4_block *block, uint64_t tree_key __unused)
 {
-	int r = EOK;
+	struct ext4_buf *buf = block->buf;
 #if CONFIG_JOURNALING_ENABLE
 	struct ext4_fs *fs = buf->bc->bdev->fs;
-	struct ext4_block block = {
-		.lb_id = buf->lba,
-		.data = buf->data,
-		.buf = buf
-	};
-
 	if (fs && fs->jbd_journal && fs->jbd_journal->error)
 		return trans_error(buf->bc->bdev, fs->jbd_journal->error);
 	if (fs && fs->jbd_journal && ext4_current_trans(fs)) {
 		struct jbd_trans *trans = ext4_current_trans(fs);
 		return trans_error(buf->bc->bdev,
-			jbd_trans_set_block_dirty(trans, &block));
+			jbd_trans_set_tree_dirty(trans, block, tree_key));
 	}
 #endif
 	ext4_bcache_set_dirty(buf);
-	return r;
+	return EOK;
+}
+
+int ext4_trans_set_block_dirty(struct ext4_buf *buf)
+{
+	struct ext4_block block = {.lb_id = buf->lba, .buf = buf};
+	return ext4_trans_set_tree_dirty(&block, 0);
 }
 
 int ext4_trans_set_block_dirty_range(struct ext4_block *block, uint32_t offset, uint32_t length)

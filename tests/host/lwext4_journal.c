@@ -37,8 +37,9 @@ void __wrap_ext4_block_rebind(struct ext4_block *block, struct ext4_block_payloa
     if (block->buf == publication_owner.rebind_buffer) publication_owner.rebinds++;
     __real_ext4_block_rebind(block, next);
 }
-void __real_ext4_bcache_publish(struct ext4_buf *, struct ext4_block_payload *);
-void __wrap_ext4_bcache_publish(struct ext4_buf *buffer, struct ext4_block_payload *next)
+void __real_ext4_bcache_publish(struct ext4_buf *, struct ext4_block_payload *, uint64_t);
+void __wrap_ext4_bcache_publish(struct ext4_buf *buffer, struct ext4_block_payload *next,
+    uint64_t tree_key)
 {
     if (buffer == publication_owner.buffer) {
         CHECK(credit_state_depth && buffer->current_payload == publication_owner.current);
@@ -49,7 +50,7 @@ void __wrap_ext4_bcache_publish(struct ext4_buf *buffer, struct ext4_block_paylo
         publication_owner.buffer = NULL;
         publication_owner.observed++;
     }
-    __real_ext4_bcache_publish(buffer, next);
+    __real_ext4_bcache_publish(buffer, next, tree_key);
 }
 static void publication_watch(struct ext4_buf *buffer, unsigned extra)
 {

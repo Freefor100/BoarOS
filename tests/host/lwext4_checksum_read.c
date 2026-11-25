@@ -4,6 +4,7 @@
 #undef main
 #include <ext4_dir.h>
 #include <ext4_dir_idx.h>
+#include <ext4_trans.h>
 #include <stddef.h>
 
 static ext4_file *second_reader;
@@ -112,8 +113,17 @@ static void readonly_directory_queries(struct ext4_fs *fs, struct ext4_blockdev 
     CHECK(ext4_transaction_abort("/", ECANCELED) == ECANCELED);
     CHECK(ext4_lookup_child("/", EXT4_INODE_ROOT_INDEX, "directory-private", 17,
         &ino, &mode) == ENOENT);
+    struct ext4_block prior;
+    if (!indexed) CHECK(ext4_block_get(dev,&prior,home)==EOK);
     CHECK(ext4_fopen(&child,"/directory-accepted","w+")==EOK);
     CHECK(ext4_fclose(&child)==EOK);
+    if (!indexed) {
+        CHECK(ext4_block_get(dev,&block,home)==EOK);
+        /* The accepted block already contains the checksum set by insertion. */
+        CHECK(block.payload->tree_verified!=0 && block.payload->tree_verified!=UINT64_MAX);
+        CHECK(ext4_block_set(dev,&block)==EOK);
+        CHECK(ext4_block_set(dev,&prior)==EOK);
+    }
     CHECK(ext4_lookup_child("/",EXT4_INODE_ROOT_INDEX,"directory-accepted",18,&ino,&mode)==EOK);
     CHECK(ext4_fs_get_inode_ref_read(fs,EXT4_INODE_ROOT_INDEX,&directory)==EOK);
     CHECK(ext4_fs_get_inode_dblk_idx(&directory,0,&home,false)==EOK);
@@ -122,6 +132,34 @@ static void readonly_directory_queries(struct ext4_fs *fs, struct ext4_blockdev 
         ext4_inode_has_flag(directory.inode,EXT4_INODE_FLAG_INDEX)));
     CHECK(ext4_block_set(dev,&block)==EOK);
     CHECK(ext4_fs_put_inode_ref(&directory)==EOK);
+
+    if (!indexed) {
+        CHECK(ext4_transaction_begin("/")==EOK);
+        CHECK(ext4_fs_get_inode_ref_read(fs,EXT4_INODE_ROOT_INDEX,&directory)==EOK);
+        unsigned before_copy=crc_calls;
+        CHECK(ext4_dir_leaf_get(&directory,&block,home,true)==EOK);
+        CHECK(crc_calls==before_copy);
+        struct ext4_dir_entry_tail *tail=EXT4_DIRENT_TAIL(block.data,dev->lg_bsize);
+        tail->checksum^=1;
+        CHECK(ext4_block_set(dev,&block)==EOK);
+        CHECK(ext4_dir_leaf_get(&directory,&block,home,true)==EUCLEAN);
+        CHECK(ext4_fs_put_inode_ref(&directory)==EOK);
+        CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
+
+        CHECK(ext4_transaction_begin("/")==EOK);
+        CHECK(ext4_fs_get_inode_ref_read(fs,EXT4_INODE_ROOT_INDEX,&directory)==EOK);
+        CHECK(ext4_trans_block_get(dev,&block,home)==EOK);
+        CHECK(ext4_dir_mark_dirty(&directory,&block)==EOK);
+        CHECK(ext4_block_set(dev,&block)==EOK);
+        CHECK(ext4_fs_put_inode_ref(&directory)==EOK);
+        /* A second write grant invalidates the first writer's certificate. */
+        CHECK(ext4_trans_block_get(dev,&block,home)==EOK);
+        CHECK(ext4_block_set(dev,&block)==EOK);
+        CHECK(ext4_transaction_end("/")==EOK);
+        CHECK(ext4_block_get(dev,&block,home)==EOK);
+        CHECK(block.payload->tree_verified==0);
+        CHECK(ext4_block_set(dev,&block)==EOK);
+    }
 }
 
 static void directory_record_search(struct ext4_sblock *super)
