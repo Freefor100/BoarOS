@@ -160,6 +160,7 @@ void ext4_operation_memory_denied(struct ext4_fs *fs);
 void ext4_operation_publish_super(struct ext4_operation *operation);
 void ext4_operation_completed(struct ext4_operation *operation, uint64_t sequence);
 int ext4_operation_record_inode(struct ext4_fs *fs, uint32_t inode, bool data);
+int ext4_operation_record_allocated_inode(struct ext4_fs *fs, uint32_t inode);
 void ext4_operation_discard_inode_goals(struct ext4_operation *operation);
 void ext4_fs_retire_inode_goals(struct ext4_fs *fs, uint64_t durable);
 int ext4_operation_prepare_super(struct ext4_operation *operation, struct ext4_sblock *merged);

@@ -78,7 +78,7 @@ struct jbd_buf {
 	bool private_access;
 	bool escaped;
 	bool modified;
-	bool fresh_full_copy;
+	bool fresh_copy;
 	bool fresh_block;
 	struct ext4_block block;
 	struct jbd_trans *trans;
@@ -240,10 +240,11 @@ int jbd_journal_stop(struct jbd_journal *journal);
 int jbd_journal_new_trans(struct jbd_journal *journal, struct jbd_trans **out);
 int jbd_trans_set_block_dirty(struct jbd_trans *trans,
 			      struct ext4_block *block);
+/* The key certifies the edited bytes combined with the accepted baseline. */
 int jbd_trans_set_tree_dirty_range(struct jbd_trans *trans,
     struct ext4_block *block, uint32_t offset, uint32_t length, uint64_t tree_key);
 bool jbd_trans_first_tree_copy_checked(struct jbd_trans *,
-    const struct ext4_block *, uint64_t tree_key);
+    const struct ext4_block *, uint64_t tree_key, uint32_t length);
 /* Obtain a private replacement before changing a buffer. */
 int jbd_trans_get_write_access(struct jbd_trans *trans,
 			       struct ext4_block *block);

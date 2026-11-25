@@ -94,18 +94,18 @@ static uint32_t ext4_ialloc_get_bgid_of_inode(struct ext4_sblock *sb,
 	return (inode - 1) / inodes_per_group;
 }
 
+static uint32_t inode_bitmap_bytes(struct ext4_sblock *sb)
+{ return (ext4_get32(sb, inodes_per_group) + 7U) / 8U; }
+
 #if CONFIG_META_CSUM_ENABLE
 static uint32_t ext4_ialloc_bitmap_csum(struct ext4_sblock *sb,	void *bitmap)
 {
 	uint32_t csum = 0;
 	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) {
-		uint32_t inodes_per_group =
-			ext4_get32(sb, inodes_per_group);
-
 		/* Start with the filesystem metadata checksum seed. */
 		csum = ext4_sb_get_csum_seed(sb);
 		/* Then calculate crc32 checksum against inode bitmap */
-		csum = ext4_crc32c(csum, bitmap, (inodes_per_group + 7) / 8);
+		csum = ext4_crc32c(csum, bitmap, inode_bitmap_bytes(sb));
 	}
 	return csum;
 }
@@ -180,7 +180,8 @@ static bool inode_bitmap_checked(struct ext4_block_group_ref *group, struct ext4
 #if CONFIG_JOURNALING_ENABLE
     if (key && observed == UINT64_MAX) {
         struct jbd_trans *trans = ext4_current_trans(group->fs);
-        if (trans && jbd_trans_first_tree_copy_checked(trans, block, key)) return true;
+        if (trans && jbd_trans_first_tree_copy_checked(trans, block, key,
+            inode_bitmap_bytes(ext4_fs_super(group->fs)))) return true;
     }
 #endif
     if (!ext4_ialloc_verify_bitmap_csum(ext4_fs_super(group->fs), group->block_group, block->data))
@@ -254,7 +255,7 @@ int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 		return EUCLEAN;
 	}
 	struct ext4_block b;
-	rc = ext4_trans_block_get(fs->bdev, &b, bitmap_block_addr);
+	rc = ext4_trans_block_get_range(fs->bdev, &b, bitmap_block_addr, 0, inode_bitmap_bytes(sb));
 	if (rc != EOK) {
 		ext4_fs_put_block_group_ref(&bg_ref);
 		return rc;
@@ -388,7 +389,7 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir,
 			ext4_fsblk_t bmp_blk_add = ext4_bg_get_inode_bitmap(bg, sb);
 
 			struct ext4_block b;
-			rc = ext4_trans_block_get(fs->bdev, &b, bmp_blk_add);
+			rc = ext4_trans_block_get_range(fs->bdev, &b, bmp_blk_add, 0, inode_bitmap_bytes(sb));
 			if (rc != EOK) {
 				ext4_fs_put_block_group_ref(&bg_ref);
 				return rc;
