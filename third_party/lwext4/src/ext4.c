@@ -6213,6 +6213,9 @@ int ext4_fraw_inode_fill(const ext4_file *file,struct ext4_inode *inode)
     return read_inode_snapshot(file->mp,file->inode,inode);
 }
 
+bool ext4_file_copy_cached_inode(const ext4_file *file,uint32_t index,struct ext4_inode *inode)
+{ return ext4_fs_copy_cached_inode(&file->mp->fs,index,inode); }
+
 int ext4_file_sync_metadata_prepare(ext4_file *file, bool data_only, uint64_t *target)
 {
 	struct ext4_inode_ref ref;

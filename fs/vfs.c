@@ -2756,11 +2756,12 @@ static void dentry_cache_trim(struct kernel_vfs_instance *instance,size_t keep)
 {
     dentry_cache_trim_bounded(instance,keep,SIZE_MAX);
 }
-/* The parent's names lock protects both the tree and its weak hint. */
+/* Tree writers hold VFS state and the parent's names lock. Either lock
+ * suffices for lookup, and concurrent readers can update the weak hint. */
 static struct kernel_vfs_dentry *find_child_name(struct kernel_vfs_dentry *parent,
     const char *name,size_t length)
 {
-    struct kernel_vfs_dentry *hint=parent->lookup_hint;
+    struct kernel_vfs_dentry *hint=__atomic_load_n(&parent->lookup_hint,__ATOMIC_RELAXED);
     if (hint && !strncmp(name,hint->name,length) && !hint->name[length])
         return hint;
     struct kernel_vfs_dentry *path=parent->children;
@@ -2768,7 +2769,7 @@ static struct kernel_vfs_dentry *find_child_name(struct kernel_vfs_dentry *paren
         int order=strncmp(name,path->name,length);
         if (!order && path->name[length]) order=-1;
         if (!order) {
-            parent->lookup_hint=path;
+            __atomic_store_n(&parent->lookup_hint,path,__ATOMIC_RELAXED);
             return path;
         }
         path = order < 0 ? path->index_left : path->index_right;
@@ -2808,7 +2809,8 @@ static void index_path(struct kernel_vfs_instance *instance,struct kernel_vfs_de
 static void unindex_child(struct kernel_vfs_dentry *path)
 {
     struct kernel_vfs_dentry *parent=path->parent;
-    if (parent->lookup_hint==path) parent->lookup_hint=NULL;
+    if (__atomic_load_n(&parent->lookup_hint,__ATOMIC_RELAXED)==path)
+        __atomic_store_n(&parent->lookup_hint,NULL,__ATOMIC_RELAXED);
     parent->children=path_index_remove(parent->children,path);
 }
 
@@ -3010,6 +3012,47 @@ static bool lookup_walk_child(struct vfs_path_walk *walk,struct kernel_vfs_path 
         *owner=walk->component;
     }
     *entry=child;
+    return true;
+}
+
+/* The serialized namespace qualification keeps names and permissions valid.
+ * VFS state keeps the weak dentries alive until the last one is pinned. */
+static bool stat_cached_prefix(struct vfs_path_walk *walk,struct kernel_vfs_path *start,
+    const char *path,size_t length,size_t begin,size_t end,size_t *next,
+    struct kernel_vfs_path *component)
+{
+    struct kernel_vfs_mount *mount=start->file.mount;
+    struct kernel_vfs_instance *instance=mount->private_data;
+    if (namespace_is_parallel(instance) || !instance->ops->owns_dentry_names ||
+        !instance->ops->search_cached || length-begin>256U ||
+        (instance->ops->error && instance->ops->error(instance))) return false;
+
+    const struct kernel_credentials *cred=kernel_credentials_current();
+    size_t cursor=*next,accepted=begin;
+    struct kernel_vfs_dentry *parent=start->dentry;
+    KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+    if (__atomic_load_n(&mount->paths_closing,__ATOMIC_ACQUIRE)) return false;
+    for (unsigned i=0;i<4 && cursor<length;i++) {
+        size_t count=end-begin;
+        struct kernel_vfs_node *node=parent->file.private_data;
+        if (count>255U || (path[begin]=='.' && (count==1 || (count==2 && path[begin+1]=='.'))) ||
+            (node->mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR || node->unlinked ||
+            !instance->ops->search_cached(node,cred)) break;
+        struct kernel_vfs_dentry *child=find_child_name(parent,path+begin,count);
+        if (!child || (child->file.mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR ||
+            __atomic_load_n(&child->mountpoint_seen,__ATOMIC_ACQUIRE) ||
+            child==mount->root_dentry || child==walk->root->dentry) break;
+        if (!__atomic_load_n(&child->recently_used,__ATOMIC_RELAXED))
+            __atomic_store_n(&child->recently_used,1,__ATOMIC_RELAXED);
+        parent=child;accepted=cursor;
+        begin=cursor;
+        while (cursor<length && path[cursor]!='/') cursor++;
+        end=cursor;
+        while (cursor<length && path[cursor]=='/') cursor++;
+    }
+    if (parent==start->dentry) return false;
+    path_bind(component,mount,parent,1,true);
+    *next=accepted;
     return true;
 }
 
@@ -3299,6 +3342,12 @@ static int resolve_object(struct kernel_vfs_path *start,
         if (component_length > 255U) {
             result = -KERNEL_ENAMETOOLONG;
             goto Finish;
+        }
+        if (borrowed && pending==path && walk->stat && !walk->resolve && suffix && !trailing_only &&
+            stat_cached_prefix(walk,current,pending,length,begin,end,&cursor,&components[0])) {
+            current=&components[0];
+            borrowed=false;
+            continue;
         }
         if (current == root && component_length == 2U &&
             pending[begin] == '.' && pending[begin + 1U] == '.') {

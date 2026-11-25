@@ -236,6 +236,29 @@ struct ext4_buf *ext4_bcache_find_get(struct ext4_bcache *bc, struct ext4_block 
     if (buf) { get_locked(bc,b,buf);read_state_locked(buf,read); }
     return buf;
 }
+
+bool ext4_bcache_copy_verified(struct ext4_bcache *bc,uint64_t lba,uint32_t offset,
+    uint64_t schema,unsigned record,void *destination,size_t length)
+{
+    KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
+    struct ext4_buf *buf=lookup_locked(bc,lba);
+    if (!buf || buf->refctr || buf->loading || buf->load_error ||
+        (__atomic_load_n(&buf->flags,__ATOMIC_RELAXED)&
+         ((1U<<BC_UPTODATE)|(1U<<BC_DIRTY)|(1U<<BC_TMP)))!=(1U<<BC_UPTODATE)) return false;
+    struct ext4_block_payload *payload=buf->current_payload;
+    if (__atomic_load_n(&payload->metadata_schema,__ATOMIC_ACQUIRE)!=schema ||
+        !(__atomic_load_n(&payload->verified[record/64],__ATOMIC_ACQUIRE)&
+          (UINT64_C(1)<<(record%64)))) return false;
+
+    /* A writer must acquire a buffer reference before changing these bytes. */
+    memcpy(destination,payload->data+offset,length);
+    if (bc->lru_tail!=buf) {
+        idle_remove_locked(bc,buf);
+        idle_append_locked(bc,buf);
+    }
+    return true;
+}
+
 void ext4_bcache_prepare_private(struct ext4_block *client, struct ext4_block *accepted,
     struct ext4_block_payload *private_payload)
 {
