@@ -280,13 +280,14 @@ static int core_poll_run(
             if (!pinned[i]) continue;
             struct kernel_wait_queue *queue = 0;
             enum kernel_open_file_kind kind = kernel_open_file_kind(pinned[i]);
-            if (kind == KERNEL_OPEN_FILE_KIND_EPOLL)
+            if (kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
+                queue=kernel_socket_wait_queue(kernel_open_file_socket(pinned[i]));
+                nodes[i].readiness_mask = (uint16_t)pfds[i].events | KERNEL_POLLERR | KERNEL_POLLHUP;
+            } else if (kind == KERNEL_OPEN_FILE_KIND_EPOLL)
                 (void)kernel_epoll_wait_pending(pinned[i], &queue);
             else (void)kernel_open_file_poll(pinned[i], (uint32_t)(uint16_t)pfds[i].events, &queue);
             if (kind == KERNEL_OPEN_FILE_KIND_SIGNALFD)
                 nodes[i].event_mask=kernel_signal_fd_mask(pinned[i]);
-            if (kind == KERNEL_OPEN_FILE_KIND_SOCKET)
-                nodes[i].readiness_mask = (uint16_t)pfds[i].events | KERNEL_POLLERR | KERNEL_POLLHUP;
             if (queue && kernel_wait_node_bind(queue, &nodes[i], &token) != KERNEL_SCHEDULER_STATUS_OK) {
                 error = -KERNEL_EIO;
                 break;

@@ -3704,6 +3704,15 @@ static int ext4_backend_truncate(struct kernel_vfs_node *node, uint64_t size, ui
     if (*changed) {node->mode=kernel_vfs_write_mode(node->mode,node->gid);((struct lwext4_node *)node)->capability_absent=1;}
     return lwext4_error(result);
 }
+static bool ext4_backend_fallocate_preserves_dirty_prefix(struct kernel_vfs_node *node)
+{
+    struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
+    /* A partial backing EOF block can need zeroing even when the logical
+     * EOF is aligned. Keep the ordinary reconciliation for that case. */
+    return adapter->device.fs->jbd_journal &&
+        !(ext4_fsize(lwext4_node_file(node)) & (node->instance->writeback_block_size-1U));
+}
+
 static int ext4_backend_fallocate(struct kernel_vfs_node *node, unsigned mode,
     uint64_t offset, uint64_t length, uint64_t *actual, int *changed)
 {
@@ -3943,6 +3952,7 @@ static void initialize_backend(void)
     ops->check_domain = ext4_check_domain;
     ops->truncate = ext4_backend_truncate;
     ops->fallocate_zero_range = true;
+    ops->fallocate_preserves_dirty_prefix = ext4_backend_fallocate_preserves_dirty_prefix;
     ops->fallocate = ext4_backend_fallocate;
     ops->reserve_write = ext4_backend_reserve_write;
     ops->overwrite_mapped = ext4_backend_overwrite_mapped;

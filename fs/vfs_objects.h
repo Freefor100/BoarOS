@@ -231,6 +231,9 @@ struct kernel_vfs_backend {
         char *buffer, size_t size, size_t *count);
     int (*truncate)(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed);
     bool fallocate_zero_range;
+    /* Called with inode write ownership for a page-aligned extension
+     * that starts at or beyond the old logical EOF. */
+    bool (*fallocate_preserves_dirty_prefix)(struct kernel_vfs_node *node);
     int (*fallocate)(struct kernel_vfs_node *node, unsigned mode, uint64_t offset,
         uint64_t length, uint64_t *actual, int *changed);
     /* prepare returns a physically backed prefix without publishing EOF.
