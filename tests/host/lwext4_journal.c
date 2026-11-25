@@ -66,6 +66,8 @@ static bool count_record_copies;
 static size_t record_copy_bytes;
 static struct kernel_raw_lock *private_rebind_cache;
 static unsigned private_rebind_cache_locks;
+static bool count_journal_pool_locks;
+static unsigned journal_pool_locks;
 static struct ext4_bcache *private_borrow_cache;
 static uint64_t private_borrow_lba;
 static unsigned private_borrow_lookups;
@@ -81,6 +83,8 @@ void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
 {
     if (lock == private_rebind_cache) private_rebind_cache_locks++;
+    if (count_journal_pool_locks && lock->rank == KERNEL_RAW_RANK_OBJECT + 1)
+        journal_pool_locks++;
     __real_kernel_raw_lock_acquire(lock, guard);
 }
 void *__real_memcpy(void *, const void *, size_t);
@@ -571,6 +575,27 @@ static void private_record_prepare(struct ext4_blockdev *dev,
         .state_read_lock = credit_state_lock, .state_unlock = credit_state_unlock};
     dev->fs->os_locks = &locks; dev->fs->jbd_journal = journal;
     CHECK(jbd_journal_group_init(journal, 4 * 1024 * 1024) == EOK);
+#ifdef TEST_JBD_RECORD_COPY
+    /* Seed both caches and check the actual allocator lock and ownership. */
+    struct jbd_image *image = jbd_image_alloc(journal);
+    void *control = jbd_alloc(journal, sizeof(struct jbd_buf));
+    CHECK(image && control);
+    memset(control, 0xff, sizeof(struct jbd_buf));
+    jbd_image_free(image);
+    jbd_free(control);
+    size_t used = jbd_memory_used(journal), cached = jbd_memory_cached(journal);
+    void *reused = NULL;
+    journal_pool_locks = 0;
+    count_journal_pool_locks = true;
+    CHECK(jbd_image_alloc_control(journal, sizeof(struct jbd_buf), &reused) == image);
+    count_journal_pool_locks = false;
+    CHECK(reused == control && journal_pool_locks == 1);
+    CHECK(jbd_memory_used(journal) == used && jbd_memory_cached(journal) < cached);
+    for (size_t i = 0; i < sizeof(struct jbd_buf); i++) CHECK(!((uint8_t *)reused)[i]);
+    jbd_image_free(image);
+    jbd_free(reused);
+    CHECK(jbd_memory_cached(journal) == cached);
+#endif
     for (unsigned round = 0; round < 3; round++) {
         struct jbd_trans *operation;
         struct ext4_block blocks[4];

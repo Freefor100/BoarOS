@@ -207,6 +207,28 @@ static void create_ref_test(struct ext4_fs *fs)
     CHECK(ext4_lookup_child("/", parent.inode, "create-initial-abort", 20, &found, &mode) == ENOENT);
     CHECK(ext4_fs_available_blocks(fs) == blocks && ext4_fs_available_inodes(fs) == inodes &&
         !fs->active_operations && !ext4_current_operation(fs));
+    const char qualified[] = "qualified-create";
+    ext4_file file = {0};
+    for (unsigned attempt = 0; attempt < 2; attempt++) {
+        CHECK(ext4_file_lookup_child(&parent, qualified, sizeof(qualified)-1,
+            &found, NULL, NULL, NULL, NULL) == ENOENT);
+        CHECK(ext4_transaction_begin("/") == EOK);
+        create_ref_begin(qualified);
+        CHECK(ext4_create_regular_missing(&parent, qualified, 0640, 53, 17, &file, &provisional) == EOK);
+        create_ref.active = false;
+        CHECK(!create_ref.searches && create_ref.count == 1 && !create_ref.gets && create_ref.puts == 1);
+        CHECK(ext4_inode_get_uid(&provisional) == 53 && ext4_inode_get_gid(&provisional) == 17);
+        CHECK(ext4_inode_get_mode(&fs->sb, &provisional) == 0100640);
+        if (!attempt) {
+            CHECK(ext4_transaction_abort("/", ECANCELED) == ECANCELED);
+            CHECK(ext4_fs_available_blocks(fs) == blocks && ext4_fs_available_inodes(fs) == inodes);
+        } else {
+            CHECK(ext4_transaction_end("/") == EOK);
+            CHECK(ext4_file_lookup_child(&parent, qualified, sizeof(qualified)-1,
+                &found, NULL, NULL, NULL, NULL) == EOK && found == file.inode);
+        }
+        CHECK(ext4_fclose(&file) == EOK);
+    }
     CHECK(ext4_fclose(&parent) == EOK);
     CHECK(ext4_mount_setup_clock("/", NULL) == EOK);
     puts("PASS creation returns actual initial attributes without reopening; types/extra times/inheritance, failed file handles, outer abort and real OOM return owners");

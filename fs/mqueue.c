@@ -54,11 +54,11 @@ static int open_inode(struct kernel_vfs_mount *mount,const char *path,uint64_t i
 }
 static int close_node(struct kernel_vfs_node *node)
 {if(node->backend_data)kernel_mqueue_put(node->backend_data);return 0;}
-static int create(struct kernel_vfs_mount *mount,uint64_t parent,const char *name,
+static int create(struct kernel_vfs_mount *mount,struct kernel_vfs_node *parent,const char *name,
     uint32_t mode,struct kernel_vfs_file *file,uint32_t umask)
 {
     mode &= ~umask;
-    if(parent!=1)return -KERNEL_ENOTDIR;
+    if(parent->inode!=1)return -KERNEL_ENOTDIR;
     if((mode&KERNEL_VFS_S_IFMT)&&(mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG)return -KERNEL_EPERM;
     struct kernel_mqueue *q=0;int made=0;
     int result=kernel_mqueue_create_name(mount_tree(mount),kernel_task_current(),name,mode,0,1,&q,&made);

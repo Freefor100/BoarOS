@@ -364,7 +364,20 @@ bool jbd_source_estimate(struct jbd_journal *journal,const struct file_data_sour
     return true;
 }
 
-static void *allocate_extra(struct jbd_journal *journal,size_t bytes,size_t extra)
+static struct jbd_image *take_image_locked(struct jbd_memory *memory, size_t *taken)
+{
+    struct jbd_image *image = memory->image_cache;
+    if (!image) return NULL;
+    memory->image_cache = image->next;
+    size_t charge = memory->block_size + ((union jbd_allocation *)image - 1)->owner.bytes;
+    if (image->active || memory->cached < charge) __builtin_trap();
+    memory->cached -= charge;
+    *taken += charge;
+    return image;
+}
+
+static void *allocate_extra(struct jbd_journal *journal,size_t bytes,size_t extra,
+    struct jbd_image **image)
 {
     /* Rounding already identifies the control pool's class. Keep both results
      * from that pass instead of counting the same powers of two again. */
@@ -376,14 +389,17 @@ static void *allocate_extra(struct jbd_journal *journal,size_t bytes,size_t extr
         {
             KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
             if (!memory->closing) {
+                size_t taken=0;
                 if (index>=0 && memory->allocation_cache[index] && room_locked(memory,extra)) {
                     cached=memory->allocation_cache[index];memory->allocation_cache[index]=*(void **)cached;
                     if (memory->cached<charge) __builtin_trap();
-                    memory->cached-=charge;account_change(memory,charge,true);
+                    memory->cached-=charge;taken=charge;
                     reserve_locked(memory,extra);
                 } else if (room_locked(memory,charge+extra)) {
                     reserve_locked(memory,charge+extra);reference_locked(memory);fresh=true;
                 }
+                if (image && (cached || fresh)) *image=take_image_locked(memory,&taken);
+                account_change(memory,taken,true);
             }
         }
         if (cached) { memset(cached,0,bytes);return cached; }
@@ -397,7 +413,7 @@ static void *allocate_extra(struct jbd_journal *journal,size_t bytes,size_t extr
     }
     budget_failure(journal);return NULL;
 }
-void *jbd_alloc(struct jbd_journal *journal,size_t bytes) { return allocate_extra(journal,bytes,0); }
+void *jbd_alloc(struct jbd_journal *journal,size_t bytes) { return allocate_extra(journal,bytes,0,NULL); }
 static inline __attribute__((always_inline)) bool cache_control_locked(struct jbd_memory *memory,void *pointer,size_t charge)
 {
     int index=cache_index(charge);size_t limit=cache_limit(memory);
@@ -509,28 +525,46 @@ static void payload_release(struct ext4_block_payload *payload)
     }
     ext4_free(image->data);jbd_memory_owner_uncharge(memory,memory->block_size);jbd_free(image);
 }
+static void start_image(struct jbd_image *image)
+{
+    ext4_block_payload_init(&image->payload, image->data, payload_release);
+    image->active = true;
+    image->next = NULL;
+}
+
 struct jbd_image *jbd_image_alloc(struct jbd_journal *journal)
 {
-    struct jbd_memory *memory=journal->memory;struct jbd_image *image=NULL;
+    struct jbd_memory *memory=journal->memory;
+    struct jbd_image *image;
     {
         KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
-        image=memory->image_cache;
-        if (image) {
-            memory->image_cache=image->next;
-            size_t charge=memory->block_size+((union jbd_allocation *)image-1)->owner.bytes;
-            if (image->active || memory->cached<charge) __builtin_trap();
-            memory->cached-=charge;account_change(memory,charge,true);
-        }
+        size_t taken = 0;
+        image = take_image_locked(memory, &taken);
+        account_change(memory, taken, true);
     }
     if (!image) {
-        image=allocate_extra(journal,sizeof(*image),memory->block_size);if (!image) return NULL;
+        image=allocate_extra(journal,sizeof(*image),memory->block_size,NULL);if (!image) return NULL;
         image->data=ext4_malloc(memory->block_size);
         if (!image->data) {finish_reservation(memory,memory->block_size,false);jbd_free(image);return NULL;}
         finish_reservation(memory,memory->block_size,true);
         image->memory=memory;
     }
-    ext4_block_payload_init(&image->payload,image->data,payload_release);
-    image->active=true;image->next=NULL;return image;
+    start_image(image);
+    return image;
+}
+
+/* Preparing a private block always needs both objects. Move any cached
+ * storage to active accounting together, then allocate misses outside the lock. */
+struct jbd_image *jbd_image_alloc_control(struct jbd_journal *journal, size_t bytes, void **out)
+{
+    struct jbd_image *image = NULL;
+    void *control = allocate_extra(journal, bytes, 0, &image);
+    if (image) start_image(image);
+    if (!control) { jbd_image_free(image); return NULL; }
+    if (!image) image = jbd_image_alloc(journal);
+    if (!image) { jbd_free(control); return NULL; }
+    *out = control;
+    return image;
 }
 void jbd_image_free(struct jbd_image *image)
 { if (image) {if (!image->active) __builtin_trap();ext4_block_payload_put(&image->payload);} }

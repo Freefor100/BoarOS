@@ -641,9 +641,9 @@ static int create_object(struct kernel_vfs_mount *view,uint64_t parent_inode,
     }
     return 0;
 }
-static int create(struct kernel_vfs_mount *view,uint64_t parent,const char *name,
+static int create(struct kernel_vfs_mount *view,struct kernel_vfs_node *parent,const char *name,
     uint32_t mode,struct kernel_vfs_file *file,uint32_t umask)
-{ return create_object(view,parent,name,mode,NULL,file,umask,NULL); }
+{ return create_object(view,parent->inode,name,mode,NULL,file,umask,NULL); }
 static int mkdir(struct kernel_vfs_mount *view,uint64_t parent,const char *name,uint32_t mode,uint32_t mask)
 { return create_object(view,parent,name,KERNEL_VFS_S_IFDIR|(mode&07777U),NULL,NULL,mask,NULL); }
 static int symlink(struct kernel_vfs_instance *i,uint64_t parent,const char *target,const char *name)

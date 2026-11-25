@@ -302,8 +302,10 @@ struct kernel_vfs_backend {
         const char *path, uint64_t inode_number,
         uint32_t inode_mode,
         struct kernel_vfs_file *file);
+    /* The caller holds the parent namespace writer across the negative lookup
+     * and publication. The parent node remains borrowed throughout. */
     int (*create)(struct kernel_vfs_mount *mount,
-        uint64_t parent_inode, const char *path,
+        struct kernel_vfs_node *parent, const char *path,
         uint32_t mode,
         struct kernel_vfs_file *file, uint32_t umask);
     int (*tmpfile)(struct kernel_vfs_mount *, uint64_t parent_inode, uint32_t mode,

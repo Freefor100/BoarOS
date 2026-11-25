@@ -325,11 +325,11 @@ void kernel_devpts_mount_set_private(struct kernel_vfs_mount *mount, void *priva
 static int no_error(struct kernel_vfs_instance *instance) { (void)instance; return 0; }
 /* Fixed Linux simple_dir_inode_operations has no namespace mutation methods.
  * namei.c returns EACCES for create and EPERM for the remaining operations. */
-static int denied_create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path,
+static int denied_create(struct kernel_vfs_mount *mount, struct kernel_vfs_node *parent, const char *path,
     uint32_t mode, struct kernel_vfs_file *file,uint32_t umask)
 {
     (void)umask;
-    (void)parent_inode;
+    (void)parent;
     (void)path; (void)mode; (void)file;
     return devpts(mount)->instance.read_only ? -KERNEL_EROFS : -KERNEL_EACCES;
 }
