@@ -687,11 +687,13 @@ _Static_assert(offsetof(struct ext4_dir_en,entry_len)==4 &&
 
 static inline __attribute__((always_inline)) int find_directory_record(uint8_t *data,
 		size_t remaining, uint32_t name_mask, size_t name_len, const char *name,
-		struct ext4_dir_search_result *result, bool aligned)
+		struct ext4_dir_search_result *result, bool aligned, bool checked,
+		struct ext4_block_payload *learn, uint32_t layout)
 {
 	struct ext4_dir_en *previous = NULL;
+	bool found = false;
 	while (remaining) {
-		if (remaining < 8) return EUCLEAN;
+		if (!checked && remaining < 8) return found ? EOK : EUCLEAN;
 		struct ext4_dir_en *de = (void *)data;
 		const directory_word *words = (const void *)data;
 		uint32_t header = aligned ? to_le32(words[1]) :
@@ -699,19 +701,25 @@ static inline __attribute__((always_inline)) int find_directory_record(uint8_t *
 			(uint32_t)de->in.name_length_high << 24;
 		uint32_t length = (uint16_t)header;
 		uint32_t bytes = (header >> 16) & name_mask;
-		if (length < 8 || length % 4 || length > remaining || bytes > length - 8)
-			return EUCLEAN;
-		if (bytes == name_len && (aligned ? words[0] : ext4_dir_en_get_inode(de)) &&
+		if (!checked && (length < 8 || length % 4 || length > remaining || bytes > length - 8))
+			return found ? EOK : EUCLEAN;
+		if (!found && bytes == name_len && (aligned ? words[0] : ext4_dir_en_get_inode(de)) &&
 			    !memcmp(name, de->name, name_len)) {
 			result->dentry = de;
 			result->previous = previous;
-			return EOK;
+			if (!learn) return EOK;
+			found = true;
 		}
 		previous = de;
 		data += length;
 		remaining -= length;
 	}
-	return ENOENT;
+	if (learn) {
+		uint32_t old = 0;
+		(void)__atomic_compare_exchange_n(&learn->directory_layout, &old,
+			layout, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+	}
+	return found ? EOK : ENOENT;
 }
 
 int ext4_dir_find_in_block(struct ext4_block *block, struct ext4_sblock *sb,
@@ -722,9 +730,20 @@ int ext4_dir_find_in_block(struct ext4_block *block, struct ext4_sblock *sb,
 		ext4_get32(sb, minor_rev_level) < 5 ? UINT16_MAX : UINT8_MAX;
 	size_t size = ext4_sb_get_block_size(sb);
 	/* Every accepted record advances by a multiple of four bytes. */
-	if (!((uintptr_t)block->data & 3U))
-		return find_directory_record(block->data,size,name_mask,name_len,name,result,true);
-	return find_directory_record(block->data,size,name_mask,name_len,name,result,false);
+	if ((uintptr_t)block->data & 3U)
+		return find_directory_record(block->data,size,name_mask,name_len,name,result,false,false,NULL,0);
+	if (block->payload && size<=4096U) {
+		uint32_t layout=size | (name_mask==UINT8_MAX);
+		uint32_t observed=__atomic_load_n(&block->payload->directory_layout,__ATOMIC_ACQUIRE);
+		if (observed==layout)
+			return find_directory_record(block->data,size,name_mask,name_len,name,result,true,true,NULL,0);
+		/* A lookup can succeed before a malformed later record. Keep that
+		 * result, and publish a reusable layout only after checking every record. */
+		if (!observed)
+			return find_directory_record(block->data,size,name_mask,name_len,name,result,
+				true,false,block->payload,layout);
+	}
+	return find_directory_record(block->data,size,name_mask,name_len,name,result,true,false,NULL,0);
 }
 
 int ext4_dir_destroy_result(struct ext4_inode_ref *parent,
