@@ -78,6 +78,7 @@ struct lwext4_node {
     uint32_t generation;
     uint8_t noatime;
     uint8_t write_completion;
+    bool synchronous;
 
     struct ext4_delalloc delalloc;
     uint8_t capability_absent; /* Inode writer updates this after capability set/remove and killpriv. */
