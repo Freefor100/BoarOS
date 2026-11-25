@@ -158,6 +158,27 @@ static void directory_record_search(struct ext4_sblock *super)
         ext4_dir_en_set_entry_len(empty,(uint16_t)(size+4));
         CHECK(ext4_dir_find_in_block(&block,super,3,"key",&result)==EUCLEAN);
     }
+    memset(storage,0,size);
+    struct ext4_dir_en *first=(void *)storage,*later=(void *)(storage+12);
+    ext4_dir_en_set_entry_len(first,12);
+    ext4_dir_en_set_inode(first,13);
+    first->name_len=3;
+    memcpy(first->name,"key",3);
+    struct ext4_block_payload payload;
+    ext4_block_payload_init(&payload,storage,NULL);
+    struct ext4_block block={.data=storage,.payload=&payload};
+    struct ext4_dir_search_result result={0};
+    CHECK(ext4_dir_find_in_block(&block,super,3,"key",&result)==EOK);
+    CHECK(result.dentry==first && !result.previous && !payload.directory_layout);
+    CHECK(ext4_dir_find_in_block(&block,super,3,"bad",&result)==EUCLEAN);
+    ext4_dir_en_set_entry_len(later,size-12);
+    CHECK(ext4_dir_find_in_block(&block,super,3,"key",&result)==EOK);
+    CHECK(payload.directory_layout);
+    CHECK(ext4_dir_find_in_block(&block,super,3,"bad",&result)==ENOENT);
+    ext4_block_payload_write(&payload);
+    ext4_dir_en_set_entry_len(later,0);
+    CHECK(ext4_dir_find_in_block(&block,super,3,"bad",&result)==EUCLEAN);
+    CHECK(payload.directory_layout==UINT32_MAX);
     puts("PASS directory search: aligned and unaligned records preserve legacy lengths, removed entries and corrupt bounds");
 }
 

@@ -57,6 +57,7 @@ extern "C" {
 struct ext4_block_payload {
 	uint8_t *data;
 	uint32_t references;
+	uint32_t directory_layout; /* Checked directory record geometry, or MAX when writable. */
 	void (*release)(struct ext4_block_payload *);
 	/* Bits identify records of one checked table layout in these exact bytes.
 	 * MAX in metadata_schema permanently disables in-place-write versions. */
@@ -70,6 +71,7 @@ static inline void ext4_block_payload_write(struct ext4_block_payload *payload)
 {
     __atomic_store_n(&payload->metadata_schema, UINT64_MAX, __ATOMIC_RELEASE);
     __atomic_store_n(&payload->tree_verified, UINT64_MAX, __ATOMIC_RELEASE);
+    __atomic_store_n(&payload->directory_layout, UINT32_MAX, __ATOMIC_RELEASE);
 }
 void ext4_block_payload_init(struct ext4_block_payload *, uint8_t *,
 	void (*release)(struct ext4_block_payload *));

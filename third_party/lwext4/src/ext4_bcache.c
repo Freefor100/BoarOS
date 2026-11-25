@@ -79,6 +79,7 @@ void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payloa
             __atomic_store_n(&payload->verified[i], 0, __ATOMIC_RELAXED);
         __atomic_store_n(&payload->metadata_schema, 0, __ATOMIC_RELAXED);
         __atomic_store_n(&payload->tree_verified, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&payload->directory_layout, 0, __ATOMIC_RELAXED);
         ext4_block_payload_get(payload);old=buf->current_payload;
         buf->current_payload=payload;buf->data=payload->data;
         advance_version(buf);
