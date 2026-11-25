@@ -481,17 +481,18 @@ Retry:;
     if (r) return r;
     if (private) return EOK;
     if (read==EXT4_BCACHE_READ_LOAD) {
+        uint64_t *next = access == EXT4_BLOCK_WRITE ? &bdev->inode_alloc_next : &bdev->inode_read_next;
         bool track=inode_table && bdev->bdif->bread_batch &&
-            (!bdev->fs || !ext4_current_operation(bdev->fs));
+            (access == EXT4_BLOCK_WRITE || !bdev->fs || !ext4_current_operation(bdev->fs));
         unsigned loaded=1;
         if (read_count>1 && track &&
-            __atomic_load_n(&bdev->inode_read_next,__ATOMIC_RELAXED)==lba)
+            __atomic_load_n(next,__ATOMIC_RELAXED)==lba)
             r=block_load_inode_run(bdev,b,read_count,&loaded);
         else if (read_count>1 && !inode_table)
             r=block_load_read_ahead(bdev,b,read_count,NULL);
         else
             r=ext4_blocks_get_direct(bdev,b->data,lba,1);
-        if (track) __atomic_store_n(&bdev->inode_read_next,r ? 0 : lba+loaded,__ATOMIC_RELAXED);
+        if (track) __atomic_store_n(next,r ? 0 : lba+loaded,__ATOMIC_RELAXED);
         ext4_block_loaded(bdev,b->buf,r);
     } else if (read==EXT4_BCACHE_READ_WAIT) r=ext4_block_wait_loaded(bdev,b);
     if (r) {
@@ -540,6 +541,12 @@ int ext4_block_get_inode_range(struct ext4_blockdev *bdev,struct ext4_block *b,
     uint64_t lba,uint32_t offset,uint32_t length,unsigned remaining)
 {
     return block_get_range(bdev,b,lba,offset,length,EXT4_BLOCK_READ,remaining,true);
+}
+
+int ext4_block_get_new_inode_range(struct ext4_blockdev *bdev, struct ext4_block *block,
+    uint64_t lba, uint32_t offset, uint32_t length, unsigned remaining)
+{
+    return block_get_range(bdev, block, lba, offset, length, EXT4_BLOCK_WRITE, remaining, true);
 }
 
 int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b, uint64_t lba)

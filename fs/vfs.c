@@ -897,7 +897,8 @@ static void dentry_release(struct kernel_vfs_dentry **);
 static void dentry_cache_trim(struct kernel_vfs_instance *,size_t);
 static void dentry_cache_trim_bounded(struct kernel_vfs_instance *,size_t,size_t);
 static int path_wrap(struct kernel_vfs_mount *,struct kernel_vfs_dentry *,struct kernel_vfs_path **);
-static int path_wrap_new(struct kernel_vfs_mount *,struct kernel_vfs_dentry *,struct kernel_vfs_path **,bool);
+static int path_wrap_new(struct kernel_vfs_mount *,struct kernel_vfs_dentry **,
+    struct kernel_vfs_path **,bool,bool *);
 static int path_walk_wrap(struct kernel_vfs_mount *,struct kernel_vfs_dentry *,
     struct kernel_vfs_path **,struct vfs_path_walk *);
 static int mount_put(struct kernel_vfs_mount *);
@@ -2990,8 +2991,8 @@ int kernel_vfs_path_stat(const struct kernel_vfs_path *path,
     return kernel_vfs_fstat(&path->file, stat);
 }
 
-static void path_bind(struct kernel_vfs_path *, struct kernel_vfs_mount *,
-    struct kernel_vfs_dentry *, int transient, bool borrow_mount);
+static void path_init(struct kernel_vfs_path *, struct kernel_vfs_mount *,
+    struct kernel_vfs_dentry *, bool transient, bool borrow_mount);
 static int vfs_open_owned_node(struct kernel_vfs_mount *, struct kernel_vfs_node *,
     struct kernel_vfs_file *, bool path_owns_location, bool inode_guarded);
 
@@ -3000,7 +3001,9 @@ static void path_bind_component(struct vfs_path_walk *walk, struct kernel_vfs_mo
 {
     bool borrow_mount = (walk->start && walk->start->file.mount == mount) ||
         (walk->root && walk->root->file.mount == mount);
-    path_bind(walk->component, mount, entry, 1, borrow_mount);
+    if ((!borrow_mount && kernel_vfs_mount_view_acquire_locked(mount)) ||
+        dentry_acquire(entry)) __builtin_trap();
+    path_init(walk->component, mount, entry, true, borrow_mount);
 }
 
 /* VFS state protects the mountpoint count and view index together. A walk
@@ -3156,7 +3159,7 @@ static int lookup_named_child(struct kernel_vfs_mount *mount,struct kernel_vfs_d
         /* The held parent qualification spans backend mutation and dentry
          * publication. A retained positive name needs no second disk lookup;
          * pseudo-filesystems with independent name changes still revalidate. */
-        int covered = 0;
+        bool covered = false;
         if (!lookup_walk_child(walk,mount,parent,name,name_length,&entry,owner,&miss)) {
             KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
             entry=find_path(instance,parent,name,name_length);
@@ -3186,10 +3189,10 @@ static int lookup_named_child(struct kernel_vfs_mount *mount,struct kernel_vfs_d
                 return result;
             }
             if (result) {dentry_release(&entry);return result;}
-            /* We just looked for a mount location under state protection.
-             * Only recheck when publishing a new wrapper: another lookup
-             * or a mount operation can have published the same location. */
-            result=path_wrap_new(mount,entry,owner,false);
+            /* Publish from the reference already taken at the name hit.
+             * Check for a mount edge while acquiring or inserting the location. */
+            result=path_wrap_new(mount,&entry,owner,false,&covered);
+            cross_mount &= covered;
             goto Enter;
         }
     }
@@ -3388,7 +3391,7 @@ static int resolve_object(struct kernel_vfs_path *start,
 {
     struct kernel_vfs_path *current;
     bool borrowed=true;
-    /* Only the reference count is read before path_bind fills a local slot.
+    /* Only the reference count is read before path_init fills a local slot.
      * The mount location's index, list and child-mount fields stay unused. */
     struct kernel_vfs_path components[2];
     components[0].references=0;
@@ -3475,8 +3478,7 @@ static int resolve_object(struct kernel_vfs_path *start,
                         goto Finish;
                     }
                 }
-                path_bind(&components[0],mount,prefix,1,true);
-                dentry_release(&prefix);
+                path_init(&components[0],mount,prefix,true,true);
                 current=&components[0];
                 borrowed=false;
                 if (!next) { cursor=part.begin;continue; }
@@ -3720,12 +3722,18 @@ static struct kernel_vfs_path *location_balance(struct kernel_vfs_path *node)
     return node;
 }
 static struct kernel_vfs_path *location_index_insert(struct kernel_vfs_path *root,
-                                                 struct kernel_vfs_path *node)
+    struct kernel_vfs_path *node, struct kernel_vfs_path **existing)
 {
     if (!root) { node->index_height = 1; return node; }
-    if (location_key_compare(node->dentry, root) < 0) root->index_left = location_index_insert(root->index_left, node);
-    else if (location_key_compare(node->dentry, root) > 0) root->index_right = location_index_insert(root->index_right, node);
-    else __builtin_trap();
+    int order=location_key_compare(node->dentry,root);
+    if (!order) {
+        *existing=root;
+        return root;
+    }
+    struct kernel_vfs_path **child=order<0 ? &root->index_left : &root->index_right;
+    struct kernel_vfs_path *updated=location_index_insert(*child,node,existing);
+    if (*existing) return root;
+    *child=updated;
     return location_balance(root);
 }
 static struct kernel_vfs_path *location_index_pop_min(struct kernel_vfs_path *root,
@@ -3804,12 +3812,11 @@ static void dentry_release(struct kernel_vfs_dentry **owner)
     }
 }
 /* A fresh persistent location starts zeroed for index/list insertion.
- * Resolver slots are private and only their owned fields are initialized. */
-static void path_bind(struct kernel_vfs_path *path,struct kernel_vfs_mount *mount,
-    struct kernel_vfs_dentry *entry,int transient,bool borrow_mount)
+ * Resolver slots are private and only their owned fields are initialized.
+ * The caller transfers the dentry and, unless borrowed, the mount reference. */
+static void path_init(struct kernel_vfs_path *path,struct kernel_vfs_mount *mount,
+    struct kernel_vfs_dentry *entry,bool transient,bool borrow_mount)
 {
-    if ((!borrow_mount && kernel_vfs_mount_view_acquire_locked(mount)) ||
-        dentry_acquire(entry)) __builtin_trap();
     path->file=entry->file;
     path->file.mount=mount;path->file.location_owner=0;
     path->heap=((struct kernel_vfs_instance *)mount->private_data)->heap;
@@ -3835,30 +3842,48 @@ static int path_walk_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentr
     path_bind_component(walk,mount,entry);*owner=walk->component;
     return 0;
 }
-static int path_wrap_new(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *entry,
-    struct kernel_vfs_path **owner,bool nosleep)
+static int path_wrap_new(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry **entry_owner,
+    struct kernel_vfs_path **owner,bool nosleep,bool *covered)
 {
     struct kernel_vfs_instance *instance=mount->private_data;
-    struct kernel_vfs_path *path=NULL,*existing;
+    struct kernel_vfs_path *path=NULL,*existing=NULL;
     enum kernel_heap_status allocation = nosleep
         ? kernel_heap_allocate_zeroed_nosleep(instance->heap,1,sizeof(*path),(void **)&path)
         : kernel_heap_allocate_zeroed(instance->heap,1,sizeof(*path),(void **)&path);
     if (allocation) return allocation==KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    path->dentry=*entry_owner;
     int result=0;
     {
         KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
-        existing=find_location(mount,entry);
-        if(mount->root_path && (__atomic_load_n(&mount->root_path->references,__ATOMIC_ACQUIRE)&VFS_PATH_CLOSING))result=-KERNEL_EBUSY;
-        else if (existing) result=kernel_vfs_path_acquire(existing);
+        if (mount->root_path &&
+            (__atomic_load_n(&mount->root_path->references,__ATOMIC_ACQUIRE)&VFS_PATH_CLOSING))
+            result=-KERNEL_EBUSY;
         else {
-            path_bind(path,mount,entry,0,false);
-            path->next=mount->paths;path->previous=&mount->paths;
-            if (path->next) path->next->previous=&path->next;
-            mount->paths=path;mount->path_index=location_index_insert(mount->path_index,path);
+            mount->path_index=location_index_insert(mount->path_index,path,&existing);
+            if (existing) {
+                result=kernel_vfs_path_acquire(existing);
+                if (!result && covered) *covered=existing->mounted_here!=NULL;
+            } else {
+                if (kernel_vfs_mount_view_acquire_locked(mount)) __builtin_trap();
+                path_init(path,mount,*entry_owner,false,false);
+                *entry_owner=NULL;
+                path->next=mount->paths;path->previous=&mount->paths;
+                if (path->next) path->next->previous=&path->next;
+                mount->paths=path;
+                if (covered) *covered=false;
+            }
         }
     }
     if (existing || result) kernel_heap_release(instance->heap,path);
     if (!result) *owner=existing ? existing : path;
+    return result;
+}
+static int path_wrap_borrowed(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *entry,
+    struct kernel_vfs_path **owner,bool nosleep)
+{
+    if (dentry_acquire(entry)) __builtin_trap();
+    int result=path_wrap_new(mount,&entry,owner,nosleep,NULL);
+    dentry_release(&entry);
     return result;
 }
 static int path_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *entry,struct kernel_vfs_path **owner)
@@ -3869,7 +3894,7 @@ static int path_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *en
         struct kernel_vfs_path *existing=find_location(mount,entry);
         if (existing) {int result=kernel_vfs_path_acquire(existing);if (!result) *owner=existing;return result;}
     }
-    return path_wrap_new(mount,entry,owner,false);
+    return path_wrap_borrowed(mount,entry,owner,false);
 }
 
 static int attach_unnamed_path_at(struct kernel_vfs_file *file,const char *name,
@@ -3999,7 +4024,7 @@ int kernel_vfs_fanotify_acquire_path(const struct kernel_vfs_path *path,
     struct kernel_vfs_path **owner)
 {
     if (path->transient || path->borrow_mount)
-        return path_wrap_new(path->file.mount, path->dentry, owner, true);
+        return path_wrap_borrowed(path->file.mount, path->dentry, owner, true);
     struct kernel_vfs_path *persistent = (struct kernel_vfs_path *)path;
     int result = kernel_vfs_path_acquire(persistent);
     if (!result) *owner = persistent;
@@ -4373,6 +4398,7 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
     if (opened) *opened=(struct kernel_vfs_open_result){0};
     if (!start || !root || !path || !request || !file || file->state || file->private_data || file->path ||
         !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
+    size_t length=strlen(path);
     unsigned flags=request->flags;
     int temporary=!!(flags & KERNEL_VFS_OPEN_TMPFILE);
     int create=!!(flags & KERNEL_VFS_OPEN_CREATE);
@@ -4388,7 +4414,7 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
         struct kernel_vfs_path *resolved=NULL;
         char missing[256];
         missing[0]=0;
-        result=resolve_object(start,root,path,strlen(path),follow,create,1,
+        result=resolve_object(start,root,path,length,follow,create,1,
             create?VFS_TRAILING_CREATE:VFS_TRAILING_FOLLOW,&resolved,missing,&walk);
         if (result) goto Complete;
         if (((struct kernel_vfs_instance *)resolved->file.mount->private_data)->quiescing)
@@ -4417,11 +4443,11 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
             }
         }
         else if (!missing[0]) {
-            if (create && path[strlen(path)-1U]=='/') result=-KERNEL_EISDIR;
+            if (create && path[length-1U]=='/') result=-KERNEL_EISDIR;
             else if (exclusive) result=-KERNEL_EEXIST;
             else result=open_existing_path(&resolved,file,request);
         } else {
-            if (path[strlen(path)-1U]=='/') result=-KERNEL_EISDIR;
+            if (path[length-1U]=='/') result=-KERNEL_EISDIR;
             else {
                 result=create_at_parent(&resolved,missing,
                     KERNEL_VFS_S_IFREG|(request->mode&07777U),file,NULL,request->umask);

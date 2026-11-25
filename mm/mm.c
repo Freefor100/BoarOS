@@ -9031,6 +9031,73 @@ static enum kernel_mm_status transparent_fault(struct mm_operation *operation,ui
     return KERNEL_MM_STATUS_OK;
 }
 
+/* The VMA qualification covers the object's lifetime. An object removal
+ * advances its epoch before waiting for this MM's gate to revoke its PTEs. */
+static __attribute__((noinline)) int try_shared_anonymous_read_fault(struct mm_operation *operation,
+    uint64_t address, const struct fault_vma *view)
+{
+    _Static_assert(KERNEL_PAGE_CACHE_READY_WINDOW <= PHYSICAL_PAGE_REFERENCE_BATCH_MAX,
+        "one physical reference batch per ready window");
+    struct kernel_mm_record *record = operation->record;
+    const struct kernel_vma *vma = &view->vma;
+    address &= ~BOAROS_PAGE_MASK;
+    uint64_t end, first = file_fault_window(vma, address, &end);
+    unsigned slots = (end - first) >> BOAROS_PAGE_SHIFT;
+    unsigned demand = (address - first) >> BOAROS_PAGE_SHIFT;
+    unsigned selected;
+    KERNEL_LOCK_SCOPE(vma_guard);
+    if (operation->shared && !kernel_rwlock_try_read(&record->vma_lock, &vma_guard)) return 0;
+    if (kernel_vma_set_generation(record->vmas) != view->generation) return 0;
+    {
+        KERNEL_RAW_READ_SCOPE(raw, &record->metadata);
+#if !defined(BOAROS_ARCH_LOONGARCH)
+        uint64_t *leaf;
+        if (riscv_sv39_user_empty_window_slot(&record->space, first, slots, &selected, &leaf) || !leaf)
+            return 0;
+#else
+        struct kernel_mm_leaf leaf;
+        unsigned missing;
+        if (arch_mmu_user_leaf_probe(&record->space, address, &leaf, &missing) !=
+                ARCH_MMU_STATUS_NOT_MAPPED || missing ||
+            arch_mmu_user_empty_window(&record->space, first, slots, &selected)) return 0;
+#endif
+    }
+    if (!(selected & (1U << demand))) return 0;
+
+    struct kernel_memory_object *object = vma->backing;
+    uint64_t epoch, current;
+    if (kernel_memory_object_epoch(object, &epoch)) return 0;
+    uint64_t refs[KERNEL_PAGE_CACHE_READY_WINDOW];
+    unsigned ready = kernel_memory_object_try_borrow_adopted(object,
+        (vma->backing_offset + first - vma->start) >> BOAROS_PAGE_SHIFT, selected, demand, refs);
+    if (!ready) return 0;
+
+    unsigned installed = 0;
+    uint32_t targets = 0;
+    struct kernel_mm_retirement batch;
+    batch.count = batch.nonleaf = batch.compound = 0;
+    {
+        KERNEL_RAW_WRITE_SCOPE(raw, &record->metadata);
+        if (!fault_range_claimed(record, first, end) &&
+            !kernel_memory_object_epoch(object, &current) && current == epoch) {
+            installed = arch_mmu_user_map_required_window(&record->space, first, ready, refs,
+                backend_permissions_from_mm(vma->permissions), 0, demand);
+            if (installed) targets = note_fault_change_locked(record, &batch, 0, 0);
+        }
+    }
+    kernel_lock_scope_release(&vma_guard);
+    if (installed != ready) {
+        unsigned index = 0, unused = 0;
+        for (unsigned bits = ready; bits; bits &= bits - 1) {
+            if (!(installed & (bits & -bits))) refs[unused++] = refs[index];
+            ++index;
+        }
+        physical_page_release_batch(record->space.allocator, refs, unused);
+    }
+    if (installed) finish_fault_change(record, &batch, targets, first, end - first, 0, 0);
+    return installed != 0;
+}
+
 static enum kernel_mm_status dispatch_fault(struct mm_operation *operation, uint64_t address,
     uint32_t access, struct fault_vma *view, int force)
 {
@@ -9061,6 +9128,13 @@ static enum kernel_mm_status dispatch_fault(struct mm_operation *operation, uint
         if (operation->shared && !force && !operation->populate && !operation->fault_pin &&
             access != KERNEL_MM_WRITE && (user_effective_permissions(view->vma.permissions) & access) &&
             !(view->vma.flags & KERNEL_VMA_RANDOM_READ) && try_elf_ready_fault(operation,address,view))
+            return KERNEL_MM_STATUS_OK;
+        return memory_fault(operation, address, access, view, force);
+    case KERNEL_VMA_KIND_ANON_SHARED:
+        if (!force && !operation->populate && !operation->fault_pin && access == KERNEL_MM_READ &&
+            (view->vma.permissions & (KERNEL_MM_READ | KERNEL_MM_EXECUTE)) == KERNEL_MM_READ &&
+            !(view->vma.flags & (KERNEL_VMA_RANDOM_READ | KERNEL_VMA_LOCK_MASK | KERNEL_VMA_USERFAULT_MISSING)) &&
+            try_shared_anonymous_read_fault(operation, address, view))
             return KERNEL_MM_STATUS_OK;
         return memory_fault(operation, address, access, view, force);
     default:

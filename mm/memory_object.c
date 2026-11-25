@@ -367,6 +367,34 @@ enum kernel_memory_object_status kernel_memory_object_prepare_page(
     struct kernel_memory_object *object, uint64_t index, uint64_t *address, int *created)
 { return get_page(object, index, address, created, 1); }
 
+static struct kernel_memory_object_page *adopted_page(struct kernel_memory_object *object,
+    uint64_t index)
+{
+    struct kernel_memory_object_page *page = object->buckets[bucket_for(index, object->bucket_count)];
+    while (page && page->index != index) page = page->next;
+    return page && page->publication == PAGE_ADOPTED ? page : NULL;
+}
+
+unsigned kernel_memory_object_try_borrow_adopted(struct kernel_memory_object *object,
+    uint64_t first, unsigned selected, unsigned demand, uint64_t *physical)
+{
+    KERNEL_LOCK_SCOPE(guard);
+    if (!kernel_mutex_try_lock(&object->lock, &guard)) return 0;
+    struct kernel_memory_object_page *required = adopted_page(object, first + demand);
+    if (!required) return 0;
+    unsigned ready = 0, count = 0;
+    for (unsigned bits = selected, slot = 0; bits; bits >>= 1, slot++) {
+        if (!(bits & 1U)) continue;
+        struct kernel_memory_object_page *page = slot == demand ? required :
+            adopted_page(object, first + slot);
+        if (!page) continue;
+        physical[count++] = page->physical_address;
+        ready |= 1U << slot;
+    }
+    physical_page_acquire_batch(object->allocator, physical, count);
+    return ready;
+}
+
 void kernel_memory_object_finish_page(struct kernel_memory_object *object,
     uint64_t index, uint64_t address, int accepted)
 {

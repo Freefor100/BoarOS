@@ -51,6 +51,9 @@ extern "C" {
 int ext4_trans_set_block_dirty(struct ext4_buf *buf);
 int ext4_trans_set_block_dirty_range(struct ext4_block *block, uint32_t offset, uint32_t length);
 int ext4_trans_set_tree_dirty(struct ext4_block *block, uint64_t tree_key);
+/* The tree proof covers the whole private image, even for a partial edit. */
+int ext4_trans_set_tree_dirty_range(struct ext4_block *block,
+    uint32_t offset, uint32_t length, uint64_t tree_key);
 
 /**@brief   Block get function (through cache, don't read).
  *          jbd_trans_get_access would be called in order to
@@ -79,6 +82,8 @@ int ext4_trans_block_get(struct ext4_blockdev *bdev,
 /* Only this record is exposed from a transaction's private block view. */
 int ext4_trans_block_get_range(struct ext4_blockdev *bdev,
     struct ext4_block *b, uint64_t lba, uint32_t offset, uint32_t length);
+int ext4_trans_block_get_new_inode_range(struct ext4_blockdev *, struct ext4_block *,
+    uint64_t lba, uint32_t offset, uint32_t length, unsigned remaining);
 
 struct kernel_block_span;
 /* Synchronous non-journal stable blocks; explicit bcache borrows remain coherent. */

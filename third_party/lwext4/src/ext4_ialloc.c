@@ -191,10 +191,12 @@ static bool inode_bitmap_checked(struct ext4_block_group_ref *group, struct ext4
     return true;
 }
 
-static int inode_bitmap_dirty(struct ext4_block_group_ref *group, struct ext4_block *block)
+static int inode_bitmap_dirty(struct ext4_block_group_ref *group, struct ext4_block *block,
+    uint32_t bit)
 {
     ext4_ialloc_set_bitmap_csum(ext4_fs_super(group->fs), group->block_group, block->data);
-    return ext4_trans_set_tree_dirty(block, inode_bitmap_key(group));
+    uint32_t offset = (bit / 8) & ~31U;
+    return ext4_trans_set_tree_dirty_range(block, offset, 32, inode_bitmap_key(group));
 }
 
 /* Called with filesystem mutation excluded. An uninitialized inode group
@@ -279,7 +281,7 @@ int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 	/* Free i-node in the bitmap */
 	ext4_bmap_bit_clr(b.data, index_in_group);
 	/* Put back the block with bitmap */
-	rc = inode_bitmap_dirty(&bg_ref, &b);
+	rc = inode_bitmap_dirty(&bg_ref, &b, index_in_group);
 	int release = ext4_block_set(fs->bdev, &b);
 	if (!rc) rc = release;
 	if (rc != EOK) {
@@ -435,7 +437,7 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir,
 			ext4_bmap_bit_set(b.data, idx_in_bg);
 
 			/* Free i-node found, save the bitmap */
-			rc = inode_bitmap_dirty(&bg_ref, &b);
+			rc = inode_bitmap_dirty(&bg_ref, &b, idx_in_bg);
 			int release = ext4_block_set(fs->bdev, &b);
 			if (!rc) rc = release;
 			if (rc != EOK) {

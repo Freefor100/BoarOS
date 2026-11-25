@@ -75,7 +75,7 @@ static void publish_verification(struct ext4_block_payload *payload, uint64_t tr
 }
 
 bool ext4_bcache_patch_current(struct ext4_buf *buf, struct ext4_block_payload *payload,
-    unsigned owners, uint32_t offset, const void *bytes, uint32_t length)
+    unsigned owners, uint32_t offset, const void *bytes, uint32_t length, uint64_t tree_key)
 {
     KERNEL_TASK_LOCK_SCOPE(guard, &buf->bc->metadata);
     if (buf->current_payload != payload ||
@@ -84,7 +84,7 @@ bool ext4_bcache_patch_current(struct ext4_buf *buf, struct ext4_block_payload *
     /* No other descriptor can observe the bytes while the cache lock
      * excludes new borrows and in-lock record copies. */
     memcpy(payload->data + offset, bytes, length);
-    publish_verification(payload, 0);
+    publish_verification(payload, tree_key);
     advance_version(buf);
     return true;
 }
