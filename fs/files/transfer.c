@@ -102,7 +102,7 @@ static int64_t regular_copy_output(struct kernel_open_file_description *out,
     if (status_flags&KERNEL_FILES_O_DIRECT) {
         if (pages) __builtin_trap();
         error=kernel_vfs_pwrite_direct(&out->file,position,buffer,allowed,&written,&operation);
-    } else error=pages?kernel_vfs_pwrite_cached(&out->file,position,pages,source_offset,allowed,&written):
+    } else error=pages?kernel_vfs_pwrite_cached(&out->file,position,pages,source_offset,allowed,&written,&operation):
         kernel_vfs_pwrite(&out->file,position,buffer,allowed,&written);
     if (written>allowed) __builtin_trap();
     /* sendfile still attempts the suffix at the size limit after accepting
@@ -133,7 +133,7 @@ static __attribute__((noinline)) int64_t regular_cached_copy(
         size_t wanted=capacity*BOAROS_PAGE_SIZE-offset;
         if (wanted>count-total) wanted=count-total;
         size_t nr=(offset+wanted+BOAROS_PAGE_MASK)>>BOAROS_PAGE_SHIFT;
-        kernel_open_file_read_begin(input,position);
+        if (total) kernel_open_file_read_begin(input,position);
         if (kernel_page_cache_get_batch(cache,kernel_vfs_data_file(source),position>>BOAROS_PAGE_SHIFT,pages,nr, kernel_open_file_read_no_reuse(input))
             ==KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT) __builtin_trap();
         size_t available=0,within=offset;

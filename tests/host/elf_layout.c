@@ -41,7 +41,6 @@ enum kernel_files_status kernel_files_release_for_task(struct kernel_files *file
     files->state=KERNEL_FILES_RELEASED;return KERNEL_FILES_STATUS_OK;
 }
 void kernel_task_account_read(uint64_t bytes) { (void)bytes;abort(); }
-void kernel_task_account_write(uint64_t bytes) { (void)bytes;abort(); }
 void kernel_page_cache_put_batch(struct kernel_page_cache *cache,
     struct kernel_page_cache_read_page *pages,size_t count)
 { (void)cache;(void)pages;(void)count;abort(); }

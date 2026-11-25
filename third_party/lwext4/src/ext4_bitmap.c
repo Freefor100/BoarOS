@@ -42,6 +42,8 @@
 
 #include <ext4_bitmap.h>
 
+typedef uintptr_t ext4_bitmap_word __attribute__((__may_alias__));
+
 void ext4_bmap_bits_free(uint8_t *bmap, uint32_t sbit, uint32_t bcnt)
 {
 	uint32_t i = sbit;
@@ -113,26 +115,25 @@ int ext4_bmap_bit_find_clr(const uint8_t *bmap, uint32_t sbit, uint32_t ebit,
 	sbit = i;
 	bmap += (sbit >> 3);
 
-#if CONFIG_UNALIGNED_ACCESS
-	while (bcnt >= 32) {
-		if (*(uint32_t *)bmap != 0xFFFFFFFF)
-			goto finish_it;
-
-		bmap += 4;
-		bcnt -= 32;
-		sbit += 32;
+	/* Allocation scans often cross a dense allocated prefix. Use native
+	 * loads on aligned bytes, and stay within the requested bit interval. */
+	while (bcnt >= 8 && ((uintptr_t)bmap & (sizeof(ext4_bitmap_word)-1))) {
+		if (*bmap != UINT8_MAX)
+			break;
+		bmap++;
+		bcnt -= 8;
+		sbit += 8;
+	}
+	if (!((uintptr_t)bmap & (sizeof(ext4_bitmap_word)-1))) {
+		const uint32_t word_bits = 8 * sizeof(ext4_bitmap_word);
+		while (bcnt >= word_bits &&
+		       *(const ext4_bitmap_word *)bmap == UINTPTR_MAX) {
+			bmap += sizeof(ext4_bitmap_word);
+			bcnt -= word_bits;
+			sbit += word_bits;
+		}
 	}
 
-	while (bcnt >= 16) {
-		if (*(uint16_t *)bmap != 0xFFFF)
-			goto finish_it;
-
-		bmap += 2;
-		bcnt -= 16;
-		sbit += 16;
-	}
-finish_it:
-#endif
 	while (bcnt >= 8) {
 		if (*bmap != 0xFF) {
 			for (i = 0; i < 8; ++i) {

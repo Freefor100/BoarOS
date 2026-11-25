@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-case "${1:-all}" in all|ownership|truncate|extent|prepend|extent-lookup|nojournal-orphan-probe|direct-reuse|nojournal-direct) ;; *) echo 'usage: lwext4-metadata.sh [all|ownership|truncate|extent|prepend|extent-lookup|nojournal-orphan-probe|direct-reuse|nojournal-direct]' >&2; exit 2;; esac
+case "${1:-all}" in all|bitmap|ownership|truncate|extent|prepend|extent-lookup|nojournal-orphan-probe|direct-reuse|nojournal-direct) ;; *) echo 'usage: lwext4-metadata.sh [all|bitmap|ownership|truncate|extent|prepend|extent-lookup|nojournal-orphan-probe|direct-reuse|nojournal-direct]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
@@ -9,12 +9,17 @@ check_fs() {
 }
 ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -Wno-unused-but-set-variable -Wno-stringop-truncation \
-    -DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 -DCONFIG_DEBUG_ASSERT=0 \
+    -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT="${LWEXT4_HOST_PAGE_SHIFT:-12}" \
+    -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 -DCONFIG_DEBUG_ASSERT=0 \
     -DTEST_RANGE_WORK_COUNTERS=1 -DTEST_DIRECT_REUSE_GOAL=1 -Wl,--wrap=ext4_balloc_alloc_blocks -Wl,--wrap=ext4_crc32c -Wl,--wrap=ext4_fs_get_inode_dblk_range -Wl,--wrap=ext4_trans_block_get \
     -include "$root/tests/host/lwext4_memory.h" \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_metadata.c" \
     "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
+if [ "${1:-all}" = bitmap ]; then
+    "$work/probe" bitmap
+    exit 0
+fi
 if [ "${1:-all}" = nojournal-direct ]; then
     for block in 1024 4096; do
         truncate -s 32M "$work/direct.img"
