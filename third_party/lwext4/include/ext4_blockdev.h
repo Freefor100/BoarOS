@@ -259,6 +259,7 @@ enum ext4_block_access {
  * transaction wrapper to return without flushing. Ordinary get reads all. */
 int ext4_block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
     uint64_t lba, uint32_t offset, uint32_t length, enum ext4_block_access access);
+int ext4_block_get_new(struct ext4_blockdev *, struct ext4_block *, uint64_t lba);
 /* Read one inode record. Continue an observed cold run only within the
  * remaining blocks of the inode table, and only in the published view. */
 int ext4_block_get_inode_range(struct ext4_blockdev *, struct ext4_block *,

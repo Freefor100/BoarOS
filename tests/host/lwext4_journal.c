@@ -568,6 +568,101 @@ static void publication_owners(struct ext4_blockdev *dev, struct jbd_journal *jo
 #endif
 
 #ifdef TEST_JBD_CREDIT_PARALLEL
+static struct {
+    struct jbd_trans *owner;
+    bool abort;
+    unsigned waits, wakes;
+} fresh_block_wait;
+
+static void complete_fresh_on_wait(void *context)
+{
+    struct ext4_buf *block = context;
+    struct jbd_trans *owner = fresh_block_wait.owner;
+    CHECK(owner && block->loading && block->fresh_load && ++fresh_block_wait.waits == 1);
+    fresh_block_wait.owner = NULL;
+    if (fresh_block_wait.abort) jbd_journal_free_trans(owner->journal, owner, true);
+    else CHECK(jbd_journal_accept(owner->journal, owner, 0) == EOK);
+}
+
+static void fresh_block_wake(void *context)
+{
+    struct ext4_buf *block = context;
+    CHECK(!block->loading && !block->fresh_load);
+    fresh_block_wait.wakes++;
+}
+
+static void fresh_block_test(struct ext4_blockdev *dev, struct jbd_journal *journal,
+    uint64_t home, bool crash)
+{
+    CHECK(jbd_journal_group_init(journal, 4 * 1024 * 1024) == EOK);
+    dev->fs->jbd_journal = journal;
+    struct jbd_trans *denied;
+    struct ext4_block retry;
+    uint64_t first_read = reads;
+    CHECK(jbd_journal_new_trans(journal, &denied) == EOK);
+    size_t limit = jbd_memory_limit(journal);
+    jbd_memory_set_limit(journal, jbd_memory_used(journal));
+    test_operation_bind(dev->fs, denied);
+    CHECK(ext4_trans_block_get_new(dev, &retry, home) == ENOMEM && !retry.payload && reads == first_read);
+    test_operation_bind(dev->fs, NULL);
+    jbd_journal_free_trans(journal, denied, true);
+    jbd_memory_set_limit(journal, limit);
+    CHECK(ext4_block_get(dev, &retry, home) == EOK && retry.data[0] == 'O' && reads == first_read + 1);
+    CHECK(ext4_block_set(dev, &retry) == EOK);
+    for (unsigned committed = 0; committed < 2; committed++) {
+        ext4_bcache_invalidate_lba(dev->bc, home, 1);
+        struct jbd_trans *owner;
+        struct ext4_block private, waiting;
+        CHECK(jbd_journal_new_trans(journal, &owner) == EOK);
+        test_operation_bind(dev->fs, owner);
+        uint64_t before = reads;
+        CHECK(ext4_trans_block_get_new(dev, &private, home) == EOK && reads == before);
+        CHECK(jbd_trans_set_block_dirty_range(owner, &private, 0, 32) == EINVAL);
+        memset(private.data, 'N', dev->lg_bsize);
+        CHECK(ext4_trans_set_block_dirty(private.buf) == EOK);
+        CHECK(ext4_block_get(dev, &waiting, home) == EOK && waiting.payload == private.payload);
+        CHECK(ext4_block_set(dev, &waiting) == EOK && ext4_block_set(dev, &private) == EOK);
+        test_operation_bind(dev->fs, NULL);
+        CHECK(jbd_trans_prepare_operation(owner) == EOK);
+        fresh_block_wait = (__typeof__(fresh_block_wait)){.owner = owner, .abort = !committed};
+        dev->bdif->wait_read = complete_fresh_on_wait;
+        dev->bdif->wake_read = fresh_block_wake;
+        int error;
+        CHECK((committed ? ext4_block_get_batch(dev, &waiting, &home, &error, 1) :
+            ext4_block_get(dev, &waiting, home)) == EOK);
+        dev->bdif->wait_read = NULL;
+        dev->bdif->wake_read = NULL;
+        CHECK(fresh_block_wait.waits == 1 && fresh_block_wait.wakes == (committed ? 1U : 2U));
+        CHECK(waiting.data[0] == (committed ? 'N' : 'O') && reads == before + !committed);
+        if (committed) {
+            /* A held accepted version is never overwritten by a new writer. */
+            CHECK(jbd_journal_new_trans(journal, &owner) == EOK);
+            test_operation_bind(dev->fs, owner);
+            CHECK(ext4_trans_block_get_new(dev, &private, home) == EOK && private.data[0] == 'N');
+            memset(private.data, 'X', dev->lg_bsize);
+            CHECK(ext4_trans_set_block_dirty(private.buf) == EOK && ext4_block_set(dev, &private) == EOK);
+            test_operation_bind(dev->fs, NULL);
+            jbd_journal_free_trans(journal, owner, true);
+            CHECK(waiting.data[0] == 'N');
+        }
+        CHECK(ext4_block_set(dev, &waiting) == EOK);
+    }
+    CHECK(jbd_journal_freeze(journal) == EOK);
+    if (crash) {
+        CHECK(jbd_journal_select_stage(journal, JBD_JOURNAL_COMMIT) == JBD_JOURNAL_COMMIT);
+        CHECK(jbd_journal_retire_stage(journal, JBD_JOURNAL_COMMIT, jbd_journal_submit(journal)) == EOK);
+        void *old = malloc(dev->lg_bsize);
+        CHECK(old && ext4_blocks_get_direct(dev, old, home, 1) == EOK && *(uint8_t *)old == 'O');
+        free(old);
+        CHECK(fault_block_crash(&disk) == 0);
+        return;
+    }
+    credit_drain(journal);
+    close_normal_journal(dev, journal);
+    CHECK(fault_block_crash(&disk) == 0);
+    puts("PASS fresh block publication and abort transfer waiting readers without reading new contents from disk");
+}
+
 static void private_record_prepare(struct ext4_blockdev *dev,
     struct jbd_journal *journal, ext4_fsblk_t home)
 {
@@ -1559,6 +1654,10 @@ int main(int argc, char **argv)
     }
     if (!strcmp(argv[2], "record-prepare")) {
         private_record_prepare(&dev, &journal, home);
+        return 0;
+    }
+    if (!strcmp(argv[2], "fresh-block") || !strcmp(argv[2], "fresh-block-crash")) {
+        fresh_block_test(&dev, &journal, home, !strcmp(argv[2], "fresh-block-crash"));
         return 0;
     }
     if (!strcmp(argv[2], "prepare-wire")) {

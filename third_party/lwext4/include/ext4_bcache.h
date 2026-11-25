@@ -129,6 +129,7 @@ struct ext4_buf {
 	/* Uncommitted journal owners forbid implicit home writeback. */
 	unsigned journal_pending;
 	bool loading;
+	bool fresh_load;
 	int load_error;
 
 	/**@brief   Logical block address*/
@@ -279,6 +280,8 @@ struct ext4_block_payload *ext4_bcache_borrow_owned(const struct ext4_block *own
 void ext4_block_rebind(struct ext4_block *, struct ext4_block_payload *);
 /* A nonzero tree key certifies the exact, complete replacement bytes. */
 void ext4_bcache_publish(struct ext4_buf *, struct ext4_block_payload *, uint64_t tree_key);
+void ext4_bcache_begin_fresh(struct ext4_buf *);
+void ext4_bcache_cancel_fresh(struct ext4_buf *);
 bool ext4_bcache_patch_current(struct ext4_buf *, struct ext4_block_payload *,
     unsigned owners, uint32_t offset, const void *bytes, uint32_t length);
 void ext4_bcache_insert_dirty_node(struct ext4_bcache *, struct ext4_buf *);
