@@ -4783,6 +4783,18 @@ Release:
     return accepted;
 }
 
+static __attribute__((noinline)) void writeback_mount_pause(void)
+{
+    if (!kernel_scheduler_can_sleep()) return;
+    KERNEL_IRQ_SCOPE(irq);
+    /* The batch has returned its inode and cache guards. Deliver pending
+     * completions before checking whether the local CPU should yield. */
+    arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK);
+    (void)arch_interrupt_save();
+    if (kernel_cpu_schedule_requested(kernel_cpu_current()) &&
+        kernel_scheduler_yield_current()) __builtin_trap();
+}
+
 int kernel_page_cache_writeback_mount(struct kernel_page_cache *cache,
     struct kernel_vfs_node **nodes,size_t count)
 {
@@ -4808,6 +4820,7 @@ int kernel_page_cache_writeback_mount(struct kernel_page_cache *cache,
                 if (error && !result) result=error;
             }
         }
+        if (i<count) writeback_mount_pause();
     }
     if (lease) foreground_workspace_put(cache,lease);
     return result;
