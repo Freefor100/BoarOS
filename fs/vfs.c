@@ -6853,12 +6853,7 @@ int kernel_vfs_sync_mount(struct kernel_vfs_mount *mount, uint64_t *observed_err
     if (instance->read_only) goto observe;
     result = snapshot_sync_nodes(instance, &snapshot);
     if (result) goto observe;
-    /* Snapshot the dirty inodes before waiting for any single file or device. */
-    for (size_t i = 0; i < snapshot.count; i++) {
-        struct kernel_vfs_node *node = snapshot.nodes[i];
-        int error = kernel_page_cache_writeback(instance->page_cache, node);
-        if (error && !result) result = error;
-    }
+    result=kernel_page_cache_writeback_mount(instance->page_cache,snapshot.nodes,snapshot.count);
     /* 捕获此前数据交接与namespace修改的durable目标一次，不等待checkpoint。 */
     if (instance->ops->sync_filesystem) {
         int error = instance->ops->sync_filesystem(mount);

@@ -4092,11 +4092,16 @@ static void capture_writeback(struct kernel_page_cache *cache,
     if (first==count) return;
     {
         CACHE_SCOPE(capture,cache);
-        uint64_t size=kernel_vfs_node_size(entries[first]->node);
+        struct kernel_vfs_node *node=NULL;
+        uint64_t size=0;
         for (size_t i=first;i<count;i++) {
             struct prepared_writeback *p=&prepared[i];
             if (!p->version) continue;
             struct kernel_page_cache_entry *entry=entries[i];
+            if (node!=entry->node) {
+                node=entry->node;
+                size=kernel_vfs_node_size(node);
+            }
             p->begin=entry->dirty_begin;p->end=entry->dirty_end;
             p->generation=entry->generation;
             uint64_t start=entry->page_index<<BOAROS_PAGE_SHIFT;
@@ -4701,6 +4706,112 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
 
 int kernel_page_cache_writeback(struct kernel_page_cache *cache, struct kernel_vfs_node *node)
 { return kernel_page_cache_writeback_range(cache, node, 0, UINT64_MAX); }
+
+enum { SMALL_FILE_WRITEBACK_MAX=8 };
+
+static size_t writeback_small_files(struct kernel_page_cache *cache,
+    struct kernel_vfs_node **nodes,size_t limit,struct writeback_storage *storage,
+    size_t *attempted)
+{
+    if (limit>SMALL_FILE_WRITEBACK_MAX) limit=SMALL_FILE_WRITEBACK_MAX;
+    if (limit>BOAROS_PAGE_CACHE_WRITEBACK_PAGES) limit=BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
+    size_t count=0,prepared_count=0,locked=0,accepted=0;
+    struct kernel_page_cache_entry **entries=storage->selected;
+    struct prepared_writeback *prepared=storage->prepared;
+    struct kernel_lock_guard guards[SMALL_FILE_WRITEBACK_MAX]={0};
+    unsigned order[SMALL_FILE_WRITEBACK_MAX];
+    {
+        CACHE_SCOPE(select,cache);
+        for (;count<limit;count++) {
+            struct kernel_vfs_node *node=nodes[count];
+            struct kernel_page_cache_dirty *dirty=kernel_vfs_node_dirty_pages(node);
+            if (dirty->count!=1 || kernel_vfs_node_size(node)>BOAROS_PAGE_SIZE ||
+                !node->instance->ops->writeback_small_candidate(node)) break;
+            struct kernel_page_cache_entry *entry=RB_MIN(kernel_page_cache_dirty_tree,&dirty->tree);
+            if (entry->page_index || entry->dirty_begin || entry->aliases || entry->writeback ||
+                __atomic_load_n(&entry->writes,__ATOMIC_RELAXED)) break;
+            entries[count]=entry;
+            entry_borrow_indexed(entry);
+        }
+        entry_borrows_add(cache->record,count);
+    }
+    if (count<2) goto Release;
+    *attempted=count;
+    COST_ADD(WRITEBACK_VISITS,count);
+    reclaim_window_memory(cache);
+    memset(prepared,0,count*sizeof(*prepared));
+    if (prepare_writeback_prefix(cache,entries,count,UINT64_MAX,0,prepared,&prepared_count) ||
+        prepared_count!=count) goto Release;
+    for (unsigned i=0;i<count;i++) {
+        if (!prepared[i].version) goto Release;
+        unsigned j=i;
+        while (j && nodes[order[j-1]]->io_lock.key>nodes[i]->io_lock.key) {
+            order[j]=order[j-1];
+            j--;
+        }
+        order[j]=i;
+    }
+    for (;locked<count;locked++)
+        if (!kernel_vfs_node_try_read(nodes[order[locked]],&guards[locked])) goto Release;
+    capture_writeback(cache,entries,prepared,count,UINT64_MAX);
+    struct file_write_span *spans=storage->spans;
+    for (size_t i=0;i<count;i++) {
+        size_t cursor=prepared[i].begin,begin,end;
+        if (!next_writeback_span(entries[i],&prepared[i],&cursor,&spans[i]) ||
+            next_writeback_range(entries[i],&prepared[i],&cursor,&begin,&end)) goto Release;
+    }
+    if (nodes[0]->instance->ops->writeback_small_files(nodes,spans,count)) goto Release;
+    accepted=count;
+    for (size_t i=0;i<count;i++) {
+        if (spans[i].written!=spans[i].size) __builtin_trap();
+        prepared[i].written=spans[i].written;
+    }
+Release:
+    while (locked) kernel_lock_release(&guards[--locked]);
+    if (!accepted) {
+        for (size_t i=0;i<prepared_count;i++)
+            if (prepared[i].version) writeback_unprepare(cache,entries[i],&prepared[i]);
+    }
+    {
+        CACHE_SCOPE(complete,cache);
+        for (size_t i=0;i<count;i++) {
+            if (accepted) (void)complete_writeback(cache,entries[i],&prepared[i],0);
+            entry_return(entries[i]);
+        }
+    }
+    if (accepted) return_prepared_versions(cache,prepared,accepted,0);
+    return accepted;
+}
+
+int kernel_page_cache_writeback_mount(struct kernel_page_cache *cache,
+    struct kernel_vfs_node **nodes,size_t count)
+{
+    int result=0;
+    union foreground_workspace *lease=NULL;
+    bool batch=count>1 && nodes[0]->instance->ops->writeback_small_files &&
+        !nodes[0]->instance->namespace_parallel && !kernel_page_cache_needs_cpu0(cache);
+    for (size_t i=0;i<count;) {
+        size_t attempted=1;
+        if (batch && !lease && count-i>1) {
+            lease=foreground_workspace_take(cache);
+            if (!lease) batch=false;
+        }
+        size_t accepted=lease?writeback_small_files(cache,nodes+i,count-i,&lease->writeback,&attempted):0;
+        if (accepted) i+=accepted;
+        else {
+            if (lease) {
+                foreground_workspace_put(cache,lease);
+                lease=NULL;
+            }
+            for (size_t end=i+attempted;i<end;i++) {
+                int error=kernel_page_cache_writeback(cache,nodes[i]);
+                if (error && !result) result=error;
+            }
+        }
+    }
+    if (lease) foreground_workspace_put(cache,lease);
+    return result;
+}
 
 static int range_has_dirty(struct kernel_vfs_node *node, uint64_t first, uint64_t last)
 {

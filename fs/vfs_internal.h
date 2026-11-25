@@ -98,6 +98,8 @@ struct kernel_vfs_node;
  * The caller owns every returned pin, including the prefix on overflow. */
 int kernel_page_cache_pin_dirty_nodes(struct kernel_page_cache *,
     const struct kernel_vfs_instance *, struct kernel_vfs_node **, size_t, size_t *, size_t *);
+int kernel_page_cache_writeback_mount(struct kernel_page_cache *,
+    struct kernel_vfs_node **, size_t);
 #if BOAROS_COST_DIAGNOSTICS
 int kernel_vfs_file_is_cost(const struct kernel_vfs_file *file);
 #endif

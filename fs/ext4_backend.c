@@ -3436,6 +3436,26 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node,
     return lwext4_error(result);
 }
 
+static int ext4_backend_writeback_small_files(struct kernel_vfs_node *const *nodes,
+    struct file_write_span *spans,size_t count)
+{
+    ext4_file *files[EXT4_SMALL_WRITEBACK_MAX];
+    if (count>EXT4_SMALL_WRITEBACK_MAX) __builtin_trap();
+    for (size_t i=0;i<count;i++) files[i]=lwext4_node_file(nodes[i]);
+    int result=ext4_fpwrite_small_files(files,spans,(unsigned)count);
+    if (!result) for (size_t i=0;i<count;i++) {
+        COST_ADD(BACKEND_REQUESTED,spans[i].size);
+        COST_ADD(BACKEND_ACCEPTED,spans[i].written);
+    }
+    return lwext4_error(result);
+}
+
+static bool ext4_backend_writeback_small_candidate(const struct kernel_vfs_node *node)
+{
+    const struct lwext4_node *live=(const struct lwext4_node *)node;
+    return __atomic_load_n(&live->delalloc.fresh_extent,__ATOMIC_RELAXED);
+}
+
 static bool ext4_backend_writeback_growth(struct kernel_vfs_node *node, uint64_t start)
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
@@ -3945,6 +3965,8 @@ static void initialize_backend(void)
     ops->read_directory = ext4_backend_read_directory;
     ops->pread = ext4_backend_pread;
     ops->writeback = ext4_backend_writeback;
+    ops->writeback_small_files = ext4_backend_writeback_small_files;
+    ops->writeback_small_candidate = ext4_backend_writeback_small_candidate;
     ops->writeback_mapped = ext4_backend_writeback_mapped;
     ops->writeback_growth = ext4_backend_writeback_growth;
     ops->direct_io = ext4_backend_direct_io;

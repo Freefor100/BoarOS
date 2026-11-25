@@ -8,6 +8,7 @@
 struct ext4_fs;
 struct jbd_trans;
 struct ext4_inode_goal;
+struct ext4_small_writeback;
 RB_HEAD(ext4_inode_goal_tree, ext4_inode_goal);
 TAILQ_HEAD(ext4_inode_goal_queue, ext4_inode_goal);
 enum ext4_resource_kind {
@@ -33,6 +34,7 @@ struct ext4_operation {
     struct ext4_delalloc *delalloc;
     struct file_write_span *delalloc_spans;
     unsigned delalloc_span_count;
+    struct ext4_small_writeback *small_writeback;
     uint64_t delalloc_credit, delalloc_used, delalloc_extent_used;
     enum ext4_extent_allocation extent_allocation;
 

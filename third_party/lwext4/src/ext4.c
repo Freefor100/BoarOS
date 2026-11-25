@@ -206,7 +206,7 @@ static struct ext4_delalloc_chunk *delalloc_find(struct ext4_delalloc *da, uint3
 static uint64_t delalloc_range(struct ext4_delalloc *da,uint64_t first,uint64_t last,bool clear)
 {
     if (first>=last) return 0;
-    da->fresh_extent=false;
+    __atomic_store_n(&da->fresh_extent,false,__ATOMIC_RELAXED);
     struct ext4_delalloc_chunk find={.key=first>>6};
     struct ext4_delalloc_chunk *chunk=RB_NFIND(ext4_delalloc_tree,&da->tree,&find);
     uint64_t count=0;
@@ -247,11 +247,32 @@ static uint64_t delalloc_spans(struct ext4_delalloc *da,
     }
     return total;
 }
+struct ext4_small_writeback_result {
+    uint64_t size;
+    struct ext4_timestamp times[3];
+    unsigned fields;
+};
+
+struct ext4_small_writeback {
+    ext4_file *const *files;
+    struct file_write_span *spans;
+    unsigned prepared;
+    struct ext4_small_writeback_result results[EXT4_SMALL_WRITEBACK_MAX];
+};
+
 static uint64_t delalloc_publish(struct ext4_operation *operation)
 {
-    if (!operation->delalloc) return 0;
-    uint64_t count=delalloc_spans(operation->delalloc,operation->delalloc_spans,
-        operation->delalloc_span_count,operation->fs->bdev->lg_bsize,true);
+    unsigned block=operation->fs->bdev->lg_bsize;
+    uint64_t count=0;
+    if (operation->small_writeback) {
+        const struct ext4_small_writeback *batch=operation->small_writeback;
+        for (unsigned i=0;i<batch->prepared;i++)
+            count+=delalloc_spans(batch->files[i]->delalloc,&batch->spans[i],1,block,true);
+        operation->small_writeback=NULL;
+    } else if (operation->delalloc)
+        count=delalloc_spans(operation->delalloc,operation->delalloc_spans,
+            operation->delalloc_span_count,block,true);
+    else return 0;
     if (count!=operation->delalloc_credit)__builtin_trap();
     return count;
 }
@@ -4521,7 +4542,7 @@ int ext4_file_reserve_write(ext4_file *file,uint64_t offset,size_t length,size_t
     /* Creation already initialized and published a valid empty extent root.
      * On that inode, the I/O writer and space-counter guard suffice until a
      * mapping change invalidates this fact through delalloc_range(). */
-    bool fresh_extent=stable_mapping && da->fresh_extent;
+    bool fresh_extent=stable_mapping && __atomic_load_n(&da->fresh_extent,__ATOMIC_RELAXED);
     if (!fresh_extent) EXT4_MP_LOCK(file->mp);
     struct ext4_inode_ref ref;
     bool have_ref=false;
@@ -5744,11 +5765,13 @@ static int ext4_write_spans(ext4_file *file, ext4_file *owner,
 	}
 	if (!blocks) return EOK;
 	struct jbd_journal *journal = file->mp->fs.jbd_journal;
-	bool outer = !ext4_operation_depth(&file->mp->fs);
-	int r = outer ? EOK : ext4_track_nested_file(owner);
+	struct ext4_operation *operation=ext4_current_operation(&file->mp->fs);
+	bool outer=!operation;
+	struct ext4_small_writeback *batch=outer?NULL:operation->small_writeback;
+	int r = outer || batch ? EOK : ext4_track_nested_file(owner);
 	if (r) return r;
 Retry:
-	r = ext4_prepare_growth(file, write_end);
+	r = batch ? EOK : ext4_prepare_growth(file, write_end);
 	if (!r && journal && journal->grouped && outer) {
 		while (!r) {
             struct jbd_journal_reclaim goal;
@@ -5775,7 +5798,8 @@ Retry:
         EXT4_STATE_SCOPE(state,fs);
         /* 在同一次预留遍历中清除即将修改的映射知识；abort 后重新查询。 */
         uint64_t credit=delalloc_spans(file->delalloc,spans,count,block_size,false);
-        if (__atomic_load_n(&file->delalloc->blocks,__ATOMIC_RELAXED)) {
+        if (batch) operation->delalloc_credit+=credit;
+        else if (__atomic_load_n(&file->delalloc->blocks,__ATOMIC_RELAXED)) {
             /* Adapter writeback commits its own operation before returning spans. */
             if (!outer)__builtin_trap();
             struct ext4_operation *operation=ext4_current_operation(fs);
@@ -5926,6 +5950,12 @@ Retry:
             offsetof(struct ext4_inode, change_inode_time), offsetof(struct ext4_inode, ctime_extra), times[2]);
     }
 	file->fsize = ext4_inode_get_size(ext4_fs_super(fs), ref.inode);
+    if (batch && !r) {
+        struct ext4_small_writeback_result *saved=&batch->results[batch->prepared];
+        saved->size=file->fsize;
+        saved->fields=fields;
+        if (fields) memcpy(saved->times,times,sizeof(saved->times));
+    }
 	int cleanup = ext4_fs_put_inode_ref(&ref);
 	if (!r) r = cleanup;
 	r = ext4_file_data_finish(file, r);
@@ -5995,6 +6025,62 @@ static int ext4_fpwrite_batch_mode(ext4_file *file, struct file_write_span *span
 
 int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count)
 { return ext4_fpwrite_batch_mode(file, spans, count, false); }
+
+int ext4_fpwrite_small_files(ext4_file *const *files, struct file_write_span *spans, unsigned count)
+{
+    if (count<2 || count>EXT4_SMALL_WRITEBACK_MAX) return EINVAL;
+    struct ext4_mountpoint *mp=files[0]->mp;
+    struct ext4_fs *fs=&mp->fs;
+    EXT4_MP_LOCK(mp);
+    int result=ENOTSUP;
+    if (!fs->jbd_journal || !fs->jbd_journal->grouped ||
+        !ext4_fs_serial_writer(fs) || ext4_current_operation(fs)) goto Unlock;
+    for (unsigned i=0;i<count;i++) {
+        ext4_file *file=files[i];
+        bool pending;
+        if (file->mp!=mp || file->fsize || !file->delalloc ||
+            !__atomic_load_n(&file->delalloc->fresh_extent,__ATOMIC_RELAXED) ||
+            spans[i].offset || !spans[i].size || !spans[i].source.retain) goto Unlock;
+        result=ext4_orphan_truncate_pending(fs,file->inode,&pending);
+        if (result) goto Unlock;
+        result=ENOTSUP;
+        if (pending) goto Unlock;
+    }
+    struct ext4_small_writeback *batch=ext4_malloc(sizeof(*batch));
+    if (!batch) {result=ENOMEM;goto Unlock;}
+    result=ext4_trans_start_mode(mp,false);
+    if (!result) {
+        batch->files=files;
+        batch->spans=spans;
+        batch->prepared=0;
+        ext4_current_operation(fs)->small_writeback=batch;
+        while (batch->prepared<count) {
+            unsigned i=batch->prepared;
+            ext4_file local=*files[i];
+            const struct file_data_source *source;
+            result=ext4_write_spans(&local,files[i],&spans[i],1,false,&source);
+            if (result) break;
+            batch->prepared++;
+        }
+        result=ext4_trans_finish(mp,result);
+        if (!result) {
+            EXT4_STATE_SCOPE(state,fs);
+            for (unsigned i=0;i<count;i++) files[i]->fsize=batch->results[i].size;
+        }
+        for (unsigned i=0;i<batch->prepared;i++) {
+            ext4_file_drain_reservations(files[i]);
+            if (!result && mp->inode_observer.written) {
+                const struct ext4_small_writeback_result *saved=&batch->results[i];
+                mp->inode_observer.written(files[i]->time_owner,saved->fields,saved->times,EOK);
+            }
+        }
+    }
+    ext4_free(batch);
+Unlock:
+    EXT4_MP_UNLOCK(mp);
+    if (result) for (unsigned i=0;i<count;i++) spans[i].written=0;
+    return result;
+}
 
 static int ext4_write_mapped(ext4_file *file, struct file_write_span *spans, unsigned count,
     struct ext4_block_write *writes)

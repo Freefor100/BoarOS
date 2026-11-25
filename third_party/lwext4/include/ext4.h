@@ -241,6 +241,10 @@ int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid, uint32_t pr
  * offset/size advance file size and completion. An ordinary buffer (empty source)
  * is copied into a private version. */
 int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count);
+/* Bounded mount writeback for distinct new files under their inode locks.
+ * An error leaves all spans unaccepted for ordinary per-file retry. */
+#define EXT4_SMALL_WRITEBACK_MAX 8U
+int ext4_fpwrite_small_files(ext4_file *const *files, struct file_write_span *spans, unsigned count);
 /* Called with the adapter's inode I/O qualification. ENOTSUP leaves the
  * entire batch to transactional writeback. */
 int ext4_fpwrite_mapped_batch(ext4_file *file, struct file_write_span *spans, unsigned count);
