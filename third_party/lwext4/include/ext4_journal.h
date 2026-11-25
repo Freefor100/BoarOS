@@ -151,6 +151,7 @@ struct jbd_trans {
 	unsigned reserved_logs;
 	/* Nonzero sequence binds a delta reservation to the actual running group. */
 	uint64_t reservation_group_sequence;
+	uint64_t reservation_group_revision;
 	unsigned ordered_count, revoke_count;
 	bool frozen;
 
@@ -192,6 +193,7 @@ struct jbd_journal {
 	uint64_t quarantined_blocks, quarantined_inodes;
 	struct jbd_memory *memory;
 	uint64_t accepted_sequence, sealed_sequence, durable_sequence, checkpoint_sequence;
+	uint64_t running_revision;
 	uint64_t seal_target;
 	uint64_t sync_join_deadline_ns;
 	ext4_fsblk_t *log_map;
@@ -205,6 +207,7 @@ struct jbd_journal {
 	uint32_t alloc_trans_id;
 
 	uint32_t block_size;
+	uint32_t tags_per_descriptor, entries_per_revoke;
 
 	TAILQ_HEAD(jbd_cp_queue, jbd_trans) cp_queue;
 	RB_HEAD(jbd_block, jbd_block_rec) block_rec_root;

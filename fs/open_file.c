@@ -102,11 +102,19 @@ enum { READ_TRACKED = 1, READ_FORWARD_SEEK = 2 };
 
 static inline int follows_read_end(unsigned state,uint64_t end,uint64_t offset)
 {
-    /* Background lookahead for short forward gaps amortizes 4 KiB demand
-     * reads. A 16 KiB cache page already covers a larger part of the gap. */
-    return end==offset || (BOAROS_PAGE_SIZE==4096U && (state&READ_FORWARD_SEEK) &&
-        offset>end && offset-end<=16384U);
+    /* Small relative seeks can keep the sequential read state. */
+    return end==offset || ((state&READ_FORWARD_SEEK) && offset>end && offset-end<=16384U);
 }
+
+#if BOAROS_PAGE_SIZE > 4096
+int kernel_open_file_read_forward_window(const struct kernel_open_file_description *file,uint64_t offset)
+{
+    unsigned state=__atomic_load_n(&file->read_sequential,__ATOMIC_RELAXED);
+    return (state&READ_FORWARD_SEEK) &&
+        offset>__atomic_load_n(&file->read_end,__ATOMIC_RELAXED) &&
+        kernel_open_file_speculative_read_allowed(file);
+}
+#endif
 
 static uint64_t reset_read_prediction_locked(struct kernel_open_file_description *file)
 {
@@ -245,7 +253,8 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
         KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
         if (file->read_advice!=policy) return;
         uint64_t last_end=file->read_end;
-        int sequential=file->read_sequential && follows_read_end(file->read_sequential,last_end,offset);
+        unsigned state=file->read_sequential;
+        int sequential=state && follows_read_end(state,last_end,offset);
         if (!sequential) {
             cancel=file->readahead_cookie;file->readahead_cookie=0;file->readahead_end=0;file->readahead_pages=initial;
         }
@@ -255,6 +264,12 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
         /* 需求读已装入未对齐末端所在页；从下一整页预读，首个窗口仍须有实际跨页进展。 */
         queue=sequential && next_unread>=previous_end &&
             (previous_end || (end>>BOAROS_PAGE_SHIFT)>(last_end>>BOAROS_PAGE_SHIFT));
+#if BOAROS_PAGE_SIZE > 4096
+        /* A short relative scan fills neighbours in the caller when it
+         * misses. Do not wake a second producer for the same scan. */
+        if ((state&READ_FORWARD_SEEK) && offset>last_end &&
+            count<=BOAROS_PAGE_SIZE-(offset&BOAROS_PAGE_MASK)) queue=0;
+#endif
         pages=file->readahead_pages?file->readahead_pages:initial;
         if (queue && previous_end && pages<maximum) {
             pages*=2;if (pages>maximum) pages=maximum;
@@ -1435,7 +1450,7 @@ enum kernel_open_file_status kernel_open_file_seek_relative(
     struct kernel_open_file_description *file,uint64_t offset)
 {
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
-    if (BOAROS_PAGE_SIZE==4096U && open_file_live(file) && file->kind==KERNEL_OPEN_FILE_KIND_REGULAR) {
+    if (open_file_live(file) && file->kind==KERNEL_OPEN_FILE_KIND_REGULAR) {
         uint64_t cookie=0;
         {
             KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);

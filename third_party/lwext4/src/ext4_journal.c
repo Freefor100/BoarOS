@@ -670,13 +670,7 @@ static int jbd_tag_bytes(struct jbd_fs *jbd_fs);
 static unsigned jbd_log_images_needed(const struct jbd_journal *journal,
 	unsigned payloads, unsigned revokes, bool commit)
 {
-	struct jbd_fs *fs = journal->jbd_fs;
-	unsigned tail = jbd_has_csum(&fs->sb) ? sizeof(struct jbd_block_tail) : 0;
-	unsigned tags = (journal->block_size - sizeof(struct jbd_bhdr) - tail - UUID_SIZE) /
-		jbd_tag_bytes(journal->jbd_fs);
-	unsigned record = JBD_HAS_INCOMPAT_FEATURE(&fs->sb, JBD_FEATURE_INCOMPAT_64BIT) ? 8 : 4;
-	unsigned entries = (journal->block_size - sizeof(struct jbd_revoke_header) - tail) / record;
-	if (!tags || !entries) __builtin_trap();
+	unsigned tags = journal->tags_per_descriptor, entries = journal->entries_per_revoke;
 	return payloads / tags + (payloads % tags != 0) +
 		revokes / entries + (revokes % entries != 0) + commit;
 }
@@ -684,7 +678,7 @@ static unsigned jbd_log_images_needed(const struct jbd_journal *journal,
 
 static int jbd_group_requirements(struct jbd_journal *journal,
     struct jbd_trans *running, struct jbd_trans *operation,
-    unsigned *credits, unsigned *images);
+    unsigned *credits);
 
 /* STATE protects credits, not wire buffers. A paused preparer therefore
  * cannot lend storage or an unclaimed ring address to the commit consumer. */
@@ -698,9 +692,8 @@ static int jbd_reserve_logs(struct jbd_trans *trans, bool serial_writer)
     if (payloads >= capacity || images >= capacity - payloads) return ENOSPC;
     unsigned count = payloads + images;
     if (journal->grouped && serial_writer && journal->running) {
-        unsigned combined, combined_images;
-        int result = jbd_group_requirements(journal, journal->running, trans,
-            &combined, &combined_images);
+        unsigned combined;
+        int result = jbd_group_requirements(journal, journal->running, trans, &combined);
         if (result) {
             /* This operation fits alone; draining the current group can make
              * room. Preserve that distinction through abort to its caller. */
@@ -710,6 +703,7 @@ static int jbd_reserve_logs(struct jbd_trans *trans, bool serial_writer)
         if (combined < journal->running->reserved_logs) __builtin_trap();
         count = combined - journal->running->reserved_logs;
         trans->reservation_group_sequence = journal->running->sequence;
+        trans->reservation_group_revision = journal->running_revision;
     }
     unsigned available = jbd_log_free_blocks(journal);
     if (journal->log_reserved > available) __builtin_trap();
@@ -1570,6 +1564,13 @@ int jbd_journal_start(struct jbd_fs *jbd_fs,
 	journal->committed_id = journal->trans_id - 1;
 
 	journal->block_size = jbd_get32(&jbd_fs->sb, blocksize);
+	unsigned tail = jbd_has_csum(&jbd_fs->sb) ? sizeof(struct jbd_block_tail) : 0;
+	unsigned record = JBD_HAS_INCOMPAT_FEATURE(&jbd_fs->sb, JBD_FEATURE_INCOMPAT_64BIT) ? 8 : 4;
+	journal->tags_per_descriptor =
+		(journal->block_size - sizeof(struct jbd_bhdr) - tail - UUID_SIZE) / jbd_tag_bytes(jbd_fs);
+	journal->entries_per_revoke =
+		(journal->block_size - sizeof(struct jbd_revoke_header) - tail) / record;
+	if (!journal->tags_per_descriptor || !journal->entries_per_revoke) return EUCLEAN;
     r = jbd_memory_start(journal, journal->block_size);
     if (r) return r;
 
@@ -1767,7 +1768,7 @@ jbd_trans_block_rec_lookup(struct jbd_journal *journal,
  * for each of its LBAs and revokes; duplicate private changes add no record. */
 static int jbd_group_requirements(struct jbd_journal *journal,
     struct jbd_trans *running, struct jbd_trans *operation,
-    unsigned *credits, unsigned *images)
+    unsigned *credits)
 {
     unsigned payloads = running->data_cnt, revokes = running->revoke_count;
     uint32_t capacity = jbd_get32(&journal->jbd_fs->sb, maxlen) - journal->first;
@@ -1786,9 +1787,9 @@ static int jbd_group_requirements(struct jbd_journal *journal,
         if (revokes == UINT32_MAX) return ENOSPC;
         revokes++;
     }
-    *images = jbd_log_images_needed(journal, payloads, revokes, true);
-    if (payloads >= capacity || *images >= capacity - payloads) return ENOSPC;
-    *credits = payloads + *images;
+    unsigned images = jbd_log_images_needed(journal, payloads, revokes, true);
+    if (payloads >= capacity || images >= capacity - payloads) return ENOSPC;
+    *credits = payloads + images;
     return EOK;
 }
 
@@ -3269,16 +3270,21 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 	}
 	struct jbd_trans *running = journal->running;
 	if (!running && journal->accepted_sequence == UINT64_MAX) return EOVERFLOW;
+	if (running && journal->running_revision == UINT64_MAX) return EOVERFLOW;
 	if (operation->reservation_group_sequence) {
 		/* The sequence is a reservation token, not a reference. A public
 		 * preparer can release its qualification before accepting: reject a
 		 * changed target before touching any accepted metadata or its owner. */
 		if (!ext4_fs_serial_writer(journal->jbd_fs->inode_ref.fs) || !running ||
 		    running->sequence != operation->reservation_group_sequence) return EAGAIN;
-		unsigned required, required_images;
-		if (jbd_group_requirements(journal, running, operation, &required, &required_images) ||
-		    running->reserved_logs + operation->reserved_logs < required)
-			return EAGAIN;
+		/* The same running group may accept another operation between
+		 * prepare and accept. Only that case needs a fresh union. */
+		if (operation->reservation_group_revision != journal->running_revision) {
+			unsigned required;
+			if (jbd_group_requirements(journal, running, operation, &required) ||
+			    running->reserved_logs + operation->reserved_logs < required)
+				return EAGAIN;
+		}
 	} else {
 		unsigned required_images=jbd_log_images_needed(journal,operation->data_cnt,operation->revoke_count,true);
 		if (operation->reserved_logs != operation->data_cnt+required_images)
@@ -3302,7 +3308,9 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 		running->first_dirty_ns = now_ns;
 		running->last_dirty_ns = now_ns;
 		journal->running = running;
+		journal->running_revision = 0;
 	} else {
+		journal->running_revision++;
 		COST_ADD(JOURNAL_MERGED, 1);
 		/* Moving into an empty running tree transfers the existing count.
 		 * Two populated trees become one only after all records have moved. */

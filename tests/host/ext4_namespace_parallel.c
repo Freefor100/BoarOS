@@ -27,6 +27,13 @@ static _Thread_local unsigned attribute_watch,attribute_reads,attribute_writes;
 static uint64_t inode_geometry_block;
 static struct ext4_blockdev *inode_geometry_device;
 int __real_ext4_block_get_range(struct ext4_blockdev *,struct ext4_block *,uint64_t,uint32_t,uint32_t,enum ext4_block_access);
+int __real_ext4_block_get_inode_range(struct ext4_blockdev *,struct ext4_block *,uint64_t,uint32_t,uint32_t,uint32_t);
+int __wrap_ext4_block_get_inode_range(struct ext4_blockdev *device,struct ext4_block *block,
+    uint64_t lba,uint32_t offset,uint32_t length,uint32_t remaining)
+{
+    if (attribute_watch) attribute_reads++;
+    return __real_ext4_block_get_inode_range(device,block,lba,offset,length,remaining);
+}
 int __wrap_ext4_block_get_range(struct ext4_blockdev *device,struct ext4_block *block,
     uint64_t lba,uint32_t offset,uint32_t length,enum ext4_block_access access)
 {
