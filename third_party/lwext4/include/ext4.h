@@ -96,6 +96,7 @@ enum ext4_journal_wait {
 	EXT4_JOURNAL_WAIT_SEALED,
 	EXT4_JOURNAL_WAIT_DURABLE,
 	EXT4_JOURNAL_WAIT_CHECKPOINT,
+	EXT4_JOURNAL_WAIT_ORDERED_RELEASE,
 };
 enum ext4_journal_work {
 	EXT4_JOURNAL_WORK_COMMIT = 1,
@@ -110,6 +111,9 @@ struct ext4_journal_runtime {
 	bool (*join_pending_metadata)(void *context);
 	/* Allow completed writes to private new blocks to precede publication. */
 	bool prewrite_fresh;
+	/* Notify memory waiters after releasing the ordered buffers. The
+	 * commit record still needs its own write and flush. */
+	void (*ordered_released)(void *context);
 };
 int ext4_journal_group_enable(const char *mount_point,
 	const struct ext4_journal_runtime *runtime, size_t memory_limit);

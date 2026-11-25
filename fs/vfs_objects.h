@@ -269,6 +269,8 @@ struct kernel_vfs_backend {
     /* Synchronizes the instance owned by the view. NULL denotes a backend
      * without persistent writeback. */
     int (*sync_filesystem)(struct kernel_vfs_mount *mount);
+    /* Brackets foreground writeback and durability with reconfiguration held. */
+    void (*sync_drain)(struct kernel_vfs_instance *instance, bool entering);
     int (*flush)(struct kernel_vfs_instance *instance);
     int (*symlink)(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *target, const char *path);
     int (*mknod)(struct kernel_vfs_instance *instance, uint64_t parent_inode, const char *path,

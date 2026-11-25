@@ -214,6 +214,7 @@ static int journal_publish_locked(struct lwext4_mount_adapter *adapter)
         if (adapter->published_sealed == journal->sealed_sequence &&
             adapter->published_durable == journal->durable_sequence &&
             adapter->published_checkpoint == journal->checkpoint_sequence &&
+            adapter->published_ordered_release == journal->ordered_release_sequence &&
             adapter->published_error == error) return 0;
         int committed = adapter->published_durable != journal->durable_sequence;
         int reclaimed = adapter->published_checkpoint != journal->checkpoint_sequence;
@@ -221,6 +222,7 @@ static int journal_publish_locked(struct lwext4_mount_adapter *adapter)
         adapter->published_sealed = journal->sealed_sequence;
         adapter->published_durable = journal->durable_sequence;
         adapter->published_checkpoint = journal->checkpoint_sequence;
+        adapter->published_ordered_release = journal->ordered_release_sequence;
         adapter->published_error = error;
         if (committed || failed) {
             wake_checkpoint = !adapter->checkpoint_requested;
@@ -1371,6 +1373,9 @@ static void journal_request(void *context, unsigned work)
 
 static uint64_t journal_reached(const struct lwext4_mount_adapter *adapter, enum ext4_journal_wait kind)
 {
+    if (kind == EXT4_JOURNAL_WAIT_ORDERED_RELEASE)
+        return adapter->published_ordered_release > adapter->published_durable ?
+            adapter->published_ordered_release : adapter->published_durable;
     return kind == EXT4_JOURNAL_WAIT_SEALED ? adapter->published_sealed :
         kind == EXT4_JOURNAL_WAIT_DURABLE ? adapter->published_durable : adapter->published_checkpoint;
 }
@@ -1467,10 +1472,13 @@ static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait
 #if BOAROS_COST_DIAGNOSTICS
     struct kernel_cost_scope elapsed __attribute__((cleanup(kernel_cost_leave))) = kernel_cost_enter(
         kind == EXT4_JOURNAL_WAIT_SEALED ? COST_JOURNAL_WAIT_SEALED_TICKS :
-        kind == EXT4_JOURNAL_WAIT_DURABLE ? COST_JOURNAL_WAIT_DURABLE_TICKS : COST_JOURNAL_WAIT_CHECKPOINT_TICKS);
+        kind == EXT4_JOURNAL_WAIT_DURABLE ? COST_JOURNAL_WAIT_DURABLE_TICKS :
+        kind == EXT4_JOURNAL_WAIT_ORDERED_RELEASE ? COST_JOURNAL_WAIT_ORDERED_RELEASE_TICKS :
+        COST_JOURNAL_WAIT_CHECKPOINT_TICKS);
 #endif
     if (kind == EXT4_JOURNAL_WAIT_SEALED) COST_ADD(JOURNAL_WAIT_SEALED, 1);
     else if (kind == EXT4_JOURNAL_WAIT_DURABLE) COST_ADD(JOURNAL_WAIT_DURABLE, 1);
+    else if (kind == EXT4_JOURNAL_WAIT_ORDERED_RELEASE) COST_ADD(JOURNAL_WAIT_ORDERED_RELEASE, 1);
     else COST_ADD(JOURNAL_WAIT_CHECKPOINT, 1);
     struct lwext4_mount_adapter *adapter = context;
     boaros_lwext4_state_read_lock(&adapter->backend_lock);
@@ -1598,6 +1606,15 @@ static void journal_checkpoint_worker(void *context)
     kernel_io_context_current()->background_reclaim = 0;
 }
 
+static void journal_ordered_released(void *context)
+{
+    struct lwext4_mount_adapter *adapter=context;
+    boaros_lwext4_state_read_lock(&adapter->backend_lock);
+    int changed=journal_publish_locked(adapter);
+    boaros_lwext4_state_unlock(&adapter->backend_lock);
+    if (changed) complete_sync_waiters(adapter);
+}
+
 static int start_journal_workers(struct kernel_vfs_mount *mount)
 {
     if (!mount || !mount->private_data) return -KERNEL_EINVAL;
@@ -1611,7 +1628,8 @@ static int start_journal_workers(struct kernel_vfs_mount *mount)
         struct ext4_journal_runtime runtime = {
             .context=adapter,.now_ns=journal_now,.request=journal_request,.wait=journal_wait,
             .prewrite_fresh=kernel_cpu_get_boot_count()>1,
-            .join_pending_metadata=journal_join_pending_metadata
+            .join_pending_metadata=journal_join_pending_metadata,
+            .ordered_released=journal_ordered_released
         };
         int result = ext4_journal_group_enable(adapter->mount_point, &runtime, budget);
         if (result != EOK) return lwext4_error(result);
@@ -1732,6 +1750,7 @@ static int ext4_backend_remount(struct kernel_vfs_mount *mount, int read_only)
             KERNEL_TASK_LOCK_SCOPE(control,&adapter->journal_control);
             if (adapter->sync_waiters) __builtin_trap();
             adapter->published_sealed=adapter->published_durable=adapter->published_checkpoint=0;
+            adapter->published_ordered_release=0;
         }
         if (!result) {
             int started=start_journal_workers(mount);
@@ -3798,6 +3817,20 @@ static int ext4_backend_flush(struct kernel_vfs_instance *instance)
     return status == KERNEL_BLOCK_STATUS_OK ? 0 :
         status == KERNEL_BLOCK_STATUS_UNSUPPORTED ? -KERNEL_ENOTSUP : -KERNEL_EIO;
 }
+static void ext4_backend_sync_drain(struct kernel_vfs_instance *instance, bool entering)
+{
+    struct lwext4_mount_adapter *adapter=lwext4_instance(instance);
+    bool resume=false;
+    boaros_lwext4_state_lock(&adapter->backend_lock);
+    struct jbd_journal *journal=adapter->device.fs->jbd_journal;
+    if (journal && journal->grouped) {
+        if (entering) journal->sync_drains++;
+        else if (!--journal->sync_drains) resume=true;
+    }
+    boaros_lwext4_state_unlock(&adapter->backend_lock);
+    if (resume) journal_request_flags(adapter,EXT4_JOURNAL_WORK_CHECKPOINT);
+}
+
 static int ext4_backend_sync_filesystem(struct kernel_vfs_mount *mount)
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(mount->private_data);
@@ -3925,6 +3958,7 @@ static void initialize_backend(void)
     ops->complete_data_range = ext4_backend_complete_data_range;
     ops->sync_prepare = ext4_backend_sync_prepare;
     ops->sync_filesystem = ext4_backend_sync_filesystem;
+    ops->sync_drain = ext4_backend_sync_drain;
     ops->flush = ext4_backend_flush;
     ops->symlink = ext4_backend_symlink;
     ops->mknod = ext4_backend_mknod;

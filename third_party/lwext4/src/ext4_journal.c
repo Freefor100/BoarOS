@@ -2807,6 +2807,28 @@ static int jbd_submit_phase(struct jbd_trans *trans, struct jbd_io_phase *phase,
     return result;
 }
 
+static int jbd_release_ordered_after_flush(struct jbd_trans *trans)
+{
+    struct jbd_journal *journal=trans->journal;
+    struct jbd_data *data;
+    unsigned count;
+    {
+        JBD_STATE_SCOPE(journal);
+        int error=jbd_journal_error(journal);
+        if (error) return error;
+        count=trans->ordered_count;
+        data=jbd_trans_detach_data(trans);
+    }
+    jbd_data_free_list(data,count);
+    {
+        JBD_STATE_SCOPE(journal);
+        trans->ordered_count=0;
+        journal->ordered_release_sequence=trans->sequence;
+    }
+    journal->ordered_released(journal->ordered_release_context);
+    return jbd_journal_error(journal);
+}
+
 static int jbd_encode_submit(struct jbd_trans *trans)
 {
     struct jbd_journal *journal = trans->journal;
@@ -2916,6 +2938,14 @@ static int jbd_encode_submit(struct jbd_trans *trans)
         result = ext4_blockdev_flush(bdev);
     }
     if (result) return result;
+    /* The home bytes are now durable. Readers with active borrows still own
+     * them, and the commit record keeps its own later durability barrier. */
+    if (journal->grouped && trans->ordered_count &&
+        __atomic_load_n(&journal->ordered_release_target,__ATOMIC_ACQUIRE)>=trans->sequence &&
+        journal->ordered_released) {
+        result=jbd_release_ordered_after_flush(trans);
+        if (result) return result;
+    }
     uint32_t commit = jbd_wire_next(trans, &used);
     if (used != (unsigned)trans->alloc_blocks) __builtin_trap();
     trans->data_csum = checksum;
@@ -3396,8 +3426,10 @@ bool jbd_journal_checkpoint_ready(const struct jbd_journal *journal)
     JBD_STATE_READ_SCOPE(journal);
 	if (jbd_journal_error(journal) || journal->checkpointing || TAILQ_EMPTY(&journal->cp_queue))
 		return false;
-	if (journal->checkpoint_target > journal->checkpoint_sequence || journal->checkpoint_count >= 4)
+	if (journal->checkpoint_target > journal->checkpoint_sequence)
 		return true;
+	if (journal->sync_drains) return false;
+	if (journal->checkpoint_count >= 4) return true;
 	struct jbd_memory_stats memory;
 	jbd_memory_snapshot(journal->memory, &memory);
     if (memory.used - memory.cached <= memory.limit / 2) return false;

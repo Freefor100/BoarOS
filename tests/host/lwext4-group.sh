@@ -11,6 +11,15 @@ ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_metadata.c" \
     "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
+ordered_release_cases()
+{
+    for fault in 0 1 2; do
+        cp "$work/base.img" "$work/release.img"
+        "$work/probe" "$work/release.img" group-ordered-release "$fault"
+        "$work/probe" "$work/release.img" group-ordered-release-recover "$fault"
+        e2fsck -fn "$work/release.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    done
+}
 "$work/probe" bitmap
 for block in 1024 4096; do
     truncate -s 32M "$work/disk.img"
@@ -18,6 +27,8 @@ for block in 1024 4096; do
     "$work/probe" "$work/disk.img" seed
     "$work/probe" "$work/disk.img" operation-context
     cp "$work/disk.img" "$work/base.img"
+    ordered_release_cases
+    if [ "${GROUP_TEST_CASE:-}" = ordered-release ]; then continue; fi
     for mode in group-checkpoint-background group-ordered-retire-batch group-sync-coalesce group-sync-coalesce-age group-sync-coalesce-force group-checkpoint-batching group-checkpoint-target group-checkpoint-pressure; do
         cp "$work/base.img" "$work/checkpoint.img"
         "$work/probe" "$work/checkpoint.img" "$mode"

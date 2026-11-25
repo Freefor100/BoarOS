@@ -196,6 +196,11 @@ struct jbd_journal {
 	uint64_t running_revision;
 	uint64_t seal_target;
 	uint64_t sync_join_deadline_ns;
+	uint64_t ordered_release_sequence;
+	uint64_t ordered_release_target;
+	void (*ordered_released)(void *context);
+	void *ordered_release_context;
+	unsigned sync_drains;
 	ext4_fsblk_t *log_map;
 	/* Each actual consumer owns one block until its synchronous I/O ends. */
 	struct jbd_image *commit_image, *checkpoint_image;
