@@ -479,6 +479,16 @@ int main(int argc, char **argv)
         CHECK(ext4_dir_mk("/checksum-directory") == EOK);
         ext4_file child;
         CHECK(ext4_fopen(&child, "/checksum-directory/target", "w+") == EOK);
+        for (unsigned i = 0; i < 22; i++) {
+            char name[221], path[256];
+            memset(name, 'x', sizeof(name) - 1);
+            snprintf(name, 12, "seed-%05u-", i);
+            name[11] = 'x';
+            name[220] = 0;
+            snprintf(path, sizeof(path), "/checksum-directory/%s", name);
+            ext4_file padding;
+            CHECK(ext4_fopen(&padding, path, "w+") == EOK && ext4_fclose(&padding) == EOK);
+        }
         ext4_dir directory;
         CHECK(ext4_dir_open(&directory, "/checksum-directory") == EOK);
         directory_reader = directory.f.inode;

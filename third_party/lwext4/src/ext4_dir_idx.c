@@ -358,6 +358,96 @@ static bool ext4_dir_dx_block_verify(struct ext4_inode_ref *inode, const struct 
 
 /****************************************************************************/
 
+static bool ext4_dir_dots_valid(struct ext4_inode_ref *dir, uint8_t *bytes, uint32_t size)
+{
+	struct ext4_sblock *sb = &dir->fs->sb;
+	struct ext4_dir_en *dot = (void *)bytes;
+	struct ext4_dir_en *parent = (void *)(bytes + 12);
+	uint32_t ino = ext4_dir_en_get_inode(parent);
+	uint16_t length = ext4_dir_en_get_entry_len(parent);
+	return ext4_dir_en_get_entry_len(dot) == 12 &&
+		ext4_dir_en_get_name_len(sb, dot) == 1 && dot->name[0] == '.' &&
+		ext4_dir_en_get_inode(dot) == dir->index && length >= 12 &&
+		length <= size - 12 && length % 4 == 0 &&
+		ext4_dir_en_get_name_len(sb, parent) == 2 &&
+		parent->name[0] == '.' && parent->name[1] == '.' &&
+		ino && ino <= ext4_get32(sb, inodes_count);
+}
+
+static void ext4_dir_dx_setup_root(struct ext4_sblock *sb, struct ext4_dir_idx_root *root,
+	ext4_lblk_t leaf)
+{
+	uint32_t block_size = ext4_sb_get_block_size(sb);
+	struct ext4_dir_idx_rinfo *info = &root->info;
+	memset(info, 0, sizeof(*info));
+	ext4_dir_dx_rinfo_set_hash_version(info, ext4_get8(sb, default_hash_version));
+	ext4_dir_dx_root_info_set_info_length(info, sizeof(*info));
+
+	uint32_t entry_space = block_size - sizeof(root->dots) - sizeof(*info);
+	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM))
+		entry_space -= sizeof(struct ext4_dir_idx_tail);
+	struct ext4_dir_idx_climit *climit = (void *)root->en;
+	ext4_dir_dx_climit_set_count(climit, 1);
+	ext4_dir_dx_climit_set_limit(climit, entry_space / sizeof(*root->en));
+	ext4_dir_dx_entry_set_block(root->en, leaf);
+}
+
+int ext4_dir_dx_promote(struct ext4_inode_ref *dir, struct ext4_block *block)
+{
+	struct ext4_fs *fs = dir->fs;
+	struct ext4_sblock *sb = &fs->sb;
+	uint32_t size = ext4_sb_get_block_size(sb);
+	bool checksum = ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM);
+	uint32_t usable = size - (checksum ? sizeof(struct ext4_dir_entry_tail) : 0);
+	if (!ext4_dir_dots_valid(dir, block->data, usable)) return EUCLEAN;
+
+	struct ext4_dir_en *dotdot = (void *)(block->data + 12);
+	uint32_t first = 12 + ext4_dir_en_get_entry_len(dotdot);
+	if (first == usable) return EUCLEAN;
+	uint32_t last = first;
+	for (uint32_t offset = first; offset < usable;) {
+		if (usable - offset < sizeof(struct ext4_fake_dir_entry)) return EUCLEAN;
+		struct ext4_dir_en *entry = (void *)(block->data + offset);
+		uint32_t length = ext4_dir_en_get_entry_len(entry);
+		if (length < sizeof(struct ext4_fake_dir_entry) || length % 4 ||
+		    length > usable - offset || ext4_dir_en_get_name_len(sb, entry) >
+		    length - sizeof(struct ext4_fake_dir_entry)) return EUCLEAN;
+		last = offset;
+		offset += length;
+	}
+
+	ext4_fsblk_t address;
+	ext4_lblk_t logical;
+	int result = ext4_fs_append_inode_dblk(dir, &address, &logical);
+	if (result) return result;
+	struct ext4_block leaf;
+	result = ext4_trans_block_get_noread(fs->bdev, &leaf, address);
+	if (result) return result;
+
+	uint32_t moved = usable - first;
+	memcpy(leaf.data, block->data + first, moved);
+	memset(leaf.data + moved, 0, size - moved);
+	ext4_dir_en_set_entry_len((void *)(leaf.data + last - first), usable - (last - first));
+	if (checksum) ext4_dir_init_entry_tail(EXT4_DIRENT_TAIL(leaf.data, size));
+	result = ext4_dir_mark_dirty(dir, &leaf);
+	int release = ext4_block_set(fs->bdev, &leaf);
+	if (result || release) return result ? result : release;
+
+	/* The former leaf becomes the root. Both images and the inode are
+	 * still private to the enclosing directory transaction. */
+	struct ext4_dir_idx_root *root = (void *)block->data;
+	memset(block->data + sizeof(root->dots), 0, size - sizeof(root->dots));
+	ext4_dir_en_set_entry_len(dotdot, size - 12);
+	ext4_dir_dx_setup_root(sb, root, logical);
+	ext4_dir_set_dx_csum(dir, (void *)block->data);
+	result = ext4_trans_set_block_dirty(block->buf);
+	if (!result) {
+		ext4_inode_set_flag(dir->inode, EXT4_INODE_FLAG_INDEX);
+		dir->dirty = true;
+	}
+	return result;
+}
+
 int ext4_dir_dx_init(struct ext4_inode_ref *dir, struct ext4_inode_ref *parent)
 {
 	/* Load block 0, where will be index root located */
@@ -387,7 +477,6 @@ int ext4_dir_dx_init(struct ext4_inode_ref *dir, struct ext4_inode_ref *parent)
 
 	/* Initialize pointers to data structures */
 	struct ext4_dir_idx_root *root = (void *)block.data;
-	struct ext4_dir_idx_rinfo *info = &(root->info);
 
 	memset(root, 0, sizeof(struct ext4_dir_idx_root));
 	struct ext4_dir_en *de;
@@ -399,29 +488,6 @@ int ext4_dir_dx_init(struct ext4_inode_ref *dir, struct ext4_inode_ref *parent)
 	de = (struct ext4_dir_en *)(root->dots + 1);
 	uint16_t elen = block_size - 12;
 	ext4_dir_write_entry(sb, de, elen, parent, "..", strlen(".."));
-
-	/* Initialize root info structure */
-	uint8_t hash_version = ext4_get8(&dir->fs->sb, default_hash_version);
-
-	ext4_dir_dx_rinfo_set_hash_version(info, hash_version);
-	ext4_dir_dx_rinfo_set_indirect_levels(info, 0);
-	ext4_dir_dx_root_info_set_info_length(info, 8);
-
-	/* Set limit and current number of entries */
-	struct ext4_dir_idx_climit *climit;
-	climit = (struct ext4_dir_idx_climit *)&root->en;
-
-	ext4_dir_dx_climit_set_count(climit, 1);
-
-	uint32_t entry_space;
-	entry_space = block_size - 2 * sizeof(struct ext4_dir_idx_dot_en) -
-			sizeof(struct ext4_dir_idx_rinfo);
-
-	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM))
-		entry_space -= sizeof(struct ext4_dir_idx_tail);
-
-	uint16_t root_limit = entry_space / sizeof(struct ext4_dir_idx_entry);
-	ext4_dir_dx_climit_set_limit(climit, root_limit);
 
 	/* Append new block, where will be new entries inserted in the future */
 	iblock++;
@@ -465,8 +531,7 @@ int ext4_dir_dx_init(struct ext4_inode_ref *dir, struct ext4_inode_ref *parent)
 	}
 
 	/* Connect new block to the only entry in index */
-	struct ext4_dir_idx_entry *entry = root->en;
-	ext4_dir_dx_entry_set_block(entry, iblock);
+	ext4_dir_dx_setup_root(sb, root, iblock);
 
 	ext4_dir_set_dx_csum(dir, (struct ext4_dir_en *)block.data);
 	ext4_trans_set_block_dirty(block.buf);
@@ -1440,19 +1505,11 @@ static int ext4_dir_parent_block(struct ext4_inode_ref *dir, struct ext4_block *
     r = write ? ext4_trans_block_get(dir->fs->bdev, block, home) :
         ext4_block_get(dir->fs->bdev, block, home);
     if (r != EOK) return r;
-    struct ext4_dir_en *dot = (void *)block->data;
     struct ext4_dir_en *parent = (void *)(block->data + 12);
     bool indexed = ext4_inode_has_flag(dir->inode, EXT4_INODE_FLAG_INDEX);
     if (indexed) r = ext4_dir_dx_check(dir, block);
     else if (!ext4_dir_block_csum_verify(dir, block)) r = EUCLEAN;
-    uint32_t ino = ext4_dir_en_get_inode(parent);
-    uint16_t length = ext4_dir_en_get_entry_len(parent);
-    if (r == EOK && (ext4_dir_en_get_entry_len(dot) != 12 ||
-        ext4_dir_en_get_name_len(sb, dot) != 1 || dot->name[0] != '.' ||
-        ext4_dir_en_get_inode(dot) != dir->index || length < 12 || length > size - 12 ||
-        length % 4 || ext4_dir_en_get_name_len(sb, parent) != 2 ||
-        parent->name[0] != '.' || parent->name[1] != '.' ||
-        !ino || ino > ext4_get32(sb, inodes_count))) r = EUCLEAN;
+    if (r == EOK && !ext4_dir_dots_valid(dir, block->data, size)) r = EUCLEAN;
     if (r != EOK) {
         ext4_block_set(dir->fs->bdev, block);
         return r;

@@ -71,6 +71,7 @@ struct ext4_dir_idx_block {
  */
 int ext4_dir_dx_init(struct ext4_inode_ref *dir,
 		     struct ext4_inode_ref *parent);
+int ext4_dir_dx_promote(struct ext4_inode_ref *dir, struct ext4_block *root);
 
 /**@brief Try to find directory entry using directory index.
  * @param result    Output value - if entry will be found,

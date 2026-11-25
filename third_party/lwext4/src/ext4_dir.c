@@ -413,6 +413,31 @@ void ext4_dir_write_entry(struct ext4_sblock *sb, struct ext4_dir_en *en,
 	memcpy(en->name, name, name_len);
 }
 
+int ext4_dir_init_child(struct ext4_inode_ref *dir, struct ext4_inode_ref *parent)
+{
+	struct ext4_fs *fs = dir->fs;
+	struct ext4_sblock *sb = &fs->sb;
+	ext4_fsblk_t address;
+	ext4_lblk_t logical;
+	int result = ext4_fs_append_inode_dblk(dir, &address, &logical);
+	if (result) return result;
+	struct ext4_block block;
+	result = ext4_trans_block_get_noread(fs->bdev, &block, address);
+	if (result) return result;
+	uint32_t size = ext4_sb_get_block_size(sb);
+	uint32_t records = size;
+	memset(block.data, 0, size);
+	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) {
+		records -= sizeof(struct ext4_dir_entry_tail);
+		ext4_dir_init_entry_tail(EXT4_DIRENT_TAIL(block.data, size));
+	}
+	ext4_dir_write_entry(sb, (void *)block.data, 12, dir, ".", 1);
+	ext4_dir_write_entry(sb, (void *)(block.data + 12), records - 12, parent, "..", 2);
+	result = ext4_dir_mark_dirty(dir, &block);
+	int release = ext4_block_set(fs->bdev, &block);
+	return result ? result : release;
+}
+
 int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 		       uint32_t name_len, struct ext4_inode_ref *child)
 {
@@ -454,6 +479,17 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 		/* If adding is successful, function can finish */
 		r = ext4_dir_try_insert_entry(sb, parent, &block, child,
 						name, name_len);
+#if CONFIG_DIR_INDEX_ENABLE
+		if (r == ENOSPC && total_blocks == 1 && ext4_current_trans(fs) &&
+		    ext4_sb_feature_com(sb, EXT4_FCOM_DIR_INDEX)) {
+			r = ext4_dir_dx_promote(parent, &block);
+			int release = ext4_block_set(fs->bdev, &block);
+			if (r) return r;
+			if (release) return release;
+			r = ext4_dir_dx_add_entry(parent, child, name, name_len);
+			return r == EXT4_ERR_BAD_DX_DIR ? EUCLEAN : r;
+		}
+#endif
 		int release = ext4_block_set(fs->bdev, &block);
 		if (r != EOK && r != ENOSPC) return r;
 		if (release != EOK) return release;

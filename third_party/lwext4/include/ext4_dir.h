@@ -320,6 +320,7 @@ int ext4_dir_destroy_result(struct ext4_inode_ref *parent,
 			    struct ext4_dir_search_result *result);
 
 int ext4_dir_mark_dirty(struct ext4_inode_ref *inode_ref, struct ext4_block *block);
+int ext4_dir_init_child(struct ext4_inode_ref *dir, struct ext4_inode_ref *parent);
 int ext4_dir_leaf_get(struct ext4_inode_ref *, struct ext4_block *, ext4_fsblk_t lba,
     bool write);
 

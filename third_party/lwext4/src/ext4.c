@@ -1010,7 +1010,10 @@ static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
 	bool is_dir = ext4_inode_is_type(ext4_fs_super(&mp->fs), ch->inode,
 			       EXT4_INODE_MODE_DIRECTORY);
 	if (is_dir && !rename) {
-
+		if (ext4_current_trans(&mp->fs)) {
+			r = ext4_dir_init_child(ch, parent);
+			if (r != EOK) return r;
+		} else
 #if CONFIG_DIR_INDEX_ENABLE
 		/* Initialize directory index if supported */
 		if (ext4_sb_feature_com(ext4_fs_super(&mp->fs), EXT4_FCOM_DIR_INDEX)) {
@@ -2875,7 +2878,7 @@ static int ext4_trunc_dir(struct ext4_mountpoint *mp,
 
 #if CONFIG_DIR_INDEX_ENABLE
 	/* Initialize directory index if supported */
-	if (ext4_sb_feature_com(ext4_fs_super(&mp->fs), EXT4_FCOM_DIR_INDEX)) {
+	if (ext4_inode_has_flag(dir->inode, EXT4_INODE_FLAG_INDEX)) {
 		r = ext4_dir_dx_init(dir, parent);
 		if (r != EOK)
 			return r;
