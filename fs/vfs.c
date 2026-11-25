@@ -711,6 +711,12 @@ static void statx_mount_info(struct kernel_vfs_mount *mount,
     stat->attributes_mask|=KERNEL_VFS_STATX_ATTR_MOUNT_ROOT;
 }
 
+static inline void clear_mount_expiry(struct kernel_vfs_mount *mount)
+{
+    if (__atomic_load_n(&mount->expiry_mark,__ATOMIC_RELAXED))
+        __atomic_store_n(&mount->expiry_mark,0U,__ATOMIC_RELAXED);
+}
+
 struct vfs_path_walk {
     const struct kernel_vfs_path *start, *root;
     struct kernel_vfs_mount *mount;
@@ -2993,16 +2999,16 @@ static struct kernel_vfs_path *find_walk_location(struct kernel_vfs_mount *mount
 /* Ordinary transient components already borrow a mount from an input
  * path. Name publication does not need to publish a mount location for
  * them. A name that has served as a mountpoint uses the full resolver. */
-static bool lookup_walk_child(struct vfs_path_walk *walk,struct kernel_vfs_path *parent,
+static bool lookup_walk_child(struct vfs_path_walk *walk,struct kernel_vfs_mount *mount,
+    struct kernel_vfs_dentry *parent,
     const char *name,size_t length,struct kernel_vfs_dentry **entry,
     struct kernel_vfs_path **owner,uint32_t *miss)
 {
-    struct kernel_vfs_mount *mount=parent->file.mount;
     if (!walk || !walk->component || walk->resolve ||
         ((!walk->start || walk->start->file.mount!=mount) &&
          (!walk->root || walk->root->file.mount!=mount))) return false;
-    KERNEL_TASK_LOCK_SCOPE(names,&parent->dentry->names_lock);
-    struct kernel_vfs_dentry *child=find_child_name(parent->dentry,name,length);
+    KERNEL_TASK_LOCK_SCOPE(names,&parent->names_lock);
+    struct kernel_vfs_dentry *child=find_child_name(parent,name,length);
     if (child) {
         if (__atomic_load_n(&child->mountpoint_seen,__ATOMIC_ACQUIRE) ||
             __atomic_load_n(&mount->paths_closing,__ATOMIC_ACQUIRE) ||
@@ -3013,28 +3019,29 @@ static bool lookup_walk_child(struct vfs_path_walk *walk,struct kernel_vfs_path 
         if (!__atomic_load_n(&child->recently_used,__ATOMIC_RELAXED))
             __atomic_store_n(&child->recently_used,1,__ATOMIC_RELAXED);
         *owner=walk->component;
-    } else *miss=parent->dentry->names_published;
+    } else *miss=parent->names_published;
     *entry=child;
     return true;
 }
 
-/* The serialized namespace qualification keeps names and permissions valid.
- * VFS state keeps the weak dentries alive until the last one is pinned. */
-static bool stat_cached_prefix(struct vfs_path_walk *walk,struct kernel_vfs_path *start,
-    const char *path,size_t length,size_t begin,size_t end,size_t *next,
-    struct kernel_vfs_path *component)
+struct path_component_span { size_t begin,end,next; };
+
+/* The namespace guard keeps names and permissions valid. The state lock
+ * protects the weak dentries until the final directory reference is taken. */
+static struct kernel_vfs_dentry *stat_cached_prefix(struct vfs_path_walk *walk,
+    struct kernel_vfs_path *start,const char *path,size_t length,struct path_component_span *part)
 {
     struct kernel_vfs_mount *mount=start->file.mount;
     struct kernel_vfs_instance *instance=mount->private_data;
+    size_t begin=part->begin,end=part->end,cursor=part->next;
     if (namespace_is_parallel(instance) || !instance->ops->owns_dentry_names ||
         !instance->ops->search_cached || length-begin>256U ||
-        (instance->ops->error && instance->ops->error(instance))) return false;
+        (instance->ops->error && instance->ops->error(instance))) return NULL;
 
     const struct kernel_credentials *cred=kernel_credentials_current();
-    size_t cursor=*next,accepted=begin;
     struct kernel_vfs_dentry *parent=start->dentry;
     KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
-    if (__atomic_load_n(&mount->paths_closing,__ATOMIC_ACQUIRE)) return false;
+    if (__atomic_load_n(&mount->paths_closing,__ATOMIC_ACQUIRE)) return NULL;
     for (unsigned i=0;i<4 && cursor<length;i++) {
         size_t count=end-begin;
         struct kernel_vfs_node *node=parent->file.private_data;
@@ -3047,16 +3054,142 @@ static bool stat_cached_prefix(struct vfs_path_walk *walk,struct kernel_vfs_path
             child==mount->root_dentry || child==walk->root->dentry) break;
         if (!__atomic_load_n(&child->recently_used,__ATOMIC_RELAXED))
             __atomic_store_n(&child->recently_used,1,__ATOMIC_RELAXED);
-        parent=child;accepted=cursor;
+        parent=child;
         begin=cursor;
         while (cursor<length && path[cursor]!='/') cursor++;
         end=cursor;
         while (cursor<length && path[cursor]=='/') cursor++;
     }
-    if (parent==start->dentry) return false;
-    path_bind(component,mount,parent,1,true);
-    *next=accepted;
-    return true;
+    if (parent==start->dentry) return NULL;
+    if (dentry_acquire(parent)) __builtin_trap();
+    *part=(struct path_component_span){begin,end,cursor};
+    return parent;
+}
+
+static int lookup_named_child(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *parent,
+    const char *name,size_t name_length,struct kernel_vfs_path **owner,
+    struct vfs_path_walk *walk,bool parsed,bool cross_mount,const struct vfs_walk_stat *query)
+{
+    struct kernel_vfs_node *directory=parent->file.private_data;
+    if (directory->unlinked) return -KERNEL_ENOENT;
+    if (!parsed) for (size_t i=0;i<name_length;i++)
+        if (name[i]=='/' || !name[i]) return -KERNEL_EINVAL;
+    int result;
+    struct kernel_vfs_instance *instance=mount->private_data;
+    struct kernel_vfs_dentry *entry=NULL;
+    uint32_t miss=UINT32_MAX;
+    if (instance->ops->owns_dentry_names) {
+        /* The held parent qualification spans backend mutation and dentry
+         * publication. A retained positive name needs no second disk lookup;
+         * pseudo-filesystems with independent name changes still revalidate. */
+        int covered = 0;
+        if (!lookup_walk_child(walk,mount,parent,name,name_length,&entry,owner,&miss)) {
+            KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+            entry=find_path(instance,parent,name,name_length);
+            if (entry) {
+                if (mount->root_path &&
+                    (__atomic_load_n(&mount->root_path->references,__ATOMIC_ACQUIRE) & VFS_PATH_CLOSING))
+                    return -KERNEL_EBUSY;
+                struct kernel_vfs_path *location = find_walk_location(mount, entry, walk);
+                if (location) {
+                    result = kernel_vfs_path_acquire(location);
+                    if (result) return result;
+                    *owner = location;
+                    covered = location->mounted_here != NULL;
+                } else if (walk && walk->component) {
+                    if (walk->component->references) __builtin_trap();
+                    path_bind_component(walk, mount, entry);
+                    *owner = walk->component;
+                } else if (dentry_acquire(entry)) __builtin_trap();
+            } else miss=parent->names_published;
+        }
+        if (entry) {
+            result=instance->ops->error ? instance->ops->error(instance) : 0;
+            if (*owner) {
+                if (!result && covered && cross_mount)
+                    result=enter_mounts(owner,walk ? walk->resolve : 0);
+                if (result && kernel_vfs_path_release(owner)) __builtin_trap();
+                return result;
+            }
+            if (result) {dentry_release(&entry);return result;}
+            /* We just looked for a mount location under state protection.
+             * Only recheck when publishing a new wrapper: another lookup
+             * or a mount operation can have published the same location. */
+            result=path_wrap_new(mount,entry,owner,false);
+            goto Enter;
+        }
+    }
+    uint64_t inode;uint32_t mode=0;
+    struct kernel_vfs_node *stat_node=NULL;
+    uint64_t node_publications=0;
+    bool stat_leaf=false;
+    /* Owned names retain real positive objects. A backend that initializes
+     * the inode itself needs no speculative child mode read before opening. */
+    char canonical[256];
+    if (!instance->ops->lookup_open) {
+        uint32_t *lookup_mode=instance->ops->owns_dentry_names ? NULL : &mode;
+        if (instance->ops->lookup_node)
+            result=instance->ops->lookup_node(directory,name,name_length,&inode,lookup_mode);
+        else result=instance->ops->lookup(instance,directory->inode,name,name_length,&inode,lookup_mode);
+        if (result) return result;
+        if (instance->ops->entry_name) {
+            result=instance->ops->entry_name(instance,inode,canonical,sizeof(canonical));
+            if (result) return result;
+            name=canonical;name_length=strlen(name);
+            miss=UINT32_MAX;
+        }
+        struct kernel_vfs_dentry *retired=NULL;
+        {
+            KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
+            if (!name_still_missing(parent,miss))
+                entry=find_path(instance,parent,name,name_length);
+            if (entry && kernel_vfs_file_inode(&entry->file)!=inode) {retired=detach_path(entry);entry=NULL;}
+            if (entry && dentry_acquire(entry)) __builtin_trap();
+            if (!entry) miss=parent->names_published;
+            /* A published mountpoint retains its dentry. An unrepresented
+             * name can complete a metadata query without a new path owner. */
+            stat_leaf=!entry && query && instance->ops->stat_inode &&
+                !__atomic_load_n(&mount->paths_closing,__ATOMIC_ACQUIRE);
+            if (stat_leaf) {
+                stat_node=kernel_vfs_node_find(instance,inode);
+                node_publications=__atomic_load_n(&instance->node_publications,__ATOMIC_RELAXED);
+                if (stat_node && kernel_vfs_node_acquire(stat_node)) {
+                    stat_leaf=false;
+                    stat_node=NULL;
+                }
+            }
+        }
+        if (retired) dentry_release(&retired);
+    }
+    if (!entry) {
+        if (stat_leaf) {
+            result=instance->ops->stat_inode(mount,directory,inode,stat_node,
+                node_publications,query->stat);
+            release_node_pin(&stat_node);
+            if (result!=-KERNEL_ENOTSUP) {
+                if (!result && query->extra) statx_mount_info(mount,query->stat,query->extra);
+                if (!result) clear_mount_expiry(mount);
+                return result;
+            }
+        }
+        enum kernel_heap_status allocation=kernel_heap_allocate_zeroed(instance->heap,1,sizeof(*entry)+name_length+1,(void **)&entry);
+        if (allocation) return allocation==KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+        entry->heap=instance->heap;entry->references=1;entry->parent=parent;
+        if (dentry_acquire(entry->parent)) __builtin_trap();
+        entry->name=entry->initial_name;
+        memcpy(entry->name,name,name_length);
+        entry->name[name_length]=0;
+        result=instance->ops->lookup_open ?
+            instance->ops->lookup_open(directory,name,name_length,&entry->file) :
+            vfs_open_inode_raw(&instance->backend_mount,inode,mode,&entry->file);
+        if (result) {dentry_release(&entry->parent);kernel_heap_release(entry->heap,entry);return result;}
+        result=register_path(&entry,name_length,miss);if (result) return result;
+    }
+    result=path_walk_wrap(mount,entry,owner,walk);
+Enter:
+    dentry_release(&entry);
+    if (!result && cross_mount) {result=enter_mounts(owner,walk ? walk->resolve : 0);if (result) (void)kernel_vfs_path_release(owner);}
+    return result;
 }
 
 static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
@@ -3093,125 +3226,7 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
         }
         result=path_walk_wrap(mount,ancestor,owner,walk);dentry_release(&ancestor);return result;
     }
-    if (((struct kernel_vfs_node *)parent->file.private_data)->unlinked) return -KERNEL_ENOENT;
-    if (!parsed) for (size_t i=0;i<name_length;i++)
-        if (name[i]=='/' || !name[i]) return -KERNEL_EINVAL;
-    struct kernel_vfs_instance *instance=mount->private_data;
-    struct kernel_vfs_dentry *entry=NULL;
-    uint32_t miss=UINT32_MAX;
-    if (instance->ops->owns_dentry_names) {
-        /* The held parent qualification spans backend mutation and dentry
-         * publication. A retained positive name needs no second disk lookup;
-         * pseudo-filesystems with independent name changes still revalidate. */
-        int covered = 0;
-        if (!lookup_walk_child(walk,parent,name,name_length,&entry,owner,&miss)) {
-            KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
-            entry=find_path(instance,parent->dentry,name,name_length);
-            if (entry) {
-                if (mount->root_path &&
-                    (__atomic_load_n(&mount->root_path->references,__ATOMIC_ACQUIRE) & VFS_PATH_CLOSING))
-                    return -KERNEL_EBUSY;
-                struct kernel_vfs_path *location = find_walk_location(mount, entry, walk);
-                if (location) {
-                    result = kernel_vfs_path_acquire(location);
-                    if (result) return result;
-                    *owner = location;
-                    covered = location->mounted_here != NULL;
-                } else if (walk && walk->component) {
-                    if (walk->component->references) __builtin_trap();
-                    path_bind_component(walk, mount, entry);
-                    *owner = walk->component;
-                } else if (dentry_acquire(entry)) __builtin_trap();
-            } else miss=parent->dentry->names_published;
-        }
-        if (entry) {
-            result=instance->ops->error ? instance->ops->error(instance) : 0;
-            if (*owner) {
-                if (!result && covered && cross_mount)
-                    result=enter_mounts(owner,walk ? walk->resolve : 0);
-                if (result && kernel_vfs_path_release(owner)) __builtin_trap();
-                return result;
-            }
-            if (result) {dentry_release(&entry);return result;}
-            /* We just looked for a mount location under state protection.
-             * Only recheck when publishing a new wrapper: another lookup
-             * or a mount operation can have published the same location. */
-            result=path_wrap_new(mount,entry,owner,false);
-            goto Enter;
-        }
-    }
-    uint64_t inode;uint32_t mode=0;
-    struct kernel_vfs_node *stat_node=NULL;
-    uint64_t node_publications=0;
-    bool stat_leaf=false;
-    /* Owned names retain real positive objects. A backend that initializes
-     * the inode itself needs no speculative child mode read before opening. */
-    char canonical[256];
-    if (!instance->ops->lookup_open) {
-        uint32_t *lookup_mode=instance->ops->owns_dentry_names ? NULL : &mode;
-        if (instance->ops->lookup_node)
-            result=instance->ops->lookup_node(parent->file.private_data,name,name_length,&inode,lookup_mode);
-        else result=instance->ops->lookup(instance,kernel_vfs_path_inode(parent),name,name_length,&inode,lookup_mode);
-        if (result) return result;
-        if (instance->ops->entry_name) {
-            result=instance->ops->entry_name(instance,inode,canonical,sizeof(canonical));
-            if (result) return result;
-            name=canonical;name_length=strlen(name);
-            miss=UINT32_MAX;
-        }
-        struct kernel_vfs_dentry *retired=NULL;
-        {
-            KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
-            if (!name_still_missing(parent->dentry,miss))
-                entry=find_path(instance,parent->dentry,name,name_length);
-            if (entry && kernel_vfs_file_inode(&entry->file)!=inode) {retired=detach_path(entry);entry=NULL;}
-            if (entry && dentry_acquire(entry)) __builtin_trap();
-            if (!entry) miss=parent->dentry->names_published;
-            /* A published mountpoint retains its dentry. An unrepresented
-             * name can complete a metadata query without a new path owner. */
-            stat_leaf=!entry && query && instance->ops->stat_inode &&
-                !__atomic_load_n(&mount->paths_closing,__ATOMIC_ACQUIRE);
-            if (stat_leaf) {
-                stat_node=kernel_vfs_node_find(instance,inode);
-                node_publications=__atomic_load_n(&instance->node_publications,__ATOMIC_RELAXED);
-                if (stat_node && kernel_vfs_node_acquire(stat_node)) {
-                    stat_leaf=false;
-                    stat_node=NULL;
-                }
-            }
-        }
-        if (retired) dentry_release(&retired);
-    }
-    if (!entry) {
-        if (stat_leaf) {
-            result=instance->ops->stat_inode(mount,parent->file.private_data,inode,stat_node,
-                node_publications,query->stat);
-            release_node_pin(&stat_node);
-            if (result!=-KERNEL_ENOTSUP) {
-                if (!result && query->extra) statx_mount_info(mount,query->stat,query->extra);
-                if (!result && __atomic_load_n(&mount->expiry_mark,__ATOMIC_RELAXED))
-                    __atomic_store_n(&mount->expiry_mark,0U,__ATOMIC_RELAXED);
-                return result;
-            }
-        }
-        enum kernel_heap_status allocation=kernel_heap_allocate_zeroed(instance->heap,1,sizeof(*entry)+name_length+1,(void **)&entry);
-        if (allocation) return allocation==KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
-        entry->heap=instance->heap;entry->references=1;entry->parent=parent->dentry;
-        if (dentry_acquire(entry->parent)) __builtin_trap();
-        entry->name=entry->initial_name;
-        memcpy(entry->name,name,name_length);
-        entry->name[name_length]=0;
-        result=instance->ops->lookup_open ?
-            instance->ops->lookup_open(parent->file.private_data,name,name_length,&entry->file) :
-            vfs_open_inode_raw(&instance->backend_mount,inode,mode,&entry->file);
-        if (result) {dentry_release(&entry->parent);kernel_heap_release(entry->heap,entry);return result;}
-        result=register_path(&entry,name_length,miss);if (result) return result;
-    }
-    result=path_walk_wrap(mount,entry,owner,walk);
-Enter:
-    dentry_release(&entry);
-    if (!result && cross_mount) {result=enter_mounts(owner,walk ? walk->resolve : 0);if (result) (void)kernel_vfs_path_release(owner);}
-    return result;
+    return lookup_named_child(mount,parent->dentry,name,name_length,owner,walk,parsed,cross_mount,query);
 }
 
 static int path_lookup_locked(struct kernel_vfs_path *parent,const char *name,size_t length,struct kernel_vfs_path **owner)
@@ -3353,11 +3368,40 @@ static int resolve_object(struct kernel_vfs_path *start,
             result = -KERNEL_ENAMETOOLONG;
             goto Finish;
         }
-        if (borrowed && pending==path && walk->stat && !walk->resolve && suffix && !trailing_only &&
-            stat_cached_prefix(walk,current,pending,length,begin,end,&cursor,&components[0])) {
-            current=&components[0];
-            borrowed=false;
-            continue;
+        if (borrowed && pending==path && walk->stat && !walk->resolve && suffix && !trailing_only) {
+            struct path_component_span part={begin,end,cursor};
+            struct kernel_vfs_dentry *prefix=stat_cached_prefix(walk,current,pending,length,&part);
+            if (prefix) {
+                struct kernel_vfs_mount *mount=current->file.mount;
+                const char *leaf=pending+part.begin;
+                size_t count=part.end-part.begin;
+                if (part.end==length && count<=255U &&
+                    !(leaf[0]=='.' && (count==1 || (count==2 && leaf[1]=='.')))) {
+                    result=inode_permission(prefix->file.private_data,KERNEL_VFS_MAY_EXEC,1,false);
+                    if (!result) {
+                        walk->component=walk->terminal;
+                        result=lookup_named_child(mount,prefix,leaf,count,&next,walk,true,true,walk->stat);
+                        walk->component=NULL;
+                    }
+                    if (result || !next || next->file.mount!=mount || !follow_final ||
+                        (next->file.mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFLNK) {
+                        clear_mount_expiry(mount);
+                        dentry_release(&prefix);
+                        if (!result) *owner=next;
+                        goto Finish;
+                    }
+                }
+                path_bind(&components[0],mount,prefix,1,true);
+                dentry_release(&prefix);
+                current=&components[0];
+                borrowed=false;
+                if (!next) { cursor=part.begin;continue; }
+                cursor=part.next;
+                end=part.end;
+                suffix=0;
+                trailing_only=1;
+                goto HaveComponent;
+            }
         }
         if (current == root && component_length == 2U &&
             pending[begin] == '.' && pending[begin + 1U] == '.') {
@@ -3394,6 +3438,7 @@ static int resolve_object(struct kernel_vfs_path *start,
             result = 0;
             goto Finish;
         }
+HaveComponent:
         if (result != 0 || !next) goto Finish;
         if (next->file.mount!=current->file.mount) {
             if (suffix && (next->file.mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFDIR &&
@@ -3834,8 +3879,7 @@ static int path_release(struct kernel_vfs_path **owner, bool keep_location, bool
     if (keep_location && (path->transient || path->borrow_mount)) __builtin_trap();
     struct kernel_vfs_mount *mount=path->file.mount;
     /* Clear the mark before dropping the reference that makes expiry busy. */
-    if (!preserve_expiry && __atomic_load_n(&mount->expiry_mark,__ATOMIC_RELAXED))
-        __atomic_store_n(&mount->expiry_mark,0U,__ATOMIC_RELAXED);
+    if (!preserve_expiry) clear_mount_expiry(mount);
     if (path->transient) {
         /* Resolver-local storage is never in the mount's weak path index. */
         if (!path->references) __builtin_trap();
