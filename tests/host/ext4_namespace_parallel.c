@@ -232,7 +232,14 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
     assert(!kernel_vfs_path_xattr(held,KERNEL_XATTR_REMOVE,KERNEL_ACL_ACCESS,NULL,0,0));
     previous=kernel_credentials_override(lower);
     assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after));
+    assert(kernel_credentials_override(previous)==lower);
+    struct kernel_vfs_path *outer=NULL;
+    assert(!kernel_vfs_path_resolve(root,root,"reuse-parent",1,&outer));
+    assert(!kernel_vfs_path_set_mode(outer,0700));
+    previous=kernel_credentials_override(lower);
+    assert(kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after)==-KERNEL_EACCES);
     assert(kernel_credentials_override(previous)==lower);kernel_credentials_put(lower);
+    assert(!kernel_vfs_path_set_mode(outer,0755) && !kernel_vfs_path_release(&outer));
     assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child",1,&after) && (after.mode&0777)==0711);
     assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/../child/file",1,&after) && after.ino==before.ino);
     assert(!kernel_vfs_symlink_at(root,root,"file","reuse-parent/child/relative"));
@@ -240,14 +247,15 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
     assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/relative",0,&after) &&
         (after.mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFLNK);
     assert(kernel_vfs_stat_at(root,root,"reuse-parent/child/relative/",1,&after)==-KERNEL_ENOTDIR);
-    struct kernel_vfs_mount *cover=NULL;
-    assert(!kernel_tmpfs_create(instance->heap,0,"",&cover) && !kernel_vfs_mount_attach(cover,held));
-    assert(kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after)==-KERNEL_ENOENT);
-    assert(!kernel_vfs_mount_prepare_detach(cover,NULL) && !kernel_vfs_mount_detach(cover,NULL) &&
-        !kernel_vfs_unmount(cover));
     assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after) && after.ino==before.ino);
     assert(!kernel_vfs_rename_at(root,root,root,"reuse-parent","reuse-renamed",0));
     assert(kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after)==-KERNEL_ENOENT);
+    assert(!kernel_vfs_stat_at(root,root,"reuse-renamed/child/file",1,&after) && after.ino==before.ino);
+    struct kernel_vfs_mount *cover=NULL;
+    assert(!kernel_tmpfs_create(instance->heap,0,"",&cover) && !kernel_vfs_mount_attach(cover,held));
+    assert(kernel_vfs_stat_at(root,root,"reuse-renamed/child/file",1,&after)==-KERNEL_ENOENT);
+    assert(!kernel_vfs_mount_prepare_detach(cover,NULL) && !kernel_vfs_mount_detach(cover,NULL) &&
+        !kernel_vfs_unmount(cover));
     assert(!kernel_vfs_stat_at(root,root,"reuse-renamed/child/file",1,&after) && after.ino==before.ino);
     (void)kernel_vfs_reclaim_clean(instance->heap->page_allocator,1);
     assert(!instance->dentry_cache_count);
