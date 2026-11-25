@@ -823,6 +823,10 @@ static void event_filtering(void)
     selected_task=0;for(unsigned i=0;i<2;i++)assert(!kernel_wait_node_remove_sync(&callbacks[i]));
     for (unsigned i=0; i<2; i++) {
         selected_task=&actors[i];
+        if (i==1) {
+            assert(!kernel_wait_cursor_prepare_event(&queue,&cursor,2,0));
+            assert(!queue.borrows && !actors[0].node.references);
+        }
         assert(!kernel_wait_prepare(&queue,0,0,&tokens[i]));
         actors[i].node.readiness_mask=1U<<i;
     }
