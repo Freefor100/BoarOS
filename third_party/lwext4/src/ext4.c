@@ -1561,6 +1561,10 @@ static uint64_t ext4_group_age_deadline(const struct jbd_trans *running)
 	const uint64_t idle_ns = 100000000;
 	if (running->ordered_count || running->revoke_count || !LIST_EMPTY(&running->quarantine))
 		return running->first_dirty_ns + idle_ns;
+	/* Keep repeated background snapshots joinable. An explicit sync target,
+	 * resource pressure or an ordinary metadata operation can seal earlier. */
+	if (running->background_times_only)
+		return running->first_dirty_ns + UINT64_C(5000000000);
 	/* Metadata that keeps arriving can share its current log record. Bound
 	 * both the wait after the last edit and the lifetime of the group. */
 	uint64_t idle = running->last_dirty_ns + idle_ns;
@@ -2493,6 +2497,10 @@ static int ext4_file_set_times_common(ext4_file *file, unsigned fields,
     if (mp->fs.read_only) { r = EROFS; goto Unlock; }
     r = ext4_trans_start_mode(mp, wait);
     if (r != EOK) goto Unlock;
+    if (!publish && !wait) {
+        struct jbd_trans *trans = ext4_current_trans(&mp->fs);
+        if (trans) trans->background_times_only = true;
+    }
     r = ext4_fs_get_inode_ref(&mp->fs, file->inode, &ref);
     if (!publish && mp->inode_observer.snapshot)
         fields = mp->inode_observer.snapshot(file->time_owner, current);

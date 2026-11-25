@@ -76,7 +76,7 @@ static int dma(const void *pointer, uint64_t size, uint64_t *address) { (void)si
 static void hot_read_access(void *argument)
 {
     (void)argument;
-    kernel_vfs_file_accessed(hot_file);
+    kernel_vfs_file_accessed(hot_file, 0);
     uintptr_t irq=riscv_interrupt_save();
     hot_read_done=1;
     check(kernel_wait_queue_wake_one(&hot_read_completion)==KERNEL_SCHEDULER_STATUS_OK,47);
@@ -181,23 +181,26 @@ static void exercise_nojournal_times(struct lwext4_mount_adapter *adapter)
     size_t inode_offset=(unsigned char *)reference.inode-reference.block.data;
     check(ext4_fs_put_inode_ref(&reference)==0,66);
     adapter->locks.unlock(adapter->locks.context);
-    check(kernel_page_cache_invalidate_node(&cache,node)==KERNEL_PAGE_CACHE_STATUS_OK,67);
-    kernel_vfs_file_accessed(&file);
+    check(kernel_page_cache_invalidate_node(&cache,node)==KERNEL_PAGE_CACHE_STATUS_OK &&
+        kernel_vfs_node_acquire(node)==0,67);
+    kernel_vfs_file_accessed(&file, 0);
     check(kernel_vfs_fstat(&file,&expected)==0 &&
         (expected.atime.seconds || expected.atime.nanoseconds) &&
         !node->dirty_cache_pages.count &&
         ((struct lwext4_node *)node)->dirty_fields==EXT4_TIME_ATIME &&
         kernel_vfs_close(&file)==0,68);
-    /* The clean data page was removed above. Only the dirty timestamp pin
-     * keeps this inode alive until the existing mount worker has stored it. */
+    /* Keep an inspection reference across close and observe the timestamp
+     * pin independently of any positive pathname cache reference. */
     check(adapter->journal_started && adapter->dirty_times,69);
+    uint32_t references=__atomic_load_n(&node->references,__ATOMIC_ACQUIRE);
     uint64_t deadline;
     check(kernel_time_deadline_from_monotonic(kernel_time_monotonic_ns()+2000000000,&deadline)==KERNEL_TIME_STATUS_OK,70);
     enum kernel_wait_wake_reason reason;
     while(adapter->dirty_times && riscv_time_read()<deadline)
         check(kernel_scheduler_block_current(&adapter->journal_progress,deadline,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,71);
     check(!adapter->dirty_times,72);
-    for(node=adapter->instance.nodes;node;node=node->next) check(node->inode!=inode,73);
+    check(__atomic_load_n(&node->references,__ATOMIC_ACQUIRE)<references &&
+        !((struct lwext4_node *)node)->dirty_fields && kernel_vfs_node_release(&node)==0,73);
     /* Read the actual inode-table block through the device, bypassing lwext4's
      * metadata cache, before any explicit sync or unmount can save the value. */
     check(block_size==sizeof(actual) && kernel_block_read_at(&device.block,
@@ -236,7 +239,7 @@ static void exercise(void *argument)
     check(kernel_vfs_open(&mount,"/noatime",&noatime)==0 &&
         kernel_vfs_file_set_times(&noatime,noatime_old)==0,63);
     uint64_t noatime_sequence=journal->accepted_sequence;
-    kernel_vfs_file_accessed(&noatime);
+    kernel_vfs_file_accessed(&noatime, 0);
     check(kernel_vfs_fstat(&noatime,&noatime_stat)==0 && noatime_stat.atime.seconds==0 &&
         noatime_stat.atime.nanoseconds==0 && journal->accepted_sequence==noatime_sequence &&
         kernel_vfs_close(&noatime)==0 && kernel_vfs_unlink(&mount,"/noatime")==0,64);
@@ -258,7 +261,7 @@ static void exercise(void *argument)
     struct riscv_virtio_mmio_block_statistics statistics;
     riscv_virtio_mmio_block_get_statistics(&device,&statistics);
     check(statistics.max_inflight>1 && statistics.max_inflight<=8,42);
-    kernel_vfs_file_accessed(&file);
+    kernel_vfs_file_accessed(&file, 0);
     hot_file=&file;
     kernel_wait_queue_init(&hot_read_completion);
     struct kernel_thread_join reader={0};
@@ -290,7 +293,7 @@ static void exercise(void *argument)
     uint64_t before=journal->accepted_sequence;
     for(unsigned repeat=0;repeat<64;repeat++) {
         check(kernel_vfs_file_modified(&file, 0, 1)==0,26);
-        kernel_vfs_file_accessed(&file);
+        kernel_vfs_file_accessed(&file, 0);
     }
     check(journal->accepted_sequence==before,50);
     struct kernel_vfs_stat stat={0}, alias_stat={0};
@@ -314,12 +317,16 @@ static void exercise(void *argument)
     /* A read after a tentative explicit set owns a newer atime. Acceptance
      * must not overwrite it with the earlier transaction's staged value. */
     const struct kernel_vfs_timespec stale_atime[2]={{0,0},{0,KERNEL_VFS_UTIME_OMIT}};
-    check(kernel_vfs_file_set_times(&file,stale_atime)==0 && kernel_vfs_fstat(&file,&stat)==0 &&
-        ext4_transaction_begin(adapter->mount_point)==0 &&
-        ext4_file_set_times(handle,EXT4_TIME_ATIME,explicit)==0,60);
-    kernel_vfs_file_accessed(&file);
-    check(ext4_transaction_end(adapter->mount_point)==0 &&
-        kernel_vfs_fstat(&file,&alias_stat)==0 && alias_stat.atime.seconds!=77,61);
+    {
+        KERNEL_LOCK_SCOPE(mutation);
+        kernel_rwlock_read(&adapter->instance.reconfiguration, &mutation);
+        check(kernel_vfs_file_set_times(&file,stale_atime)==0 && kernel_vfs_fstat(&file,&stat)==0 &&
+            ext4_transaction_begin(adapter->mount_point)==0 &&
+            ext4_file_set_times(handle,EXT4_TIME_ATIME,explicit)==0,60);
+        kernel_vfs_file_accessed(&file, 0);
+        check(ext4_transaction_end(adapter->mount_point)==0 &&
+            kernel_vfs_fstat(&file,&alias_stat)==0 && alias_stat.atime.seconds!=77,61);
+    }
     /* A metadata-only fsync must encode the current RAM values even though
      * every data page was already clean before these writes were announced. */
     check(kernel_vfs_sync(&file,0,&error)==0 &&
@@ -341,11 +348,17 @@ static void exercise(void *argument)
     check(kernel_vfs_close(&alias)==0,57);
     struct kernel_vfs_file time_only={0};
     check(kernel_vfs_create(&mount,"/time-only",0600,&time_only)==0 &&
+        ext4_journal_group_drain(adapter->mount_point)==0 &&
         kernel_vfs_file_modified(&time_only,0,0)==0 &&
         kernel_vfs_fstat(&time_only,&stat)==0 && kernel_vfs_close(&time_only)==0,58);
     uint64_t deadline;
-    check(kernel_time_deadline_from_monotonic(kernel_time_monotonic_ns()+2000000000,&deadline)==KERNEL_TIME_STATUS_OK,27);
     enum kernel_wait_wake_reason reason;
+    check(kernel_time_deadline_from_monotonic(kernel_time_monotonic_ns()+1000000000,&deadline)==KERNEL_TIME_STATUS_OK,98);
+    while (riscv_time_read()<deadline)
+        check(kernel_scheduler_block_current(&adapter->journal_progress,deadline,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,98);
+    check(!adapter->dirty_times && journal->running && journal->running->background_times_only &&
+        journal->durable_sequence<journal->running->sequence,99);
+    check(kernel_time_deadline_from_monotonic(kernel_time_monotonic_ns()+6000000000,&deadline)==KERNEL_TIME_STATUS_OK,27);
     while((adapter->dirty_times || journal->checkpoint_sequence!=journal->accepted_sequence) && riscv_time_read()<deadline)
         check(kernel_scheduler_block_current(&adapter->journal_progress,deadline,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,28);
     check(!adapter->dirty_times && journal->checkpoint_sequence==journal->accepted_sequence,29);
