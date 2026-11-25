@@ -51,6 +51,7 @@ struct lwext4_mount_adapter {
     struct kernel_raw_lock journal_control;
     struct kernel_rwlock journal_service; /* Pause live workers only after draining durable work. */
     uint64_t published_sealed, published_durable, published_checkpoint;
+    uint64_t published_ordered_release;
     int published_error;
 };
 struct lwext4_directory_mapping {

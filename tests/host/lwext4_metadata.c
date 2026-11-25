@@ -1145,6 +1145,98 @@ static void group_ordered_retire_recover(struct ext4_fs *fs)
     CHECK(ext4_fclose(&file)==EOK);
     free(bytes);
 }
+
+struct ordered_release_test {
+    struct jbd_journal *journal;
+    struct owned_file_page *pages;
+    struct jbd_data_borrow reader;
+    uint64_t flushes, durable;
+    unsigned notifications;
+};
+static void group_ordered_released(void *context)
+{
+    struct ordered_release_test *test=context;
+    struct jbd_journal *journal=test->journal;
+    CHECK(!test->notifications++ && disk.flushes==test->flushes+1);
+    CHECK(journal->durable_sequence==test->durable && journal->committing &&
+        journal->ordered_release_sequence==journal->committing->sequence);
+    CHECK(!journal->committing->ordered_count && !test->pages[1].references &&
+        test->pages[0].references==1 && ((const unsigned char *)test->reader.data)[0]==0x85);
+    jbd_journal_release_borrow(&test->reader);
+    CHECK(!test->pages[0].references);
+}
+
+static void group_ordered_release(struct ext4_fs *fs,unsigned fault)
+{
+    ext4_file file;
+    unsigned block=fs->bdev->lg_bsize;
+    size_t count;
+    unsigned char *original=malloc(2*block);
+    CHECK(original && ext4_fopen(&file,"/file","r+")==EOK);
+    memset(original,0x51,2*block);
+    CHECK(ext4_fpwrite(&file,0,original,2*block,&count)==EOK && count==2*block);
+    free(original);
+    struct ext4_timestamp times[3]={{8246,17},{0,0},{0,0}};
+    CHECK(ext4_file_set_times(&file,1,times)==EOK);
+    struct jbd_journal *journal=fs->jbd_journal;
+    struct owned_file_page pages[2];
+    struct ordered_release_test test={.journal=journal,.pages=pages};
+    struct ext4_journal_runtime runtime={.now_ns=group_clock,.context=&test,
+        .ordered_released=group_ordered_released};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    struct file_write_span spans[2];
+    for (unsigned i=0;i<2;i++) {
+        owned_page_init(&pages[i],block,0x85+i);
+        spans[i]=(struct file_write_span){.offset=i*block,.buffer=pages[i].bytes,.size=block,
+            .source={&pages[i],owned_page_retain,owned_page_release,block}};
+    }
+    CHECK(ext4_fpwrite_batch(&file,spans,2)==EOK);
+    for (unsigned i=0;i<2;i++) owned_page_release(&pages[i]);
+    times[0].seconds=9123;
+    CHECK(ext4_file_set_times(&file,1,times)==EOK);
+    struct ext4_inode_ref ref;
+    ext4_fsblk_t home;
+    CHECK(ext4_fs_get_inode_ref_read(fs,file.inode,&ref)==EOK);
+    CHECK(ext4_fs_get_inode_dblk_idx(&ref,0,&home,false)==EOK && home);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    CHECK(jbd_journal_borrow_data(fs,home,&test.reader));
+    test.flushes=disk.flushes;
+    test.durable=journal->durable_sequence;
+    journal->ordered_release_target=journal->accepted_sequence;
+    if (fault) disk.fail_flush=disk.flushes+fault;
+    CHECK(ext4_journal_group_commit("/",true)==(fault?EIO:EOK));
+    CHECK(test.notifications==(fault!=1));
+    if (fault==1) {
+        CHECK(pages[0].references==1 && pages[1].references==1);
+        jbd_journal_release_borrow(&test.reader);
+    }
+    if (fault) CHECK(journal->durable_sequence==test.durable && !fault_block_crash(&disk));
+    else {
+        CHECK(journal->durable_sequence>test.durable);
+        journal->sync_drains=1;
+        uint64_t flushes=disk.flushes;
+        CHECK(ext4_journal_group_checkpoint_background("/")==EAGAIN && disk.flushes==flushes);
+        CHECK(ext4_journal_group_drain("/")==EOK && disk.flushes==flushes+2);
+        journal->sync_drains=0;
+        CHECK(ext4_fclose(&file)==EOK);
+    }
+    printf("PASS ordered release: flush fault %u, exact buffer release and publication\n",fault);
+}
+
+static void group_ordered_release_recover(struct ext4_fs *fs,unsigned fault)
+{
+    ext4_file file;
+    struct ext4_inode inode;
+    unsigned block=fs->bdev->lg_bsize;
+    unsigned char *bytes=malloc(2*block);
+    size_t count;
+    CHECK(bytes && ext4_fopen(&file,"/file","r")==EOK && ext4_fraw_inode_fill(&file,&inode)==EOK);
+    CHECK(to_le32(inode.access_time)==(fault?8246:9123));
+    CHECK(ext4_fpread(&file,0,bytes,2*block,&count)==EOK && count==2*block);
+    for (unsigned i=0;i<count;i++) CHECK(bytes[i]==(fault==1?0x51:i<block?0x85:0x86));
+    CHECK(ext4_fclose(&file)==EOK);
+    free(bytes);
+}
 static void owned_page_init(struct owned_file_page *page,size_t size,unsigned char value)
 {
     *page=(struct owned_file_page){.references=1,.bytes=malloc(size)};
@@ -3693,6 +3785,12 @@ int main(int argc,char **argv)
     }
     else if(!strcmp(argv[2],"group-ordered-retire-batch"))group_ordered_retire_batch(dev.fs);
     else if(!strcmp(argv[2],"group-ordered-retire-recover"))group_ordered_retire_recover(dev.fs);
+    else if(!strcmp(argv[2],"group-ordered-release")) {
+        unsigned fault=strtoul(argv[3],NULL,10);
+        group_ordered_release(dev.fs,fault);if(fault)return 0;
+    }
+    else if(!strcmp(argv[2],"group-ordered-release-recover"))
+        group_ordered_release_recover(dev.fs,strtoul(argv[3],NULL,10));
     else if(!strcmp(argv[2],"group-data-batch"))group_data_batch(dev.fs);
     else if(!strcmp(argv[2],"group-borrow-admission"))group_borrow_admission(dev.fs);
     else if(!strcmp(argv[2],"group-source-budget") || !strcmp(argv[2],"group-source-error")) {

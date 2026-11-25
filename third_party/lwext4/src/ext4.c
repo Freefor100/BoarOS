@@ -1616,17 +1616,29 @@ static int ext4_group_freeze(struct ext4_mountpoint *mp, bool force)
 }
 
 __unused
+static uint64_t ext4_group_reached(const struct jbd_journal *journal, enum ext4_journal_wait kind)
+{
+	if (kind == EXT4_JOURNAL_WAIT_SEALED) return journal->sealed_sequence;
+	if (kind == EXT4_JOURNAL_WAIT_CHECKPOINT) return journal->checkpoint_sequence;
+	if (kind == EXT4_JOURNAL_WAIT_ORDERED_RELEASE &&
+		journal->ordered_release_sequence > journal->durable_sequence)
+		return journal->ordered_release_sequence;
+	return journal->durable_sequence;
+}
+
+__unused
 static int ext4_group_wait(struct ext4_mountpoint *mp, uint64_t target, enum ext4_journal_wait kind)
 {
 	struct jbd_journal *journal = mp->fs.jbd_journal;
 	{
 	EXT4_STATE_SCOPE(state, &mp->fs);
-	uint64_t reached = kind == EXT4_JOURNAL_WAIT_SEALED ? journal->sealed_sequence :
-		kind == EXT4_JOURNAL_WAIT_DURABLE ? journal->durable_sequence : journal->checkpoint_sequence;
+	uint64_t reached = ext4_group_reached(journal, kind);
 	int error = jbd_journal_error(journal);
 	if (error || reached >= target) return error;
 	if (journal->seal_target < target) journal->seal_target = target;
 	journal->sync_join_deadline_ns = 0;
+	if (kind == EXT4_JOURNAL_WAIT_ORDERED_RELEASE && journal->ordered_release_target < target)
+		__atomic_store_n(&journal->ordered_release_target,target,__ATOMIC_RELEASE);
 	if (kind == EXT4_JOURNAL_WAIT_CHECKPOINT && journal->checkpoint_target < target)
 		journal->checkpoint_target = target;
 	}
@@ -1636,8 +1648,7 @@ static int ext4_group_wait(struct ext4_mountpoint *mp, uint64_t target, enum ext
 	for (;;) {
 		{
 		EXT4_STATE_SCOPE(state, &mp->fs);
-		uint64_t reached = kind == EXT4_JOURNAL_WAIT_SEALED ? journal->sealed_sequence :
-			kind == EXT4_JOURNAL_WAIT_DURABLE ? journal->durable_sequence : journal->checkpoint_sequence;
+		uint64_t reached = ext4_group_reached(journal, kind);
 		int error = jbd_journal_error(journal);
 		if (error || reached >= target) return error;
 		}
@@ -1676,11 +1687,18 @@ static int ext4_group_reclaim_goal(struct ext4_mountpoint *mp, unsigned resource
         (resources & JBD_JOURNAL_LOG ? ENOSPC : ENOMEM);
 }
 
+static enum ext4_journal_wait ext4_reclaim_wait_kind(const struct ext4_mountpoint *mp,
+    const struct jbd_journal_reclaim *goal)
+{
+    if (goal->stage != JBD_JOURNAL_COMMIT) return EXT4_JOURNAL_WAIT_CHECKPOINT;
+    return mp->journal_runtime.ordered_released ?
+        EXT4_JOURNAL_WAIT_ORDERED_RELEASE : EXT4_JOURNAL_WAIT_DURABLE;
+}
+
 static int ext4_group_wait_reclaim(struct ext4_mountpoint *mp,
     const struct jbd_journal_reclaim *goal)
 {
-    return ext4_group_wait(mp, goal->sequence, goal->stage == JBD_JOURNAL_COMMIT ?
-        EXT4_JOURNAL_WAIT_DURABLE : EXT4_JOURNAL_WAIT_CHECKPOINT);
+    return ext4_group_wait(mp, goal->sequence, ext4_reclaim_wait_kind(mp, goal));
 }
 
 __unused
@@ -1752,8 +1770,7 @@ static int __ext4_trans_start(struct ext4_mountpoint *mp, bool wait)
                     result = ext4_group_reclaim_goal(mp, resources, &goal);
                     if (!result) {
                         target = goal.sequence;
-                        kind = goal.stage == JBD_JOURNAL_COMMIT ?
-                            EXT4_JOURNAL_WAIT_DURABLE : EXT4_JOURNAL_WAIT_CHECKPOINT;
+                        kind = ext4_reclaim_wait_kind(mp, &goal);
                     }
                 }
             }
@@ -1770,8 +1787,7 @@ static int __ext4_trans_start(struct ext4_mountpoint *mp, bool wait)
                     if (reclaim) result = reclaim == ENOMEM ? allocation : reclaim;
                     else {
                         target = goal.sequence;
-                        kind = goal.stage == JBD_JOURNAL_COMMIT ?
-                            EXT4_JOURNAL_WAIT_DURABLE : EXT4_JOURNAL_WAIT_CHECKPOINT;
+                        kind = ext4_reclaim_wait_kind(mp, &goal);
                         result = EOK; retry_allocation = true;
                     }
                 }
@@ -1927,6 +1943,10 @@ int ext4_journal_group_enable(const char *mount_point,
 	if (r == EOK) {
 		mp->journal_runtime = *runtime;
 		r = jbd_journal_group_init(journal, memory_limit);
+		if (r == EOK) {
+			journal->ordered_released = runtime->ordered_released;
+			journal->ordered_release_context = runtime->context;
+		}
 	}
 	EXT4_MP_UNLOCK(mp);
 	return r;
@@ -1950,7 +1970,8 @@ static int ext4_journal_group_run(const char *mount_point, bool force,
 	if (r == EOK && stage == JBD_JOURNAL_CHECKPOINT) {
         /* Aged home writes are optional while newer accepted work needs the
          * same device. Explicit targets and actual retention pressure win. */
-        if (background && journal->accepted_sequence > journal->durable_sequence &&
+        if (background && (journal->sync_drains ||
+            journal->accepted_sequence > journal->durable_sequence) &&
             !jbd_journal_checkpoint_ready(journal)) r = EAGAIN;
         else if (journal->checkpoint_target < journal->durable_sequence)
             journal->checkpoint_target = journal->durable_sequence;

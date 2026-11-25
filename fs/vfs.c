@@ -6853,12 +6853,14 @@ int kernel_vfs_sync_mount(struct kernel_vfs_mount *mount, uint64_t *observed_err
     if (instance->read_only) goto observe;
     result = snapshot_sync_nodes(instance, &snapshot);
     if (result) goto observe;
+    if (instance->ops->sync_drain) instance->ops->sync_drain(instance,true);
     result=kernel_page_cache_writeback_mount(instance->page_cache,snapshot.nodes,snapshot.count);
     /* 捕获此前数据交接与namespace修改的durable目标一次，不等待checkpoint。 */
     if (instance->ops->sync_filesystem) {
         int error = instance->ops->sync_filesystem(mount);
         if (error && !result) result = error;
     } else if (instance->page_cache) __builtin_trap();
+    if (instance->ops->sync_drain) instance->ops->sync_drain(instance,false);
 observe:
     if (observed_error) {
         KERNEL_TASK_LOCK_SCOPE(guard, &instance->error_lock);
