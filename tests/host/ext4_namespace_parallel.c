@@ -16,6 +16,12 @@ static uint32_t directory_inode_watch;
 static unsigned directory_inode_reads,directory_inode_reject;
 static unsigned directory_name_lookups,directory_name_error;
 static unsigned borrowed_path_watch,borrowed_path_state_locks;
+struct shared_name_walk {
+    const char *name;
+    struct kernel_vfs_path *root,*found;
+    unsigned found_inode,resume;
+};
+static _Thread_local struct shared_name_walk *shared_name_pause;
 static _Thread_local unsigned inode_geometry_watch,inode_geometry_reads,inode_geometry_fail;
 static _Thread_local unsigned attribute_watch,attribute_reads,attribute_writes;
 static uint64_t inode_geometry_block;
@@ -78,7 +84,13 @@ int __wrap_ext4_file_lookup_child(const ext4_file *parent,const char *name,uint3
         directory_name_lookups++;
         if (directory_name_error) return EIO;
     }
-    return __real_ext4_file_lookup_child(parent,name,length,inode,mode,snapshot,current,lookup_block);
+    int result=__real_ext4_file_lookup_child(parent,name,length,inode,mode,snapshot,current,lookup_block);
+    if (shared_name_pause && !result && strlen(shared_name_pause->name)==length &&
+        !memcmp(shared_name_pause->name,name,length)) {
+        __atomic_store_n(&shared_name_pause->found_inode,1,__ATOMIC_RELEASE);
+        while (!__atomic_load_n(&shared_name_pause->resume,__ATOMIC_ACQUIRE)) sched_yield();
+    }
+    return result;
 }
 int __real_ext4_fopen_inode(ext4_file *,const char *,uint32_t,struct ext4_inode *);
 int __wrap_ext4_fopen_inode(ext4_file *file,const char *mount,uint32_t inode,struct ext4_inode *initial)
@@ -487,6 +499,33 @@ static void removed_directory_qualification(struct kernel_vfs_path *root)
     puts("PASS removed intermediate directory: last dentry close follows namespace qualification return");
 }
 
+static void *lookup_shared_name(void *argument)
+{
+    struct shared_name_walk *walk=argument;
+    mm_test_attach(7);mm_test_activate_task();kernel_cpu_current()->logical_id=1;
+    shared_name_pause=walk;
+    assert(!kernel_vfs_path_resolve(walk->root,walk->root,walk->name,1,&walk->found));
+    shared_name_pause=NULL;mm_test_finish();return NULL;
+}
+
+static void shared_name_publication_case(struct kernel_vfs_path *root)
+{
+    if (!((struct kernel_vfs_instance *)root->file.mount->private_data)->namespace_parallel) return;
+    const char name[]="concurrent-lookup-publishes-this-regular-file-once";
+    assert(!kernel_vfs_mknod_at(root,root,name,KERNEL_VFS_S_IFREG|0600,0,0));
+    struct shared_name_walk walk={.root=root,.name=name};
+    pthread_t thread;
+    assert(!pthread_create(&thread,NULL,lookup_shared_name,&walk));
+    while (!__atomic_load_n(&walk.found_inode,__ATOMIC_ACQUIRE)) sched_yield();
+    struct kernel_vfs_path *published=NULL;
+    assert(!kernel_vfs_path_resolve(root,root,name,1,&published));
+    __atomic_store_n(&walk.resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(thread,NULL) && walk.found==published);
+    assert(!kernel_vfs_path_release(&walk.found) && !kernel_vfs_path_release(&published));
+    assert(!kernel_vfs_unlink_at(root,root,name,0));
+    puts("PASS concurrent publication: both namespace readers return the same live path");
+}
+
 struct parallel_actor {
     struct kernel_vfs_path *parent,*root;
     struct kernel_vfs_file file,*existing;
@@ -887,6 +926,7 @@ int main(int argc,char **argv)
     struct kernel_vfs_path *root=NULL,*directories[65]={0};
     assert(!kernel_vfs_path_root(&mount,&heap,&root));
     attribute_read_qualification_case(root);
+    shared_name_publication_case(root);
     if (getenv("EXT4_NAMESPACE_REUSE_ONLY")) {
         unsigned parallel=adapter->instance.namespace_parallel;
         adapter->instance.namespace_parallel=0;

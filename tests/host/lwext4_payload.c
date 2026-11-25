@@ -255,23 +255,40 @@ static void verified_inode_copy(struct ext4_blockdev *dev)
     assert(ext4_block_get(dev,&ref,15)==EOK);
     ref.payload->metadata_schema=schema;
     ref.payload->verified[0]=2U;
-    assert(!ext4_bcache_copy_verified(dev->bc,15,256,schema,1,inode,sizeof(inode)));
+    assert(!ext4_bcache_copy_record(dev->bc,15,256,schema,1,inode,sizeof(inode),NULL));
     assert(ext4_block_set(dev,&ref)==EOK);
     unsigned reads=read_calls;
-    assert(ext4_bcache_copy_verified(dev->bc,15,256,schema,1,inode,sizeof(inode)));
+    assert(ext4_bcache_copy_record(dev->bc,15,256,schema,1,inode,sizeof(inode),NULL));
     check_bytes(inode,sizeof(inode),0x31);
     assert(read_calls==reads && dev->bc->idle_blocks==1);
-    assert(!ext4_bcache_copy_verified(dev->bc,15,0,schema,0,inode,sizeof(inode)));
-    assert(!ext4_bcache_copy_verified(dev->bc,15,256,schema+2,1,inode,sizeof(inode)));
+    assert(!ext4_bcache_copy_record(dev->bc,15,0,schema,0,inode,sizeof(inode),NULL));
+    assert(!ext4_bcache_copy_record(dev->bc,15,256,schema+2,1,inode,sizeof(inode),NULL));
 
     assert(ext4_block_get(dev,&ref,15)==EOK);
     struct ext4_block_payload *accepted=image(0xe1,dev->lg_bsize);
     ext4_bcache_publish(ref.buf,accepted);
     ext4_block_payload_put(accepted);
     assert(ext4_block_set(dev,&ref)==EOK);
-    assert(!ext4_bcache_copy_verified(dev->bc,15,256,schema,1,inode,sizeof(inode)));
+    assert(!ext4_bcache_copy_record(dev->bc,15,256,schema,1,inode,sizeof(inode),NULL));
+    struct ext4_bcache_verification check={.bytes=inode,.length=sizeof(inode)};
+    assert(ext4_bcache_copy_record(dev->bc,15,256,schema,1,inode,sizeof(inode),&check));
+    assert(check.version && dev->bc->idle_blocks==1);
+    check_bytes(inode,sizeof(inode),0xe1);
+    ext4_bcache_record_verified(dev->bc,15,schema,1,check.version);
+    assert(ext4_bcache_copy_record(dev->bc,15,256,schema,1,inode,sizeof(inode),NULL));
+    uint64_t old_version=check.version;
+    assert(ext4_block_get(dev,&ref,15)==EOK);
+    accepted=image(0xab,dev->lg_bsize);
+    ext4_bcache_publish(ref.buf,accepted);
+    ext4_block_payload_put(accepted);
+    assert(ext4_block_set(dev,&ref)==EOK);
+    ext4_bcache_record_verified(dev->bc,15,schema,1,old_version);
+    assert(!ext4_bcache_copy_record(dev->bc,15,256,schema,1,inode,sizeof(inode),NULL));
     ext4_bcache_invalidate_lba(dev->bc,15,1);
-    assert(!ext4_bcache_copy_verified(dev->bc,15,256,schema,1,inode,sizeof(inode)));
+    assert(ext4_block_get(dev,&ref,15)==EOK && ext4_block_set(dev,&ref)==EOK);
+    ext4_bcache_record_verified(dev->bc,15,schema,1,old_version);
+    assert(!ext4_bcache_copy_record(dev->bc,15,256,schema,1,inode,sizeof(inode),NULL));
+    ext4_bcache_invalidate_lba(dev->bc,15,1);
     assert(!dev->bc->ref_blocks && !allocations);
 }
 

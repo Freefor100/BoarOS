@@ -713,6 +713,12 @@ static void metadata_checked(struct ext4_block_payload *payload,
             UINT64_C(1)<<(check->position%64),__ATOMIC_RELEASE);
 }
 
+#if CONFIG_META_CSUM_ENABLE
+static bool ext4_fs_verify_inode_csum(struct ext4_inode_ref *);
+#else
+#define ext4_fs_verify_inode_csum(...) true
+#endif
+
 bool ext4_fs_copy_cached_inode(struct ext4_fs *fs,uint32_t index,struct ext4_inode *inode)
 {
     if (!index || !fs->inode_table_starts || index>fs->table_inode_count ||
@@ -734,9 +740,20 @@ bool ext4_fs_copy_cached_inode(struct ext4_fs *fs,uint32_t index,struct ext4_ino
      * verification bitmap only represents the first 256 records. */
     uint64_t schema=metadata_schema(index,record,fs->table_inode_size,true);
     size_t bytes=fs->table_inode_size<sizeof(*inode) ? fs->table_inode_size : sizeof(*inode);
-    if (record>=256 || !ext4_bcache_copy_verified(device->bc,block,offset,schema,
-        record,inode,bytes) || __atomic_load_n(location,__ATOMIC_ACQUIRE)!=table)
+    union { struct ext4_inode inode; uint64_t words[32]; } raw;
+    struct ext4_bcache_verification check={.bytes=&raw,.length=fs->table_inode_size};
+    if (record>=256 || !ext4_bcache_copy_record(device->bc,block,offset,schema,
+        record,inode,bytes,check.length<=sizeof(raw) ? &check : NULL))
         return false;
+    if (check.version) {
+#if CONFIG_META_CSUM_ENABLE
+        struct ext4_inode_ref ref={.inode=&raw.inode,.fs=fs,.index=index};
+        if (!ext4_fs_verify_inode_csum(&ref)) return false;
+#endif
+        ext4_bcache_record_verified(device->bc,block,schema,record,check.version);
+        memcpy(inode,&raw.inode,bytes);
+    }
+    if (__atomic_load_n(location,__ATOMIC_ACQUIRE)!=table) return false;
     if (bytes<sizeof(*inode)) memset((uint8_t *)inode+bytes,0,sizeof(*inode)-bytes);
     return true;
 }
@@ -1016,8 +1033,6 @@ static bool ext4_fs_verify_inode_csum(struct ext4_inode_ref *inode_ref)
 	return ext4_inode_get_csum(sb, inode_ref->inode) ==
 		ext4_fs_inode_checksum(inode_ref);
 }
-#else
-#define ext4_fs_verify_inode_csum(...) true
 #endif
 
 static int inode_table_start(struct ext4_fs *fs, uint32_t group, ext4_fsblk_t *output)

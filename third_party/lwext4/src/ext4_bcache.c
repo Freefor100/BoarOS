@@ -60,6 +60,11 @@ void ext4_block_rebind(struct ext4_block *block, struct ext4_block_payload *payl
     block->payload=payload;block->data=payload->data;
     ext4_block_payload_put(old);
 }
+static void advance_version(struct ext4_buf *buf)
+{
+    if (!(buf->version=++buf->bc->next_version)) __builtin_trap();
+}
+
 void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payload)
 {
     struct ext4_block_payload *old;
@@ -76,6 +81,7 @@ void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payloa
         __atomic_store_n(&payload->tree_verified, 0, __ATOMIC_RELAXED);
         ext4_block_payload_get(payload);old=buf->current_payload;
         buf->current_payload=payload;buf->data=payload->data;
+        advance_version(buf);
     }
     ext4_block_payload_put(old);
 }
@@ -237,18 +243,30 @@ struct ext4_buf *ext4_bcache_find_get(struct ext4_bcache *bc, struct ext4_block 
     return buf;
 }
 
-bool ext4_bcache_copy_verified(struct ext4_bcache *bc,uint64_t lba,uint32_t offset,
-    uint64_t schema,unsigned record,void *destination,size_t length)
+static bool clean_idle_record(const struct ext4_buf *buf)
+{
+    return buf && !buf->refctr && !buf->loading && !buf->load_error &&
+        (__atomic_load_n(&buf->flags,__ATOMIC_RELAXED)&
+         ((1U<<BC_UPTODATE)|(1U<<BC_DIRTY)|(1U<<BC_TMP)))==(1U<<BC_UPTODATE);
+}
+
+bool ext4_bcache_copy_record(struct ext4_bcache *bc,uint64_t lba,uint32_t offset,
+    uint64_t schema,unsigned record,void *destination,size_t length,struct ext4_bcache_verification *check)
 {
     KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
     struct ext4_buf *buf=lookup_locked(bc,lba);
-    if (!buf || buf->refctr || buf->loading || buf->load_error ||
-        (__atomic_load_n(&buf->flags,__ATOMIC_RELAXED)&
-         ((1U<<BC_UPTODATE)|(1U<<BC_DIRTY)|(1U<<BC_TMP)))!=(1U<<BC_UPTODATE)) return false;
+    if (!clean_idle_record(buf)) return false;
     struct ext4_block_payload *payload=buf->current_payload;
-    if (__atomic_load_n(&payload->metadata_schema,__ATOMIC_ACQUIRE)!=schema ||
-        !(__atomic_load_n(&payload->verified[record/64],__ATOMIC_ACQUIRE)&
-          (UINT64_C(1)<<(record%64)))) return false;
+    uint64_t layout=__atomic_load_n(&payload->metadata_schema,__ATOMIC_ACQUIRE);
+    if (layout==schema && (__atomic_load_n(&payload->verified[record/64],__ATOMIC_ACQUIRE)&
+            (UINT64_C(1)<<(record%64)))) {
+        if (check) check->version=0;
+    } else {
+        if (!check || (layout && layout!=schema)) return false;
+        check->version=buf->version;
+        destination=check->bytes;
+        length=check->length;
+    }
 
     /* A writer must acquire a buffer reference before changing these bytes. */
     memcpy(destination,payload->data+offset,length);
@@ -257,6 +275,21 @@ bool ext4_bcache_copy_verified(struct ext4_bcache *bc,uint64_t lba,uint32_t offs
         idle_append_locked(bc,buf);
     }
     return true;
+}
+
+void ext4_bcache_record_verified(struct ext4_bcache *bc,uint64_t lba,uint64_t schema,
+    unsigned record,uint64_t version)
+{
+    KERNEL_TASK_LOCK_SCOPE(guard,&bc->metadata);
+    struct ext4_buf *buf=lookup_locked(bc,lba);
+    if (!clean_idle_record(buf) || buf->version!=version) return;
+    struct ext4_block_payload *payload=buf->current_payload;
+    uint64_t layout=__atomic_load_n(&payload->metadata_schema,__ATOMIC_RELAXED);
+    /* In-place writes permanently disable this payload's checked layout. An
+     * idle buffer with our version and layout still contains the copied bytes. */
+    if (layout && layout!=schema) return;
+    if (!layout) __atomic_store_n(&payload->metadata_schema,schema,__ATOMIC_RELEASE);
+    __atomic_fetch_or(&payload->verified[record/64],UINT64_C(1)<<(record%64),__ATOMIC_RELEASE);
 }
 
 void ext4_bcache_prepare_private(struct ext4_block *client, struct ext4_block *accepted,
@@ -329,6 +362,7 @@ int ext4_bcache_alloc(struct ext4_bcache *bc, struct ext4_block *b,
         } else if (candidate) {
             buf=candidate;candidate=NULL;
             buf->bc=bc;buf->lba=b->lb_id;buf->refctr=1;
+            advance_version(buf);
             if (RB_INSERT(ext4_buf_lba,&bc->lba_root,buf)) __builtin_trap();
             bc->ref_blocks++;
             if (bc->max_ref_blocks<bc->ref_blocks) bc->max_ref_blocks=bc->ref_blocks;
