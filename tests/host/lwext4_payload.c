@@ -247,6 +247,34 @@ static void invalidation_keeps_readers(struct ext4_blockdev *dev)
     assert(!dev->bc->ref_blocks && !dev->bc->idle_blocks && !allocations);
     check_bytes(disk+13*size,size,0x31);
 }
+static void verified_inode_copy(struct ext4_blockdev *dev)
+{
+    const uint64_t schema=UINT64_C(1)<<32 | 513;
+    unsigned char inode[128];
+    struct ext4_block ref=EXT4_BLOCK_ZERO();
+    assert(ext4_block_get(dev,&ref,15)==EOK);
+    ref.payload->metadata_schema=schema;
+    ref.payload->verified[0]=2U;
+    assert(!ext4_bcache_copy_verified(dev->bc,15,256,schema,1,inode,sizeof(inode)));
+    assert(ext4_block_set(dev,&ref)==EOK);
+    unsigned reads=read_calls;
+    assert(ext4_bcache_copy_verified(dev->bc,15,256,schema,1,inode,sizeof(inode)));
+    check_bytes(inode,sizeof(inode),0x31);
+    assert(read_calls==reads && dev->bc->idle_blocks==1);
+    assert(!ext4_bcache_copy_verified(dev->bc,15,0,schema,0,inode,sizeof(inode)));
+    assert(!ext4_bcache_copy_verified(dev->bc,15,256,schema+2,1,inode,sizeof(inode)));
+
+    assert(ext4_block_get(dev,&ref,15)==EOK);
+    struct ext4_block_payload *accepted=image(0xe1,dev->lg_bsize);
+    ext4_bcache_publish(ref.buf,accepted);
+    ext4_block_payload_put(accepted);
+    assert(ext4_block_set(dev,&ref)==EOK);
+    assert(!ext4_bcache_copy_verified(dev->bc,15,256,schema,1,inode,sizeof(inode)));
+    ext4_bcache_invalidate_lba(dev->bc,15,1);
+    assert(!ext4_bcache_copy_verified(dev->bc,15,256,schema,1,inode,sizeof(inode)));
+    assert(!dev->bc->ref_blocks && !allocations);
+}
+
 int main(int argc,char **argv)
 {
     assert(argc==2);unsigned size=(unsigned)strtoul(argv[1],NULL,10);assert(size==1024 || size==4096);
@@ -257,6 +285,7 @@ int main(int argc,char **argv)
     assert(ext4_block_bind_bcache(&dev,&cache)==EOK);
     publication(&dev);current_private_loan(&dev);parallel_publication(&dev);loaders(&dev);
     flush_snapshot(&dev);owned_payload_loan(&dev);scope_and_eviction(&dev);invalidation_keeps_readers(&dev);
+    verified_inode_copy(&dev);
     assert(ext4_bcache_fini_dynamic(&cache)==EOK);
     printf("PASS cache payload publication/read/batch/error/flush/private-view/scope/eviction block=%u releases=%u\n",size,releases);
     return 0;

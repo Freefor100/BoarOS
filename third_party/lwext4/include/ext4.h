@@ -689,6 +689,8 @@ int ext4_raw_inode_fill(const char *path, uint32_t *ret_ino,
  * entry has been unlinked while the handle still owns the inode.
  */
 int ext4_fraw_inode_fill(const ext4_file *file, struct ext4_inode *inode);
+/* The caller keeps a live mount reference throughout this cached read. */
+bool ext4_file_copy_cached_inode(const ext4_file *,uint32_t index,struct ext4_inode *);
 
 /* Submit the held inode's metadata buffer, without draining unrelated files.
  * Caller must have submitted data first and issue the device barrier after. */

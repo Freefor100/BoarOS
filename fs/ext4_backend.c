@@ -625,6 +625,14 @@ struct lwext4_staged_inode {
     bool restore_file;
 };
 
+/* Caller holds the timestamp qualification. */
+static void advance_metadata_epoch(struct lwext4_node *node)
+{
+    uint64_t next=node->metadata_epoch+1U;
+    if (!next) __builtin_trap();
+    __atomic_store_n(&node->metadata_epoch,next,__ATOMIC_RELEASE);
+}
+
 static struct lwext4_staged_inode *stage_inode(struct lwext4_mount_adapter *adapter,
     void *owner,uint32_t inode)
 {
@@ -645,8 +653,7 @@ static struct lwext4_staged_inode *stage_inode(struct lwext4_mount_adapter *adap
         if (!record) {
             /* Nonjournal bytes can already be modified on this failure.
              * There is no record left to invalidate at completion. */
-            { TIMESTAMP_SCOPE(snapshot,adapter);
-              if (!++((struct lwext4_node *)base)->metadata_epoch) __builtin_trap(); }
+            { TIMESTAMP_SCOPE(snapshot,adapter);advance_metadata_epoch((struct lwext4_node *)base); }
             if (!operation->error) operation->error=ENOMEM;
             if (operation->trans && !operation->trans->error) operation->trans->error=ENOMEM;
         } else {
@@ -719,7 +726,7 @@ static void time_finish(void *context, void *staged_inodes, bool accepted)
             TIMESTAMP_SCOPE(times, adapter);
             /* Invalidate even after abort: nonjournal failures may have an
              * accepted prefix. No candidate attributes are ever published. */
-            if (!++node->metadata_epoch) __builtin_trap();
+            advance_metadata_epoch(node);
             unsigned changed=0;
             for (unsigned i = 0; i < 3; i++) {
                 if (!accepted || !(record->fields & (1U << i)) ||
@@ -2760,6 +2767,17 @@ static int ext4_acl_read(struct kernel_vfs_node *node,const char *name,void **ou
     if (result) {if (converted) kernel_heap_release(node->instance->heap,converted);return result;}
     *out=converted;*length=converted_size;return 0;
 }
+static bool ext4_search_cached(struct kernel_vfs_node *node,const struct kernel_credentials *cred)
+{
+    if (cred->fsuid!=node->uid && (node->mode&0070U)) {
+        struct lwext4_node *live=(struct lwext4_node *)node;
+        uint64_t epoch=__atomic_load_n(&live->metadata_epoch,__ATOMIC_ACQUIRE)+1U;
+        if (!epoch || __atomic_load_n(&live->access_acl_absent_epoch,__ATOMIC_ACQUIRE)!=epoch ||
+            ext4_current_operation(lwext4_instance(node->instance)->device.fs)) return false;
+    }
+    return !kernel_vfs_dac_permission(node->mode,node->uid,node->gid,KERNEL_VFS_MAY_EXEC,cred);
+}
+
 static int ext4_backend_permission(struct kernel_vfs_node *node,const struct kernel_credentials *cred,unsigned access)
 {
     if (cred->fsuid==node->uid || !(node->mode & 0070U))
@@ -2780,7 +2798,8 @@ static int ext4_backend_permission(struct kernel_vfs_node *node,const struct ker
     if (result==-KERNEL_ENODATA) {
         if (accepted) {
             TIMESTAMP_SCOPE(guard,adapter);
-            if (live->metadata_epoch+1U==epoch) live->access_acl_absent_epoch=epoch;
+            if (live->metadata_epoch+1U==epoch)
+                __atomic_store_n(&live->access_acl_absent_epoch,epoch,__ATOMIC_RELEASE);
         }
         return kernel_vfs_dac_permission(node->mode,node->uid,node->gid,access,cred);
     }
@@ -2963,8 +2982,11 @@ static int ext4_backend_stat_inode(struct kernel_vfs_mount *mount,
     int result=0;
     struct kernel_vfs_node *late=NULL;
     if (!node) {
-        ext4_file file={.mp=lwext4_node_file(parent)->mp,.inode=(uint32_t)number};
-        result=ext4_fraw_inode_fill(&file,&inode);
+        ext4_file *directory=lwext4_node_file(parent);
+        if (!ext4_file_copy_cached_inode(directory,(uint32_t)number,&inode)) {
+            ext4_file file={.mp=directory->mp,.inode=(uint32_t)number};
+            result=ext4_fraw_inode_fill(&file,&inode);
+        }
         /* A different spelling may have opened this inode while the read
          * waited. The live node owns delayed allocation and current EOF. */
         late=kernel_vfs_node_pin(instance,number);
@@ -3845,6 +3867,7 @@ static void initialize_backend(void)
     ops->set_mode = ext4_backend_set_mode;
     ops->set_owner = ext4_backend_set_owner;
     ops->acl_permission = ext4_backend_permission;
+    ops->search_cached = ext4_search_cached;
     ops->exec_metadata=ext4_backend_exec_metadata;
     ops->xattr=ext4_backend_xattr;
     ops->killpriv=ext4_backend_killpriv;

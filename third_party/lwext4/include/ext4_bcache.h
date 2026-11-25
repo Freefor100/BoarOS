@@ -281,6 +281,9 @@ int ext4_bcache_shake(struct ext4_bcache *);
 /* Memory pressure: drop only idle clean buffers, without I/O or allocation. */
 uint32_t ext4_bcache_reclaim(struct ext4_bcache *);
 int ext4_bcache_free_read(struct ext4_bcache *, struct ext4_block *);
+/* Copy a verified record from an idle, clean accepted block without a loan. */
+bool ext4_bcache_copy_verified(struct ext4_bcache *,uint64_t lba,uint32_t offset,
+    uint64_t schema,unsigned record,void *destination,size_t length);
 /* Caller owns the returned dirty buffer across lock-free device I/O. */
 struct ext4_buf *ext4_bcache_dirty_get(struct ext4_bcache *, struct ext4_block *);
 

@@ -97,6 +97,8 @@ static void inode_geometry_reuse_case(struct lwext4_mount_adapter *adapter)
     inode_geometry_device=fs->bdev;inode_geometry_block=group.block.lb_id;
     assert(!ext4_fs_put_block_group_ref(&group));
     ext4_fs_reset_inode_locations(fs);
+    struct ext4_inode snapshot;
+    assert(!ext4_fs_copy_cached_inode(fs,number,&snapshot));
     inode_geometry_watch=1;inode_geometry_reads=0;inode_geometry_fail=1;
     struct ext4_inode_ref failed;
     assert(ext4_fs_get_inode_ref_read(fs,number,&failed)==EIO);
@@ -131,6 +133,7 @@ static void inode_geometry_reuse_case(struct lwext4_mount_adapter *adapter)
     printf("inode location after allocation and free: GDT reads=%u\n",inode_geometry_reads);
     assert(!inode_geometry_reads);
     assert(!ext4_fs_get_block_group_ref_write(fs,index,&group));
+    assert(!ext4_fs_copy_cached_inode(fs,number,&snapshot));
     uint16_t checksum=group.block_group->checksum;
     group.block_group->checksum^=1;
     struct ext4_inode_ref inode;
@@ -208,6 +211,13 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
     assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after));
     assert(kernel_credentials_override(previous)==lower);kernel_credentials_put(lower);
     assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child",1,&after) && (after.mode&0777)==0711);
+    assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/../child/file",1,&after) && after.ino==before.ino);
+    struct kernel_vfs_mount *cover=NULL;
+    assert(!kernel_tmpfs_create(instance->heap,0,"",&cover) && !kernel_vfs_mount_attach(cover,held));
+    assert(kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after)==-KERNEL_ENOENT);
+    assert(!kernel_vfs_mount_prepare_detach(cover,NULL) && !kernel_vfs_mount_detach(cover,NULL) &&
+        !kernel_vfs_unmount(cover));
+    assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after) && after.ino==before.ino);
     assert(!kernel_vfs_rename_at(root,root,root,"reuse-parent","reuse-renamed",0));
     assert(kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after)==-KERNEL_ENOENT);
     assert(!kernel_vfs_stat_at(root,root,"reuse-renamed/child/file",1,&after) && after.ino==before.ino);
@@ -878,7 +888,11 @@ int main(int argc,char **argv)
     assert(!kernel_vfs_path_root(&mount,&heap,&root));
     attribute_read_qualification_case(root);
     if (getenv("EXT4_NAMESPACE_REUSE_ONLY")) {
-        directory_reuse_case(root);removed_directory_qualification(root);lookup_attributes_case(root);inode_attribute_lifecycle(adapter,root);
+        unsigned parallel=adapter->instance.namespace_parallel;
+        adapter->instance.namespace_parallel=0;
+        directory_reuse_case(root);
+        adapter->instance.namespace_parallel=parallel;
+        removed_directory_qualification(root);lookup_attributes_case(root);inode_attribute_lifecycle(adapter,root);
         rename_order_case(adapter,root);rename_order_directory_case(adapter,root);
         rename_inode_case(adapter,root);goto Finish;}
     lookup_attributes_case(root);

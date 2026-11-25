@@ -194,8 +194,12 @@ void ext4_fs_prepare_inode_locations(struct ext4_fs *fs)
 	/* This is an optional acceleration. A failed allocation leaves ordinary
 	 * GDT lookup responsible for every inode, with its original errors. */
 	fs->inode_table_starts = ext4_calloc(groups, sizeof(*fs->inode_table_starts));
-	if (fs->inode_table_starts)
+	if (fs->inode_table_starts) {
 		fs->inode_table_groups = groups;
+		fs->table_inode_count = ext4_get32(&fs->sb,inodes_count);
+		fs->table_group_inodes = ext4_get32(&fs->sb,inodes_per_group);
+		fs->table_inode_size = ext4_get16(&fs->sb,inode_size);
+	}
 }
 
 void ext4_fs_reset_inode_locations(struct ext4_fs *fs)
@@ -660,25 +664,34 @@ struct metadata_check {
     uint64_t schema;
     uint32_t position;
 };
+static struct metadata_check metadata_record(uint32_t index,uint32_t offset,
+    uint32_t length,bool inode)
+{
+    if (!length || (length&31) || length>65536) return (struct metadata_check){0};
+    uint32_t position=offset/length;
+    if (position>=256 || offset!=position*length || index<position)
+        return (struct metadata_check){0};
+    /* Record identities increase by one at each table stride. Keep that
+     * table's base identity, stride and type; an offset alone is not identity. */
+    return (struct metadata_check){(uint64_t)(index-position)<<32 | (uint64_t)length<<1 | inode,position};
+}
+
 static bool metadata_cached(struct ext4_block_payload *payload,uint32_t index,
     uint32_t offset,uint32_t length,bool inode,struct metadata_check *check)
 {
     *check=(struct metadata_check){0};
-    if (!length || (length&31) || length>65536) return false;
-    uint32_t position=offset/length;
-    if (position>=256 || offset!=position*length || index<position) return false;
-    /* Record identities increase by one at each table stride. Keep that
-     * table's base identity, stride and type; an offset alone is not identity. */
-    uint64_t schema=(uint64_t)(index-position)<<32 | (uint64_t)length<<1 | inode;
+    struct metadata_check record=metadata_record(index,offset,length,inode);
+    uint64_t schema=record.schema;
+    if (!schema) return false;
     uint64_t observed=__atomic_load_n(&payload->metadata_schema,__ATOMIC_ACQUIRE);
     if (!observed) {
         if (__atomic_compare_exchange_n(&payload->metadata_schema,&observed,schema,
             false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) observed=schema;
     }
     if (observed!=schema) return false;
-    check->schema=schema;check->position=position;
-    return (__atomic_load_n(&payload->verified[position/64],__ATOMIC_ACQUIRE) &
-        (UINT64_C(1)<<(position%64)))!=0;
+    *check=record;
+    return (__atomic_load_n(&payload->verified[record.position/64],__ATOMIC_ACQUIRE) &
+        (UINT64_C(1)<<(record.position%64)))!=0;
 }
 static void metadata_checked(struct ext4_block_payload *payload,
     const struct metadata_check *check)
@@ -688,6 +701,29 @@ static void metadata_checked(struct ext4_block_payload *payload,
     if (check->schema)
         __atomic_fetch_or(&payload->verified[check->position/64],
             UINT64_C(1)<<(check->position%64),__ATOMIC_RELEASE);
+}
+
+bool ext4_fs_copy_cached_inode(struct ext4_fs *fs,uint32_t index,struct ext4_inode *inode)
+{
+    if (!index || !fs->inode_table_starts || index>fs->table_inode_count ||
+        ext4_current_operation(fs)) return false;
+    uint32_t group=(index-1U)/fs->table_group_inodes;
+    if (group>=fs->inode_table_groups) return false;
+    uint32_t offset=(index-1U)%fs->table_group_inodes*fs->table_inode_size;
+    const ext4_fsblk_t *location=&fs->inode_table_starts[group];
+    ext4_fsblk_t table=__atomic_load_n(location,__ATOMIC_ACQUIRE);
+    if (!table || table==UINT64_MAX) return false;
+
+    struct ext4_blockdev *device=fs->bdev;
+    ext4_fsblk_t block=table+offset/device->lg_bsize;
+    offset%=device->lg_bsize;
+    struct metadata_check record=metadata_record(index,offset,fs->table_inode_size,true);
+    size_t bytes=fs->table_inode_size<sizeof(*inode) ? fs->table_inode_size : sizeof(*inode);
+    if (!record.schema || !ext4_bcache_copy_verified(device->bc,block,offset,record.schema,
+        record.position,inode,bytes) || __atomic_load_n(location,__ATOMIC_ACQUIRE)!=table)
+        return false;
+    if (bytes<sizeof(*inode)) memset((uint8_t *)inode+bytes,0,sizeof(*inode)-bytes);
+    return true;
 }
 
 enum block_group_access {

@@ -88,6 +88,8 @@ struct ext4_fs {
 	 * group's reuse until recovery/remount. No mutable allocation state. */
 	ext4_fsblk_t *inode_table_starts;
 	uint32_t inode_table_groups;
+	uint32_t table_inode_count, table_group_inodes;
+	uint16_t table_inode_size;
 	uint32_t active_operations;
 	const struct ext4_lock *os_locks;
     const struct ext4_inode_observer *inode_observer;
@@ -297,6 +299,7 @@ enum ext4_tree_block_type {
 uint64_t ext4_fs_tree_check_key(const struct ext4_inode_ref *,enum ext4_tree_block_type);
 int ext4_fs_get_inode_ref_read(struct ext4_fs *fs, uint32_t index,
     struct ext4_inode_ref *ref);
+bool ext4_fs_copy_cached_inode(struct ext4_fs *,uint32_t index,struct ext4_inode *inode);
 /* Qualify an existing read reference before exposing writable inode bytes. */
 int ext4_fs_inode_ref_write(struct ext4_inode_ref *ref);
 

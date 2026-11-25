@@ -291,6 +291,8 @@ struct kernel_vfs_backend {
     int (*permission)(struct kernel_vfs_node *, const struct kernel_credentials *, unsigned);
     /* ACL-aware DAC on backends that store per-inode access ACLs. */
     int (*acl_permission)(struct kernel_vfs_node *, const struct kernel_credentials *, unsigned);
+    /* True only when a qualified directory search can be granted without I/O. */
+    bool (*search_cached)(struct kernel_vfs_node *,const struct kernel_credentials *);
     int (*exec_metadata)(struct kernel_vfs_node *, struct kernel_vfs_exec_metadata *);
     int (*killpriv)(struct kernel_vfs_node *, uint32_t mode);
     int (*open)(struct kernel_vfs_mount *mount,
