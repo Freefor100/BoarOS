@@ -176,6 +176,7 @@ struct kernel_page_cache_record {
     struct kernel_mutex metadata;
     struct cache_request *reads_head, **reads_tail;
     struct range_writeback *range_head, **range_tail;
+    uint64_t range_collect_until;
     struct kernel_wait_queue range_progress;
     uint64_t range_sequence;
     unsigned range_count;
@@ -3249,7 +3250,7 @@ static void complete_space(void *argument)
     struct prepare_space *request=argument;
     struct kernel_vfs_node *node=request->node;
     request->error=kernel_page_cache_writeback_range_borrowing(node->instance->page_cache,
-        node,0,UINT64_MAX,kernel_io_context_current()->locks);
+        node,0,UINT64_MAX,kernel_io_context_current()->locks,false);
     if (!request->error) request->error=node->instance->ops->complete_write(node);
 }
 static int prepare_space_request(struct kernel_page_cache *cache,struct prepare_space *request,
@@ -4468,7 +4469,8 @@ struct foreground_writeback {
     int result,done;
 };
 
-enum { RANGE_WRITEBACK_SLOTS = 32 };
+enum { RANGE_WRITEBACK_SLOTS = 32, RANGE_COLLECT_REQUESTS = 4 };
+#define RANGE_COLLECT_NS UINT64_C(200000)
 struct range_writeback {
     struct range_writeback *next;
     struct foreground_writeback window;
@@ -4624,7 +4626,7 @@ static void cache_yield(void);
 
 int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node,uint64_t start,uint64_t end,
-    const struct kernel_lock_guard *borrowed)
+    const struct kernel_lock_guard *borrowed, bool data_only)
 {
     if (!cache_live(cache) || !node || start>=end) return -KERNEL_EINVAL;
     if (kernel_lock_held(&node->io_lock,0)) __builtin_trap();
@@ -4634,8 +4636,9 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
     size_t dirty;
     struct kernel_page_cache_entry *single=NULL;
     int multiple=0;
-    bool subpage_mapped = node->instance->ops->writeback_mapped &&
-        node->instance->writeback_block_size && node->instance->writeback_block_size < BOAROS_PAGE_SIZE;
+    bool prefer_mapped = node->instance->ops->writeback_mapped &&
+        node->instance->writeback_block_size &&
+        (data_only || node->instance->writeback_block_size < BOAROS_PAGE_SIZE);
     int dispatch=node->instance->ops->file_operation_execution==KERNEL_VFS_EXECUTION_CPU0 &&
         kernel_page_cache_needs_cpu0(cache);
 #if BOAROS_MAX_CPUS == 1
@@ -4651,7 +4654,7 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
         multiple=next && next->page_index<=last;
         first=entry->page_index;
         dirty=kernel_vfs_node_dirty_pages(node)->count;
-        if (!multiple && !dispatch && (!subpage_mapped || !can_writeback_mapped(entry, end))) {
+        if (!multiple && !dispatch && (!prefer_mapped || !can_writeback_mapped(entry, end))) {
             /* Transfer the selection's borrow to the scalar consumer. */
             entry_borrow(entry);
             single=entry;
@@ -4699,7 +4702,7 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
             large=!writeback_workspace_init(cache,&work,large_capacity);
         if (large) capacity=large_capacity;
     }
-    mapped |= subpage_mapped;
+    mapped |= prefer_mapped;
     union foreground_workspace *lease=NULL;
     if (multiple && !large) {
         lease=foreground_workspace_take(cache);
@@ -4740,7 +4743,7 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
 
 int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node,uint64_t start,uint64_t end)
-{ return kernel_page_cache_writeback_range_borrowing(cache,node,start,end,NULL); }
+{ return kernel_page_cache_writeback_range_borrowing(cache,node,start,end,NULL,false); }
 
 int kernel_page_cache_writeback(struct kernel_page_cache *cache, struct kernel_vfs_node *node)
 { return kernel_page_cache_writeback_range(cache, node, 0, UINT64_MAX); }
@@ -4878,7 +4881,7 @@ static void wait_range_progress(struct kernel_wait_token *token)
 }
 
 int kernel_page_cache_submit_range(struct kernel_page_cache *cache,
-    struct kernel_vfs_node *node, uint64_t start, uint64_t end)
+    struct kernel_vfs_node *node, uint64_t start, uint64_t end, bool collect)
 {
     struct kernel_page_cache_record *record = cache->record;
     uint64_t first = start >> BOAROS_PAGE_SHIFT;
@@ -4919,10 +4922,21 @@ int kernel_page_cache_submit_range(struct kernel_page_cache *cache,
                 request->first = first;
                 request->sequence = ++record->range_sequence;
                 if (!request->sequence) __builtin_trap();
+                bool starts_queue = !record->range_head;
+                if (starts_queue && collect && request->window.mapped_candidate &&
+                    node->instance->writeback_block_size < BOAROS_PAGE_SIZE &&
+                    kernel_vfs_node_dirty_pages(node)->count > last - first + 1) {
+                    /* A series of asynchronous hints can publish before the
+                     * worker takes the inode and starts a device batch. */
+                    record->range_collect_until = kernel_time_monotonic_ns() + RANGE_COLLECT_NS;
+                }
                 *record->range_tail = request;
                 record->range_tail = &request->next;
                 record->range_count++;
-                cache_wake(&record->work);
+                if (record->range_collect_until && (!collect || record->range_head->window.node != node ||
+                    record->range_count >= RANGE_COLLECT_REQUESTS))
+                    record->range_collect_until = 0;
+                if (starts_queue || !record->range_collect_until) cache_wake(&record->work);
                 return 0;
             }
             if (kernel_wait_prepare(&record->range_progress, 0, 0, &token))
@@ -4956,6 +4970,10 @@ void kernel_page_cache_wait_range(struct kernel_page_cache *cache,
                 if (item->window.node == node && item->first <= last && item->window.last >= first)
                     break;
             if (item && item->sequence <= sequence) {
+                if (record->range_collect_until) {
+                    record->range_collect_until = 0;
+                    cache_wake(&record->work);
+                }
                 if (kernel_wait_prepare(&record->range_progress, 0, 0, &token))
                     __builtin_trap();
             } else {
@@ -5675,6 +5693,7 @@ static void page_cache_worker(void *argument)
         bool batch_range = false;
         struct kernel_wait_token token = {0};
         int cleanup = 0, stopping=0, park=1, waiting_batch=0;
+        uint64_t deadline = 0;
         {
             CACHE_SCOPE(check, cache);
             stopping=r->stopping;
@@ -5694,9 +5713,13 @@ static void page_cache_worker(void *argument)
                 r->dirty_deadline=0;r->expired_writeback=1;r->requested=1;
             }
 #endif
-            if (r->range_head && (prefer_range || !r->requested || waiting_batch) &&
+            if (r->range_collect_until && !stopping && !r->requested &&
+                kernel_time_deadline_from_monotonic(r->range_collect_until, &deadline) != KERNEL_TIME_STATUS_OK)
+                r->range_collect_until = deadline = 0;
+            if (r->range_head && !deadline && (prefer_range || !r->requested || waiting_batch) &&
                 (!r->reads_head || reads >= 16)) {
                 range = r->range_head;
+                r->range_collect_until = 0;
                 batch_range = range->window.mapped_candidate && range->next &&
                     range->next->window.node == range->window.node;
                 reads = 0;
@@ -5709,14 +5732,15 @@ static void page_cache_worker(void *argument)
             } else if (cleanup_entries) cleanup=2;
             else if (r->stopping && !waiting_batch) break;
             else {
-                uint64_t deadline=0;
 #if BOAROS_PAGE_CACHE_DIRTY_AGE
                 if (r->dirty_deadline) {
-                    enum kernel_time_status status=kernel_time_deadline_from_monotonic(r->dirty_deadline,&deadline);
+                    uint64_t dirtied;
+                    enum kernel_time_status status=kernel_time_deadline_from_monotonic(r->dirty_deadline,&dirtied);
                     if (status==KERNEL_TIME_STATUS_DEADLINE_PASSED) {
                         r->dirty_deadline=0;r->expired_writeback=1;r->requested=1;continue;
                     }
                     if (status!=KERNEL_TIME_STATUS_OK) __builtin_trap();
+                    if (!deadline || dirtied < deadline) deadline = dirtied;
                 }
 #endif
                 if (kernel_wait_prepare(&r->work,deadline,0,&token)) __builtin_trap();
