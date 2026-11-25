@@ -328,10 +328,16 @@ enum arch_mmu_status arch_mmu_secret_page_restore(
 
 static struct arch_mmu_user_space kernel_window;
 int arch_mmu_kernel_window_active(void) { return kernel_window.root_address!=0; }
-static uint64_t *table(const struct arch_mmu_user_space *s, uint64_t address)
+static __attribute__((always_inline)) inline uint64_t *table(
+    const struct arch_mmu_user_space *s, uint64_t address)
 {
+    if (!address || (address&BOAROS_PAGE_MASK)) la_virt_fatal("page table owner");
+    /* The parent entry holds the table owner. For the virt allocator, the
+     * bound access callback is just the fixed direct-map translation. */
+    if (s->allocator->access == la_virt_page_access)
+        return la_virt_direct_page(address);
     void *p;
-    if (!address || (address&BOAROS_PAGE_MASK) || physical_page_map_owned(s->allocator,address,&p)!=PHYSICAL_PAGE_STATUS_OK)
+    if (physical_page_map_owned(s->allocator,address,&p)!=PHYSICAL_PAGE_STATUS_OK)
         la_virt_fatal("page table owner");
     return p;
 }
@@ -511,6 +517,17 @@ static enum arch_mmu_status walk_leaf(const struct arch_mmu_user_space *s,
         if (!directory_entry(*entry)) return ARCH_MMU_STATUS_STATE;
         current = table(s, *entry);
     }
+}
+int arch_mmu_user_base_page(const struct arch_mmu_user_space *s,uint64_t address,
+    uint32_t access,uint64_t *physical)
+{
+    uint64_t *slot;
+    uint32_t order;
+    if (walk_leaf(s,address,&slot,&order) || order) return 0;
+    uint64_t entry=*slot;
+    if ((leaf_permissions(entry)&(access|ARCH_MMU_USER))!=(access|ARCH_MMU_USER)) return 0;
+    *physical=entry&PTE_ADDRESS;
+    return 1;
 }
 enum arch_mmu_status arch_mmu_user_leaf_probe_slot(const struct arch_mmu_user_space *s,
     uint64_t v, struct kernel_mm_leaf *out, unsigned *missing_tables, uint64_t **base_slot)

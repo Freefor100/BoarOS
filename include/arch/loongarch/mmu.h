@@ -74,6 +74,10 @@ struct arch_mmu_mapping {
 /* Native PMD leaves are 32 MiB (two 16 MiB EntryLo halves). */
 #define ARCH_MMU_HUGE_ORDER 11U
 #define ARCH_MMU_HUGE_SIZE (UINT64_C(1) << 25)
+/* Return a permitted base-page frame for a bounded copy under the MM
+ * metadata lock. The leaf owns the reference throughout the copy. */
+int arch_mmu_user_base_page(const struct arch_mmu_user_space *, uint64_t,
+    uint32_t access, uint64_t *physical);
 /* Snapshot includes PROT_NONE and accepts an interior byte VA. Caller holds
  * MM metadata protection; the result does not itself acquire ownership. */
 enum arch_mmu_status arch_mmu_user_leaf_snapshot(
