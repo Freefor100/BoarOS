@@ -207,10 +207,33 @@ static void reuse_queries(struct ext4_fs *fs, struct ext4_blockdev *dev)
     uint32_t ino, mode;
     CHECK(ext4_lookup_child("/", EXT4_INODE_ROOT_INDEX, "file", 4, &ino, &mode) == EOK);
     CHECK(ext4_fopen_inode(&file, "/", ino, NULL) == EOK);
+    /* On some geometries the test file shares the journal inode's table
+     * block. Release that persistent loan to exercise the idle cache path. */
+    CHECK(ext4_journal_stop("/") == EOK);
     ext4_bcache_reclaim(dev->bc);
     struct ext4_inode before, after;
     CHECK(ext4_fraw_inode_fill(&file, &before) == EOK);
+    struct ext4_inode_ref cached;
+    CHECK(ext4_fs_get_inode_ref_read(fs, ino, &cached) == EOK);
+    uint32_t offset=(uint8_t *)cached.inode-cached.block.data;
+    unsigned record=offset/ext4_get16(&fs->sb,inode_size);
+    uint64_t lba=cached.block.lb_id;
+    cached.block.payload->verified[record/64]&=~(UINT64_C(1)<<(record%64));
+    /* Simulate unverified bytes already present in the cache. */
+    cached.block.data[offset]^=1;
+    CHECK(ext4_fs_put_inode_ref(&cached) == EOK);
+    CHECK(!ext4_fs_copy_cached_inode(fs,ino,&after));
+    struct ext4_block repair;
+    CHECK(ext4_block_get(dev,&repair,lba) == EOK);
+    repair.data[offset]^=1;
+    CHECK(ext4_block_set(dev,&repair) == EOK);
+    unsigned first_crc=crc_calls;
+    CHECK(ext4_fs_copy_cached_inode(fs,ino,&after) && crc_calls>first_crc);
+    CHECK(!memcmp(&before,&after,sizeof(before)));
     unsigned warmed = crc_calls;
+    CHECK(ext4_fs_copy_cached_inode(fs,ino,&after) && crc_calls==warmed);
+    CHECK(ext4_journal_start("/") == EOK);
+    warmed = crc_calls;
     for (unsigned i = 0; i < 8; i++) {
         CHECK(ext4_fraw_inode_fill(&file, &after) == EOK);
         CHECK(!memcmp(&before, &after, sizeof(before)));

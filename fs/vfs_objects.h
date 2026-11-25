@@ -137,6 +137,7 @@ struct kernel_vfs_dentry {
     /* Weak child names. VFS state precedes this lock on publication and
      * final retirement. A cache-hit reader can obtain a reference here. */
     struct kernel_raw_lock names_lock;
+    uint32_t names_published; /* Saturates when a miss can no longer be reused. */
     struct kernel_vfs_dentry *children, *lookup_hint;
     uint8_t index_height;
     char initial_name[];

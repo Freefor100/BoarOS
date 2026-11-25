@@ -170,6 +170,7 @@ struct ext4_buf {
 	 * Every borrower of this embedded payload also holds a buffer reference. */
 	struct ext4_block_payload initial_payload;
 	struct ext4_block_payload *current_payload;
+	uint64_t version; /* Accepted bytes at this LBA, protected by cache metadata. */
 };
 
 enum { EXT4_BCACHE_RECENT = 16 };
@@ -179,6 +180,7 @@ struct ext4_bcache {
 	/* Index, LRU, references and load publication; no allocation/I/O inside. */
 	struct kernel_raw_lock metadata;
 	struct ext4_writeback_scope *writeback_scope;
+	uint64_t next_version;
 
 	/**@brief   Retained idle-buffer target; active/journal owners are separate. */
 	uint32_t cnt;
@@ -281,9 +283,16 @@ int ext4_bcache_shake(struct ext4_bcache *);
 /* Memory pressure: drop only idle clean buffers, without I/O or allocation. */
 uint32_t ext4_bcache_reclaim(struct ext4_bcache *);
 int ext4_bcache_free_read(struct ext4_bcache *, struct ext4_block *);
-/* Copy a verified record from an idle, clean accepted block without a loan. */
-bool ext4_bcache_copy_verified(struct ext4_bcache *,uint64_t lba,uint32_t offset,
-    uint64_t schema,unsigned record,void *destination,size_t length);
+struct ext4_bcache_verification {
+    void *bytes;
+    size_t length;
+    uint64_t version; /* Zero when the copy was already verified. */
+};
+/* Without check storage only an already verified record can be copied. */
+bool ext4_bcache_copy_record(struct ext4_bcache *,uint64_t lba,uint32_t offset,
+    uint64_t schema,unsigned record,void *destination,size_t length,struct ext4_bcache_verification *);
+void ext4_bcache_record_verified(struct ext4_bcache *,uint64_t lba,uint64_t schema,
+    unsigned record,uint64_t version);
 /* Caller owns the returned dirty buffer across lock-free device I/O. */
 struct ext4_buf *ext4_bcache_dirty_get(struct ext4_bcache *, struct ext4_block *);
 

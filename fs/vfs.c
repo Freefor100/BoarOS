@@ -2777,22 +2777,23 @@ static struct kernel_vfs_dentry *find_child_name(struct kernel_vfs_dentry *paren
     return 0;
 }
 
-/* The global state lock keeps a returned weak entry alive after releasing
- * the name lock. Fast readers obtain their reference before releasing it. */
+/* The state lock protects the tree and the returned weak entry. Wait-free
+ * hint reads/writes also permit a concurrent reader using only names_lock. */
 static struct kernel_vfs_dentry *find_path(struct kernel_vfs_instance *instance,
     struct kernel_vfs_dentry *parent,const char *name,size_t length)
 {
     if (!parent) return instance->root_name;
-    struct kernel_vfs_dentry *entry;
-    {
-        KERNEL_TASK_LOCK_SCOPE(names,&parent->names_lock);
-        entry=find_child_name(parent,name,length);
-    }
+    struct kernel_vfs_dentry *entry=find_child_name(parent,name,length);
     if (entry && entry->cached && entry!=instance->dentry_cache_last) {
         dentry_cache_remove(entry);dentry_cache_append(entry);
     }
     return entry;
 }
+
+/* Only insertion can invalidate a missed exact name. The directory stays
+ * owned for the entire lookup; state protects the comparison and reuse. */
+static inline bool name_still_missing(const struct kernel_vfs_dentry *parent,uint32_t observed)
+{ return observed!=UINT32_MAX && observed==parent->names_published; }
 
 static void index_path(struct kernel_vfs_instance *instance,struct kernel_vfs_dentry *path)
 {
@@ -2800,6 +2801,7 @@ static void index_path(struct kernel_vfs_instance *instance,struct kernel_vfs_de
     if (parent) {
         KERNEL_TASK_LOCK_SCOPE(names,&parent->names_lock);
         parent->children=path_index_insert(parent->children,path);
+        if (parent->names_published!=UINT32_MAX) parent->names_published++;
     } else {
         if (instance->root_name) __builtin_trap();
         instance->root_name=path;path->index_height=1;
@@ -2843,7 +2845,7 @@ static struct kernel_vfs_dentry *detach_path(struct kernel_vfs_dentry *path)
     return NULL;
 }
 
-static int register_path(struct kernel_vfs_dentry **owner)
+static int register_path(struct kernel_vfs_dentry **owner,size_t name_length,uint32_t miss)
 {
     struct kernel_vfs_dentry *path=*owner,*existing,*retired=NULL;
     struct kernel_vfs_instance *adapter = path->file.mount->private_data;
@@ -2851,7 +2853,8 @@ static int register_path(struct kernel_vfs_dentry **owner)
     kernel_raw_lock_init(&path->names_lock,KERNEL_RAW_RANK_DIRECTORY_NAMES);
     {
         KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
-        existing=find_path(adapter,path->parent,path->name,strlen(path->name));
+        existing=name_still_missing(path->parent,miss) ? NULL :
+            find_path(adapter,path->parent,path->name,name_length);
         if (existing && kernel_vfs_file_inode(&existing->file)!=kernel_vfs_file_inode(&path->file)) {
             retired=detach_path(existing);existing=NULL;
         }
@@ -2992,7 +2995,7 @@ static struct kernel_vfs_path *find_walk_location(struct kernel_vfs_mount *mount
  * them. A name that has served as a mountpoint uses the full resolver. */
 static bool lookup_walk_child(struct vfs_path_walk *walk,struct kernel_vfs_path *parent,
     const char *name,size_t length,struct kernel_vfs_dentry **entry,
-    struct kernel_vfs_path **owner)
+    struct kernel_vfs_path **owner,uint32_t *miss)
 {
     struct kernel_vfs_mount *mount=parent->file.mount;
     if (!walk || !walk->component || walk->resolve ||
@@ -3010,7 +3013,7 @@ static bool lookup_walk_child(struct vfs_path_walk *walk,struct kernel_vfs_path 
         if (!__atomic_load_n(&child->recently_used,__ATOMIC_RELAXED))
             __atomic_store_n(&child->recently_used,1,__ATOMIC_RELAXED);
         *owner=walk->component;
-    }
+    } else *miss=parent->dentry->names_published;
     *entry=child;
     return true;
 }
@@ -3095,12 +3098,13 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
         if (name[i]=='/' || !name[i]) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance=mount->private_data;
     struct kernel_vfs_dentry *entry=NULL;
+    uint32_t miss=UINT32_MAX;
     if (instance->ops->owns_dentry_names) {
         /* The held parent qualification spans backend mutation and dentry
          * publication. A retained positive name needs no second disk lookup;
          * pseudo-filesystems with independent name changes still revalidate. */
         int covered = 0;
-        if (!lookup_walk_child(walk,parent,name,name_length,&entry,owner)) {
+        if (!lookup_walk_child(walk,parent,name,name_length,&entry,owner,&miss)) {
             KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
             entry=find_path(instance,parent->dentry,name,name_length);
             if (entry) {
@@ -3118,7 +3122,7 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
                     path_bind_component(walk, mount, entry);
                     *owner = walk->component;
                 } else if (dentry_acquire(entry)) __builtin_trap();
-            }
+            } else miss=parent->dentry->names_published;
         }
         if (entry) {
             result=instance->ops->error ? instance->ops->error(instance) : 0;
@@ -3153,13 +3157,16 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
             result=instance->ops->entry_name(instance,inode,canonical,sizeof(canonical));
             if (result) return result;
             name=canonical;name_length=strlen(name);
+            miss=UINT32_MAX;
         }
         struct kernel_vfs_dentry *retired=NULL;
         {
             KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
-            entry=find_path(instance,parent->dentry,name,name_length);
+            if (!name_still_missing(parent->dentry,miss))
+                entry=find_path(instance,parent->dentry,name,name_length);
             if (entry && kernel_vfs_file_inode(&entry->file)!=inode) {retired=detach_path(entry);entry=NULL;}
             if (entry && dentry_acquire(entry)) __builtin_trap();
+            if (!entry) miss=parent->dentry->names_published;
             /* A published mountpoint retains its dentry. An unrepresented
              * name can complete a metadata query without a new path owner. */
             stat_leaf=!entry && query && instance->ops->stat_inode &&
@@ -3198,7 +3205,7 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
             instance->ops->lookup_open(parent->file.private_data,name,name_length,&entry->file) :
             vfs_open_inode_raw(&instance->backend_mount,inode,mode,&entry->file);
         if (result) {dentry_release(&entry->parent);kernel_heap_release(entry->heap,entry);return result;}
-        result=register_path(&entry);if (result) return result;
+        result=register_path(&entry,name_length,miss);if (result) return result;
     }
     result=path_walk_wrap(mount,entry,owner,walk);
 Enter:
@@ -3799,7 +3806,7 @@ int kernel_vfs_path_root(struct kernel_vfs_mount *mount,struct kernel_heap *heap
         entry->heap=heap;entry->references=1;entry->name=entry->initial_name;entry->name[0]='/';
         result=vfs_open_inode_raw(&instance->backend_mount,inode,mode,&entry->file);
         if (result) {kernel_heap_release(heap,entry);return result;}
-        result=register_path(&entry);if (result) return result;
+        result=register_path(&entry,1,UINT32_MAX);if (result) return result;
     }
     /* 视图独立保留根目录项，旧子路径在摘树后仍按同一根解释相对路径。 */
     if (!mount->root_dentry) {if (dentry_acquire(entry)) __builtin_trap();mount->root_dentry=entry;}
@@ -4166,11 +4173,12 @@ static int create_at_parent(struct kernel_vfs_path **owner,const char *name,uint
     if (((struct kernel_vfs_node *)parent->file.private_data)->unlinked) return -KERNEL_ENOENT;
     int result=directory_mutation_allowed(parent,NULL);if (result) return result;
     struct kernel_vfs_dentry *entry=NULL;
-    enum kernel_heap_status allocation=kernel_heap_allocate_zeroed(instance->heap,1,sizeof(*entry)+strlen(name)+1,(void **)&entry);
+    size_t name_length=strlen(name);
+    enum kernel_heap_status allocation=kernel_heap_allocate_zeroed(instance->heap,1,sizeof(*entry)+name_length+1,(void **)&entry);
     if (allocation) return allocation==KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     entry->heap=instance->heap;entry->references=1;entry->parent=parent->dentry;
     if (dentry_acquire(entry->parent)) __builtin_trap();
-    entry->name=entry->initial_name;memcpy(entry->name,name,strlen(name)+1);
+    entry->name=entry->initial_name;memcpy(entry->name,name,name_length+1);
     struct kernel_vfs_file *created=file ? file : &entry->file;
     result=vfs_create_raw(mount,kernel_vfs_path_inode(parent),name,mode,created,umask);
     if (result) {dentry_release(&entry->parent);kernel_heap_release(entry->heap,entry);return result;}
@@ -4183,7 +4191,7 @@ static int create_at_parent(struct kernel_vfs_path **owner,const char *name,uint
         __atomic_fetch_add(&instance->external_files,1,__ATOMIC_RELAXED);
     } else if (entry->file.location_owner) mount_put(mount);
     entry->file.mount=&instance->backend_mount;entry->file.location_owner=0;
-    result=register_path(&entry);
+    result=register_path(&entry,name_length,UINT32_MAX);
     if (!result) {
         struct kernel_vfs_path *path=NULL;result=path_wrap(mount,entry,&path);
         if (!result) {if (file) file->path=path;else *path_owner=path;}
