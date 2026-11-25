@@ -43,6 +43,13 @@ static void raw_crc32c(void)
                 bytes + offset + split, 257 - split) ==
                 bitwise_crc32c(seeds[seed], bytes + offset, 257));
     }
+    /* Exercise aligned zero batches on both sides of nonzero words. */
+    memset(bytes, 0, 320);
+    for (unsigned i = 3; i < 320; i += 67) bytes[i] = (unsigned char)i;
+    for (unsigned offset = 0; offset < 16; offset++)
+        for (uint32_t size = 0; size <= 304; size++)
+            assert(ext4_crc32c(0x1234abcd, bytes + offset, size) ==
+                bitwise_crc32c(0x1234abcd, bytes + offset, size));
     long page_size = sysconf(_SC_PAGESIZE);
     assert(page_size > 0);
     size_t page = (size_t)page_size;
