@@ -821,6 +821,22 @@ static void event_filtering(void)
     masks[0]=masks[1]=0;assert(!kernel_wait_queue_wake_all(&queue));assert(kernel_wait_record_phase(&actors[1].wait)==KERNEL_WAIT_NOTIFIED);
     for(unsigned i=0;i<3;i++){selected_task=&actors[i];assert(!kernel_wait_finish(&tokens[i]));assert(!actors[i].node.event_mask);}
     selected_task=0;for(unsigned i=0;i<2;i++)assert(!kernel_wait_node_remove_sync(&callbacks[i]));
+    for (unsigned i=0; i<2; i++) {
+        selected_task=&actors[i];
+        assert(!kernel_wait_prepare(&queue,0,0,&tokens[i]));
+        actors[i].node.readiness_mask=1U<<i;
+    }
+    assert(kernel_wait_cursor_prepare_event(&queue,&cursor,2,0));
+    kernel_wait_cursor_wake(&cursor,1);
+    assert(kernel_wait_record_phase(&actors[0].wait)==KERNEL_WAIT_PREPARED);
+    assert(kernel_wait_record_phase(&actors[1].wait)==KERNEL_WAIT_NOTIFIED);
+    assert(!kernel_wait_queue_wake_all(&queue));
+    assert(kernel_wait_record_phase(&actors[0].wait)==KERNEL_WAIT_NOTIFIED);
+    for (unsigned i=0; i<2; i++) {
+        selected_task=&actors[i];
+        assert(!kernel_wait_finish(&tokens[i]) && !actors[i].node.readiness_mask);
+    }
+    selected_task=0;
     assert(!kernel_wait_queue_close(&queue)&&!kernel_wait_queue_destroy(&queue));
     puts("wait: directed event filters, shared callbacks and mask-change broadcast passed");
 }
@@ -999,17 +1015,17 @@ static void stale_signal_generation(void)
 {
     struct kernel_wait_token token;
     assert(!kernel_wait_prepare(0,0,1,&token));
-    struct kernel_wait_token old_signal={&task,kernel_wait_signal_generation(&task.wait)};
+    struct kernel_wait_token old_signal={&task,kernel_wait_signal_generation(&task.wait,0)};
     assert(old_signal.generation==token.generation);
     assert(!kernel_wait_finish(&token));
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         assert(!kernel_wait_notify_locked(&old_signal,KERNEL_WAIT_SIGNALLED));
         assert(kernel_wait_record_phase(&task.wait)==KERNEL_WAIT_FINISHED);
-        assert(!kernel_wait_signal_generation(&task.wait));
+        assert(!kernel_wait_signal_generation(&task.wait,0));
     }
     assert(!kernel_wait_prepare(0,0,0,&token));
-    assert(token.generation!=old_signal.generation && !kernel_wait_signal_generation(&task.wait));
+    assert(token.generation!=old_signal.generation && !kernel_wait_signal_generation(&task.wait,0));
     {
         KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
         assert(!kernel_wait_notify_locked(&old_signal,KERNEL_WAIT_SIGNALLED));
@@ -1054,18 +1070,18 @@ static void stale_signal_while_domain_busy(void)
         barrier(&signal_generation_step);
         barrier(&signal_generation_step);
         struct kernel_wait_record *record=&signal_generation_task->wait;
-        struct kernel_wait_token old_signal={signal_generation_task,kernel_wait_signal_generation(record)};
+        struct kernel_wait_token old_signal={signal_generation_task,kernel_wait_signal_generation(record,0)};
         assert(old_signal.generation && old_signal.generation==kernel_wait_record_generation(record));
         /* The owner finishes the sampled interruptible wait while this CPU
          * retains the domain and its old signal token. */
         barrier(&signal_generation_step);
         barrier(&signal_generation_step);
         assert(!kernel_wait_notify_locked(&old_signal,KERNEL_WAIT_SIGNALLED));
-        assert(kernel_wait_record_phase(record)==KERNEL_WAIT_FINISHED && !kernel_wait_signal_generation(record));
+        assert(kernel_wait_record_phase(record)==KERNEL_WAIT_FINISHED && !kernel_wait_signal_generation(record,0));
         barrier(&signal_generation_step);
         barrier(&signal_generation_step);
         uint64_t next_generation=kernel_wait_record_generation(record);
-        assert(next_generation!=old_signal.generation && !kernel_wait_signal_generation(record));
+        assert(next_generation!=old_signal.generation && !kernel_wait_signal_generation(record,0));
         assert(!kernel_wait_notify_locked(&old_signal,KERNEL_WAIT_SIGNALLED));
         assert(!kernel_wait_notify(&old_signal,KERNEL_WAIT_SIGNALLED));
         assert(kernel_wait_record_generation(record)==next_generation &&

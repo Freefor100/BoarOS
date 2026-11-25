@@ -96,12 +96,20 @@ static struct socket_state_guard *socket_state_owner(struct kernel_raw_lock *loc
     return (struct socket_state_guard *)held;
 #endif
 }
-static void socket_state_notify(struct socket_state_guard *guard,struct kernel_wait_queue *queue)
+static void socket_state_notify_event(struct socket_state_guard *guard,
+    struct kernel_wait_queue *queue, uint32_t events)
 {
-    for(unsigned i=0;i<guard->count;i++)if(guard->notifications[i].queue==queue)return;
+    for (unsigned i=0;i<guard->count;i++) {
+        struct kernel_wait_cursor *pending=&guard->notifications[i];
+        if (pending->queue!=queue) continue;
+        pending->event=pending->event && events ? pending->event | events : 0;
+        return;
+    }
     if(guard->count==2)__builtin_trap();
-    if(kernel_wait_cursor_prepare(queue,&guard->notifications[guard->count]))guard->count++;
+    if(kernel_wait_cursor_prepare_event(queue,&guard->notifications[guard->count],events,NULL))guard->count++;
 }
+static void socket_state_notify(struct socket_state_guard *guard,struct kernel_wait_queue *queue)
+{ socket_state_notify_event(guard,queue,0); }
 static void socket_state_async(struct socket_state_guard *guard,struct kernel_wait_queue *queue,unsigned reason)
 {
     if (!kernel_wait_queue_registrations(queue)) return;

@@ -195,6 +195,7 @@ struct kernel_wait_node {
     struct kernel_wait_queue *borrow_owner;
     uint64_t generation, sequence;
     uint32_t references;
+    uint32_t readiness_mask; /* poll event bits, or zero to accept all events */
     /* Optional source interest, protected by its queue. The registration
      * owner keeps this mask storage alive through all cursor borrows. */
     const uint64_t *event_mask;
