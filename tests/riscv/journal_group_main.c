@@ -220,6 +220,31 @@ static void exercise_nojournal_times(struct lwext4_mount_adapter *adapter)
     completed=1;
 }
 
+static void exercise_disjoint_preallocation(void)
+{
+    struct kernel_vfs_file file={0};
+    size_t count;
+    check(kernel_vfs_create(&mount,"/allocate-tail",0600,&file)==0,101);
+    struct kernel_vfs_node *node=kernel_vfs_file_node(&file);
+    memset(bytes,0x65,sizeof(bytes));
+    check(kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&count)==0 &&
+        count==sizeof(bytes) && node->dirty_cache_pages.count==1,102);
+    check(kernel_vfs_fallocate(&file,0,2*sizeof(bytes),sizeof(bytes))==0 &&
+        kernel_vfs_node_size(node)==3*sizeof(bytes) && node->dirty_cache_pages.count==1,103);
+    check(kernel_vfs_pread(&file,0,actual,sizeof(actual),&count,NULL)==0 &&
+        count==sizeof(actual) && !memcmp(bytes,actual,count),104);
+    uint64_t error=0;
+    check(kernel_vfs_sync(&file,1,&error)==0 &&
+        kernel_page_cache_invalidate_node(&cache,node)==KERNEL_PAGE_CACHE_STATUS_OK,105);
+    check(kernel_vfs_pread(&file,0,actual,sizeof(actual),&count,NULL)==0 &&
+        count==sizeof(actual) && !memcmp(bytes,actual,count),106);
+    memset(bytes,0,sizeof(bytes));
+    for (unsigned i=1;i<=2;i++)
+        check(kernel_vfs_pread(&file,i*sizeof(bytes),actual,sizeof(actual),&count,NULL)==0 &&
+            count==sizeof(actual) && !memcmp(bytes,actual,count),107);
+    check(kernel_vfs_close(&file)==0 && kernel_vfs_unlink(&mount,"/allocate-tail")==0,108);
+}
+
 static void exercise(void *argument)
 {
     (void)argument;
@@ -233,6 +258,7 @@ static void exercise(void *argument)
     struct jbd_journal *journal=adapter->device.fs->jbd_journal;
     journaled=journal!=NULL;
     if(!journaled){exercise_nojournal_times(adapter);riscv_interrupt_restore(irq);return;}
+    exercise_disjoint_preallocation();
     struct kernel_vfs_file noatime={0};
     const struct kernel_vfs_timespec noatime_old[2]={{0,0},{0,0}};
     struct kernel_vfs_stat noatime_stat;

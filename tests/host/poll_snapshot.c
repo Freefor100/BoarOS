@@ -30,6 +30,10 @@ const uint64_t *kernel_signal_fd_mask(struct kernel_open_file_description *f)
 { CHECK(f==&target && target_kind!=KERNEL_OPEN_FILE_KIND_SIGNALFD);return 0; }
 enum kernel_open_file_kind kernel_open_file_kind(const struct kernel_open_file_description *f)
 { CHECK(f==&target);return target_kind; }
+struct kernel_socket *kernel_open_file_socket(struct kernel_open_file_description *f)
+{ CHECK(f==&target && refs && target_kind==KERNEL_OPEN_FILE_KIND_SOCKET);return (void *)&target; }
+struct kernel_wait_queue *kernel_socket_wait_queue(struct kernel_socket *socket)
+{ CHECK(socket==(void *)&target);return &queue; }
 static uint64_t now_ns = 1000, wait_deadline;
 void kernel_service_scope_begin(struct kernel_service_scope *scope)
 { CHECK(!scope->entered);scope->entered=1;service_entries++; }
@@ -42,7 +46,7 @@ enum kernel_files_status kernel_files_pin(struct kernel_files *f,int64_t fd,
 enum kernel_open_file_status kernel_open_file_release(struct kernel_open_file_description **out)
 { CHECK(*out==&target && refs);refs--;*out=NULL;return KERNEL_OPEN_FILE_STATUS_OK; }
 uint32_t kernel_open_file_poll(struct kernel_open_file_description *f,uint32_t requested,struct kernel_wait_queue **out)
-{ CHECK(f==&target);CHECK(target_kind!=KERNEL_OPEN_FILE_KIND_EPOLL || !live);polls++;*out=&queue;
+{ CHECK(f==&target);CHECK(target_kind!=KERNEL_OPEN_FILE_KIND_EPOLL || !live);polls++;if(out)*out=&queue;
   if (target_kind==KERNEL_OPEN_FILE_KIND_REGULAR)
       return KERNEL_POLLIN|KERNEL_POLLRDNORM|KERNEL_POLLOUT|KERNEL_POLLWRNORM;
   return readable?(requested&(KERNEL_POLLIN|KERNEL_POLLRDNORM)):0; }
@@ -66,6 +70,8 @@ void kernel_signal_restore_temporary_mask(struct kernel_task *t,uint64_t m,int i
 enum kernel_signal_status kernel_signal_set_temporary_mask(struct kernel_task *t,uint64_t m,uint64_t *saved)
 { CHECK(t && saved);*saved=t->signal_blocked;t->signal_blocked=m;return KERNEL_SIGNAL_STATUS_OK; }
 uint64_t kernel_time_monotonic_ns(void) { return now_ns; }
+uint64_t kernel_time_select_deadline(const struct kernel_task *task,uint64_t deadline)
+{ (void)task;return deadline; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t *deadline)
 { CHECK(ns>now_ns);*deadline=ns;return KERNEL_TIME_STATUS_OK; }
 enum kernel_uaccess_status kernel_copy_from_user(struct kernel_mm *mm,void *to,uint64_t from,size_t n,size_t *copied)
@@ -172,9 +178,11 @@ int main(void)
         reset();target_kind=i?KERNEL_OPEN_FILE_KIND_EPOLL:KERNEL_OPEN_FILE_KIND_SOCKET;
         p[0]=(struct kernel_pollfd){7,KERNEL_POLLIN,0};at_park=1;
         CHECK(run(p,1,0)==1 && finishes==1);
+        if (!i) CHECK(polls==3);
         reset();target_kind=i?KERNEL_OPEN_FILE_KIND_EPOLL:KERNEL_OPEN_FILE_KIND_SOCKET;
         p[0]=(struct kernel_pollfd){7,KERNEL_POLLIN,0};at_bind=1;
         CHECK(run(p,1,0)==1 && finishes==1 && !parks);
+        if (!i) CHECK(polls==2);
     }
     CHECK(hints==2 && polls==2);
     reset();target_kind=KERNEL_OPEN_FILE_KIND_EPOLL;stale_hint=1;

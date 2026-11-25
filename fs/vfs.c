@@ -5325,6 +5325,10 @@ static int fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
     if (changes_data && (node->file_seals&KERNEL_SEAL_WRITES)) return -KERNEL_EPERM;
     if (!punch && (node->file_seals&KERNEL_SEAL_GROW) && end>old_size) return -KERNEL_EPERM;
     struct kernel_page_cache *cache = node->instance->page_cache;
+    bool preserve_prefix = cache && !mode && offset>=old_size &&
+        !((old_size|offset)&BOAROS_PAGE_MASK) &&
+        node->instance->ops->fallocate_preserves_dirty_prefix &&
+        node->instance->ops->fallocate_preserves_dirty_prefix(node);
     int result = kernel_file_mapping_prepare(node);
     if (result) return result;
     kernel_file_mapping_close(node);
@@ -5336,9 +5340,10 @@ static int fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
         last = end & ~(ARCH_MMU_HUGE_SIZE - 1U);
     }
     if (changes_data && first<last) kernel_file_mapping_invalidate_range(node,first,last);
-    /* Buffered EOF can lead persistent EOF. Publish its dirty prefix before
-     * a range update changes the cached data or computes its new size. */
-    result = cache ? kernel_page_cache_writeback_range_borrowing(cache,node,0,UINT64_MAX,
+    /* Buffered EOF can lead persistent EOF. An eligible extension allocates
+     * beyond both and sets a size at least as large as the cached prefix.
+     * Other operations reconcile the dirty prefix before changing the range. */
+    result = cache && !preserve_prefix ? kernel_page_cache_writeback_range_borrowing(cache,node,0,UINT64_MAX,
         borrowed ? borrowed : &operation, false) : 0;
     struct kernel_page_cache_resize resize = {0};
     if (!result && cache && !(mode & KERNEL_VFS_FALLOC_KEEP_SIZE) && end > old_size)
