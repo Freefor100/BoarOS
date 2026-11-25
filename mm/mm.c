@@ -9458,10 +9458,9 @@ int kernel_mm_copy_ready_short(struct kernel_mm *mm,uint64_t address,void *buffe
     int closed=pin_admission_closed(record);
     if (closed==1 || (closed==2 && write)) return 0;
 
-    struct kernel_mm_mapping mapping;
-    if (lookup_user_mapping(record,address,write ? KERNEL_MM_WRITE : KERNEL_MM_READ,&mapping) ||
-        mapping.order) return 0;
-    uint64_t physical=mapping.physical_address&~BOAROS_PAGE_MASK;
+    uint64_t physical;
+    if (!arch_mmu_user_base_page(&record->space,address,write ? KERNEL_MM_WRITE : KERNEL_MM_READ,
+        &physical)) return 0;
     if (record->has_secret_mappings && kernel_secretmem_page_protected(physical)) return 0;
     if (write) {
         struct mm_file_alias_resident *resident=file_alias_resident(

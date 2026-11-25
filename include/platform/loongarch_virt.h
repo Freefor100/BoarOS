@@ -12,6 +12,8 @@ void la_virt_restart(void) __attribute__((noreturn));
 void la_virt_halt(void) __attribute__((noreturn));
 void la_virt_fatal(const char *) __attribute__((noreturn));
 int la_virt_boot_memory(uint64_t, uint64_t, uint64_t, struct boot_memory_layout *);
+static inline void *la_virt_direct_page(uint64_t address)
+{ return (void *)(uintptr_t)(LA_DIRECT_BASE + address); }
 void *la_virt_page_access(uint64_t);
 void la_virt_use_kernel_mapping(void);
 int la_virt_physical_address(const void *, uint64_t *);

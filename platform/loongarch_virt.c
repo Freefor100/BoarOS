@@ -69,7 +69,7 @@ void la_virt_restart(void)
 void la_virt_fatal(const char *message)
 { kernel_console_emergency_begin(); la_virt_puts("BoarOS: fatal LA "); la_virt_puts(message); la_virt_puts("\n"); la_virt_shutdown(); }
 void *la_virt_page_access(uint64_t address)
-{ return (void *)(uintptr_t)(LA_DIRECT_BASE + address); }
+{ return la_virt_direct_page(address); }
 int la_virt_physical_address(const void *pointer, uint64_t *address)
 {
     uint64_t v = (uintptr_t)pointer;
