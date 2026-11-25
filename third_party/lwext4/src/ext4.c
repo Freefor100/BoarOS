@@ -50,6 +50,7 @@
 #include <ext4_dir.h>
 #include <ext4_inode.h>
 #include <ext4_ialloc.h>
+#include <ext4_balloc.h>
 #include <ext4_super.h>
 #include <ext4_block_group.h>
 #include <ext4_dir_idx.h>
@@ -257,8 +258,12 @@ struct ext4_small_writeback {
     ext4_file *const *files;
     struct file_write_span *spans;
     unsigned prepared;
+    struct ext4_block_allocation allocation;
     struct ext4_small_writeback_result results[EXT4_SMALL_WRITEBACK_MAX];
 };
+
+struct ext4_block_allocation *ext4_small_writeback_allocation(struct ext4_small_writeback *batch)
+{ return &batch->allocation; }
 
 static uint64_t delalloc_publish(struct ext4_operation *operation)
 {
@@ -6053,6 +6058,7 @@ int ext4_fpwrite_small_files(ext4_file *const *files, struct file_write_span *sp
         batch->files=files;
         batch->spans=spans;
         batch->prepared=0;
+        batch->allocation.allocated=0;
         ext4_current_operation(fs)->small_writeback=batch;
         while (batch->prepared<count) {
             unsigned i=batch->prepared;
@@ -6062,6 +6068,7 @@ int ext4_fpwrite_small_files(ext4_file *const *files, struct file_write_span *sp
             if (result) break;
             batch->prepared++;
         }
+        result=ext4_balloc_finish_allocation(&batch->allocation,result);
         result=ext4_trans_finish(mp,result);
         if (!result) {
             EXT4_STATE_SCOPE(state,fs);

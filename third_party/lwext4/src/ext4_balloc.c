@@ -408,6 +408,28 @@ int ext4_balloc_free_blocks(struct ext4_inode_ref *inode_ref,
 	return rc;
 }
 
+int ext4_balloc_finish_allocation(struct ext4_block_allocation *allocation, int error)
+{
+    if (!allocation || !allocation->allocated) return error;
+    struct ext4_block_group_ref *group=&allocation->group;
+    struct ext4_fs *fs=group->fs;
+    struct ext4_sblock *sb=ext4_fs_super(fs);
+    if (!error) {
+        ext4_balloc_set_bitmap_csum(sb,group->block_group,allocation->bitmap.data);
+        error=ext4_trans_set_tree_dirty(&allocation->bitmap,block_bitmap_key(group));
+        if (!error) {
+            ext4_bg_set_free_blocks_count(group->block_group,sb,
+                ext4_bg_get_free_blocks_count(group->block_group,sb)-allocation->allocated);
+            group->dirty=true;
+        }
+    }
+    allocation->allocated=0;
+    int bitmap_release=ext4_block_set(fs->bdev,&allocation->bitmap);
+    int group_release=ext4_fs_put_block_group_ref(group);
+    if (error) return error;
+    return bitmap_release?bitmap_release:group_release;
+}
+
 int ext4_balloc_alloc_blocks(struct ext4_inode_ref *inode_ref,
     ext4_fsblk_t goal, uint32_t max_blocks, ext4_fsblk_t *fblock, uint32_t *count)
 {
@@ -415,58 +437,64 @@ int ext4_balloc_alloc_blocks(struct ext4_inode_ref *inode_ref,
     *fblock = 0; *count = 0;
     struct ext4_fs *fs = inode_ref->fs;
     struct ext4_sblock *sb = ext4_fs_super(fs);
+    struct ext4_operation *operation=ext4_current_operation(fs);
+    struct ext4_block_allocation *batch=operation && operation->small_writeback ?
+        ext4_small_writeback_allocation(operation->small_writeback):NULL;
     if (goal < ext4_get32(sb, first_data_block) || goal >= ext4_sb_get_blocks_cnt(sb))
         goal = ext4_fs_inode_to_goal_block(inode_ref);
     uint32_t first_group = ext4_balloc_get_bgid_of_block(sb, goal);
     uint32_t groups = ext4_block_group_cnt(sb);
     for (uint32_t step = 0; step < groups; step++) {
         uint32_t group = (first_group + step) % groups;
-        struct ext4_block_group_ref bg;
+        bool held=batch && batch->allocated && batch->group.index==group;
+        struct ext4_block_group_ref local_bg;
+        struct ext4_block local_bitmap;
+        struct ext4_block_group_ref *bg=held?&batch->group:&local_bg;
+        struct ext4_block *bitmap=held?&batch->bitmap:&local_bitmap;
         bool shared=false,contended=false;
-        int r=fs->jbd_journal && fs->jbd_journal->grouped ?
-            ext4_operation_require_shared_block_group(fs,group,&shared):EOK;
-        if (r) return r;
-        r=shared?ext4_fs_get_block_group_ref_claim(fs,group,&bg):
-            ext4_fs_get_block_group_ref_alloc(fs,group,&bg,false);
-        if (r) return r;
-        if (shared && ext4_bg_has_flag(bg.block_group,EXT4_BLOCK_GROUP_BLOCK_UNINIT)) {
-            r=ext4_fs_put_block_group_ref(&bg);
+        int r=EOK;
+        if (!held) {
+            if (batch) r=ext4_balloc_finish_allocation(batch,EOK);
             if (r) return r;
-            /* Initialization changes the entire bitmap and descriptor. The
-             * operation replays with the normal exclusive group owner. */
-            return ext4_operation_require_resource(fs,EXT4_RESOURCE_BLOCK_GROUP,group);
-        }
-        if (!ext4_bg_get_free_blocks_count(bg.block_group, sb)) {
-            r = ext4_fs_put_block_group_ref(&bg);
+            r=fs->jbd_journal && fs->jbd_journal->grouped ?
+                ext4_operation_require_shared_block_group(fs,group,&shared):EOK;
+            if (r) return r;
+            r=shared?ext4_fs_get_block_group_ref_claim(fs,group,bg):
+                ext4_fs_get_block_group_ref_alloc(fs,group,bg,false);
+            if (r) return r;
+            if (shared && ext4_bg_has_flag(bg->block_group,EXT4_BLOCK_GROUP_BLOCK_UNINIT)) {
+                r=ext4_fs_put_block_group_ref(bg);
+                if (r) return r;
+                /* Initialization changes the entire bitmap and descriptor. The
+                 * operation replays with the normal exclusive group owner. */
+                return ext4_operation_require_resource(fs,EXT4_RESOURCE_BLOCK_GROUP,group);
+            }
+            if (!ext4_bg_get_free_blocks_count(bg->block_group,sb)) {
+                r=ext4_fs_put_block_group_ref(bg);
+                if (r) return r;
+                continue;
+            }
+            r=ext4_trans_block_get(fs->bdev,bitmap,ext4_bg_get_block_bitmap(bg->block_group,sb));
+            if (r) { ext4_fs_put_block_group_ref(bg); return r; }
+            if (!shared && !block_bitmap_checked(bg,bitmap)) {
+                ext4_block_set(fs->bdev,bitmap);
+                ext4_fs_put_block_group_ref(bg);
+                return EUCLEAN;
+            }
+        } else if (ext4_bg_get_free_blocks_count(bg->block_group,sb)==batch->allocated) {
+            r=ext4_balloc_finish_allocation(batch,EOK);
             if (r) return r;
             continue;
-        }
-        struct ext4_block bitmap;
-        ext4_fsblk_t bitmap_lba=ext4_bg_get_block_bitmap(bg.block_group,sb);
-        const struct ext4_block_payload *checked=NULL;
-        if (!shared && fs->jbd_journal) {
-            struct ext4_operation *operation=ext4_current_operation(fs);
-            if (operation && operation->small_writeback)
-                /* The previous file already verified and released this
-                 * private bitmap. The next writable borrow ends the proof. */
-                checked=jbd_trans_checked_payload(operation->trans,bitmap_lba,block_bitmap_key(&bg));
-        }
-        r = ext4_trans_block_get(fs->bdev,&bitmap,bitmap_lba);
-        if (r) { ext4_fs_put_block_group_ref(&bg); return r; }
-        if (!shared && (!checked || bitmap.payload!=checked) && !block_bitmap_checked(&bg,&bitmap)) {
-            ext4_block_set(fs->bdev, &bitmap);
-            ext4_fs_put_block_group_ref(&bg);
-            return EUCLEAN;
         }
         uint32_t end = ext4_blocks_in_group_cnt(sb, group);
         uint32_t start = step ? 0 : ext4_fs_addr_to_idx_bg(sb, goal);
         uint32_t found = end, length=0;
         /* Search the goal suffix, then the same group's prefix, without
          * borrowing or checksumming its bitmap a second time. */
-        if (shared) r=jbd_trans_claim_blocks(&bg,&bitmap,start,end,max_blocks,&found,&length,&contended);
+        if (shared) r=jbd_trans_claim_blocks(bg,bitmap,start,end,max_blocks,&found,&length,&contended);
         else for (unsigned pass = 0; pass < (start ? 2U : 1U); pass++) {
             uint32_t limit = pass ? start : end;
-            int scan=jbd_journal_find_reusable(fs,bitmap.data,
+            int scan=jbd_journal_find_reusable(fs,bitmap->data,
                 ext4_fs_bg_idx_to_addr(sb,0,group),pass ? 0 : start,limit,
                 max_blocks,false,&found,&length);
             if (scan==EOK) break;
@@ -475,33 +503,53 @@ int ext4_balloc_alloc_blocks(struct ext4_inode_ref *inode_ref,
         if (!r && length && !shared) {
             length = ext4_fs_reserve_block_range(fs, length);
             if (!length) {
-                ext4_block_set(fs->bdev, &bitmap);
-                ext4_fs_put_block_group_ref(&bg);
+                if (!held) {
+                    ext4_block_set(fs->bdev,bitmap);
+                    ext4_fs_put_block_group_ref(bg);
+                }
                 return ENOSPC;
             }
-            for (uint32_t i = 0; i < length; i++) ext4_bmap_bit_set(bitmap.data, found + i);
-            ext4_balloc_set_bitmap_csum(sb, bg.block_group, bitmap.data);
+            for (uint32_t i = 0; i < length; i++) ext4_bmap_bit_set(bitmap->data, found + i);
         }
-        if (!r && length) {
+        /* Lazy initialization already changed the descriptor. Publish that
+         * private record now so subsequent inode lookups see a valid one. */
+        bool keep=batch && !shared && !r && length && !bg->dirty;
+        if (keep) {
+            if (!held) {
+                batch->group=*bg;
+                batch->bitmap=*bitmap;
+            }
+            batch->allocated+=length;
+        } else if (held) {
+            r=ext4_balloc_finish_allocation(batch,r);
+            if (r) return r;
+            continue;
+        } else {
+            if (!r && length && !shared)
+                ext4_balloc_set_bitmap_csum(sb,bg->block_group,bitmap->data);
             /* The new descriptor checksum certifies this private bitmap.
              * Publication transfers the proof with its actual payload. */
-            r=ext4_trans_set_tree_dirty(&bitmap,shared?0:block_bitmap_key(&bg));
+            if (!r && length) r=ext4_trans_set_tree_dirty(bitmap,shared?0:block_bitmap_key(bg));
+            int cleanup=ext4_block_set(fs->bdev,bitmap);
+            if (!r) r=cleanup;
+            if (r) { ext4_fs_put_block_group_ref(bg); return r; }
         }
-        int cleanup=ext4_block_set(fs->bdev,&bitmap);
-        if (!r) r=cleanup;
-        if (r) { ext4_fs_put_block_group_ref(&bg); return r; }
         if (length) {
             ext4_fs_account_blocks(fs, -(int64_t)length);
             ext4_inode_set_blocks_count(sb, inode_ref->inode,
                 ext4_inode_get_blocks_count(sb, inode_ref->inode) +
                 (uint64_t)length * (ext4_sb_get_block_size(sb) / EXT4_INODE_BLOCK_SIZE));
             inode_ref->dirty = true;
-            if (!shared) ext4_bg_set_free_blocks_count(bg.block_group, sb,
-                ext4_bg_get_free_blocks_count(bg.block_group, sb) - length);
-            bg.dirty = true;
+            if (!keep) {
+                if (!shared) ext4_bg_set_free_blocks_count(bg->block_group,sb,
+                    ext4_bg_get_free_blocks_count(bg->block_group,sb)-length);
+                bg->dirty=true;
+            }
         }
-        r = ext4_fs_put_block_group_ref(&bg);
-        if (r) return r;
+        if (!keep) {
+            r=ext4_fs_put_block_group_ref(bg);
+            if (r) return r;
+        }
         if (length) {
             *fblock = ext4_fs_bg_idx_to_addr(sb, found, group);
             *count = length;

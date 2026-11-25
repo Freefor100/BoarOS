@@ -529,6 +529,8 @@ int __real_ext4_trans_write_data(struct ext4_blockdev *,uint64_t,uint32_t,
     const void *,uint32_t,bool,const struct file_data_source *);
 static unsigned small_files_watch,small_files_active,small_files_fault;
 static unsigned small_files_committed,small_files_aborted;
+static bool small_files_check_groups,small_files_crossed_group;
+static uint32_t small_files_first_group;
 int __real_ext4_fpwrite_small_files(ext4_file *const *,struct file_write_span *,unsigned);
 int __wrap_ext4_fpwrite_small_files(ext4_file *const *files,struct file_write_span *spans,unsigned count)
 {
@@ -545,6 +547,12 @@ int __wrap_ext4_trans_write_data(struct ext4_blockdev *bdev,uint64_t lba,uint32_
     const void *data,uint32_t length,bool initialize,const struct file_data_source *source)
 {
     int result=__real_ext4_trans_write_data(bdev,lba,offset,data,length,initialize,source);
+    if (!result && small_files_active && small_files_check_groups) {
+        struct ext4_sblock *sb=ext4_fs_super(bdev->fs);
+        uint32_t group=ext4_balloc_get_bgid_of_block(sb,lba);
+        if (small_files_first_group==UINT32_MAX) small_files_first_group=group;
+        else if (small_files_first_group!=group) small_files_crossed_group=true;
+    }
     if (!result && small_files_active && small_files_fault && !--small_files_fault)
         return KERNEL_EIO;
     struct claim_actor *actor=claim_actor;
@@ -1066,21 +1074,36 @@ static void small_files_sync_case(struct kernel_page_cache *cache,const char *pa
     struct lwext4_mount_adapter *adapter=mount.private_data;
     const struct ext4_journal_runtime runtime={.now_ns=small_files_now};
     assert(!ext4_journal_group_enable(adapter->mount_point,&runtime,8*1024*1024));
-    for (unsigned fault=0;fault<3;fault++) {
+    char directory[32];
+    struct kernel_vfs_stat directory_stat;
+    unsigned inodes_per_group=ext4_get32(ext4_fs_super(adapter->device.fs),inodes_per_group);
+    bool found=false;
+    for (unsigned i=0;i<32;i++) {
+        snprintf(directory,sizeof(directory),"/other-group-%u",i);
+        assert(!kernel_vfs_mkdir(&mount,directory,0700));
+        assert(!kernel_vfs_stat_path(&mount,directory,1,&directory_stat));
+        if (directory_stat.ino>inodes_per_group) { found=true; break; }
+    }
+    assert(found);
+    for (unsigned fault=0;fault<4;fault++) {
         struct kernel_vfs_file files[4]={{0}};
-        char name[32];
+        char name[64];
         for (unsigned i=0;i<4;i++) {
-            snprintf(name,sizeof(name),"/small-%u-%u",fault,i);
+            snprintf(name,sizeof(name),"%s/small-%u-%u",fault==3 && i>=2?directory:"",fault,i);
             assert(!kernel_vfs_create(&mount,name,0600,&files[i]));
             unsigned char bytes[512];memset(bytes,0x55+i,sizeof(bytes));
             size_t done=0;
             assert(!kernel_vfs_pwrite(&files[i],0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
         }
         small_files_committed=small_files_aborted=0;
-        small_files_watch=1;small_files_fault=fault?2:0;
+        small_files_watch=1;small_files_fault=fault==3?4:fault?2:0;
+        small_files_check_groups=fault==3;
+        small_files_first_group=UINT32_MAX;
+        small_files_crossed_group=false;
         if (fault==2) small_files_scalar_failure=lwext4_node_file(files[1].private_data);
         int result=kernel_vfs_sync_mount(&mount,NULL);
         small_files_watch=0;
+        if (small_files_check_groups) assert(small_files_crossed_group);
         if (fault==2) {
             assert(result==-KERNEL_EIO);
             for (unsigned i=0;i<4;i++) {
@@ -1101,7 +1124,7 @@ static void small_files_sync_case(struct kernel_page_cache *cache,const char *pa
         }
     }
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(cache) && !close(image_fd));
-    puts("PASS mount writeback: grouped acceptance, private abort, independent retry errors and durable contents");
+    puts("PASS mount writeback: grouped acceptance, private abort across block groups, independent retry errors and durable contents");
 }
 
 static void snapshot_copy_case(struct kernel_page_cache *cache,const char *path)
