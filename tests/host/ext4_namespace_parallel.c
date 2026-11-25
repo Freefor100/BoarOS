@@ -192,6 +192,15 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
     assert(!kernel_vfs_create_at(root,root,"reuse-parent/child/file",0600,&f,0));
     assert(!kernel_vfs_close(&f));
     assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&before));
+    const struct kernel_vfs_open_request reopen={.flags=KERNEL_VFS_OPEN_FOLLOW,.access=KERNEL_VFS_MAY_READ};
+    for (unsigned i=0;i<8;i++) {
+        borrowed_path_watch=1;borrowed_path_state_locks=0;
+        assert(!kernel_vfs_open_at(root,root,"reuse-parent/child/file",&reopen,&f,NULL));
+        borrowed_path_watch=0;
+        assert(borrowed_path_state_locks==1);
+        assert(kernel_vfs_file_inode(&f)==before.ino);
+        assert(!kernel_vfs_close(&f));
+    }
     stat_lookup_watch=1;stat_lookup_reads=stat_lookup_opens=stat_lookup_io_locks=stat_lookup_allocations=0;
     for(unsigned i=0;i<32;i++) {
         assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after));

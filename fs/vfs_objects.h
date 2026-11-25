@@ -37,6 +37,7 @@ struct kernel_vfs_instance {
     uint64_t stat_gap_first, stat_gap_end; /* Empty interval of the live inode index. */
     struct kernel_vfs_node *cleanup_nodes;
     struct kernel_vfs_dentry *paths; /* Weak canonical directory-entry registry. */
+    struct kernel_vfs_path *idle_path; /* One unbound allocation, under VFS state. */
     uint32_t external_files;
     uint32_t accounting_files; /* Protected by kernel_vfs_state_lock. */
     uint64_t writeback_error_sequence;
