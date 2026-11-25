@@ -160,6 +160,34 @@ static void demand_reset_and_error_prefix(struct kernel_open_file_description *f
     puts("PASS read error preserves only the completed prefix; stopped worker accepts no prediction");
 }
 
+static void forward_seek_prediction(struct kernel_open_file_description *file,struct kernel_page_cache *cache)
+{
+    cold_stream(file,cache);
+    struct kernel_page_cache_statistics before=readahead_stats(cache);
+    read_bytes(file,0,1);
+    {
+        KERNEL_LOCK_SCOPE(position);
+        kernel_mutex_lock(&file->offset_lock,&position);
+        assert(!kernel_open_file_seek_relative(file,BOAROS_PAGE_SIZE));
+    }
+    read_bytes(file,BOAROS_PAGE_SIZE,1);
+    if (BOAROS_PAGE_SIZE!=4096U) {
+        assert(readahead_stats(cache).readahead_queued==before.readahead_queued);
+        puts("PASS relative seek on larger cache pages follows demand reads");
+        return;
+    }
+    assert(readahead_stats(cache).readahead_queued==before.readahead_queued+1);
+    wait_prediction(cache,before.readahead_completed+1);
+    cached_page(file,2);
+    {
+        KERNEL_LOCK_SCOPE(position);
+        kernel_mutex_lock(&file->offset_lock,&position);
+        assert(!kernel_open_file_seek_relative(file,0));
+    }
+    assert(!file->read_sequential && !file->readahead_cookie);
+    puts("PASS small forward seek retains the read stream; backward seek cancels it");
+}
+
 int main(int argc,char **argv)
 {
     assert(argc==2);setvbuf(stdout,NULL,_IONBF,0);mm_test_attach(0);mm_test_activate_task();
@@ -180,6 +208,7 @@ int main(int argc,char **argv)
     unaligned_stream(file,&cache,1024);unaligned_stream(file,&cache,4096);
     prediction_boundaries(file,&cache);
     demand_reset_and_error_prefix(file,&cache);
+    forward_seek_prediction(file,&cache);
     kernel_page_cache_stop_worker(&cache);
     assert(!kernel_open_file_release(&file) && !kernel_vfs_unmount(&mount));
     assert(!kernel_page_cache_destroy(&cache) && !kernel_block_unregister(&disk));
