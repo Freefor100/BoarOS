@@ -5123,7 +5123,7 @@ static int pwrite_source(struct kernel_vfs_file *file,uint64_t offset,
     if (!file || file->state!=VFS_FILE_STATE_LIVE || !file->private_data)
         return -KERNEL_EINVAL;
     KERNEL_LOCK_SCOPE(operation);
-    kernel_vfs_file_write_lock(file,&operation);
+    if (!source->operation) kernel_vfs_file_write_lock(file,&operation);
     if ((file->mode&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG) return -KERNEL_EINVAL;
     VFS_TEMPORARY_WRITER(writer,file);
     size_t written=0;
@@ -5180,9 +5180,10 @@ int kernel_vfs_aio_direct_write(struct kernel_vfs_file *file,uint64_t offset,
 }
 
 int kernel_vfs_pwrite_cached(struct kernel_vfs_file *file,uint64_t offset,
-    const struct kernel_page_cache_read_page *pages,size_t source_offset,size_t size,size_t *written)
+    const struct kernel_page_cache_read_page *pages,size_t source_offset,size_t size,size_t *written,
+    const struct kernel_lock_guard *operation)
 {
-    struct kernel_vfs_write_source source={.cached=pages,.cached_offset=source_offset};
+    struct kernel_vfs_write_source source={.cached=pages,.cached_offset=source_offset,.operation=operation};
     return pwrite_source(file,offset,&source,size,written);
 }
 

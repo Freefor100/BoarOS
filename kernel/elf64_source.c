@@ -7,6 +7,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define KERNEL_ELF64_SOURCE_MAGIC UINT64_C(0x454c46534f555243)
 #define KERNEL_ELF64_INTERPRETER_LIMIT UINT64_C(4096)
@@ -790,16 +791,6 @@ unsigned kernel_elf64_source_acquire_ready(struct kernel_elf64_source *source,
         offset>>BOAROS_PAGE_SHIFT,selected,addresses,capacity,0,NULL);
 }
 
-static void zero_page(void *page, uint64_t page_size)
-{
-    unsigned char *bytes = page;
-    uint64_t index;
-
-    for (index = 0U; index < page_size; index++) {
-        bytes[index] = 0U;
-    }
-}
-
 enum kernel_elf64_source_status kernel_elf64_source_page(
     struct kernel_elf64_source *source,
     struct physical_page_allocator *allocator,
@@ -862,9 +853,18 @@ enum kernel_elf64_source_status kernel_elf64_source_page(
                             address,
                             KERNEL_ELF64_SOURCE_STATUS_STATE);
     }
-    zero_page(page, source->page_size);
-    if (run->kind == KERNEL_ELF64_SOURCE_RUN_COMPOSITE ||
-        (run->kind == KERNEL_ELF64_SOURCE_RUN_FILE && !source->file)) {
+    if (run->kind == KERNEL_ELF64_SOURCE_RUN_FILE) {
+        /* Run construction proves that the reader supplies the entire page. */
+        if (kernel_read_source_read_exact(&source->reader,
+                run->file_offset + (virtual_offset - run->start),
+                page, (size_t)source->page_size) != 0) {
+            return discard_page(source, allocator, address,
+                                KERNEL_ELF64_SOURCE_STATUS_IO);
+        }
+    } else {
+        memset(page, 0, (size_t)source->page_size);
+    }
+    if (run->kind == KERNEL_ELF64_SOURCE_RUN_COMPOSITE) {
         uint16_t index;
         uint64_t page_end;
 

@@ -1920,13 +1920,16 @@ static void cost_test(struct ext4_fs *fs)
 static bool namespace_hold;
 static void bitmap_test(void)
 {
-    unsigned char bitmap[16];
+    _Alignas(uintptr_t) unsigned char storage[40];
+    enum { map_size = 32 };
+    for(unsigned offset=0;offset<sizeof(uintptr_t);offset++)
     for(unsigned pattern=0;pattern<4;pattern++) {
-        for(unsigned i=0;i<sizeof(bitmap);i++)
+        unsigned char *bitmap=storage+offset;
+        for(unsigned i=0;i<map_size;i++)
             bitmap[i]=(unsigned char[]){0xff,0xfe,0x55,0xa5}[pattern];
-        bitmap[5]&=~0x80U;
-        for(unsigned first=0;first<128;first++)
-        for(unsigned end=first;end<=128;end++) {
+        bitmap[25]&=~0x80U;
+        for(unsigned first=0;first<=map_size*8;first++)
+        for(unsigned end=first;end<=map_size*8;end++) {
             unsigned expected=first;
             while(expected<end && (bitmap[expected/8]&(1U<<(expected%8)))) expected++;
             uint32_t actual=UINT32_MAX;

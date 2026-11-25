@@ -1311,24 +1311,13 @@ int ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *inode_ref,
 		mode |= ext4_fs_correspond_inode_mode(filetype);
 	}
 	ext4_inode_set_mode(ext4_fs_super(fs), inode, mode);
-
-	ext4_inode_set_links_cnt(inode, 0);
-	ext4_inode_set_uid(inode, 0);
-	ext4_inode_set_gid(inode, 0);
-	ext4_inode_set_size(inode, 0);
-	ext4_inode_set_access_time(inode, 0);
-	ext4_inode_set_change_inode_time(inode, 0);
-	ext4_inode_set_modif_time(inode, 0);
-	ext4_inode_set_del_time(inode, 0);
-	ext4_inode_set_blocks_count(ext4_fs_super(fs), inode, 0);
-	ext4_inode_set_flags(inode, 0);
+	/* The inode-wide clear already initializes counters, times and block pointers. */
 	ext4_inode_set_generation(inode, generation);
 	if (inode_size > EXT4_GOOD_OLD_INODE_SIZE) {
 		uint16_t size = ext4_get16(ext4_fs_super(fs), want_extra_isize);
 		ext4_inode_set_extra_isize(ext4_fs_super(fs), inode, size);
 	}
 
-	memset(inode->blocks, 0, sizeof(inode->blocks));
 	inode_ref->dirty = true;
 
 	return EOK;

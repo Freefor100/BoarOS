@@ -209,9 +209,10 @@ static inline void kernel_vfs_write_source_finish(struct kernel_vfs_write_source
 
 int kernel_page_cache_write_source(struct kernel_page_cache *, struct kernel_vfs_file *,
     uint64_t offset, struct kernel_vfs_write_source *, size_t size, size_t *written);
-/* The file-copy caller holds the successful, contiguous source prefix alive
- * until this returns. Source and destination must be different inodes. */
+/* The file-copy caller holds the destination write operation and the source
+ * prefix alive until this returns. Source and destination are distinct inodes. */
 int kernel_vfs_pwrite_cached(struct kernel_vfs_file *,uint64_t offset,
-    const struct kernel_page_cache_read_page *,size_t source_offset,size_t size,size_t *written);
+    const struct kernel_page_cache_read_page *,size_t source_offset,size_t size,size_t *written,
+    const struct kernel_lock_guard *operation);
 
 #endif

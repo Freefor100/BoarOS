@@ -60,7 +60,8 @@ static void iocsr_write(uint32_t address,uint32_t value)
 static volatile uint32_t *pic(unsigned offset)
 { return (void *)(uintptr_t)(LA_UNCACHED_BASE+0x10000000+offset); }
 static int initialized,dispatching;
-static struct { uint32_t source;void (*handle)(void *);void *owner; } handlers[32];
+static struct { void (*handle)(void *);void *owner; } handlers[32];
+static uint32_t irq_slots[64];
 int la_virt_irq_active(void)
 {
 #if BOAROS_MAX_CPUS > 1
@@ -100,7 +101,8 @@ int la_virt_irq_register(uint32_t source,void (*handle)(void *),void *owner)
         if(!handlers[i].owner) slot=i;
     }
     if(slot==32) {arch_interrupt_restore(irq);return 0;}
-    handlers[slot].source=source;handlers[slot].handle=handle;handlers[slot].owner=owner;
+    handlers[slot].handle=handle;handlers[slot].owner=owner;
+    irq_slots[source]|=UINT32_C(1)<<slot;
     *(volatile uint8_t *)((uintptr_t)pic(0x200)+source)=source;
     iocsr_write(0x1600+(source/32)*4,iocsr_read(0x1600+(source/32)*4)|(1U<<(source%32)));
     *pic(0x20+(source/32)*4)&=~(1U<<(source%32));
@@ -108,12 +110,17 @@ int la_virt_irq_register(uint32_t source,void (*handle)(void *),void *owner)
 }
 void la_virt_irq_unregister(uint32_t source,void *owner)
 {
-    uintptr_t irq=arch_interrupt_save();unsigned found=32,remaining=0;
-    for(unsigned i=0;i<32;i++) if(handlers[i].source==source && handlers[i].owner) {
-        if(handlers[i].owner==owner) found=i;else remaining++;
+    uintptr_t irq=arch_interrupt_save();
+    unsigned found=32;
+    uint32_t slots=source<64?irq_slots[source]:0;
+    while(slots) {
+        unsigned slot=(unsigned)__builtin_ctz(slots);
+        if(handlers[slot].owner==owner) {found=slot;break;}
+        slots&=slots-1;
     }
     if(found==32) la_virt_fatal("PCI interrupt owner");
-    if(!remaining) {
+    irq_slots[source]&=~(UINT32_C(1)<<found);
+    if(!irq_slots[source]) {
         *pic(0x20+(source/32)*4)|=1U<<(source%32);
         iocsr_write(0x1600+(source/32)*4,iocsr_read(0x1600+(source/32)*4)&~(1U<<(source%32)));
     }
@@ -124,10 +131,10 @@ void la_virt_irq_dispatch(void)
     if(!initialized || dispatching) la_virt_fatal("external interrupt state");
     dispatching=1;
     for(unsigned round=0;round<64;round++) {
-        uint32_t pending=iocsr_read(0x1800)|iocsr_read(0x1804);
-        if(!pending) break;
+        uint32_t pending[2]={iocsr_read(0x1800),iocsr_read(0x1804)};
+        if(!(pending[0]|pending[1])) break;
         for(unsigned group=0;group<2;group++) {
-            uint32_t bits=iocsr_read(0x1800+group*4);
+            uint32_t bits=pending[group];
             while(bits) {
                 unsigned bit=(unsigned)__builtin_ctz(bits),source=group*32+bit;bits&=bits-1;
                 kernel_cpu_interrupt_handled();
@@ -135,11 +142,14 @@ void la_virt_irq_dispatch(void)
                 *pic(0x20+group*4)|=1U<<bit;
                 arch_io_barrier();
                 iocsr_write(0x1800+group*4,1U<<bit);
-                unsigned handled=0;
-                for(unsigned i=0;i<32;i++) if(handlers[i].owner && handlers[i].source==source) {
-                    handled++;handlers[i].handle(handlers[i].owner);
+                uint32_t remaining=UINT32_MAX,slots;
+                while ((slots=irq_slots[source]&remaining)) {
+                    unsigned slot=(unsigned)__builtin_ctz(slots);
+                    uint32_t mask=UINT32_C(1)<<slot;
+                    remaining=~(mask | (mask-1U));
+                    handlers[slot].handle(handlers[slot].owner);
                 }
-                if(handled) *pic(0x20+group*4)&=~(1U<<bit);
+                if(irq_slots[source]) *pic(0x20+group*4)&=~(1U<<bit);
                 arch_io_barrier();
             }
         }
