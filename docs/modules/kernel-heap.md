@@ -64,6 +64,7 @@ heap->lock (Rank 10)  ──▶  physical_page_allocator->lock (Rank 20)
 为了缩短临界区并允许底层的内存回收安全重入内核堆（例如页缓存回收元数据可能需要短暂使用堆），所有耗时或可能阻塞的操作均被移到 `heap->lock` 之外：
 
 - **小对象快路径**：命中已有非满 Slab 时，仅在单次 `heap->lock` 内摘槽、置位图并更新统计，完全不触碰物理页分配器。
+- **小对象归还**。存活对象所在的 Slab 持有一张 0 阶物理页。生产构建在 `heap->lock` 内核对块首页的状态、Slab 归属和目标槽位，直接归还槽位。最后一个槽位归还时，先确认整张分配位图为空，再把物理页归还给伙伴分配器。锁调试构建与扩容查询仍检查位图中已分配位的总数。
 - **新 Slab 私有构造**：无可用非满 Slab 时，先释放 `heap->lock`，在锁外向伙伴分配器申请 0 阶页并初始化页头和空闲槽链表，再重新加锁挂入 `partial_slabs[class]` 并取走首个槽位；若期间其他线程也创建了同类 Slab，两者各自独立存活互不冲突。
 - **大对象与清零/复制**：大对象页帧申请、`calloc` 的 `memset` 清零以及 `resize` 的旧数据 `memcpy` 拷贝均在 `heap->lock` 外完成。
 
@@ -84,7 +85,7 @@ heap->lock (Rank 10)  ──▶  physical_page_allocator->lock (Rank 20)
 | **零长度申请** | `size == 0` 返回 `KERNEL_HEAP_STATUS_OK` 并将输出指针置为 `NULL`；`kernel_heap_release(heap, NULL)` 安全空操作返回 `void` |
 | **清零乘法溢出** | `kernel_heap_allocate_zeroed()` 在 `count * size` 溢出时递增调用与失败计数，返回 `KERNEL_HEAP_STATUS_OVERFLOW`，不改动输出指针 |
 | **弹性扩容（`resize`）** | `old_pointer == NULL` 等价于新分配；`new_size == 0` 释放旧对象并输出 `NULL`；若 `new_size` 不超过当前槽位或高阶块的实际容量，原地直接返回旧指针；扩容时先申请新对象并复制旧容量数据再释放旧对象，申请失败则完整保留旧对象和输出 |
-| **归属校验与 fail-stop** | 释放时校验指针位于直接映射域、物理页确为本堆已分配块、Slab 魔数/位图/链表一致且对应槽位确实处于已分配态（区分页内错位指针、外部页与二次释放）。任何堆或底层页分配器不变量损坏均直接触发 fatal trap，绝不把内存损坏降级为可重试错误 |
+| **归属校验与故障停止** | 释放时核对指针位于直接映射域。大对象由伙伴分配器验证分配块首页。小对象核对 Slab 所属的堆、槽位边界和已分配位，识别页内错位指针、外部页和重复归还。检测到破坏归属、位图或链表一致性的情况时，内核触发致命陷阱 |
 | **实时统计** | `kernel_heap_get_statistics()` 在锁内输出 `allocation_calls`、`allocation_failures`、`live_allocations`、`current_pages` 和 `peak_pages`，用于内核测试与根启动退出时的零泄漏核验 |
 
 ---
