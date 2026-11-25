@@ -9448,8 +9448,48 @@ int kernel_mm_local_secret_address(struct kernel_mm *mm,uint64_t address)
 }
 
 #if defined(__loongarch__)
+int kernel_mm_copy_ready_short(struct kernel_mm *mm,uint64_t address,void *buffer,
+    size_t length,enum kernel_user_copy_direction direction,size_t *copied)
+{
+    struct kernel_mm_record *record;
+    if (mm->state!=KERNEL_MM_LIVE || resolve_record(mm,&record)) return 0;
+    bool write=direction==USER_COPY_OUT;
+    KERNEL_RAW_READ_SCOPE(guard,&record->metadata);
+    int closed=pin_admission_closed(record);
+    if (closed==1 || (closed==2 && write)) return 0;
+
+    struct kernel_mm_mapping mapping;
+    if (lookup_user_mapping(record,address,write ? KERNEL_MM_WRITE : KERNEL_MM_READ,&mapping) ||
+        mapping.order) return 0;
+    uint64_t physical=mapping.physical_address&~BOAROS_PAGE_MASK;
+    if (record->has_secret_mappings && kernel_secretmem_page_protected(physical)) return 0;
+    if (write) {
+        struct mm_file_alias_resident *resident=file_alias_resident(
+            find_file_resident(record,address&~BOAROS_PAGE_MASK));
+        if (resident && kernel_page_cache_alias_active(&resident->alias)) return 0;
+    }
+    void *page;
+    if (physical_page_map_owned(mm->allocator,physical,&page)) return 0;
+
+    /* The PTE still owns the page, and a mapping editor or fork must take
+     * the writer before revoking access. The bounded copy never waits. */
+    unsigned char *user=(unsigned char *)page+(address&BOAROS_PAGE_MASK);
+    size_t done=length;
+    if (write) memcpy(user,buffer,length);
+    else if (direction==USER_COPY_IN) memcpy(buffer,user,length);
+    else {
+        unsigned char *string=buffer;
+        for (size_t i=0;i<length;i++) {
+            string[i]=user[i];
+            if (!string[i]) { done=i;break; }
+        }
+    }
+    *copied=done;
+    return 1;
+}
+
 enum kernel_mm_status kernel_mm_copy_local_secret(struct kernel_mm *mm,uint64_t address,
-    void *buffer,size_t length,enum kernel_secret_copy direction,size_t *copied)
+    void *buffer,size_t length,enum kernel_user_copy_direction direction,size_t *copied)
 {
     *copied = 0;
     struct kernel_mm_record *record = mm->record;
@@ -9459,7 +9499,7 @@ enum kernel_mm_status kernel_mm_copy_local_secret(struct kernel_mm *mm,uint64_t 
     struct kernel_task *actor = fault_actor(mm);
     if (!actor) return KERNEL_MM_STATUS_ACCESS;
 
-    uint32_t access = direction == SECRET_COPY_OUT ? KERNEL_MM_WRITE : KERNEL_MM_READ;
+    uint32_t access = direction == USER_COPY_OUT ? KERNEL_MM_WRITE : KERNEL_MM_READ;
     while (*copied < length) {
         uint64_t current = address + *copied;
         enum kernel_mm_status status;
@@ -9483,8 +9523,8 @@ enum kernel_mm_status kernel_mm_copy_local_secret(struct kernel_mm *mm,uint64_t 
                 size_t count = length - *copied < 1024 ? length - *copied : 1024;
                 unsigned char *user = (void *)(uintptr_t)current;
                 unsigned char *bytes = (unsigned char *)buffer + *copied;
-                if (direction == SECRET_COPY_OUT) memcpy(user,bytes,count);
-                else if (direction == SECRET_COPY_IN) memcpy(bytes,user,count);
+                if (direction == USER_COPY_OUT) memcpy(user,bytes,count);
+                else if (direction == USER_COPY_IN) memcpy(bytes,user,count);
                 else {
                     for (size_t i = 0; i < count; i++) {
                         bytes[i] = user[i];

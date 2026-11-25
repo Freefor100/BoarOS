@@ -33,6 +33,7 @@ struct kernel_vfs_instance {
     size_t writeback_block_size; /* Zero means no block alignment requirement. */
     struct kernel_vfs_node *nodes, *node_index;
     size_t node_count;
+    uint64_t node_publications;
     struct kernel_vfs_node *cleanup_nodes;
     struct kernel_vfs_dentry *paths; /* Weak canonical directory-entry registry. */
     uint32_t external_files;
@@ -319,7 +320,8 @@ struct kernel_vfs_backend {
         struct kernel_vfs_stat *stat);
     /* Metadata-only lookup of a regular entry in a namespace-qualified directory. */
     int (*stat_inode)(struct kernel_vfs_mount *, struct kernel_vfs_node *parent,
-        uint64_t inode, struct kernel_vfs_node *live, struct kernel_vfs_stat *);
+        uint64_t inode, struct kernel_vfs_node *live, uint64_t publications,
+        struct kernel_vfs_stat *);
     int (*mkdir)(struct kernel_vfs_mount *mount,
         uint64_t parent_inode, const char *path,
         uint32_t mode, uint32_t umask);

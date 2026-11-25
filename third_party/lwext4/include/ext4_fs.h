@@ -90,6 +90,7 @@ struct ext4_fs {
 	uint32_t inode_table_groups;
 	uint32_t table_inode_count, table_group_inodes;
 	uint16_t table_inode_size;
+	uint8_t table_group_shift, table_block_shift;
 	uint32_t active_operations;
 	const struct ext4_lock *os_locks;
     const struct ext4_inode_observer *inode_observer;

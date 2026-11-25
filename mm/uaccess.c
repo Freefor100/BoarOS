@@ -45,6 +45,27 @@ static inline enum kernel_uaccess_status pin_user_prefix(
     struct kernel_mm_user_pin *pin,unsigned *count)
 { return access_status(kernel_uaccess_pin_resolved(mm,address,second,access,pin,count)); }
 
+#if defined(__loongarch__)
+static inline int copy_ready_short(struct kernel_mm *mm,uint64_t address,void *buffer,
+    size_t length,enum kernel_user_copy_direction direction,size_t *copied)
+{
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_tag tag=kernel_cost_capture();
+    uint64_t start=kernel_cost_clock();
+#endif
+    int ready=kernel_mm_copy_ready_short(mm,address,buffer,length,direction,copied);
+    if (ready) {
+        COST_ADD(USER_RESOLUTIONS,1);COST_IO_ADD(4,1);
+#if BOAROS_COST_DIAGNOSTICS
+        size_t bytes=*copied+(direction==USER_COPY_STRING && *copied<length);
+        kernel_cost_add_tag(tag,COST_UACCESS_COPY_TICKS,kernel_cost_clock()-start);
+        kernel_cost_add_tag(tag,COST_UACCESS_COPY_BYTES,bytes);
+#endif
+    }
+    return ready;
+}
+#endif
+
 #if ARCH_UACCESS_NATIVE
 static inline int local_user_mm(const struct kernel_mm *mm)
 {
@@ -216,7 +237,7 @@ enum kernel_uaccess_status kernel_uaccess_write_cursor_copy(
             if (status == KERNEL_UACCESS_STATUS_FAULT) {
                 size_t done;
                 status = access_status(kernel_mm_copy_local_secret(mm,current,(void *)(source+copied),
-                    chunk,SECRET_COPY_OUT,&done));
+                    chunk,USER_COPY_OUT,&done));
                 copied += done;
                 COST_ADD(COPY_TO_USER,done);
                 if (!status) continue;
@@ -287,12 +308,17 @@ enum kernel_uaccess_status kernel_copy_to_user(
         *bytes_copied = 0;
         if (kernel_user_range_check(user_destination, size))
             return KERNEL_UACCESS_STATUS_FAULT;
+        if (size<=KERNEL_MM_SHORT_COPY_BYTES && copy_ready_short(mm,user_destination,
+            (void *)kernel_source,size,USER_COPY_OUT,bytes_copied)) {
+            COST_ADD(COPY_TO_USER,size);
+            return KERNEL_UACCESS_STATUS_OK;
+        }
         struct kernel_mm_user_pin pin = {0};
         enum kernel_uaccess_status status =
             pin_user_prefix(mm, user_destination, 0, KERNEL_MM_WRITE, &pin, NULL);
         if (status == KERNEL_UACCESS_STATUS_FAULT) {
             status = access_status(kernel_mm_copy_local_secret(mm, user_destination,
-                (void *)kernel_source, size, SECRET_COPY_OUT, bytes_copied));
+                (void *)kernel_source, size, USER_COPY_OUT, bytes_copied));
             COST_ADD(COPY_TO_USER, *bytes_copied);
         } else if (status == KERNEL_UACCESS_STATUS_OK) {
             copy_to_pinned_page((unsigned char *)pin.page + (user_destination & BOAROS_PAGE_MASK),
@@ -341,6 +367,13 @@ enum kernel_uaccess_status kernel_copy_from_user(
 #if ARCH_UACCESS_NATIVE
     if (local_user_mm(mm)) return local_copy(mm,user_source,kernel_destination,size,bytes_copied,0);
 #endif
+#if defined(__loongarch__)
+    if (size<=KERNEL_MM_SHORT_COPY_BYTES && size<=BOAROS_PAGE_SIZE-(user_source&BOAROS_PAGE_MASK) &&
+        copy_ready_short(mm,user_source,kernel_destination,size,USER_COPY_IN,bytes_copied)) {
+        COST_ADD(COPY_FROM_USER,size);COST_IO_ADD(3,size);
+        return KERNEL_UACCESS_STATUS_OK;
+    }
+#endif
 
     while (copied < size) {
         struct kernel_mm_user_pin pin = {0};
@@ -358,7 +391,7 @@ enum kernel_uaccess_status kernel_copy_from_user(
         if (status == KERNEL_UACCESS_STATUS_FAULT) {
             size_t done;
             status = access_status(kernel_mm_copy_local_secret(mm,current,destination+copied,
-                chunk,SECRET_COPY_IN,&done));
+                chunk,USER_COPY_IN,&done));
             copied += done;
             COST_ADD(COPY_FROM_USER,done); COST_IO_ADD(3,done);
             if (!status) continue;
@@ -436,6 +469,16 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 #if ARCH_UACCESS_NATIVE
     if (local_user_mm(mm)) return local_string(mm,kernel_destination,user_source,capacity,string_length);
 #endif
+#if defined(__loongarch__)
+    size_t first=BOAROS_PAGE_SIZE-(user_source&BOAROS_PAGE_MASK);
+    if (first>capacity) first=capacity;
+    if (first>KERNEL_MM_SHORT_COPY_BYTES) first=KERNEL_MM_SHORT_COPY_BYTES;
+    if (copy_ready_short(mm,user_source,kernel_destination,first,USER_COPY_STRING,&copied) &&
+        copied<first) {
+        *string_length=copied;
+        return KERNEL_UACCESS_STATUS_OK;
+    }
+#endif
 
     while (copied < capacity) {
         struct kernel_mm_user_pin pin = {0};
@@ -463,7 +506,7 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
         if (status == KERNEL_UACCESS_STATUS_FAULT) {
             size_t done;
             status = access_status(kernel_mm_copy_local_secret(mm,current,kernel_destination+copied,
-                chunk,SECRET_COPY_STRING,&done));
+                chunk,USER_COPY_STRING,&done));
             copied += done;
             if (!status) {
                 if (done == chunk) continue;
