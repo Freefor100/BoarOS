@@ -373,7 +373,9 @@ static void source_leaf_split(struct ext4_fs *fs)
     CHECK(ext4_dir_mk("/leaf-split")==EOK);
     uint32_t parent=directory("/leaf-split"),numbers[64];
     bool indexed;
+    bool supports_index=ext4_sb_feature_com(&fs->sb,EXT4_FCOM_DIR_INDEX);
     uint64_t size=directory_size(fs,parent,&indexed);
+    CHECK(!indexed && size==ext4_sb_get_block_size(&fs->sb));
     char names[64][224],path[256];unsigned count=0;
     /* Stop at the first actual directory growth and abort that insertion.
      * This leaves one full leaf without assuming hash seed or block numbers. */
@@ -384,8 +386,10 @@ static void source_leaf_split(struct ext4_fs *fs)
         CHECK(ext4_transaction_begin("/")==EOK);
         ext4_file file;CHECK(ext4_fopen(&file,path,"w+")==EOK);
         numbers[count]=file.inode;CHECK(ext4_fclose(&file)==EOK);
-        if(directory_size(fs,parent,NULL)!=size) {
+        if(directory_size(fs,parent,&indexed)!=size) {
+            CHECK(indexed==supports_index);
             CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
+            CHECK(directory_size(fs,parent,&indexed)==size && !indexed && !exists(path));
             break;
         }
         CHECK(ext4_transaction_end("/")==EOK);
@@ -403,21 +407,36 @@ static void source_leaf_split(struct ext4_fs *fs)
         int result=rename_entry(parent,names[i],parent,target,0,&out);
         source_search.active=false;
         CHECK(result==EOK && out.changed && !out.replaced_inode);
-        CHECK(directory_size(fs,parent,NULL)>size);
+        CHECK(directory_size(fs,parent,&indexed)>size && indexed==supports_index);
         snprintf(path,sizeof(path),"/leaf-split/%s",target);
         CHECK(inode(path)==numbers[i]);
         if(source_search.first_leaf!=source_search.last_leaf) {
             CHECK(source_search.lookups==2);moved++;
         } else CHECK(source_search.lookups==1);
         CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
-        CHECK(directory_size(fs,parent,NULL)==size && !exists(path));
+        CHECK(directory_size(fs,parent,&indexed)==size && !indexed && !exists(path));
         snprintf(path,sizeof(path),"/leaf-split/%.220s",names[i]);
         CHECK(inode(path)==numbers[i] && ext4_fs_available_blocks(fs)==blocks &&
             ext4_fs_available_inodes(fs)==inodes && !fs->active_operations && !ext4_current_operation(fs));
-        if(moved || !indexed)break;
+        if(moved || !supports_index)break;
     }
-    CHECK(!indexed || moved);
-    printf("PASS retained source leaf: indexed=%u actual_source_relocations=%u; growth, identity and abort space/owners\n",indexed,moved);
+    CHECK(!supports_index || moved);
+    snprintf(path,sizeof(path),"/leaf-split/%.220s",names[count]);
+    ext4_file file;
+    CHECK(ext4_fopen(&file,path,"w+")==EOK);
+    numbers[count]=file.inode;
+    CHECK(ext4_fclose(&file)==EOK);
+    CHECK(directory_size(fs,parent,&indexed)>size && indexed==supports_index);
+    for(unsigned i=0;i<=count;i++) {
+        snprintf(path,sizeof(path),"/leaf-split/%.220s",names[i]);
+        CHECK(inode(path)==numbers[i]);
+    }
+    struct ext4_inode_ref ref;
+    uint32_t parent_inode;
+    CHECK(ext4_fs_get_inode_ref_read(fs,parent,&ref)==EOK);
+    CHECK(ext4_dir_parent_inode(&ref,&parent_inode)==EOK && parent_inode==EXT4_INODE_ROOT_INDEX);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    printf("PASS directory growth: indexed=%u source_relocations=%u; names, parent identity and abort space/owners\n",indexed,moved);
 }
 
 static void wide(struct ext4_fs *fs)

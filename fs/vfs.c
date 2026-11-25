@@ -743,6 +743,7 @@ struct vfs_path_walk {
     const struct vfs_walk_stat *stat;
     unsigned final_write, resolve;
     bool cached_prefix;
+    bool mkdir;
     uint64_t topology_generation;
 };
 static void path_walk_release(struct vfs_path_walk *walk)
@@ -3047,7 +3048,8 @@ struct path_component_span { size_t begin,end,next; };
 /* The namespace guard keeps names and permissions valid. The state lock
  * protects the weak dentries until the final directory reference is taken. */
 static struct kernel_vfs_dentry *cached_path_prefix(struct vfs_path_walk *walk,
-    struct kernel_vfs_path *start,const char *path,size_t length,struct path_component_span *part)
+    struct kernel_vfs_path *start,const char *path,size_t length,
+    struct path_component_span *part,bool *existing_directory)
 {
     struct kernel_vfs_mount *mount=start->file.mount;
     struct kernel_vfs_instance *instance=mount->private_data;
@@ -3108,7 +3110,8 @@ static struct kernel_vfs_dentry *cached_path_prefix(struct vfs_path_walk *walk,
         while (cursor<length && path[cursor]=='/') cursor++;
     }
     if (parent==start->dentry) return NULL;
-    if (count_dirs>=2 && end==length && begin-first<=sizeof(recent_stat_prefix.name)) {
+    if (count_dirs>=2 && (end==length || (walk->mkdir && cursor==length)) &&
+        begin-first<=sizeof(recent_stat_prefix.name)) {
         recent_stat_prefix.directory=parent;
         recent_stat_prefix.anchor=start->dentry;
         recent_stat_prefix.mount_id=mount->id;
@@ -3116,6 +3119,22 @@ static struct kernel_vfs_dentry *cached_path_prefix(struct vfs_path_walk *walk,
         memcpy(recent_stat_prefix.name,path+first,begin-first);
     }
 Found:
+    if (walk->mkdir && cursor==length && end>begin && end-begin<=255U) {
+        struct kernel_vfs_node *node=parent->file.private_data;
+        if (!node->unlinked && instance->ops->search_cached(node,cred)) {
+            struct kernel_vfs_dentry *child=find_child_name(parent,path+begin,end-begin);
+            if (child && (child->file.mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR &&
+                child!=mount->root_dentry && child!=walk->root->dentry &&
+                !__atomic_load_n(&child->mountpoint_seen,__ATOMIC_ACQUIRE)) {
+                /* Existence was established under the namespace guard.
+                 * There is no write to qualify and no path to export. */
+                __atomic_store_n(&child->recently_used,1,__ATOMIC_RELAXED);
+                clear_mount_expiry(mount);
+                *existing_directory=true;
+                return NULL;
+            }
+        }
+    }
     if (dentry_acquire(parent)) __builtin_trap();
     *part=(struct path_component_span){begin,end,cursor};
     return parent;
@@ -3429,12 +3448,18 @@ static int resolve_object(struct kernel_vfs_path *start,
         }
         if (borrowed && pending==path && walk->cached_prefix && suffix && !trailing_only) {
             struct path_component_span part={begin,end,cursor};
-            struct kernel_vfs_dentry *prefix=cached_path_prefix(walk,current,pending,length,&part);
+            bool existing_directory=false;
+            struct kernel_vfs_dentry *prefix=cached_path_prefix(walk,current,pending,length,&part,
+                &existing_directory);
+            if (existing_directory) {
+                result=-KERNEL_EEXIST;
+                goto Finish;
+            }
             if (prefix) {
                 struct kernel_vfs_mount *mount=current->file.mount;
                 const char *leaf=pending+part.begin;
                 size_t count=part.end-part.begin;
-                if (part.end==length && count<=255U &&
+                if (!walk->final_write && part.end==length && count<=255U &&
                     !(leaf[0]=='.' && (count==1 || (count==2 && leaf[1]=='.')))) {
                     result=inode_permission(prefix->file.private_data,KERNEL_VFS_MAY_EXEC,1,false);
                     if (!result) {
@@ -5864,6 +5889,8 @@ int kernel_vfs_mkdir_at(struct kernel_vfs_path *start,
 {
     if (!start || !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
     VFS_PATH_WALK(walk,start,root);
+    walk.cached_prefix=true;
+    walk.mkdir=true;
 
     struct kernel_vfs_path *path = 0;
     char name[256] = {0};
