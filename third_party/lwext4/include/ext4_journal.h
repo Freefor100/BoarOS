@@ -154,6 +154,7 @@ struct jbd_trans {
 	uint64_t reservation_group_revision;
 	unsigned ordered_count, revoke_count;
 	bool frozen;
+	bool background_times_only;
 
 	struct jbd_journal *journal;
 	struct ext4_orphan_undo *orphan_undo;

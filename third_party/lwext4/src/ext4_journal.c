@@ -3346,6 +3346,7 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 	} else {
 		journal->running_revision++;
 		COST_ADD(JOURNAL_MERGED, 1);
+		running->background_times_only &= operation->background_times_only;
 		/* Moving into an empty running tree transfers the existing count.
 		 * Two populated trees become one only after all records have moved. */
 		bool merge_data_trees = running->ordered_count && operation->ordered_count;
