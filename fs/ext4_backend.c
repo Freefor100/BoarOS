@@ -2748,12 +2748,17 @@ static int ext4_acl_read(struct kernel_vfs_node *node,const char *name,void **ou
     if (result) {if (converted) kernel_heap_release(node->instance->heap,converted);return result;}
     *out=converted;*length=converted_size;return 0;
 }
+static bool ext4_access_acl_absent(const struct lwext4_node *node,uint64_t *epoch)
+{
+    *epoch=__atomic_load_n(&node->metadata_epoch,__ATOMIC_ACQUIRE)+1U;
+    return *epoch && __atomic_load_n(&node->access_acl_absent_epoch,__ATOMIC_ACQUIRE)==*epoch;
+}
+
 static bool ext4_search_cached(struct kernel_vfs_node *node,const struct kernel_credentials *cred)
 {
     if (cred->fsuid!=node->uid && (node->mode&0070U)) {
-        struct lwext4_node *live=(struct lwext4_node *)node;
-        uint64_t epoch=__atomic_load_n(&live->metadata_epoch,__ATOMIC_ACQUIRE)+1U;
-        if (!epoch || __atomic_load_n(&live->access_acl_absent_epoch,__ATOMIC_ACQUIRE)!=epoch ||
+        uint64_t epoch;
+        if (!ext4_access_acl_absent((struct lwext4_node *)node,&epoch) ||
             ext4_current_operation(lwext4_instance(node->instance)->device.fs)) return false;
     }
     return !kernel_vfs_dac_permission(node->mode,node->uid,node->gid,KERNEL_VFS_MAY_EXEC,cred);
@@ -2766,14 +2771,10 @@ static int ext4_backend_permission(struct kernel_vfs_node *node,const struct ker
     struct lwext4_node *live=(struct lwext4_node *)node;
     struct lwext4_mount_adapter *adapter=lwext4_instance(node->instance);
     bool accepted=!ext4_current_operation(adapter->device.fs);
-    bool absent=false;
     uint64_t epoch=0;
-    if (accepted) {
-        TIMESTAMP_SCOPE(guard,adapter);
-        epoch=live->metadata_epoch+1U;
-        absent=epoch && live->access_acl_absent_epoch==epoch;
-    }
-    if (absent) return kernel_vfs_dac_permission(node->mode,node->uid,node->gid,access,cred);
+    /* The caller's inode or directory guard excludes access ACL edits. */
+    if (accepted && ext4_access_acl_absent(live,&epoch))
+        return kernel_vfs_dac_permission(node->mode,node->uid,node->gid,access,cred);
     void *acl=NULL;size_t length=0;
     int result=ext4_acl_read(node,KERNEL_ACL_ACCESS,&acl,&length);
     if (result==-KERNEL_ENODATA) {
