@@ -153,6 +153,7 @@ struct ext4_blockdev {
 
 	/**@brief   Block count: logical*/
 	uint64_t lg_bcnt;
+	uint64_t inode_read_next; /* Next cold block following an inode table read run. */
 
 	/**@brief   Cache write back mode reference counter*/
 	uint32_t cache_write_back;
@@ -258,6 +259,10 @@ enum ext4_block_access {
  * transaction wrapper to return without flushing. Ordinary get reads all. */
 int ext4_block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
     uint64_t lba, uint32_t offset, uint32_t length, enum ext4_block_access access);
+/* Read one inode record. Continue an observed cold run only within the
+ * remaining blocks of the inode table, and only in the published view. */
+int ext4_block_get_inode_range(struct ext4_blockdev *, struct ext4_block *,
+    uint64_t lba, uint32_t offset, uint32_t length, unsigned remaining);
 /* Cache-aware reads. Successful blocks retain one caller reference each,
  * failed blocks are released. Duplicate LBAs share content and loading. */
 int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,
