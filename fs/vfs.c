@@ -4383,6 +4383,7 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
         VFS_PATH_WALK(walk,start,root);
         walk.final_write=create || temporary;
         walk.resolve=request->resolve;
+        walk.cached_prefix=!request->resolve;
         if (opened) walk.pathless_link=&opened->pathless_link;
         struct kernel_vfs_path *resolved=NULL;
         char missing[256];

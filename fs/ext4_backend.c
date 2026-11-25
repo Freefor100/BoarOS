@@ -88,6 +88,7 @@ static void complete_sync_waiters(struct lwext4_mount_adapter *adapter);
 static bool vfs_realtime(struct ext4_timestamp *now);
 static int lwext4_error(int error);
 static int ext4_acl_read(struct kernel_vfs_node *,const char *,void **,size_t *);
+static bool ext4_access_acl_absent(const struct lwext4_node *,uint64_t *);
 static int block_open(struct ext4_blockdev *device);
 static int block_read(struct ext4_blockdev *device,
                       void *buffer,
@@ -562,14 +563,14 @@ static struct kernel_vfs_node *time_drop_dirty(struct lwext4_node *node)
 
 /* Caller holds timestamp_lock. The acquired list pin is atomic; wakeups and
  * final node releases stay outside this short cross-hart publication. */
-static int time_dirty_locked(struct lwext4_node *node, unsigned fields,
-                             struct ext4_timestamp now)
+static inline int time_update_locked(struct lwext4_node *node, unsigned fields,
+    const struct ext4_timestamp *values, bool shared_value)
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(node->node.instance);
     int notify = 0;
     unsigned changed=0;
     for (unsigned i = 0; i < 3; i++) if (fields & (1U << i)) {
-        struct ext4_timestamp value = normalize_time(node, i, now);
+        struct ext4_timestamp value = normalize_time(node, i, values[shared_value ? 0 : i]);
         if (!time_compare(node->times[i], value)) continue;
         node->times[i] = value;
         changed=1;
@@ -587,6 +588,10 @@ static int time_dirty_locked(struct lwext4_node *node, unsigned fields,
     }
     return notify;
 }
+
+static int time_dirty_locked(struct lwext4_node *node, unsigned fields,
+                             struct ext4_timestamp now)
+{ return time_update_locked(node, fields, &now, true); }
 
 static void time_notify(struct lwext4_mount_adapter *adapter, int notify)
 {
@@ -842,6 +847,7 @@ static void initialize_times(struct kernel_vfs_node *base,
     lwext4_node_file(base)->time_owner = base;
     lwext4_node_file(base)->delalloc = &node->delalloc;
     node->noatime = ext4_inode_has_flag(inode, EXT4_INODE_FLAG_NOATIME);
+    node->synchronous = ext4_inode_has_flag(inode, EXT4_INODE_FLAG_SYNC);
     node->times[0] = (struct ext4_timestamp){node->metadata.atime.seconds,node->metadata.atime.nanoseconds};
     node->times[1] = (struct ext4_timestamp){node->metadata.mtime.seconds,node->metadata.mtime.nanoseconds};
     node->times[2] = (struct ext4_timestamp){node->metadata.ctime.seconds,node->metadata.ctime.nanoseconds};
@@ -2134,6 +2140,26 @@ static int ext4_backend_statfs(struct kernel_vfs_mount *mount,
     return 0;
 }
 
+/* Accepted timestamp-only changes share the live regular inode and its
+ * writeback reference. A nested operation must keep changes in its rollback
+ * domain. The caller holds the inode writer and mount mutation qualification. */
+static bool can_defer_attribute_times(const struct lwext4_node *node,
+    const struct lwext4_mount_adapter *adapter)
+{
+    const struct ext4_fs *fs = adapter->device.fs;
+    return (node->node.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG &&
+        !node->synchronous && fs->jbd_journal && fs->jbd_journal->grouped &&
+        !ext4_current_operation(adapter->device.fs);
+}
+
+static int defer_ctime(struct lwext4_node *node)
+{
+    struct ext4_timestamp now;
+    if (!ext4_file_read_clock(&node->file, &now)) return -KERNEL_EIO;
+    time_dirty(node, EXT4_TIME_CTIME, now);
+    return 0;
+}
+
 static int ext4_backend_set_times(struct kernel_vfs_file *file,
                               const struct kernel_vfs_timespec times[2])
 {
@@ -2148,7 +2174,8 @@ static int ext4_backend_set_times(struct kernel_vfs_file *file,
     kernel_vfs_node_lock(node, &node_guard, 1);
     if (node->instance->read_only) return -KERNEL_EROFS;
     int allowed=kernel_vfs_inode_times_allowed(node,times); if (allowed) return allowed;
-    int result = mount_error(lwext4_instance(node->instance));
+    struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
+    int result = mount_error(adapter);
     if (result) return lwext4_error(result);
     struct ext4_timestamp now, values[3];
     if (!ext4_file_read_clock(lwext4_node_file(node), &now)) return -KERNEL_EIO;
@@ -2160,6 +2187,16 @@ static int ext4_backend_set_times(struct kernel_vfs_file *file,
         values[i] = !times || times[i].nanoseconds == KERNEL_VFS_UTIME_NOW
                   ? now : (struct ext4_timestamp){times[i].seconds,
                                                     (uint32_t)times[i].nanoseconds};
+    }
+    struct lwext4_node *owner = (struct lwext4_node *)node;
+    if (can_defer_attribute_times(owner, adapter)) {
+        int notify;
+        {
+            TIMESTAMP_SCOPE(guard, adapter);
+            notify = time_update_locked(owner, fields, values, false);
+        }
+        time_notify(adapter, notify);
+        return 0;
     }
     return lwext4_error(ext4_file_set_times(lwext4_node_file(node), fields, values));
 }
@@ -2211,10 +2248,16 @@ static int ext4_backend_set_mode(struct kernel_vfs_file *file, uint32_t mode)
     kernel_vfs_node_lock(node, &node_guard, 1);
     if (node->instance->read_only) return -KERNEL_EROFS;
     int allowed=kernel_vfs_chmod_allowed(node->uid,node->gid,&mode); if (allowed) return allowed;
-    int result = mount_error(lwext4_instance(node->instance));
+    struct lwext4_node *owner = (struct lwext4_node *)node;
+    struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
+    int result = mount_error(adapter);
     if (result) return lwext4_error(result);
+    uint64_t epoch;
+    bool no_acl = can_defer_attribute_times(owner, adapter) && ext4_access_acl_absent(owner, &epoch);
+    if (no_acl && (mode & 07777U) == (node->mode & 07777U))
+        return defer_ctime(owner);
     void *acl=NULL;size_t acl_size=0;
-    result=ext4_acl_read(node,KERNEL_ACL_ACCESS,&acl,&acl_size);
+    result=no_acl ? -KERNEL_ENODATA : ext4_acl_read(node,KERNEL_ACL_ACCESS,&acl,&acl_size);
     if (result==-KERNEL_ENODATA)
         result=lwext4_error(ext4_file_set_mode(lwext4_node_file(node),mode & 07777U));
     else if (!result) {
@@ -2247,9 +2290,14 @@ static int ext4_backend_set_owner(struct kernel_vfs_file *file, uint32_t uid, ui
     kernel_vfs_node_lock(node, &node_guard, 1);
     if (node->instance->read_only) return -KERNEL_EROFS;
     int allowed=kernel_vfs_chown_allowed(node->uid,node->gid,node->mode,uid,gid); if (allowed) return allowed;
-    int result = mount_error(lwext4_instance(node->instance));
+    struct lwext4_node *owner = (struct lwext4_node *)node;
+    struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
+    int result = mount_error(adapter);
     if (result) return lwext4_error(result);
     uint32_t mode=kernel_vfs_chown_mode(node->mode,node->gid,gid==UINT32_MAX?node->gid:gid);
+    if ((uid == UINT32_MAX || uid == node->uid) && (gid == UINT32_MAX || gid == node->gid) &&
+        mode == node->mode && owner->capability_absent && can_defer_attribute_times(owner, adapter))
+        return defer_ctime(owner);
     result = lwext4_error(ext4_file_set_owner(lwext4_node_file(node), uid, gid, mode));
     if (!result) {
         file->mode = node->mode = mode;
@@ -2641,6 +2689,8 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     node->attributes=ext4_inode_get_flags(&initial)&KERNEL_VFS_INODE_ATTRIBUTES;
     initialize_times(node, adapter, &initial);
     ((struct lwext4_node *)node)->capability_absent=1;
+    if (!request.access_size)
+        ((struct lwext4_node *)node)->access_acl_absent_epoch=1;
     ((struct lwext4_node *)node)->delalloc.fresh_extent=type==KERNEL_VFS_S_IFREG &&
         ext4_inode_has_flag(&initial,EXT4_INODE_FLAG_EXTENTS);
     node->unlinked = path == NULL;
