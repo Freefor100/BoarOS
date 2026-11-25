@@ -2628,8 +2628,11 @@ static enum kernel_files_status lseek_pinned(
         }
         description->generated_read_offset = (uint64_t)target;
     }
-    if (kernel_open_file_seek(description, (uint64_t)target) !=
-        KERNEL_OPEN_FILE_STATUS_OK) {
+    enum kernel_open_file_status seek = BOAROS_PAGE_CACHE_READAHEAD_PAGES &&
+        BOAROS_PAGE_SIZE==4096U && whence==KERNEL_FILES_SEEK_CUR ?
+        kernel_open_file_seek_relative(description,(uint64_t)target) :
+        kernel_open_file_seek(description,(uint64_t)target);
+    if (seek != KERNEL_OPEN_FILE_STATUS_OK) {
         return KERNEL_FILES_STATUS_STATE;
     }
     if (kind == KERNEL_OPEN_FILE_KIND_GENERATED && target == 0)

@@ -98,6 +98,16 @@ int kernel_open_file_fallocate(struct kernel_open_file_description *file,
 }
 
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+enum { READ_TRACKED = 1, READ_FORWARD_SEEK = 2 };
+
+static inline int follows_read_end(unsigned state,uint64_t end,uint64_t offset)
+{
+    /* Background lookahead for short forward gaps amortizes 4 KiB demand
+     * reads. A 16 KiB cache page already covers a larger part of the gap. */
+    return end==offset || (BOAROS_PAGE_SIZE==4096U && (state&READ_FORWARD_SEEK) &&
+        offset>end && offset-end<=16384U);
+}
+
 static uint64_t reset_read_prediction_locked(struct kernel_open_file_description *file)
 {
     uint64_t cookie = file->readahead_cookie;
@@ -196,12 +206,13 @@ int kernel_open_file_advise(struct kernel_open_file_description *file,int64_t of
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
 void kernel_open_file_read_begin(struct kernel_open_file_description *file, uint64_t offset)
 {
-    if (!file || !open_file_live(file) || !__atomic_load_n(&file->read_sequential,__ATOMIC_RELAXED)) return;
-    if (__atomic_load_n(&file->read_end,__ATOMIC_RELAXED)==offset) return;
+    if (!file || !open_file_live(file)) return;
+    unsigned state=__atomic_load_n(&file->read_sequential,__ATOMIC_RELAXED);
+    if (!state || follows_read_end(state,__atomic_load_n(&file->read_end,__ATOMIC_RELAXED),offset)) return;
     uint64_t cancel=0;
     {
         KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
-        if (file->read_sequential && file->read_end != offset) {
+        if (file->read_sequential && !follows_read_end(file->read_sequential,file->read_end,offset)) {
             cancel=file->readahead_cookie;
             file->readahead_cookie=0;__atomic_store_n(&file->read_sequential,0,__ATOMIC_RELAXED);
             file->readahead_end=0;file->readahead_pages=0;
@@ -233,16 +244,17 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
     {
         KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
         if (file->read_advice!=policy) return;
-        int sequential=file->read_sequential && file->read_end==offset;
+        uint64_t last_end=file->read_end;
+        int sequential=file->read_sequential && follows_read_end(file->read_sequential,last_end,offset);
         if (!sequential) {
             cancel=file->readahead_cookie;file->readahead_cookie=0;file->readahead_end=0;file->readahead_pages=initial;
         }
         __atomic_store_n(&file->read_end,end,__ATOMIC_RELAXED);
-        __atomic_store_n(&file->read_sequential,1,__ATOMIC_RELAXED);
+        __atomic_store_n(&file->read_sequential,READ_TRACKED,__ATOMIC_RELAXED);
         previous_end=file->readahead_end;cookie=file->readahead_cookie;
         /* 需求读已装入未对齐末端所在页；从下一整页预读，首个窗口仍须有实际跨页进展。 */
         queue=sequential && next_unread>=previous_end &&
-            (previous_end || (end>>BOAROS_PAGE_SHIFT)>(offset>>BOAROS_PAGE_SHIFT));
+            (previous_end || (end>>BOAROS_PAGE_SHIFT)>(last_end>>BOAROS_PAGE_SHIFT));
         pages=file->readahead_pages?file->readahead_pages:initial;
         if (queue && previous_end && pages<maximum) {
             pages*=2;if (pages>maximum) pages=maximum;
@@ -1417,6 +1429,27 @@ enum kernel_open_file_status kernel_open_file_seek(
     reset_read_prediction(file);
     file->offset = offset;
     return KERNEL_OPEN_FILE_STATUS_OK;
+}
+
+enum kernel_open_file_status kernel_open_file_seek_relative(
+    struct kernel_open_file_description *file,uint64_t offset)
+{
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    if (BOAROS_PAGE_SIZE==4096U && open_file_live(file) && file->kind==KERNEL_OPEN_FILE_KIND_REGULAR) {
+        uint64_t cookie=0;
+        {
+            KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
+            if (file->read_sequential && offset>=file->offset &&
+                follows_read_end(READ_FORWARD_SEEK,file->read_end,offset))
+                __atomic_store_n(&file->read_sequential,READ_TRACKED|READ_FORWARD_SEEK,__ATOMIC_RELAXED);
+            else cookie=reset_read_prediction_locked(file);
+            file->offset=offset;
+        }
+        if (cookie) kernel_page_cache_cancel_readahead(kernel_vfs_file_page_cache(&file->file),cookie);
+        return KERNEL_OPEN_FILE_STATUS_OK;
+    }
+#endif
+    return kernel_open_file_seek(file,offset);
 }
 
 enum kernel_open_file_status kernel_open_file_advance(

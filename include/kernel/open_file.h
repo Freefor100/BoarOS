@@ -235,6 +235,9 @@ enum kernel_open_file_status kernel_open_file_advance(
 enum kernel_open_file_status kernel_open_file_seek(
     struct kernel_open_file_description *file,
     uint64_t offset);
+/* A user relative seek holds the shared file-position lock. */
+enum kernel_open_file_status kernel_open_file_seek_relative(
+    struct kernel_open_file_description *file, uint64_t offset);
 
 /* Successful regular-file reads feed only this OFD's sequential predictor. */
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
