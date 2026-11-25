@@ -156,6 +156,49 @@ ext4_ialloc_verify_bitmap_csum(struct ext4_sblock *sb __unused,
 	return true;
 }
 
+static uint64_t inode_bitmap_key(struct ext4_block_group_ref *group __unused)
+{
+#if CONFIG_META_CSUM_ENABLE
+    struct ext4_sblock *sb = ext4_fs_super(group->fs);
+    if (!ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM) ||
+        group->index > UINT32_MAX >> 2)
+        return 0;
+    const struct ext4_bgroup *bg = group->block_group;
+    uint32_t checksum = to_le16(bg->inode_bitmap_csum_lo);
+    if (ext4_sb_get_desc_size(sb) == EXT4_MAX_BLOCK_GROUP_DESCRIPTOR_SIZE)
+        checksum |= (uint32_t)to_le16(bg->inode_bitmap_csum_hi) << 16;
+    /* Tag 3 is distinct from directory leaves, directory indexes and extents. */
+    uint64_t key = (uint64_t)group->index << 34 | (uint64_t)checksum << 2 | 3U;
+    if (key != UINT64_MAX) return key;
+#endif
+    return 0;
+}
+
+static bool inode_bitmap_checked(struct ext4_block_group_ref *group, struct ext4_block *block)
+{
+    uint64_t key = inode_bitmap_key(group);
+    uint64_t observed = __atomic_load_n(&block->payload->tree_verified, __ATOMIC_ACQUIRE);
+    if (key && observed == key) return true;
+#if CONFIG_JOURNALING_ENABLE
+    if (key && observed == UINT64_MAX) {
+        struct jbd_trans *trans = ext4_current_trans(group->fs);
+        if (trans && jbd_trans_first_tree_copy_checked(trans, block, key)) return true;
+    }
+#endif
+    if (!ext4_ialloc_verify_bitmap_csum(ext4_fs_super(group->fs), group->block_group, block->data))
+        return false;
+    if (key && observed != UINT64_MAX)
+        (void)__atomic_compare_exchange_n(&block->payload->tree_verified, &observed,
+            key, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    return true;
+}
+
+static int inode_bitmap_dirty(struct ext4_block_group_ref *group, struct ext4_block *block)
+{
+    ext4_ialloc_set_bitmap_csum(ext4_fs_super(group->fs), group->block_group, block->data);
+    return ext4_trans_set_tree_dirty(block, inode_bitmap_key(group));
+}
+
 /* Called with filesystem mutation excluded. An uninitialized inode group
  * cannot be used as a source of exportable objects. */
 int ext4_ialloc_inode_present(struct ext4_fs *fs, uint32_t index)
@@ -174,7 +217,7 @@ int ext4_ialloc_inode_present(struct ext4_fs *fs, uint32_t index)
         unsigned size = ext4_sb_get_block_size(sb);
         result = ext4_block_get_range(fs->bdev, &block, bitmap, 0, size, EXT4_BLOCK_READ);
         if (!result) {
-            if (!ext4_ialloc_verify_bitmap_csum(sb, group.block_group, block.data))
+            if (!inode_bitmap_checked(&group, &block))
                 result = EUCLEAN;
             else if (!ext4_bmap_is_bit_set(block.data, ext4_ialloc_inode_to_bgidx(sb, index)))
                 result = ENOENT;
@@ -218,7 +261,7 @@ int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 	}
 
 	uint32_t index_in_group = ext4_ialloc_inode_to_bgidx(sb, index);
-	if (!ext4_ialloc_verify_bitmap_csum(sb, bg, b.data) ||
+	if (!inode_bitmap_checked(&bg_ref, &b) ||
 	    !ext4_bmap_is_bit_set(b.data, index_in_group)) {
 		ext4_dbg(DEBUG_IALLOC,
 			DBG_WARN "Invalid inode bitmap or unallocated inode."
@@ -237,11 +280,10 @@ int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
     }
 	/* Free i-node in the bitmap */
 	ext4_bmap_bit_clr(b.data, index_in_group);
-	ext4_ialloc_set_bitmap_csum(sb, bg, b.data);
-	ext4_trans_set_block_dirty(b.buf);
-
 	/* Put back the block with bitmap */
-	rc = ext4_block_set(fs->bdev, &b);
+	rc = inode_bitmap_dirty(&bg_ref, &b);
+	int release = ext4_block_set(fs->bdev, &b);
+	if (!rc) rc = release;
 	if (rc != EOK) {
 		/* Error in saving bitmap */
 		ext4_fs_put_block_group_ref(&bg_ref);
@@ -352,7 +394,7 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir,
 				return rc;
 			}
 
-			if (!ext4_ialloc_verify_bitmap_csum(sb, bg, b.data)) {
+			if (!inode_bitmap_checked(&bg_ref, &b)) {
 				ext4_dbg(DEBUG_IALLOC,
 					DBG_WARN "Bitmap checksum failed."
 					"Group: %" PRIu32"\n",
@@ -395,11 +437,9 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir,
 			ext4_bmap_bit_set(b.data, idx_in_bg);
 
 			/* Free i-node found, save the bitmap */
-			ext4_ialloc_set_bitmap_csum(sb,bg,
-						    b.data);
-			ext4_trans_set_block_dirty(b.buf);
-
-			rc = ext4_block_set(fs->bdev, &b);
+			rc = inode_bitmap_dirty(&bg_ref, &b);
+			int release = ext4_block_set(fs->bdev, &b);
+			if (!rc) rc = release;
 			if (rc != EOK) {
 				ext4_fs_put_block_group_ref(&bg_ref);
 				return rc;

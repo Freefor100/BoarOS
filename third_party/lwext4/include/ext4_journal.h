@@ -163,6 +163,7 @@ struct jbd_trans {
 	struct jbd_allocation_group *allocation_groups;
 	RB_HEAD(jbd_revoke_tree, jbd_revoke_rec) revoke_root;
 	LIST_HEAD(jbd_trans_block_rec, jbd_block_rec) tbrec_list;
+	uint64_t last_dirty_ns;
 	TAILQ_ENTRY(jbd_trans) trans_node;
 };
 

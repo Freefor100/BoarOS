@@ -11,6 +11,7 @@ struct kernel_pipe;
 struct kernel_record_lock;
 struct kernel_vfs_path;
 struct kernel_fs_paths;
+struct kernel_task_io_buffer;
 struct kernel_vfs_size_limit;
 void kernel_files_size_limit_notify(const struct kernel_vfs_size_limit *);
 struct kernel_files_pin_guard {
@@ -28,6 +29,11 @@ int kernel_files_path_start(struct kernel_files *files,
                             const struct kernel_fs_paths *snapshot,
                             int64_t dirfd, const char *path,
                             struct kernel_vfs_path **start);
+int kernel_files_borrow_lookup_start(struct kernel_files *, const struct kernel_fs_paths *,
+    int64_t dirfd, const char *, struct kernel_vfs_path **start, struct kernel_vfs_path **owner);
+void kernel_files_path_buffer_release(struct kernel_task_io_buffer *);
+enum kernel_files_status kernel_files_copy_user_path(struct kernel_mm *, uint64_t,
+    struct kernel_task_io_buffer *, int *result);
 
 #define KERNEL_FILES_INITIAL_CAPACITY 32U
 #define KERNEL_FILES_MAX_CAPACITY ((uint32_t)KERNEL_RLIMIT_NOFILE_CAP)

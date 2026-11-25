@@ -360,9 +360,18 @@ static void group_test(struct ext4_fs *fs)
     CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
     CHECK(ext4_fraw_inode_fill(&f,&actual)==EOK && !memcmp(&actual,&committed,sizeof(actual)));
     CHECK(ext4_journal_group_service("/",false)==EOK && disk.writes==writes);
-    group_now=99999999;
+    struct ext4_timestamp continuing[3] = {{1111,0},{2222,2},{3333,3}};
+    for (unsigned edit=1;edit<=5;edit++) {
+        group_now=UINT64_C(90000000)*edit;
+        continuing[0].nanoseconds=128+edit;
+        CHECK(ext4_file_set_times(&f,7,continuing)==EOK);
+        CHECK(ext4_journal_group_service("/",false)==EOK && disk.writes==writes);
+    }
+    CHECK(ext4_fraw_inode_fill(&f,&committed)==EOK);
+    CHECK(ext4_journal_group_progress("/",&after_repeat)==EOK && after_repeat.deadline_ns==500000000);
+    group_now=499999999;
     CHECK(ext4_journal_group_service("/",false)==EOK && disk.writes==writes);
-    group_now=100000000;
+    group_now=500000000;
     CHECK(ext4_journal_group_service("/",false)==EOK);
     CHECK(fs->jbd_journal->committed_id==tid+1);
     CHECK(disk.flushes-flushes < 32*2);

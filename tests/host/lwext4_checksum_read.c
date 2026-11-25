@@ -4,6 +4,7 @@
 #undef main
 #include <ext4_dir.h>
 #include <ext4_dir_idx.h>
+#include <ext4_ialloc.h>
 #include <ext4_trans.h>
 #include <stddef.h>
 
@@ -297,8 +298,33 @@ static void extent_node_queries(struct ext4_fs *fs)
     CHECK(ext4_fs_put_inode_ref(&inode)==EOK && ext4_fclose(&file)==EOK);
 }
 
+static void inode_bitmap_queries(struct ext4_fs *fs, struct ext4_blockdev *dev)
+{
+    ext4_file file;
+    CHECK(ext4_fopen(&file, "/bitmap-check", "w+") == EOK);
+    uint32_t group = (file.inode - 1) / ext4_get32(&fs->sb, inodes_per_group);
+    struct ext4_block_group_ref descriptor;
+    CHECK(ext4_fs_get_block_group_ref(fs, group, &descriptor) == EOK);
+    ext4_fsblk_t lba = ext4_bg_get_inode_bitmap(descriptor.block_group, &fs->sb);
+    CHECK(ext4_fs_put_block_group_ref(&descriptor) == EOK);
+    CHECK(ext4_ialloc_inode_present(fs, file.inode) == EOK);
+    unsigned before = crc_calls;
+    CHECK(ext4_ialloc_inode_present(fs, file.inode) == EOK && crc_calls == before);
+    struct ext4_block block;
+    CHECK(ext4_block_get(dev, &block, lba) == EOK);
+    ext4_block_payload_write(block.payload);
+    block.data[0] ^= 1;
+    CHECK(ext4_ialloc_inode_present(fs, file.inode) == EUCLEAN);
+    block.data[0] ^= 1;
+    CHECK(ext4_block_set(dev, &block) == EOK);
+    CHECK(ext4_ialloc_inode_present(fs, file.inode) == EOK);
+    CHECK(ext4_fclose(&file) == EOK);
+    CHECK(ext4_fremove("/bitmap-check") == EOK);
+}
+
 static void reuse_queries(struct ext4_fs *fs, struct ext4_blockdev *dev)
 {
+    inode_bitmap_queries(fs, dev);
     ext4_file file;
     uint32_t ino, mode;
     CHECK(ext4_lookup_child("/", EXT4_INODE_ROOT_INDEX, "file", 4, &ino, &mode) == EOK);

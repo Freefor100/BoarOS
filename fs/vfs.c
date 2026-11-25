@@ -742,6 +742,7 @@ struct vfs_path_walk {
     struct kernel_vfs_path **pathless_link;
     const struct vfs_walk_stat *stat;
     unsigned final_write, resolve;
+    bool cached_prefix;
     uint64_t topology_generation;
 };
 static void path_walk_release(struct vfs_path_walk *walk)
@@ -3045,7 +3046,7 @@ struct path_component_span { size_t begin,end,next; };
 
 /* The namespace guard keeps names and permissions valid. The state lock
  * protects the weak dentries until the final directory reference is taken. */
-static struct kernel_vfs_dentry *stat_cached_prefix(struct vfs_path_walk *walk,
+static struct kernel_vfs_dentry *cached_path_prefix(struct vfs_path_walk *walk,
     struct kernel_vfs_path *start,const char *path,size_t length,struct path_component_span *part)
 {
     struct kernel_vfs_mount *mount=start->file.mount;
@@ -3426,9 +3427,9 @@ static int resolve_object(struct kernel_vfs_path *start,
             result = -KERNEL_ENAMETOOLONG;
             goto Finish;
         }
-        if (borrowed && pending==path && walk->stat && !walk->resolve && suffix && !trailing_only) {
+        if (borrowed && pending==path && walk->cached_prefix && suffix && !trailing_only) {
             struct path_component_span part={begin,end,cursor};
-            struct kernel_vfs_dentry *prefix=stat_cached_prefix(walk,current,pending,length,&part);
+            struct kernel_vfs_dentry *prefix=cached_path_prefix(walk,current,pending,length,&part);
             if (prefix) {
                 struct kernel_vfs_mount *mount=current->file.mount;
                 const char *leaf=pending+part.begin;
@@ -3645,6 +3646,7 @@ static int path_resolve(struct kernel_vfs_path *start,
     if (!path || !start || !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
     VFS_PATH_WALK(walk,start,root);
     walk.pathless_link=pathless_link;walk.terminal=terminal;walk.stat=query;
+    walk.cached_prefix=true;
     return resolve_object(start, root, path, length, follow_final, 0, 0, VFS_TRAILING_FOLLOW,
                           owner, 0, &walk);
 }
