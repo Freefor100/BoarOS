@@ -673,7 +673,7 @@ static struct lwext4_staged_inode *stage_inode(struct lwext4_mount_adapter *adap
     if (pin && kernel_vfs_node_release(&pin)) __builtin_trap();
     return record;
 }
-static void inode_changed(void *context,uint32_t inode)
+static bool inode_changed(void *context,uint32_t inode)
 {
     struct lwext4_mount_adapter *adapter=context;
     struct ext4_name_cache *cache=adapter->name_cache;
@@ -683,7 +683,7 @@ static void inode_changed(void *context,uint32_t inode)
         if (__atomic_fetch_add(&cache->epochs[inode%EXT4_NAME_EPOCHS],1,__ATOMIC_RELEASE)==UINT64_MAX)
             __builtin_trap();
     }
-    (void)stage_inode(context,NULL,inode);
+    return stage_inode(context,NULL,inode)!=NULL;
 }
 
 static int track_nested_file(void *context, ext4_file *file)
@@ -701,16 +701,18 @@ static int track_nested_file(void *context, ext4_file *file)
     return EOK;
 }
 
-static void time_stage(void *context,void *owner,uint32_t inode,unsigned field,
-    struct ext4_timestamp value)
+static void time_stage(void *context,void *owner,uint32_t inode,unsigned fields,
+    const struct ext4_timestamp values[3])
 {
     struct lwext4_mount_adapter *adapter=context;
     struct lwext4_staged_inode *record=stage_inode(adapter,owner,inode);
     if (record && (record->node->node.mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG) {
         TIMESTAMP_SCOPE(times,adapter);
-        record->values[field]=value;
-        record->versions[field]=record->node->time_version[field];
-        record->fields|=1U<<field;
+        for (unsigned i=0;i<3;i++) if (fields&(1U<<i)) {
+            record->values[i]=values[i];
+            record->versions[i]=record->node->time_version[i];
+        }
+        record->fields|=fields;
     }
 }
 

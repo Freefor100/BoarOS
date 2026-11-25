@@ -296,7 +296,14 @@ int ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 			  struct ext4_inode_ref *ref);
 enum ext4_tree_block_type {
     EXT4_TREE_DIRECTORY_LEAF, EXT4_TREE_DIRECTORY_INDEX, EXT4_TREE_EXTENT,
+    EXT4_TREE_INODE_BITMAP, EXT4_TREE_BLOCK_BITMAP,
 };
+static inline uint64_t ext4_block_check_key(uint32_t id, uint32_t check,
+    enum ext4_tree_block_type type)
+{
+    if (id > (UINT32_MAX >> 3)) return 0;
+    return (uint64_t)id << 35 | (uint64_t)check << 3 | type;
+}
 uint64_t ext4_fs_tree_check_key(const struct ext4_inode_ref *,enum ext4_tree_block_type);
 int ext4_fs_get_inode_ref_read(struct ext4_fs *fs, uint32_t index,
     struct ext4_inode_ref *ref);

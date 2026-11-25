@@ -261,7 +261,7 @@ struct ext4_inode_goal {
     TAILQ_ENTRY(ext4_inode_goal) pending;
     uint32_t inode;
     uint64_t full_sequence, data_sequence;
-    bool data;
+    bool data, observed;
 };
 static int inode_goal_order(const struct ext4_inode_goal *left,
                             const struct ext4_inode_goal *right)
@@ -271,15 +271,23 @@ RB_GENERATE_STATIC(ext4_inode_goal_tree, ext4_inode_goal, index, inode_goal_orde
 int ext4_operation_record_inode(struct ext4_fs *fs, uint32_t inode, bool data)
 {
     struct ext4_operation *operation = ext4_current_operation(fs);
-    if (operation && fs->inode_observer && fs->inode_observer->changed)
-        fs->inode_observer->changed(fs->inode_observer->context,inode);
-    if (operation && operation->error) return operation->error;
     struct jbd_journal *journal = fs->jbd_journal;
-    if (!journal || !journal->grouped) return EOK;
+    if (!journal || !journal->grouped) {
+        /* Standalone writes may publish a prefix even on failure. */
+        if (operation && fs->inode_observer && fs->inode_observer->changed)
+            fs->inode_observer->changed(fs->inode_observer->context,inode);
+        return operation ? operation->error : EOK;
+    }
     if (!operation) __builtin_trap();
     if (operation->error) return operation->error;
     struct ext4_inode_goal probe = {.inode = inode};
     struct ext4_inode_goal *goal = RB_FIND(ext4_inode_goal_tree, &operation->inode_goals, &probe);
+    bool observed = goal && goal->observed;
+    /* One observation covers an already pinned live inode. A bare number
+     * can acquire a live owner before another edit in the same operation. */
+    if (!observed && fs->inode_observer && fs->inode_observer->changed)
+        observed=fs->inode_observer->changed(fs->inode_observer->context,inode);
+    if (operation->error) return operation->error;
     if (!goal) {
         /* Reserve before acceptance; an allocation failure still aborts only
          * this operation's private inode/namespace versions. */
@@ -292,6 +300,7 @@ int ext4_operation_record_inode(struct ext4_fs *fs, uint32_t inode, bool data)
         goal->inode = inode;
         if (RB_INSERT(ext4_inode_goal_tree, &operation->inode_goals, goal)) __builtin_trap();
     }
+    goal->observed=observed;
     goal->data |= data;
     return EOK;
 }
@@ -951,10 +960,12 @@ static void ext4_publish_times(struct ext4_mountpoint *mp,
         offsetof(struct ext4_inode, modification_time), offsetof(struct ext4_inode, change_inode_time)};
     static const size_t extra[3] = {offsetof(struct ext4_inode, atime_extra),
         offsetof(struct ext4_inode, mtime_extra), offsetof(struct ext4_inode, ctime_extra)};
-    if (!mp->inode_observer.store) return;
+    fields &= EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME;
+    if (!fields || !mp->inode_observer.store) return;
+    struct ext4_timestamp values[3];
     for (unsigned i = 0; i < 3; i++) if (fields & (1U << i))
-        mp->inode_observer.store(mp->inode_observer.context, owner, ref->index, i,
-                               ext4_time_load(ref, base[i], extra[i]));
+        values[i] = ext4_time_load(ref, base[i], extra[i]);
+    mp->inode_observer.store(mp->inode_observer.context, owner, ref->index, fields, values);
 }
 
 static bool ext4_relatime_expired(struct ext4_inode_ref *ref, struct ext4_timestamp now)
@@ -969,11 +980,11 @@ static bool ext4_relatime_expired(struct ext4_inode_ref *ref, struct ext4_timest
         ext4_time_compare(ctime, atime) >= 0 || now.seconds - atime.seconds >= 86400;
 }
 
-static void ext4_touch_inode(struct ext4_mountpoint *mp,
-                             struct ext4_inode_ref *ref, unsigned int fields, void *owner)
+static unsigned ext4_store_current_times(struct ext4_mountpoint *mp,
+    struct ext4_inode_ref *ref, unsigned fields)
 {
     struct ext4_timestamp now;
-    if (mp->fs.read_only || !mp->clock || !mp->clock(&now)) return;
+    if (mp->fs.read_only || !mp->clock || !mp->clock(&now)) return 0;
     if (ext4_inode_has_flag(ref->inode, EXT4_INODE_FLAG_NOATIME) ||
         ((fields & (EXT4_TIME_ATIME | EXT4_TIME_RELATIME)) ==
          (EXT4_TIME_ATIME | EXT4_TIME_RELATIME) && !ext4_relatime_expired(ref, now)))
@@ -987,7 +998,20 @@ static void ext4_touch_inode(struct ext4_mountpoint *mp,
     if (fields & EXT4_TIME_CTIME)
         ext4_time_store(ref, offsetof(struct ext4_inode, change_inode_time),
                         offsetof(struct ext4_inode, ctime_extra), now);
-    ext4_publish_times(mp, ref, fields, owner);
+    return fields;
+}
+
+static void ext4_touch_inode(struct ext4_mountpoint *mp,
+    struct ext4_inode_ref *ref, unsigned fields, void *owner)
+{
+    ext4_publish_times(mp,ref,ext4_store_current_times(mp,ref,fields),owner);
+}
+
+static void ext4_initialize_inode_times(struct ext4_mountpoint *mp,struct ext4_inode_ref *ref)
+{
+    /* The caller will publish the newly allocated inode and its initial
+     * attributes together. There is no live timestamp owner yet. */
+    (void)ext4_store_current_times(mp,ref,EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME);
 }
 
 static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
@@ -2915,7 +2939,7 @@ static int ext4_alloc_linked_child(struct ext4_mountpoint *mp,
         if (type == EXT4_DE_DIR)
             ext4_inode_set_mode(sb, child->inode, ext4_inode_get_mode(sb, child->inode) | 02000U);
     }
-    ext4_touch_inode(mp, child, EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
+    ext4_initialize_inode_times(mp,child);
     result = ext4_link(mp, parent, child, name, length, false);
     if (result) {
         ext4_fs_free_inode(child);
@@ -6941,7 +6965,7 @@ static int ext4_create_child_nojournal(struct ext4_mountpoint *mp, uint32_t pare
     ext4_inode_set_gid(child.inode, gid);
     if (ext4_inode_has_flag(directory.inode, EXT4_INODE_FLAG_NODUMP))
         ext4_inode_set_flag(child.inode, EXT4_INODE_FLAG_NODUMP);
-    ext4_touch_inode(mp, &child, EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
+    ext4_initialize_inode_times(mp,&child);
     if (type == EXT4_DE_SYMLINK)
         result = ext4_symlink_inode_set(&child, target, (uint32_t)length, true);
     else if (type == EXT4_DE_DIR)
@@ -7109,7 +7133,7 @@ int ext4_tmpfile_child(const char *mount, uint32_t parent, uint32_t mode,
         ext4_inode_set_uid(ref.inode, uid);
         ext4_inode_set_gid(ref.inode, gid);
         if (nodump) ext4_inode_set_flag(ref.inode, EXT4_INODE_FLAG_NODUMP);
-        ext4_touch_inode(mp, &ref, EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
+        ext4_initialize_inode_times(mp,&ref);
         result = ext4_orphan_add(&ref);
         if (!result) {
             file.mp = mp; file.inode = ref.index; file.flags = O_RDWR;

@@ -119,9 +119,9 @@ static struct {
     struct kernel_vfs_file *closing;
     unsigned entered, close_entered, close_done;
 } timestamp_owner;
-static void (*metadata_store)(void *,void *,uint32_t,unsigned,struct ext4_timestamp);
+static void (*metadata_store)(void *,void *,uint32_t,unsigned,const struct ext4_timestamp [3]);
 static void observe_metadata_store(void *context, void *owner, uint32_t inode,
-    unsigned field, struct ext4_timestamp value)
+    unsigned fields, const struct ext4_timestamp values[3])
 {
     if (owner && owner == timestamp_owner.target) {
         assert(kernel_cpu_current()->logical_id == 1 &&
@@ -130,7 +130,7 @@ static void observe_metadata_store(void *context, void *owner, uint32_t inode,
         /* close 进入后再发布时间戳；它可能要等当前截断释放后端状态。 */
         wait_progress(&timestamp_owner.close_entered,1);
     }
-    metadata_store(context,owner,inode,field,value);
+    metadata_store(context,owner,inode,fields,values);
 }
 int __real_ext4_mount_setup_inode_observer(const char *,const struct ext4_inode_observer *);
 int __wrap_ext4_mount_setup_inode_observer(const char *path,const struct ext4_inode_observer *observer)

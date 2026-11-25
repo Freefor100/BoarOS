@@ -662,9 +662,7 @@ void ext4_fs_update_bg_csum(struct ext4_sblock *sb,uint32_t bgid,struct ext4_bgr
 uint64_t ext4_fs_tree_check_key(const struct ext4_inode_ref *inode,
     enum ext4_tree_block_type type)
 {
-    if (inode->index>(UINT32_MAX>>2)) return 0;
-    return (uint64_t)inode->index<<34 |
-        (uint64_t)ext4_inode_get_generation(inode->inode)<<2 | type;
+    return ext4_block_check_key(inode->index,ext4_inode_get_generation(inode->inode),type);
 }
 
 struct metadata_check {
