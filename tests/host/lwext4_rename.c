@@ -279,7 +279,12 @@ static void basic(struct ext4_fs *fs)
     CHECK(rename_entry(new, "empty", new, "moved", 0, &out) == EOK);
     CHECK(links(fs, new) == 3 && dotdot(fs, directory("/new/moved")) == new);
     CHECK(ext4_dir_mk("/new/another") == EOK);
+    source_search = (__typeof__(source_search)){
+        .active = true, .parent = new, .name = "another"
+    };
     CHECK(rename_entry(new, "moved", new, "another", 0, &out) == EOK);
+    source_search.active = false;
+    CHECK(source_search.lookups == 1);
     CHECK(links(fs, new) == 3);
     CHECK(ext4_orphan_free("/", out.replaced_inode) == EOK);
     CHECK(rename_entry(new, "target", new, "renamed", 1, &out) == EOK);

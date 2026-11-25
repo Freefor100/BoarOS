@@ -658,12 +658,16 @@ static int jbd_block_set(struct jbd_fs *jbd_fs,
 	return r != EOK ? r : release;
 }
 
+static unsigned jbd_log_used_blocks(const struct jbd_journal *journal, uint32_t end)
+{
+	if (end >= journal->start) return end - journal->start;
+	return jbd_get32(&journal->jbd_fs->sb, maxlen) - journal->start + end - journal->first;
+}
+
 static unsigned jbd_log_free_blocks(const struct jbd_journal *journal)
 {
 	uint32_t capacity = jbd_get32(&journal->jbd_fs->sb, maxlen) - journal->first;
-	uint32_t used = journal->last >= journal->start ? journal->last - journal->start :
-		capacity - (journal->start - journal->last);
-	return capacity - used - 1;
+	return capacity - jbd_log_used_blocks(journal, journal->last) - 1;
 }
 
 static int jbd_tag_bytes(struct jbd_fs *jbd_fs);
@@ -3421,6 +3425,9 @@ int jbd_journal_submit(struct jbd_journal *journal)
     return jbd_encode_submit(trans);
 }
 
+#define JBD_CHECKPOINT_BATCH_GROUPS 8U
+#define JBD_CHECKPOINT_BATCH_BYTES (256U * 1024U)
+
 bool jbd_journal_checkpoint_ready(const struct jbd_journal *journal)
 {
     JBD_STATE_READ_SCOPE(journal);
@@ -3429,7 +3436,14 @@ bool jbd_journal_checkpoint_ready(const struct jbd_journal *journal)
 	if (journal->checkpoint_target > journal->checkpoint_sequence)
 		return true;
 	if (journal->sync_drains) return false;
-	if (journal->checkpoint_count >= 4) return true;
+	if (journal->checkpoint_count >= JBD_CHECKPOINT_BATCH_GROUPS) return true;
+	/* Only committed records can be reclaimed by this checkpoint. Small
+	 * groups can share the home-write and journal-tail barriers. */
+	const struct jbd_trans *last = TAILQ_LAST(&journal->cp_queue, jbd_cp_queue);
+	uint32_t end = last->start_iblock + last->alloc_blocks;
+	wrap(&journal->jbd_fs->sb, end);
+	if ((uint64_t)jbd_log_used_blocks(journal, end) * journal->block_size >=
+	    JBD_CHECKPOINT_BATCH_BYTES) return true;
 	struct jbd_memory_stats memory;
 	jbd_memory_snapshot(journal->memory, &memory);
     if (memory.used - memory.cached <= memory.limit / 2) return false;
@@ -3451,7 +3465,7 @@ enum jbd_journal_stage jbd_journal_select_stage(struct jbd_journal *journal,
 	if (stage != JBD_JOURNAL_COMMIT && jbd_journal_checkpoint_ready(journal)) {
 		journal->checkpointing = journal->checkpoint_last = trans;
 		unsigned count = 1;
-		while (count < 8 && TAILQ_NEXT(journal->checkpoint_last, trans_node)) {
+		while (count < JBD_CHECKPOINT_BATCH_GROUPS && TAILQ_NEXT(journal->checkpoint_last, trans_node)) {
 			journal->checkpoint_last = TAILQ_NEXT(journal->checkpoint_last, trans_node);
 			count++;
 		}

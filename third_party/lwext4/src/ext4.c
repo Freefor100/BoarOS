@@ -3598,15 +3598,23 @@ static int ext4_rename_replace_found(struct ext4_inode_ref *parent,
 }
 
 static int ext4_rename_replace(struct ext4_inode_ref *parent, const char *name,
-		uint32_t length, struct ext4_inode_ref *source, uint32_t victim)
+		uint32_t length, struct ext4_inode_ref *source, uint32_t victim,
+		struct ext4_dir_search_result *target, const struct ext4_block *source_leaf)
 {
-	struct ext4_dir_search_result found = {0};
 	int r = ext4_operation_record_inode(parent->fs, parent->index, true);
 	if (!r) r = ext4_operation_record_inode(parent->fs, source->index, false);
-	if (!r) r = ext4_dir_find_entry(&found, parent, name, length, true);
 	if (r != EOK) return r;
-	r = ext4_rename_replace_found(parent, name, length, source, victim, &found);
-	return ext4_result(r, ext4_dir_destroy_result(parent, &found));
+	if (!target->block.lb_id) {
+		r = ext4_dir_find_entry(target, parent, name, length, true);
+	} else if (target->block.payload != source_leaf->payload) {
+		/* The parent namespace stays locked across discovery and upgrade.
+		 * Use the same slot in the transaction's private leaf. */
+		size_t offset = (uint8_t *)target->dentry - target->block.data;
+		r = jbd_trans_get_write_access(ext4_current_trans(parent->fs), &target->block);
+		if (!r) target->dentry = (void *)(target->block.data + offset);
+	}
+	if (!r) r = ext4_rename_replace_found(parent, name, length, source, victim, target);
+	return ext4_result(r, ext4_dir_destroy_result(parent, target));
 }
 
 static bool ext4_rename_can_add_directory(struct ext4_inode_ref *parent)
@@ -3632,7 +3640,7 @@ int ext4_rename_child(const char *mount_point,
 	struct ext4_inode_ref old = {0}, new = {0}, source = {0}, victim = {0};
 	struct ext4_inode_ref *destination = old_parent == new_parent ? &old : &new;
 	struct ext4_rename_result output = {0};
-	struct ext4_dir_search_result found = {0};
+	struct ext4_dir_search_result found = {0}, target = {0};
 	uint32_t source_ino = 0, victim_ino = 0, parent;
 	bool is_dir = false, target_dir = false;
 	bool exchange = flags == EXT4_RENAME_EXCHANGE;
@@ -3666,7 +3674,10 @@ int ext4_rename_child(const char *mount_point,
 	r = ext4_dir_find_entry(&found, &old, old_name, old_len, true);
 	if (r != EOK) goto Put;
 	source_ino = ext4_dir_en_get_inode(found.dentry);
-	r = ext4_rename_lookup(destination, new_name, new_len, &victim_ino);
+	if (fs->jbd_journal) {
+		r = ext4_dir_find_entry(&target, destination, new_name, new_len, false);
+		if (!r) victim_ino = ext4_dir_en_get_inode(target.dentry);
+	} else r = ext4_rename_lookup(destination, new_name, new_len, &victim_ino);
 	if (r != EOK && r != ENOENT) goto Put;
 	if (victim_ino && flags == EXT4_RENAME_NOREPLACE) { r = EEXIST; goto Put; }
 	if (exchange && !victim_ino) { r = ENOENT; goto Put; }
@@ -3745,7 +3756,8 @@ int ext4_rename_child(const char *mount_point,
 	if (exchange) {
 		r = ext4_operation_record_inode(fs, old_parent, true);
 		if (r == EOK) r = ext4_operation_record_inode(fs, victim_ino, false);
-		if (r == EOK) r = ext4_rename_replace(destination, new_name, new_len, &source, victim_ino);
+		if (r == EOK) r = ext4_rename_replace(destination, new_name, new_len,
+		    &source, victim_ino, &target, &found.block);
 		if (r == EOK) r = ext4_rename_replace_found(&old, old_name, old_len,
 		    &victim, source_ino, &found);
 		if (r != EOK) goto Put;
@@ -3764,7 +3776,8 @@ int ext4_rename_child(const char *mount_point,
 	}
 	uint64_t previous_size = fs->ext2_format ? ext4_inode_get_size(sb, destination->inode) : 0;
 	if (victim_ino)
-		r = ext4_rename_replace(destination, new_name, new_len, &source, victim_ino);
+		r = ext4_rename_replace(destination, new_name, new_len, &source, victim_ino,
+		    &target, &found.block);
 	else r = ext4_dir_add_entry(destination, new_name, new_len, &source);
 	if (fs->ext2_format) {
 		/* An index split or an appended leaf can already have changed
@@ -3777,7 +3790,7 @@ int ext4_rename_child(const char *mount_point,
 	/* The held block borrows this transaction's private payload. Same-parent
 	 * insertion may repack it or move the source to a new leaf; discard the
 	 * old entry and predecessor and scan the current records before deleting. */
-	if (r == EOK && old_parent == new_parent) {
+	if (r == EOK && old_parent == new_parent && (!victim_ino || fs->ext2_format)) {
 		found.dentry = NULL;
 		r = ext4_dir_find_in_block(&found.block, sb, old_len, old_name, &found);
 		if (r == ENOENT) {
@@ -3813,6 +3826,7 @@ Touch:
 		ext4_touch_inode(mp, destination, EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
 	output.changed = true;
 Put:
+	if (target.block.lb_id) r = ext4_result(r, ext4_dir_destroy_result(destination, &target));
 	if (found.block.lb_id) r = ext4_result(r, ext4_dir_destroy_result(&old, &found));
 	if (victim.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&victim));
 	if (source.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&source));
