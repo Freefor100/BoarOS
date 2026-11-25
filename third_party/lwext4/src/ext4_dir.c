@@ -150,7 +150,7 @@ int ext4_dir_leaf_get(struct ext4_inode_ref *dir, struct ext4_block *block,
     if (write) {
         struct jbd_trans *trans = ext4_current_trans(dir->fs);
         uint64_t key = ext4_fs_tree_check_key(dir, EXT4_TREE_DIRECTORY_LEAF);
-        if (trans && key && jbd_trans_first_tree_copy_checked(trans, block, key))
+        if (trans && key && jbd_trans_first_tree_copy_checked(trans, block, key, dev->lg_bsize))
             return EOK;
     }
 #endif

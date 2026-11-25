@@ -287,14 +287,14 @@ struct ext4_inode_goal {
     TAILQ_ENTRY(ext4_inode_goal) pending;
     uint32_t inode;
     uint64_t full_sequence, data_sequence;
-    bool data, observed;
+    bool data, observed, allocated;
 };
 static int inode_goal_order(const struct ext4_inode_goal *left,
                             const struct ext4_inode_goal *right)
 { return left->inode < right->inode ? -1 : left->inode != right->inode; }
 RB_GENERATE_STATIC(ext4_inode_goal_tree, ext4_inode_goal, index, inode_goal_order);
 
-int ext4_operation_record_inode(struct ext4_fs *fs, uint32_t inode, bool data)
+static int operation_record_inode(struct ext4_fs *fs, uint32_t inode, bool data, bool allocated)
 {
     struct ext4_operation *operation = ext4_current_operation(fs);
     struct jbd_journal *journal = fs->jbd_journal;
@@ -308,11 +308,15 @@ int ext4_operation_record_inode(struct ext4_fs *fs, uint32_t inode, bool data)
     if (operation->error) return operation->error;
     struct ext4_inode_goal probe = {.inode = inode};
     struct ext4_inode_goal *goal = RB_FIND(ext4_inode_goal_tree, &operation->inode_goals, &probe);
-    bool observed = goal && goal->observed;
-    /* One observation covers an already pinned live inode. A bare number
-     * can acquire a live owner before another edit in the same operation. */
-    if (!observed && fs->inode_observer && fs->inode_observer->changed)
-        observed=fs->inode_observer->changed(fs->inode_observer->context,inode);
+    if (goal && (goal->observed || goal->allocated)) {
+        goal->data |= data;
+        return EOK;
+    }
+    /* An allocation owns the new identity until acceptance. Observe it
+     * once to invalidate any prior-incarnation cache entries. A regular
+     * inode without a pinned observer can acquire a live owner later. */
+    bool observed = fs->inode_observer && fs->inode_observer->changed &&
+        fs->inode_observer->changed(fs->inode_observer->context, inode);
     if (operation->error) return operation->error;
     if (!goal) {
         /* Reserve before acceptance; an allocation failure still aborts only
@@ -327,9 +331,16 @@ int ext4_operation_record_inode(struct ext4_fs *fs, uint32_t inode, bool data)
         if (RB_INSERT(ext4_inode_goal_tree, &operation->inode_goals, goal)) __builtin_trap();
     }
     goal->observed=observed;
+    goal->allocated=allocated;
     goal->data |= data;
     return EOK;
 }
+
+int ext4_operation_record_inode(struct ext4_fs *fs, uint32_t inode, bool data)
+{ return operation_record_inode(fs, inode, data, false); }
+
+int ext4_operation_record_allocated_inode(struct ext4_fs *fs, uint32_t inode)
+{ return operation_record_inode(fs, inode, true, true); }
 
 void ext4_operation_discard_inode_goals(struct ext4_operation *operation)
 {

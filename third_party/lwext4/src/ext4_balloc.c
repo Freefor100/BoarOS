@@ -172,7 +172,7 @@ static bool block_bitmap_checked(struct ext4_block_group_ref *group, struct ext4
 #if CONFIG_JOURNALING_ENABLE
     uint64_t key=block_bitmap_key(group);
     struct jbd_trans *trans=ext4_current_trans(group->fs);
-    if (key && trans && jbd_trans_first_tree_copy_checked(trans,block,key)) return true;
+    if (key && trans && jbd_trans_first_tree_copy_checked(trans,block,key,group->fs->bdev->lg_bsize)) return true;
 #endif
     return ext4_balloc_verify_bitmap_csum(ext4_fs_super(group->fs),group->block_group,block->data);
 }

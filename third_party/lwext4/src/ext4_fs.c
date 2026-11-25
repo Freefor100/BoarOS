@@ -1271,7 +1271,7 @@ int ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *inode_ref,
 		return rc;
 	}
 	rc = ext4_operation_claim_inode(fs, index);
-	if (!rc) rc = ext4_operation_record_inode(fs, index, true);
+	if (!rc) rc = ext4_operation_record_allocated_inode(fs, index);
 	if (rc != EOK) {
 		ext4_fs_put_inode_ref(inode_ref);
 		ext4_ialloc_free_inode(fs, index, is_dir);

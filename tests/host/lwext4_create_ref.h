@@ -109,6 +109,18 @@ static bool create_ref_clock(struct ext4_timestamp *now)
 
 static unsigned create_inode_read_batches;
 static uint64_t create_inode_table_first, create_inode_table_end;
+static ext4_fsblk_t watched_inode_bitmap;
+static unsigned watched_inode_bitmap_bytes;
+
+int __real_jbd_trans_get_write_access_range(struct jbd_trans *, struct ext4_block *,
+    uint32_t, uint32_t);
+int __wrap_jbd_trans_get_write_access_range(struct jbd_trans *trans, struct ext4_block *block,
+    uint32_t offset, uint32_t length)
+{
+    if (watched_inode_bitmap && block->lb_id == watched_inode_bitmap)
+        watched_inode_bitmap_bytes += length;
+    return __real_jbd_trans_get_write_access_range(trans, block, offset, length);
+}
 
 static int create_inode_read_batch(struct ext4_blockdev *dev, struct block_read_span *spans,
     unsigned count, const struct block_read_completion *completion)
@@ -165,6 +177,13 @@ static uint32_t create_inode_bitmap_file(const ext4_file *parent, const char *na
     return inode;
 }
 
+static unsigned new_inode_observations;
+static bool count_create_observation(void *parent, uint32_t inode)
+{
+    if (inode != *(const uint32_t *)parent) new_inode_observations++;
+    return false;
+}
+
 static void create_inode_bitmap_test(struct ext4_fs *fs, const ext4_file *parent)
 {
     const struct ext4_journal_runtime runtime = {.now_ns = group_clock};
@@ -182,7 +201,20 @@ static void create_inode_bitmap_test(struct ext4_fs *fs, const ext4_file *parent
     uintptr_t original = (uintptr_t)bitmap.payload;
     uint64_t original_key = bitmap.payload->tree_verified;
     CHECK(ext4_block_set(fs->bdev, &bitmap) == EOK);
+    watched_inode_bitmap = lba;
+    watched_inode_bitmap_bytes = 0;
+    uint32_t parent_inode = parent->inode;
+    const struct ext4_inode_observer observer = {
+        .context = &parent_inode, .changed = count_create_observation,
+    };
+    CHECK(ext4_mount_setup_inode_observer("/", &observer) == EOK);
+    new_inode_observations = 0;
     uint32_t next = create_inode_bitmap_file(parent, "bitmap-next");
+    CHECK(ext4_mount_setup_inode_observer("/", NULL) == EOK);
+    watched_inode_bitmap = 0;
+    uint32_t bytes = (per_group + 7) / 8;
+    CHECK(watched_inode_bitmap_bytes == bytes);
+    CHECK(new_inode_observations == 1);
     CHECK(ext4_block_get(fs->bdev, &bitmap, lba) == EOK);
     CHECK((uintptr_t)bitmap.payload == original);
     CHECK(bitmap.payload->tree_verified && bitmap.payload->tree_verified != original_key);
@@ -194,6 +226,7 @@ static void create_inode_bitmap_test(struct ext4_fs *fs, const ext4_file *parent
     CHECK(current.payload != bitmap.payload);
     CHECK(!ext4_bmap_is_bit_set(bitmap.data, (held - 1) % per_group));
     CHECK(ext4_bmap_is_bit_set(current.data, (held - 1) % per_group));
+    CHECK(!memcmp(current.data + bytes, bitmap.data + bytes, fs->bdev->lg_bsize - bytes));
     CHECK(ext4_fs_get_block_group_ref(fs, group_id, &group) == EOK);
     CHECK(ext4_ialloc_verify_bitmap_csum(&fs->sb, group.block_group, current.data));
     CHECK(ext4_fs_put_block_group_ref(&group) == EOK);
