@@ -115,13 +115,7 @@ int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
                           struct kernel_heap *heap,
                           struct kernel_page_cache *page_cache);
 static int valid_utime_nsec(int64_t value);
-static int inode_extra_field_present(struct ext4_sblock *superblock,
-                                     struct ext4_inode *inode,
-                                     size_t field_offset,
-                                     size_t field_size);
-static struct kernel_vfs_timespec decode_inode_time(
-    uint32_t base, uint32_t extra, int has_extra);
-static void fill_stat(struct kernel_vfs_mount *mount,
+static unsigned fill_stat(struct kernel_vfs_mount *mount,
                       struct ext4_sblock *superblock,
                       uint32_t inode_number,
                       struct ext4_inode *inode,
@@ -834,22 +828,15 @@ static void initialize_times(struct kernel_vfs_node *base,
     struct lwext4_mount_adapter *adapter, struct ext4_inode *inode)
 {
     struct lwext4_node *node = (struct lwext4_node *)base;
-    fill_stat(&adapter->instance.backend_mount,adapter->superblock,
+    node->extra_times=fill_stat(&adapter->instance.backend_mount,adapter->superblock,
         base->inode,inode,&node->metadata);
     node->metadata_seen=node->metadata_epoch;
     lwext4_node_file(base)->time_owner = base;
     lwext4_node_file(base)->delalloc = &node->delalloc;
     node->noatime = ext4_inode_has_flag(inode, EXT4_INODE_FLAG_NOATIME);
-    size_t offsets[3] = {offsetof(struct ext4_inode, atime_extra),
-        offsetof(struct ext4_inode, mtime_extra), offsetof(struct ext4_inode, ctime_extra)};
-    uint32_t seconds[3] = {inode->access_time, inode->modification_time, inode->change_inode_time};
-    uint32_t extra[3] = {inode->atime_extra, inode->mtime_extra, inode->ctime_extra};
-    for (unsigned i = 0; i < 3; i++) {
-        int extended = inode_extra_field_present(adapter->superblock, inode, offsets[i], sizeof(uint32_t));
-        if (extended) node->extra_times |= 1U << i;
-        struct kernel_vfs_timespec value = decode_inode_time(seconds[i], extra[i], extended);
-        node->times[i] = (struct ext4_timestamp){value.seconds, value.nanoseconds};
-    }
+    node->times[0] = (struct ext4_timestamp){node->metadata.atime.seconds,node->metadata.atime.nanoseconds};
+    node->times[1] = (struct ext4_timestamp){node->metadata.mtime.seconds,node->metadata.mtime.nanoseconds};
+    node->times[2] = (struct ext4_timestamp){node->metadata.ctime.seconds,node->metadata.ctime.nanoseconds};
     publish_relatime_due(node);
 }
 
@@ -2014,17 +2001,17 @@ static int valid_utime_nsec(int64_t value)
            value == KERNEL_VFS_UTIME_NOW || value == KERNEL_VFS_UTIME_OMIT;
 }
 
-static int inode_extra_field_present(struct ext4_sblock *superblock,
-                                     struct ext4_inode *inode,
-                                     size_t field_offset,
-                                     size_t field_size)
+static unsigned inode_time_fields(struct ext4_sblock *superblock,struct ext4_inode *inode)
 {
-    uint16_t extra_size = ext4_inode_get_extra_isize(superblock, inode);
-
-    return field_offset <= SIZE_MAX - field_size &&
-           field_offset + field_size <= ext4_get16(superblock, inode_size) &&
-           field_offset + field_size <=
-               EXT4_GOOD_OLD_INODE_SIZE + (size_t)extra_size;
+    uint32_t size=ext4_get16(superblock,inode_size);
+    if (size<=EXT4_GOOD_OLD_INODE_SIZE) return 0;
+    uint32_t end=EXT4_GOOD_OLD_INODE_SIZE+(uint32_t)to_le16(inode->extra_isize);
+    if (end>size) end=size;
+    unsigned fields=0;
+    if (end>=offsetof(struct ext4_inode,atime_extra)+sizeof(inode->atime_extra)) fields|=EXT4_TIME_ATIME;
+    if (end>=offsetof(struct ext4_inode,mtime_extra)+sizeof(inode->mtime_extra)) fields|=EXT4_TIME_MTIME;
+    if (end>=offsetof(struct ext4_inode,ctime_extra)+sizeof(inode->ctime_extra)) fields|=EXT4_TIME_CTIME;
+    return fields;
 }
 
 static struct kernel_vfs_timespec decode_inode_time(
@@ -2044,7 +2031,7 @@ static struct kernel_vfs_timespec decode_inode_time(
     return result;
 }
 
-static void fill_stat(struct kernel_vfs_mount *mount,
+static unsigned fill_stat(struct kernel_vfs_mount *mount,
                       struct ext4_sblock *superblock,
                       uint32_t inode_number,
                       struct ext4_inode *inode,
@@ -2052,7 +2039,6 @@ static void fill_stat(struct kernel_vfs_mount *mount,
 {
     uint32_t creator_os;
 
-    memset(stat, 0, sizeof(*stat));
     stat->dev = ((struct kernel_vfs_instance *)mount->private_data)->device_id;
     stat->ino = inode_number;
     stat->mode = ext4_inode_get_mode(superblock, inode);
@@ -2066,30 +2052,17 @@ static void fill_stat(struct kernel_vfs_mount *mount,
         stat->uid |= (uint32_t)to_le16(inode->osd2.linux2.uid_high) << 16U;
         stat->gid |= (uint32_t)to_le16(inode->osd2.linux2.gid_high) << 16U;
     }
-    if ((stat->mode & EXT4_INODE_MODE_TYPE_MASK) ==
-            EXT4_INODE_MODE_CHARDEV ||
-        (stat->mode & EXT4_INODE_MODE_TYPE_MASK) ==
-            EXT4_INODE_MODE_BLOCKDEV) {
-        stat->rdev = ext4_inode_get_dev(inode);
-    }
+    uint32_t type=stat->mode&EXT4_INODE_MODE_TYPE_MASK;
+    stat->rdev = type==EXT4_INODE_MODE_CHARDEV || type==EXT4_INODE_MODE_BLOCKDEV ?
+        ext4_inode_get_dev(inode) : 0;
     stat->size = ext4_inode_get_size(superblock, inode);
     stat->blocks = ext4_inode_get_blocks_count(superblock, inode);
     stat->blksize = ext4_sb_get_block_size(superblock);
-    stat->atime = decode_inode_time(
-        ext4_inode_get_access_time(inode), inode->atime_extra,
-        inode_extra_field_present(superblock, inode,
-                                  offsetof(struct ext4_inode, atime_extra),
-                                  sizeof(inode->atime_extra)));
-    stat->mtime = decode_inode_time(
-        ext4_inode_get_modif_time(inode), inode->mtime_extra,
-        inode_extra_field_present(superblock, inode,
-                                  offsetof(struct ext4_inode, mtime_extra),
-                                  sizeof(inode->mtime_extra)));
-    stat->ctime = decode_inode_time(
-        ext4_inode_get_change_inode_time(inode), inode->ctime_extra,
-        inode_extra_field_present(superblock, inode,
-                                  offsetof(struct ext4_inode, ctime_extra),
-                                  sizeof(inode->ctime_extra)));
+    unsigned times=inode_time_fields(superblock,inode);
+    stat->atime = decode_inode_time(to_le32(inode->access_time),inode->atime_extra,times&EXT4_TIME_ATIME);
+    stat->mtime = decode_inode_time(to_le32(inode->modification_time),inode->mtime_extra,times&EXT4_TIME_MTIME);
+    stat->ctime = decode_inode_time(to_le32(inode->change_inode_time),inode->ctime_extra,times&EXT4_TIME_CTIME);
+    return times;
 }
 
 static uint8_t dirent_type_from_ext4(uint8_t inode_type)
