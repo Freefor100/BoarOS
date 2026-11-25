@@ -25,6 +25,15 @@ static err_t held_completion_tcp_output(struct tcp_pcb *);
 #include "../../kernel/pid.c"
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __func__, __LINE__, #x); exit(1); } } while (0)
+/* This fixture attaches a VirtIO interface. The other link backend is not used. */
+void kernel_igb_mac_address(const struct kernel_igb_rx *device, uint8_t address[6])
+{ (void)device;(void)address;abort(); }
+void kernel_igb_tx_flush(struct kernel_igb_rx *device)
+{ (void)device;abort(); }
+int kernel_igb_tx_copy(struct kernel_igb_rx *device, unsigned length,
+    int (*copy)(const void *,void *,uint32_t), const void *context, int more)
+{ (void)device;(void)length;(void)copy;(void)context;(void)more;abort(); }
+
 static struct {unsigned references,calls;uint32_t keep;} raw_filter_test,mld_filter_test[2];
 static struct {unsigned references,calls;} tcp_train_filter;
 static pthread_mutex_t raw_gate=PTHREAD_MUTEX_INITIALIZER;
@@ -236,8 +245,10 @@ void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor,int all)
             struct kernel_wait_node *next=node->next;
             if(next)next->references++;
             CHECK(node->callback);
-            if(node->callback==unix_space_notify)space_callbacks++;
-            node->callback(node,KERNEL_WAIT_WOKEN,cursor->event);
+            if (!cursor->event || !node->readiness_mask || (node->readiness_mask & cursor->event)) {
+                if(node->callback==unix_space_notify)space_callbacks++;
+                node->callback(node,KERNEL_WAIT_WOKEN,cursor->event);
+            }
             CHECK(node->references);node->references--;node=next;
         }
     }
@@ -4452,11 +4463,25 @@ static void unix_write_completion_notifications(void)
         struct kernel_wait_node observer={0};
         kernel_wait_node_init_callback(&observer,count_space_wakeup,&notifications);
         kernel_wait_queue_add(&sender->wait,&observer);
+        unsigned readable=0;
+        struct kernel_wait_node reader={0};
+        if (type==SOCKET_STREAM) {
+            kernel_wait_node_init_callback(&reader,count_space_wakeup,&readable);
+            reader.readiness_mask=KERNEL_POLLIN|KERNEL_POLLERR|KERNEL_POLLHUP;
+            kernel_wait_queue_add(&sender->wait,&reader);
+        }
         CHECK(write_buffer(sender,"credit",6,0)==6);
         CHECK(!notifications);
         struct kernel_socket_address source=read_named_packet(receiver,"credit");
         kernel_socket_address_release(&source);
         CHECK(notifications && !sender->unix_memory && !sender->unix_packets);
+        if (type==SOCKET_STREAM) {
+            CHECK(!readable);
+            CHECK(write_buffer(receiver,"reply",5,0)==5 && readable==1);
+            source=read_named_packet(sender,"reply");
+            kernel_socket_address_release(&source);
+            CHECK(readable==1 && kernel_wait_node_remove_sync(&reader)==KERNEL_SCHEDULER_STATUS_OK);
+        }
         CHECK(!kernel_socket_set_option(sender,KERNEL_SOCKET_SNDBUF,4096));
         char bytes[3000]={0};const unsigned sizes[]={sizeof(bytes),5};
         for(unsigned i=0;i<sizeof(sizes)/sizeof(sizes[0]);i++) {

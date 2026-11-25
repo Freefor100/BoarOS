@@ -189,8 +189,7 @@ static int poll_snapshot(struct kernel_pollfd *pfds,
                         *epoll_pending = 1;
                 } else if (query == POLL_QUERY_EPOLL && !epoll) events = (uint16_t)pfds[i].revents;
                 else {
-                    struct kernel_wait_queue *queue = 0;
-                    events = kernel_open_file_poll(pinned[i], (uint32_t)(uint16_t)pfds[i].events, &queue)
+                    events = kernel_open_file_poll(pinned[i], (uint32_t)(uint16_t)pfds[i].events, NULL)
                         & ((uint32_t)(uint16_t)pfds[i].events | KERNEL_POLLERR | KERNEL_POLLHUP | KERNEL_POLLNVAL);
                 }
             }
@@ -280,10 +279,14 @@ static int core_poll_run(
         for (uint32_t i = 0; i < nfds; i++) {
             if (!pinned[i]) continue;
             struct kernel_wait_queue *queue = 0;
-            if (kernel_open_file_kind(pinned[i]) == KERNEL_OPEN_FILE_KIND_EPOLL)
+            enum kernel_open_file_kind kind = kernel_open_file_kind(pinned[i]);
+            if (kind == KERNEL_OPEN_FILE_KIND_EPOLL)
                 (void)kernel_epoll_wait_pending(pinned[i], &queue);
             else (void)kernel_open_file_poll(pinned[i], (uint32_t)(uint16_t)pfds[i].events, &queue);
-            nodes[i].event_mask=kernel_signal_fd_mask(pinned[i]);
+            if (kind == KERNEL_OPEN_FILE_KIND_SIGNALFD)
+                nodes[i].event_mask=kernel_signal_fd_mask(pinned[i]);
+            if (kind == KERNEL_OPEN_FILE_KIND_SOCKET)
+                nodes[i].readiness_mask = (uint16_t)pfds[i].events | KERNEL_POLLERR | KERNEL_POLLHUP;
             if (queue && kernel_wait_node_bind(queue, &nodes[i], &token) != KERNEL_SCHEDULER_STATUS_OK) {
                 error = -KERNEL_EIO;
                 break;

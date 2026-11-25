@@ -1207,6 +1207,9 @@ static void wake_socket(struct kernel_socket *socket)
     }
     socket_state_notify(state,&socket->wait);
 }
+static void unix_stream_ready(struct kernel_socket *socket, uint32_t events)
+{ socket_state_notify_event(socket_state_owner(&socket_state_lock),&socket->wait,events); }
+
 static void socket_async(struct kernel_socket *socket,unsigned reason)
 { socket_state_async(socket_state_owner(socket_endpoint_lock(socket)),&socket->async_events,reason); }
 static void socket_async_close(struct kernel_socket *socket)
@@ -1745,7 +1748,9 @@ static struct kernel_socket *unix_uncharge_locked(struct socket_packet *packet)
     packet->unix_sender=0;
     int release=!sender->unix_packets && unix_put_locked(sender);
     if(!sender->destroying) {
-        wake_socket(sender);
+        if (sender->type==SOCKET_STREAM)
+            unix_stream_ready(sender,KERNEL_POLLOUT|KERNEL_POLLWRNORM|KERNEL_POLLWRBAND);
+        else wake_socket(sender);
         if (unix_writable(sender)) socket_async(sender,KERNEL_ASYNC_POLL_OUT);
     }
     return release?sender:NULL;
@@ -4555,7 +4560,6 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
         /* 单个报文出队与其发送额度/源名引用一起提交；对象实际销毁仍在锁外。 */
         released_sender=unix_uncharge_locked(retired);
     }
-    if(charge && socket->type==SOCKET_STREAM && socket->peer)wake_socket(socket->peer);
     if (socket->domain == KERNEL_SOCKET_DOMAIN_INET) {
         int needs_reap=!socket->receive_credit && !socket->retired_head;
 #if BOAROS_USER_SMP
@@ -4631,7 +4635,8 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
     *request->pin_owner = request->pin;
     request->pin = 0;
     request->socket = 0;
-    wake_socket(socket);
+    if (!unix_stream || socket_receive_empty(socket,0)!=-KERNEL_EAGAIN) wake_socket(socket);
+    else if (socket->packets_head) unix_stream_ready(socket,KERNEL_POLLIN|KERNEL_POLLRDNORM);
     uint32_t delivered = user_fault && request->datagram ? 0 : bytes;
     if (request->waitall && delivered) {
         request->progressed = 1;
@@ -4785,7 +4790,9 @@ static void clear_write_request(struct kernel_socket_write_request *request)
             request->socket->tx_reserved-=request->reserved;request->reserved=0;
             /* UNIX reservations charge sender memory, not TCP tx_budget.
              * Return that credit before notifying writers and pollers. */
-            wake_socket(request->socket);
+            if (request->socket->type==SOCKET_STREAM)
+                unix_stream_ready(request->socket,KERNEL_POLLOUT|KERNEL_POLLWRNORM|KERNEL_POLLWRBAND);
+            else wake_socket(request->socket);
             if (unix_writable(request->socket)) socket_async(request->socket,KERNEL_ASYNC_POLL_OUT);
         }
     }else kernel_socket_stream_cancel(request);
@@ -5009,7 +5016,10 @@ static __attribute__((noinline)) int unix_publish_packet(
         peer->packets_tail=packet;
         uint32_t payload=packet->length ? packet->length : 1U;
         if(peer->rx_bytes>UINT32_MAX-payload)__builtin_trap();
-        peer->rx_bytes+=payload;request->packet=0;wake_socket(peer);socket_async(peer,KERNEL_ASYNC_POLL_IN);result=(int)count;
+        peer->rx_bytes+=payload;request->packet=0;
+        if (peer->type==SOCKET_STREAM) unix_stream_ready(peer,KERNEL_POLLIN|KERNEL_POLLRDNORM);
+        else wake_socket(peer);
+        socket_async(peer,KERNEL_ASYNC_POLL_IN);result=(int)count;
         /* 发布已经归还全部reservation；同一次提交撤销request和peer借用。 */
         socket_write_end(request);
     }

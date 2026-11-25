@@ -458,7 +458,7 @@ enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *token)
         kernel_wait_queue_remove(node);
         if (kernel_wait_node_references(node)) { kernel_wait_backend_quiesce();continue; }
         record->nodes=node->token_next;
-        node->generation=0;node->event_mask=0;node->token_next=0;
+        node->generation=0;node->event_mask=0;node->readiness_mask=0;node->token_next=0;
     }
     while (kernel_wait_record_borrows(record)) kernel_wait_backend_quiesce();
     record->deadline=0;record->convert_deadline=0;record->interruptible=0;
@@ -482,7 +482,9 @@ void kernel_wait_switch_finish_locked(struct kernel_task *task)
 }
 static int event_accepts(const struct kernel_wait_node *node,uint64_t event,struct kernel_task *recipient)
 {
-    if(!event || !node->event_mask)return 1;
+    if (!event) return 1;
+    if (node->readiness_mask && !(node->readiness_mask & event)) return 0;
+    if (!node->event_mask) return 1;
     return (__atomic_load_n(node->event_mask,__ATOMIC_ACQUIRE) & event) && (!node->task || !recipient || node->task==recipient);
 }
 static int cursor_prepare_queue_locked(struct kernel_wait_queue *queue,
