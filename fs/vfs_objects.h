@@ -34,6 +34,7 @@ struct kernel_vfs_instance {
     struct kernel_vfs_node *nodes, *node_index;
     size_t node_count;
     uint64_t node_publications;
+    uint64_t stat_gap_first, stat_gap_end; /* Empty interval of the live inode index. */
     struct kernel_vfs_node *cleanup_nodes;
     struct kernel_vfs_dentry *paths; /* Weak canonical directory-entry registry. */
     uint32_t external_files;

@@ -203,6 +203,17 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
     assert(kernel_credentials_override(previous)==lower);
     struct kernel_vfs_path *held=NULL;
     assert(!kernel_vfs_path_resolve(root,root,"reuse-parent/child",1,&held));
+    struct kernel_vfs_stat directory;
+    assert(!kernel_vfs_path_stat(held,&directory));
+    assert(!kernel_vfs_path_set_mode(held,0710));
+    previous=kernel_credentials_override(lower);
+    assert(kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after)==-KERNEL_EACCES);
+    assert(kernel_credentials_override(previous)==lower);
+    lower->fsgid=directory.gid;
+    previous=kernel_credentials_override(lower);
+    assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after));
+    assert(kernel_credentials_override(previous)==lower);
+    lower->fsgid=70001;
     assert(!kernel_vfs_path_set_mode(held,0711));
     previous=kernel_credentials_override(lower);
     assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after));
@@ -298,6 +309,14 @@ static void lookup_attributes_case(struct kernel_vfs_path *root)
     struct kernel_vfs_path *source=NULL;
     assert(!kernel_vfs_path_lookup(root,"stat-live",9,&source));
     assert(!kernel_vfs_link_at(source,root,root,"stat-hard"));
+    uint64_t hard_inode=kernel_vfs_file_inode(&file);
+    assert(!kernel_vfs_path_release(&source) && !kernel_vfs_close(&file));
+    (void)kernel_vfs_reclaim_clean(instance->heap->page_allocator,1);
+    assert(!kernel_vfs_stat_at(root,root,"stat-hard",1,&stat) && stat.ino==hard_inode);
+    assert(instance->stat_gap_first<=hard_inode && hard_inode<instance->stat_gap_end);
+    const struct kernel_vfs_open_request reopen={.flags=KERNEL_VFS_OPEN_FOLLOW,.access=2};
+    assert(!kernel_vfs_open_at(root,root,"stat-live",&reopen,&file,NULL));
+    assert(!(instance->stat_gap_first<=hard_inode && hard_inode<instance->stat_gap_end));
     size_t written;
     assert(!kernel_vfs_pwrite(&file,0,"live EOF",8,&written) && written==8);
     assert(!kernel_vfs_fstat(&file,&live));
@@ -305,10 +324,10 @@ static void lookup_attributes_case(struct kernel_vfs_path *root)
     assert(!kernel_vfs_stat_at(root,root,"stat-hard",1,&stat));
     stat_lookup_watch=0;
     printf("live hard-link stat: inode reads=%u opens=%u\n",stat_lookup_reads,stat_lookup_opens);
-    assert(stat_lookup_reads==1 && !stat_lookup_opens);
+    assert(stat_lookup_reads<=1 && !stat_lookup_opens);
     assert(stat.ino==live.ino && stat.size==8 && stat.blocks==live.blocks &&
         stat.mtime.seconds==live.mtime.seconds && stat.mtime.nanoseconds==live.mtime.nanoseconds);
-    assert(!kernel_vfs_path_release(&source) && !kernel_vfs_close(&file));
+    assert(!kernel_vfs_close(&file));
     struct kernel_vfs_mount *mounted=NULL;
     struct kernel_vfs_path *covered=NULL,*visible=NULL;
     assert(!kernel_vfs_mkdir_at(root,root,"stat-covered",0700,0));

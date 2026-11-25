@@ -324,8 +324,11 @@ static void path_topology_changed(void)
 int kernel_vfs_dac_permission(uint32_t mode, uint32_t uid, uint32_t gid,
     unsigned access, const struct kernel_credentials *cred)
 {
-    unsigned granted = cred->fsuid == uid ? mode >> 6 :
-        kernel_credentials_in_group(cred, gid) ? mode >> 3 : mode;
+    unsigned granted=mode;
+    if (cred->fsuid==uid) granted=mode>>6;
+    /* Group membership cannot affect an access bit shared by both classes. */
+    else if (((mode^(mode>>3))&access&7U) && kernel_credentials_in_group(cred,gid))
+        granted=mode>>3;
     if (!(access & ~granted & 7U)) return 0;
     int directory = (mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR;
     if (kernel_credentials_capable(cred, KERNEL_CAP_DAC_OVERRIDE) &&
@@ -697,6 +700,7 @@ static struct kernel_vfs_path *find_location(struct kernel_vfs_mount *,struct ke
 static int dentry_acquire(struct kernel_vfs_dentry *);
 static void dentry_release(struct kernel_vfs_dentry **);
 static void release_node_pin(struct kernel_vfs_node **);
+static struct kernel_vfs_node *find_stat_node(struct kernel_vfs_instance *,uint64_t);
 
 struct vfs_walk_stat {
     struct kernel_vfs_stat *stat;
@@ -3151,7 +3155,7 @@ static int lookup_named_child(struct kernel_vfs_mount *mount,struct kernel_vfs_d
             stat_leaf=!entry && query && instance->ops->stat_inode &&
                 !__atomic_load_n(&mount->paths_closing,__ATOMIC_ACQUIRE);
             if (stat_leaf) {
-                stat_node=kernel_vfs_node_find(instance,inode);
+                stat_node=find_stat_node(instance,inode);
                 node_publications=__atomic_load_n(&instance->node_publications,__ATOMIC_RELAXED);
                 if (stat_node && kernel_vfs_node_acquire(stat_node)) {
                     stat_leaf=false;
@@ -6462,14 +6466,37 @@ static struct kernel_vfs_node *node_index_remove(struct kernel_vfs_node *root,
     }
     return node_balance(root);
 }
-struct kernel_vfs_node *kernel_vfs_node_find(struct kernel_vfs_instance *instance, uint64_t inode)
+static inline struct kernel_vfs_node *find_inode_node(struct kernel_vfs_instance *instance,
+    uint64_t inode,bool remember_gap)
 {
+    uint64_t first=0,end=UINT64_MAX;
     struct kernel_vfs_node *node = instance->node_index;
     while (node) {
         if (inode == node->inode) return node->retired || node->closed ? 0 : node;
-        node = inode < node->inode ? node->index_left : node->index_right;
+        if (inode<node->inode) {
+            if (remember_gap) end=node->inode;
+            node=node->index_left;
+        } else {
+            if (remember_gap) first=node->inode+1;
+            node=node->index_right;
+        }
+    }
+    if (remember_gap) {
+        instance->stat_gap_first=first;
+        instance->stat_gap_end=end;
     }
     return 0;
+}
+
+struct kernel_vfs_node *kernel_vfs_node_find(struct kernel_vfs_instance *instance,uint64_t inode)
+{ return find_inode_node(instance,inode,false); }
+
+/* The VFS state lock covers both the interval and inode publication.
+ * Unlinking an index entry cannot add an inode to the interval. */
+static struct kernel_vfs_node *find_stat_node(struct kernel_vfs_instance *instance,uint64_t inode)
+{
+    if (inode>=instance->stat_gap_first && inode<instance->stat_gap_end) return NULL;
+    return find_inode_node(instance,inode,true);
 }
 
 struct kernel_vfs_node *kernel_vfs_node_pin(struct kernel_vfs_instance *instance, uint64_t inode)
@@ -7891,6 +7918,8 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
         node->previous = &instance->nodes;
         if (node->next) node->next->previous = &node->next;
         instance->nodes = node;
+        if (node->inode>=instance->stat_gap_first && node->inode<instance->stat_gap_end)
+            instance->stat_gap_end=instance->stat_gap_first;
         instance->node_index = node_index_insert(instance->node_index, node);
         instance->node_count++;
         uint64_t sequence=__atomic_load_n(&instance->node_publications,__ATOMIC_RELAXED)+1U;
