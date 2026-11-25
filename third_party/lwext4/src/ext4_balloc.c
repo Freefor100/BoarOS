@@ -152,6 +152,31 @@ ext4_balloc_verify_bitmap_csum(struct ext4_sblock *sb,
 	return true;
 }
 
+static uint64_t block_bitmap_key(const struct ext4_block_group_ref *group __unused)
+{
+#if CONFIG_META_CSUM_ENABLE
+    struct ext4_sblock *sb=ext4_fs_super(group->fs);
+    if (!ext4_sb_feature_ro_com(sb,EXT4_FRO_COM_METADATA_CSUM)) return 0;
+    const struct ext4_bgroup *bg=group->block_group;
+    uint32_t checksum=to_le16(bg->block_bitmap_csum_lo);
+    if (ext4_sb_get_desc_size(sb)==EXT4_MAX_BLOCK_GROUP_DESCRIPTOR_SIZE)
+        checksum|=(uint32_t)to_le16(bg->block_bitmap_csum_hi)<<16;
+    return ext4_block_check_key(group->index,checksum,EXT4_TREE_BLOCK_BITMAP);
+#else
+    return 0;
+#endif
+}
+
+static bool block_bitmap_checked(struct ext4_block_group_ref *group, struct ext4_block *block)
+{
+#if CONFIG_JOURNALING_ENABLE
+    uint64_t key=block_bitmap_key(group);
+    struct jbd_trans *trans=ext4_current_trans(group->fs);
+    if (key && trans && jbd_trans_first_tree_copy_checked(trans,block,key)) return true;
+#endif
+    return ext4_balloc_verify_bitmap_csum(ext4_fs_super(group->fs),group->block_group,block->data);
+}
+
 static int ext4_balloc_prepare_free_groups(struct ext4_inode_ref *inode,
     uint32_t first, uint32_t last)
 {
@@ -420,7 +445,7 @@ int ext4_balloc_alloc_blocks(struct ext4_inode_ref *inode_ref,
         r = ext4_trans_block_get(fs->bdev, &bitmap,
             ext4_bg_get_block_bitmap(bg.block_group, sb));
         if (r) { ext4_fs_put_block_group_ref(&bg); return r; }
-        if (!shared && !ext4_balloc_verify_bitmap_csum(sb, bg.block_group, bitmap.data)) {
+        if (!shared && !block_bitmap_checked(&bg,&bitmap)) {
             ext4_block_set(fs->bdev, &bitmap);
             ext4_fs_put_block_group_ref(&bg);
             return EUCLEAN;
@@ -449,7 +474,11 @@ int ext4_balloc_alloc_blocks(struct ext4_inode_ref *inode_ref,
             for (uint32_t i = 0; i < length; i++) ext4_bmap_bit_set(bitmap.data, found + i);
             ext4_balloc_set_bitmap_csum(sb, bg.block_group, bitmap.data);
         }
-        if (!r && length) r=ext4_trans_set_block_dirty(bitmap.buf);
+        if (!r && length) {
+            /* The new descriptor checksum certifies this private bitmap.
+             * Publication transfers the proof with its actual payload. */
+            r=ext4_trans_set_tree_dirty(&bitmap,shared?0:block_bitmap_key(&bg));
+        }
         int cleanup=ext4_block_set(fs->bdev,&bitmap);
         if (!r) r=cleanup;
         if (r) { ext4_fs_put_block_group_ref(&bg); return r; }

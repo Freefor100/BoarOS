@@ -7,21 +7,26 @@
 
 static _Thread_local unsigned stage_oom,inside_stage;
 static unsigned stage_denied;
-static void (*original_store)(void *,void *,uint32_t,unsigned,struct ext4_timestamp);
-static void (*original_changed)(void *,uint32_t);
+static void (*original_store)(void *,void *,uint32_t,unsigned,const struct ext4_timestamp [3]);
+static bool (*original_changed)(void *,uint32_t);
 void *__real_ext4_user_calloc(size_t,size_t);
 void *__wrap_ext4_user_calloc(size_t count,size_t bytes)
 {
     if (stage_oom && inside_stage) { stage_denied++;return NULL; }
     return __real_ext4_user_calloc(count,bytes);
 }
-static void observe_store(void *context,void *owner,uint32_t inode,unsigned field,
-    struct ext4_timestamp value)
+static void observe_store(void *context,void *owner,uint32_t inode,unsigned fields,
+    const struct ext4_timestamp values[3])
 {
-    inside_stage++;original_store(context,owner,inode,field,value);inside_stage--;
+    inside_stage++;original_store(context,owner,inode,fields,values);inside_stage--;
 }
-static void observe_changed(void *context,uint32_t inode)
-{ inside_stage++;original_changed(context,inode);inside_stage--; }
+static bool observe_changed(void *context,uint32_t inode)
+{
+    inside_stage++;
+    bool result=original_changed(context,inode);
+    inside_stage--;
+    return result;
+}
 int __real_ext4_mount_setup_inode_observer(const char *,const struct ext4_inode_observer *);
 int __wrap_ext4_mount_setup_inode_observer(const char *path,const struct ext4_inode_observer *observer)
 {

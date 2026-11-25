@@ -6819,12 +6819,15 @@ static int snapshot_sync_nodes(struct kernel_vfs_instance *instance,
     snapshot->nodes = snapshot->local;
     size_t capacity = sizeof(snapshot->local) / sizeof(snapshot->local[0]);
     for (;;) {
+        size_t required = 0;
         int result = kernel_page_cache_pin_dirty_nodes(instance->page_cache, instance,
-            snapshot->nodes, capacity, &snapshot->count);
+            snapshot->nodes, capacity, &snapshot->count, &required);
         if (result <= 0) return result;
         release_sync_nodes(snapshot);
-        if (capacity > SIZE_MAX / 2 / sizeof(*snapshot->nodes)) return -KERNEL_ENOMEM;
-        capacity *= 2;
+        size_t limit = SIZE_MAX / sizeof(*snapshot->nodes);
+        if (required > limit) return -KERNEL_ENOMEM;
+        size_t growth = capacity <= limit / 2 ? capacity * 2 : limit;
+        capacity = required > growth ? required : growth;
         enum kernel_heap_status allocation = kernel_heap_allocate(instance->heap,
                    capacity * sizeof(*snapshot->nodes), (void **)&snapshot->nodes);
         if (allocation != KERNEL_HEAP_STATUS_OK) {

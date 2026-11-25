@@ -4594,6 +4594,8 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
     size_t dirty;
     struct kernel_page_cache_entry *single=NULL;
     int multiple=0;
+    int dispatch=node->instance->ops->file_operation_execution==KERNEL_VFS_EXECUTION_CPU0 &&
+        kernel_page_cache_needs_cpu0(cache);
 #if BOAROS_MAX_CPUS == 1
     bool several_dirty_files;
 #endif
@@ -4607,10 +4609,27 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
         multiple=next && next->page_index<=last;
         first=entry->page_index;
         dirty=kernel_vfs_node_dirty_pages(node)->count;
+        if (!multiple && !dispatch) {
+            /* Transfer the selection's borrow to the scalar consumer. */
+            entry_borrow(entry);
+            single=entry;
+            COST_ADD(WRITEBACK_VISITS,1);
+        }
 #if BOAROS_MAX_CPUS == 1
         several_dirty_files=r->dirty_head!=r->dirty_tail;
 #endif
         request_borrow(r);
+    }
+    if (single) {
+        size_t used;
+        int result=writeback_run(cache,&single,1,end,&used,NULL,0);
+        {
+            CACHE_SCOPE(guard,cache);
+            entry_return(single);
+        }
+        reclaim_window_memory(cache);
+        request_return(r);
+        return result;
     }
     reclaim_window_memory(cache);
     const size_t large_capacity=(512U * 1024U) / BOAROS_PAGE_SIZE;
@@ -4654,8 +4673,6 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
         .mapped_candidate=mapped && !growth};
     /* 前台批次使用调用者的描述符和稳定版本，可与同一 cache 上另一设备的
      * 后台写回并行。只在后端要求 CPU0 时借用执行队列。 */
-    int dispatch=node->instance->ops->file_operation_execution==KERNEL_VFS_EXECUTION_CPU0 &&
-        kernel_page_cache_needs_cpu0(cache);
     if (dispatch) {
         if (run_cpu0_until(cache,writeback_window,&request,borrowed,&request.done))
             request.result=-KERNEL_EIO;
@@ -4857,7 +4874,7 @@ static void run_range_writeback(struct kernel_page_cache *cache,
 
 int kernel_page_cache_pin_dirty_nodes(struct kernel_page_cache *cache,
     const struct kernel_vfs_instance *instance, struct kernel_vfs_node **nodes,
-    size_t capacity, size_t *count)
+    size_t capacity, size_t *count, size_t *required)
 {
     if (!cache_live(cache)) return -KERNEL_EINVAL;
     CACHE_SCOPE(guard, cache);
@@ -4867,12 +4884,13 @@ int kernel_page_cache_pin_dirty_nodes(struct kernel_page_cache *cache,
          * the inode. An in-flight write stays dirty through backend acceptance. */
         struct kernel_vfs_node *node = RB_MIN(kernel_page_cache_dirty_tree, &dirty->tree)->node;
         if (node->instance != instance) continue;
-        if (*count == capacity) return 1;
+        (*required)++;
+        if (*count == capacity) continue;
         int result = kernel_vfs_node_acquire(node);
         if (result) return result;
         nodes[(*count)++] = node;
     }
-    return 0;
+    return *required > capacity;
 }
 
 int kernel_page_cache_resize_prepare(struct kernel_page_cache *cache,struct kernel_vfs_node *node,

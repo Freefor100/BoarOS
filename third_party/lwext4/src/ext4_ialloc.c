@@ -160,18 +160,16 @@ static uint64_t inode_bitmap_key(struct ext4_block_group_ref *group __unused)
 {
 #if CONFIG_META_CSUM_ENABLE
     struct ext4_sblock *sb = ext4_fs_super(group->fs);
-    if (!ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM) ||
-        group->index > UINT32_MAX >> 2)
+    if (!ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM))
         return 0;
     const struct ext4_bgroup *bg = group->block_group;
     uint32_t checksum = to_le16(bg->inode_bitmap_csum_lo);
     if (ext4_sb_get_desc_size(sb) == EXT4_MAX_BLOCK_GROUP_DESCRIPTOR_SIZE)
         checksum |= (uint32_t)to_le16(bg->inode_bitmap_csum_hi) << 16;
-    /* Tag 3 is distinct from directory leaves, directory indexes and extents. */
-    uint64_t key = (uint64_t)group->index << 34 | (uint64_t)checksum << 2 | 3U;
-    if (key != UINT64_MAX) return key;
-#endif
+    return ext4_block_check_key(group->index,checksum,EXT4_TREE_INODE_BITMAP);
+#else
     return 0;
+#endif
 }
 
 static bool inode_bitmap_checked(struct ext4_block_group_ref *group, struct ext4_block *block)

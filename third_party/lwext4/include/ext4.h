@@ -187,9 +187,10 @@ typedef bool (*ext4_clock_read)(struct ext4_timestamp *now);
  * and resolves tentative times after acceptance/abort, before API return. */
 struct ext4_inode_observer {
     void *context;
-    void (*store)(void *context, void *owner, uint32_t inode, unsigned field,
-                  struct ext4_timestamp value);
-    void (*changed)(void *context, uint32_t inode);
+    void (*store)(void *context, void *owner, uint32_t inode, unsigned fields,
+                  const struct ext4_timestamp values[3]);
+    /* True when the operation owns an observation record for this live inode. */
+    bool (*changed)(void *context, uint32_t inode);
     int (*track_file)(void *context, ext4_file *file);
     void (*finish)(void *context, void *staged_inodes, bool accepted);
     unsigned (*snapshot)(void *owner, struct ext4_timestamp times[3]);
