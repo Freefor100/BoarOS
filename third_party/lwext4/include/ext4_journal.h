@@ -79,6 +79,7 @@ struct jbd_buf {
 	bool escaped;
 	bool modified;
 	bool fresh_full_copy;
+	bool fresh_block;
 	struct ext4_block block;
 	struct jbd_trans *trans;
 	/* Prepare borrows the index identity; accepted access is queued in it. */
@@ -239,6 +240,7 @@ int jbd_trans_get_write_access(struct jbd_trans *trans,
 			       struct ext4_block *block);
 int jbd_trans_get_write_access_range(struct jbd_trans *trans,
     struct ext4_block *block, uint32_t offset, uint32_t length);
+int jbd_trans_get_new_access(struct jbd_trans *, struct ext4_block *);
 int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t block,
 	uint32_t offset, const void *data, uint32_t length, bool initialize,
 	const struct file_data_source *source);

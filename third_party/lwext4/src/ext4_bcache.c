@@ -96,7 +96,7 @@ void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payloa
     if (!buf || !payload || !payload->data) __builtin_trap();
     {
         KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
-        if (!buf->refctr || buf->loading) __builtin_trap();
+        if (!buf->refctr || (buf->loading && !buf->fresh_load)) __builtin_trap();
         if (buf->current_payload==payload) return;
         /* A private replacement is complete before publication; no writer
          * retains permission to mutate this accepted version. */
@@ -104,6 +104,11 @@ void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payloa
         ext4_block_payload_get(payload);old=buf->current_payload;
         buf->current_payload=payload;buf->data=payload->data;
         advance_version(buf);
+        if (buf->fresh_load) {
+            ext4_bcache_set_flag(buf, BC_UPTODATE);
+            buf->fresh_load = buf->loading = false;
+            if (buf->bc->bdev->bdif->wake_read) buf->bc->bdev->bdif->wake_read(buf);
+        }
     }
     ext4_block_payload_put(old);
 }
@@ -265,6 +270,14 @@ struct ext4_buf *ext4_bcache_find_get(struct ext4_bcache *bc, struct ext4_block 
     return buf;
 }
 
+void ext4_bcache_begin_fresh(struct ext4_buf *buf)
+{
+    KERNEL_TASK_LOCK_SCOPE(guard, &buf->bc->metadata);
+    if (!buf->loading || buf->fresh_load || ext4_bcache_test_flag(buf, BC_UPTODATE))
+        __builtin_trap();
+    buf->fresh_load = true;
+}
+
 static bool clean_idle_record(const struct ext4_buf *buf)
 {
     return buf && !buf->refctr && !buf->loading && !buf->load_error &&
@@ -324,7 +337,8 @@ void ext4_bcache_prepare_private(struct ext4_block *client, struct ext4_block *a
     struct ext4_block_payload *old=NULL;
     {
         KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
-        if (!buf->refctr || buf->loading || buf->refctr==UINT32_MAX) __builtin_trap();
+        if (!buf->refctr || (buf->loading && !buf->fresh_load) || buf->refctr==UINT32_MAX)
+            __builtin_trap();
         struct ext4_block_payload *current=buf->current_payload;
         if (client->payload!=current) {
             ext4_block_payload_get(current);
@@ -348,7 +362,8 @@ struct ext4_block_payload *ext4_bcache_borrow_owned(const struct ext4_block *own
     struct ext4_buf *buf = owner->buf;
     struct ext4_block_payload *newer = NULL;
     KERNEL_TASK_LOCK_SCOPE(guard, &buf->bc->metadata);
-    if (!buf->refctr || buf->refctr == UINT32_MAX || buf->loading) __builtin_trap();
+    if (!buf->refctr || buf->refctr == UINT32_MAX || (buf->loading && !buf->fresh_load))
+        __builtin_trap();
     buf->refctr++;
     ext4_block_payload_get(view);
     *borrowed = (struct ext4_block){owner->lb_id, buf, view->data, view};
@@ -407,6 +422,16 @@ static void detach_locked(struct ext4_bcache *bc, struct ext4_buf *buf)
     dirty_remove_locked(bc,buf);
     ext4_bcache_clear_dirty(buf);
     ext4_bcache_set_flag(buf,BC_DETACHED);
+}
+
+void ext4_bcache_cancel_fresh(struct ext4_buf *buf)
+{
+    struct ext4_bcache *bc = buf->bc;
+    KERNEL_TASK_LOCK_SCOPE(guard, &bc->metadata);
+    if (!buf->fresh_load || !buf->refctr) __builtin_trap();
+    detach_locked(bc, buf);
+    buf->fresh_load = buf->loading = false;
+    if (bc->bdev->bdif->wake_read) bc->bdev->bdif->wake_read(buf);
 }
 void ext4_bcache_invalidate_lba(struct ext4_bcache *bc, uint64_t from, uint32_t cnt)
 {

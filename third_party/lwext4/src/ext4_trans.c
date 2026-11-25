@@ -117,6 +117,14 @@ int ext4_trans_block_get_range(struct ext4_blockdev *bdev,
 	if (r && b->payload) ext4_bcache_free_read(bdev->bc, b);
 	return trans_error(bdev, r);
 }
+
+int ext4_trans_block_get_new(struct ext4_blockdev *bdev, struct ext4_block *block, uint64_t lba)
+{
+    block->payload = NULL;
+    int result = ext4_block_get_new(bdev, block, lba);
+    if (result && block->payload) ext4_bcache_free_read(bdev->bc, block);
+    return trans_error(bdev, result);
+}
 int ext4_trans_block_get(struct ext4_blockdev *bdev,
     struct ext4_block *b, uint64_t lba)
 { return ext4_trans_block_get_range(bdev,b,lba,0,bdev->lg_bsize); }

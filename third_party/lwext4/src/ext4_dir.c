@@ -417,14 +417,28 @@ int ext4_dir_init_child(struct ext4_inode_ref *dir, struct ext4_inode_ref *paren
 {
 	struct ext4_fs *fs = dir->fs;
 	struct ext4_sblock *sb = &fs->sb;
-	ext4_fsblk_t address;
-	ext4_lblk_t logical;
-	int result = ext4_fs_append_inode_dblk(dir, &address, &logical);
-	if (result) return result;
-	struct ext4_block block;
-	result = ext4_trans_block_get_noread(fs->bdev, &block, address);
-	if (result) return result;
 	uint32_t size = ext4_sb_get_block_size(sb);
+	ext4_fsblk_t address;
+	bool fresh = false;
+	int result;
+	if (!ext4_inode_get_size(sb, dir->inode)) {
+		struct ext4_inode_block_range range;
+		result = ext4_fs_get_inode_dblk_range(dir, 0, 1, true, &range);
+		if (result) return result;
+		if (!range.block || range.unwritten) return EUCLEAN;
+		address = range.block;
+		fresh = range.allocated;
+		ext4_inode_set_size(dir->inode, size);
+		dir->dirty = true;
+	} else {
+		ext4_lblk_t logical;
+		result = ext4_fs_append_inode_dblk(dir, &address, &logical);
+		if (result) return result;
+	}
+	struct ext4_block block;
+	result = fresh ? ext4_trans_block_get_new(fs->bdev, &block, address) :
+	    ext4_trans_block_get_noread(fs->bdev, &block, address);
+	if (result) return result;
 	uint32_t records = size;
 	memset(block.data, 0, size);
 	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) {

@@ -62,6 +62,9 @@ int ext4_trans_set_tree_dirty(struct ext4_block *block, uint64_t tree_key);
 int ext4_trans_block_get_noread(struct ext4_blockdev *bdev,
 			  struct ext4_block *b,
 			  uint64_t lba);
+/* Only for a newly allocated block whose entire contents are initialized
+ * and marked dirty by this transaction before its caller releases the view. */
+int ext4_trans_block_get_new(struct ext4_blockdev *, struct ext4_block *, uint64_t lba);
 
 /**@brief   Block get function (through cache).
  *          jbd_trans_get_access would be called in order to

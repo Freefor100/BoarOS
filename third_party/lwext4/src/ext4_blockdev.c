@@ -361,12 +361,28 @@ static void ext4_block_loaded(struct ext4_blockdev *bdev, struct ext4_buf *buf, 
     /* Notification borrows the buffer through the producer reference. */
     if (bdev->bdif->wake_read) bdev->bdif->wake_read(buf);
 }
-static int ext4_block_wait_loaded(struct ext4_blockdev *bdev, struct ext4_buf *buf)
+static int ext4_block_wait_loaded(struct ext4_blockdev *bdev, struct ext4_block *block)
 {
+    struct ext4_buf *buf = block->buf;
     for (;;) {
         {
             KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
-            if (!buf->loading) return buf->load_error;
+            if (!buf->loading) {
+                if (buf->load_error) return buf->load_error;
+                if (!ext4_bcache_test_flag(buf, BC_UPTODATE)) return -EAGAIN;
+                /* A fresh block publishes a new payload instead of loading
+                 * into the initial buffer borrowed by the waiter. */
+                struct ext4_block_payload *old = block->payload;
+                struct ext4_block_payload *current = buf->current_payload;
+                if (old != current) {
+                    ext4_block_payload_get(current);
+                    block->payload = current;
+                    block->data = current->data;
+                    kernel_task_lock_release(&guard);
+                    ext4_block_payload_put(old);
+                }
+                return EOK;
+            }
             if (!bdev->bdif->wait_read) return EBUSY;
         }
         COST_ADD(BLOCK_CACHE_LOAD_WAITS,1);
@@ -458,6 +474,7 @@ static inline int block_get_range(struct ext4_blockdev *bdev, struct ext4_block 
     unsigned read_count, bool inode_table)
 {
     if (offset > bdev->lg_bsize || !length || length > bdev->lg_bsize - offset) return EINVAL;
+Retry:;
     enum ext4_bcache_read_state read;
     bool private;
     int r=block_get_reference(bdev,b,lba,offset,length,access,&read,&private);
@@ -476,9 +493,10 @@ static inline int block_get_range(struct ext4_blockdev *bdev, struct ext4_block 
             r=ext4_blocks_get_direct(bdev,b->data,lba,1);
         if (track) __atomic_store_n(&bdev->inode_read_next,r ? 0 : lba+loaded,__ATOMIC_RELAXED);
         ext4_block_loaded(bdev,b->buf,r);
-    } else if (read==EXT4_BCACHE_READ_WAIT) r=ext4_block_wait_loaded(bdev,b->buf);
+    } else if (read==EXT4_BCACHE_READ_WAIT) r=ext4_block_wait_loaded(bdev,b);
     if (r) {
         ext4_bcache_free_read(bdev->bc,b);
+        if (r == -EAGAIN) goto Retry;
         return r;
     }
     if (access != EXT4_BLOCK_WRITE) return EOK;
@@ -494,6 +512,29 @@ static inline int block_get_range(struct ext4_blockdev *bdev, struct ext4_block 
 int ext4_block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
     uint64_t lba, uint32_t offset, uint32_t length, enum ext4_block_access access)
 { return block_get_range(bdev,b,lba,offset,length,access,1,false); }
+
+int ext4_block_get_new(struct ext4_blockdev *bdev, struct ext4_block *block, uint64_t lba)
+{
+#if CONFIG_JOURNALING_ENABLE
+    struct jbd_trans *trans = bdev->fs ? ext4_current_trans(bdev->fs) : NULL;
+    if (trans) {
+        enum ext4_bcache_read_state read;
+        bool owned;
+        int result = block_get_reference(bdev, block, lba, 0, bdev->lg_bsize,
+            EXT4_BLOCK_WRITE, &read, &owned);
+        if (result || owned) return result;
+        if (read == EXT4_BCACHE_READ_LOAD) {
+            ext4_bcache_begin_fresh(block->buf);
+            result = jbd_trans_get_new_access(trans, block);
+            if (result) ext4_bcache_cancel_fresh(block->buf);
+            return result;
+        }
+        ext4_bcache_free_read(bdev->bc, block);
+        return ext4_block_get_range(bdev, block, lba, 0, bdev->lg_bsize, EXT4_BLOCK_WRITE);
+    }
+#endif
+    return ext4_block_get_noread(bdev, block, lba);
+}
 
 int ext4_block_get_inode_range(struct ext4_blockdev *bdev,struct ext4_block *b,
     uint64_t lba,uint32_t offset,uint32_t length,unsigned remaining)
@@ -598,8 +639,9 @@ int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,
 	int first = EOK;
 	for (unsigned i = 0; i < count; i++) {
 		if (!errors[i] && (waiters & (UINT32_C(1)<<i))) {
-            errors[i]=ext4_block_wait_loaded(bdev,blocks[i].buf);
+            errors[i]=ext4_block_wait_loaded(bdev,&blocks[i]);
             if (errors[i]) ext4_bcache_free_read(bdev->bc,&blocks[i]);
+            if (errors[i] == -EAGAIN) errors[i] = ext4_block_get(bdev, &blocks[i], lbas[i]);
 		}
 		if (!first) first = errors[i];
 	}
