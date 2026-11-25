@@ -735,7 +735,7 @@ static void group_checkpoint_background(struct ext4_fs *fs)
     CHECK(journal->checkpoint_count==4);
     times[0].nanoseconds++;
     CHECK(ext4_file_set_times(&file,1,times)==EOK && journal->accepted_sequence>old);
-    CHECK(ext4_journal_group_checkpoint_background("/")==EOK && journal->checkpoint_sequence==old);
+    CHECK(ext4_journal_group_checkpoint_background("/")==EAGAIN && journal->checkpoint_sequence<old);
     CHECK(ext4_journal_group_commit("/",true)==EOK);
     old=journal->durable_sequence;
     times[0].nanoseconds++;
@@ -764,14 +764,14 @@ static void group_checkpoint_batching(struct ext4_fs *fs)
     struct ext4_journal_progress progress;
     uint64_t checkpoint=journal->checkpoint_sequence;
     struct ext4_timestamp times[3]={{9123,11},{9456,22},{9789,33}};
-    for (unsigned group=1;group<=4;group++) {
+    for (unsigned group=1;group<=8;group++) {
         times[0].nanoseconds=group;
         CHECK(ext4_file_set_times(&file,7,times)==EOK);
         CHECK(ext4_journal_group_commit("/",true)==EOK);
         CHECK(journal->checkpoint_count==group && journal->checkpoint_sequence==checkpoint);
         CHECK(ext4_journal_group_progress("/",&progress)==EOK);
         CHECK(progress.checkpoint_pending && !progress.commit_ready && progress.durable==progress.accepted);
-        if (group<4) {
+        if (group<8) {
             CHECK(!progress.checkpoint_ready && !progress.ready);
             uint64_t writes=disk.writes,flushes=disk.flushes;
             CHECK(ext4_journal_group_service("/",false)==EOK);
@@ -796,7 +796,7 @@ static void group_checkpoint_batching(struct ext4_fs *fs)
     CHECK(ext4_journal_group_progress("/",&progress)==EOK &&
         !progress.checkpoint_pending && !progress.checkpoint_ready && !progress.ready);
     free(actual); free(expected); CHECK(ext4_fclose(&file)==EOK);
-    puts("checkpoint batching: 1/2/3 durable groups wait without I/O; fourth group merges one home version with two flushes");
+    puts("checkpoint batching: small durable groups wait without I/O; eight groups merge one home version with two flushes");
 }
 
 static void group_checkpoint_target(struct ext4_fs *fs)
