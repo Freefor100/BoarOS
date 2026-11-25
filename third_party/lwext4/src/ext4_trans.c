@@ -60,7 +60,8 @@ static int trans_error(struct ext4_blockdev *bdev, int r)
 	return r;
 }
 
-int ext4_trans_set_tree_dirty(struct ext4_block *block, uint64_t tree_key __unused)
+int ext4_trans_set_tree_dirty_range(struct ext4_block *block, uint32_t offset __unused,
+    uint32_t length __unused, uint64_t tree_key __unused)
 {
 	struct ext4_buf *buf = block->buf;
 #if CONFIG_JOURNALING_ENABLE
@@ -70,11 +71,16 @@ int ext4_trans_set_tree_dirty(struct ext4_block *block, uint64_t tree_key __unus
 	if (fs && fs->jbd_journal && ext4_current_trans(fs)) {
 		struct jbd_trans *trans = ext4_current_trans(fs);
 		return trans_error(buf->bc->bdev,
-			jbd_trans_set_tree_dirty(trans, block, tree_key));
+			jbd_trans_set_tree_dirty_range(trans, block, offset, length, tree_key));
 	}
 #endif
 	ext4_bcache_set_dirty(buf);
 	return EOK;
+}
+
+int ext4_trans_set_tree_dirty(struct ext4_block *block, uint64_t tree_key)
+{
+    return ext4_trans_set_tree_dirty_range(block, 0, block->buf->bc->bdev->lg_bsize, tree_key);
 }
 
 int ext4_trans_set_block_dirty(struct ext4_buf *buf)
@@ -116,6 +122,15 @@ int ext4_trans_block_get_range(struct ext4_blockdev *bdev,
 	int r = ext4_block_get_range(bdev, b, lba, offset, length, EXT4_BLOCK_WRITE);
 	if (r && b->payload) ext4_bcache_free_read(bdev->bc, b);
 	return trans_error(bdev, r);
+}
+
+int ext4_trans_block_get_new_inode_range(struct ext4_blockdev *bdev, struct ext4_block *block,
+    uint64_t lba, uint32_t offset, uint32_t length, unsigned remaining)
+{
+    block->payload = NULL;
+    int result = ext4_block_get_new_inode_range(bdev, block, lba, offset, length, remaining);
+    if (result && block->payload) ext4_bcache_free_read(bdev->bc, block);
+    return trans_error(bdev, result);
 }
 
 int ext4_trans_block_get_new(struct ext4_blockdev *bdev, struct ext4_block *block, uint64_t lba)

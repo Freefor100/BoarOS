@@ -2193,6 +2193,8 @@ static int jbd_mark_dirty(struct jbd_trans *trans, struct ext4_block *block,
         uint64_t *initialized = jbd_initialized_ranges(private);
         uint32_t first = offset / 32, end = (offset + length) / 32;
         if (!(jbd_range_test(initialized, first, end) & JBD_RANGE_ALL)) __builtin_trap();
+        if (tree_key && length != size &&
+            !(jbd_range_test(initialized, 0, size / 32) & JBD_RANGE_ALL)) __builtin_trap();
         jbd_range_fill(private->dirty_ranges, first, end);
         block->data = private->after->data;
         return EOK;
@@ -2207,9 +2209,9 @@ int jbd_trans_set_block_dirty_range(struct jbd_trans *trans,
 int jbd_trans_set_block_dirty(struct jbd_trans *trans, struct ext4_block *block)
 { return jbd_trans_set_block_dirty_range(trans, block, 0, trans->journal->block_size); }
 
-int jbd_trans_set_tree_dirty(struct jbd_trans *trans,
-    struct ext4_block *block, uint64_t tree_key)
-{ return jbd_mark_dirty(trans, block, 0, trans->journal->block_size, tree_key); }
+int jbd_trans_set_tree_dirty_range(struct jbd_trans *trans,
+    struct ext4_block *block, uint32_t offset, uint32_t length, uint64_t tree_key)
+{ return jbd_mark_dirty(trans, block, offset, length, tree_key); }
 
 static struct jbd_buf *jbd_trans_find_buf(struct jbd_trans *trans, ext4_fsblk_t lba)
 {
@@ -2490,7 +2492,7 @@ static bool jbd_patch_running(const struct jbd_buf *jb, const struct jbd_buf *ru
         return false;
     uint32_t offset = first * 32U;
     return ext4_bcache_patch_current(jb->block.buf, current, 4, offset,
-        (const uint8_t *)jb->after->data + offset, length);
+        (const uint8_t *)jb->after->data + offset, length, jb->checked_tree);
 }
 
 /* All records and credits were reserved before publication. Validate the full
@@ -2522,6 +2524,10 @@ static int jbd_publish_private(struct jbd_trans *trans, struct jbd_trans *runnin
          * current proves that no competing publication changed these bytes. */
         if (jb->block.buf->current_payload == jb->block.payload) continue;
         uint32_t end = journal->block_size / 32;
+        /* A partial edit's checksum includes bytes outside its dirty units.
+         * Replacing any part of that accepted baseline requires rebuilding it. */
+        if (jb->checked_tree && !(jbd_range_test(jb->dirty_ranges, 0, end) & JBD_RANGE_ALL))
+            return EAGAIN;
         for (uint32_t unit = 0;
              (unit = jbd_range_next(jb->dirty_ranges, unit, end, true)) < end;) {
             uint32_t first = unit;
@@ -2579,7 +2585,7 @@ static int jbd_publish_private(struct jbd_trans *trans, struct jbd_trans *runnin
         struct jbd_buf *old = running ? TAILQ_LAST(&rec->dirty_buf_queue, jbd_buf_dirty) : NULL;
         bool joining = old && old->trans == running;
         bool patched = joining && jbd_patch_running(jb, old);
-        if (!patched) {
+        if (!patched && !jb->checked_tree) {
             /* STATE keeps the latest accepted version stable through this merge. */
             uint32_t end = journal->block_size / 32;
             for (uint32_t unit = 0;

@@ -76,6 +76,11 @@ void kernel_memory_object_discard_new_page(
  * A successful lookup owns one page reference; a hole never allocates. */
 enum kernel_memory_object_status kernel_memory_object_find_page(
     struct kernel_memory_object *object, uint64_t page_index, uint64_t *physical_address);
+/* Borrow already adopted backing without waiting or allocating. Selected
+ * includes demand and fits one physical reference batch. Output references
+ * are packed in bit order, and a nonempty result always includes demand. */
+unsigned kernel_memory_object_try_borrow_adopted(struct kernel_memory_object *,
+    uint64_t first, unsigned selected, unsigned demand, uint64_t *physical);
 /* Query published backing without adopting, allocating or pinning a page. */
 int kernel_memory_object_seek_sparse(struct kernel_memory_object *, uint64_t start,
     uint64_t end, int seek_hole, uint64_t *position);

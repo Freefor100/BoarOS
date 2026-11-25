@@ -364,6 +364,44 @@ static void anonymous_zero_aliases(void)
     assert(!kernel_mm_munmap(&mm[0], base, 16 * page));
     puts("MM read faults share zero backing with isolated writes and fork");
 }
+
+static void shared_anonymous_read_window(void)
+{
+    const uint64_t page = BOAROS_PAGE_SIZE;
+    uint64_t base;
+    assert(!kernel_mm_mmap_anonymous(&mm[0], 0x63000000, 16 * page,
+        KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED | KERNEL_MM_MAP_SHARED, &base));
+    assert(!kernel_mm_fork(&child, &mm[0]));
+    assert(!kernel_mm_context(&child, &child_context));
+
+    mm_test_context = child_context;
+    assert(!kernel_mm_resolve_user_fault(&child, base, KERNEL_MM_READ));
+    mm_test_context = context;
+    size_t copied;
+    for (unsigned i = 1; i <= 3; i++) {
+        unsigned char value = 0x60 + i;
+        assert(!kernel_copy_to_user(&mm[0], base + i * page, &value, 1, &copied) && copied == 1);
+    }
+
+    mm_test_context = child_context;
+    struct kernel_mm_mapping neighbour;
+    assert(kernel_mm_lookup(&child, base + 2 * page, &neighbour) == KERNEL_MM_STATUS_NOT_MAPPED);
+    assert(!kernel_mm_resolve_user_fault(&child, base + page, KERNEL_MM_READ));
+    assert(!kernel_mm_lookup(&child, base + 2 * page, &neighbour));
+    unsigned char value;
+    assert(!kernel_copy_from_user(&child, &value, base + 2 * page, 1, &copied) && value == 0x62);
+    assert(kernel_mm_lookup(&child, base + 4 * page, &neighbour) == KERNEL_MM_STATUS_NOT_MAPPED);
+
+    /* Removing backing must revoke leaves installed by the batch as well. */
+    assert(!kernel_mm_madvise(&child, base + 2 * page, page, KERNEL_MM_ADVICE_REMOVE));
+    assert(kernel_mm_lookup(&child, base + 2 * page, &neighbour) == KERNEL_MM_STATUS_NOT_MAPPED);
+    mm_test_context = context;
+    assert(!kernel_copy_from_user(&mm[0], &value, base + 2 * page, 1, &copied) && value == 0);
+    assert(!kernel_mm_release(&child));
+    child = (struct kernel_mm){0};
+    assert(!kernel_mm_munmap(&mm[0], base, 16 * page));
+    puts("MM shared anonymous read faults install only existing object pages and honor removal");
+}
 static void *race_fault(void *argument)
 {
     unsigned id = (unsigned)(uintptr_t)argument;
@@ -786,6 +824,7 @@ int main(void)
     fault_candidates();
     fork_cow();
     anonymous_zero_aliases();
+    shared_anonymous_read_window();
     retirement();
 #else
     assert(!kernel_mm_munmap(&mm[0], address, BOAROS_PAGE_SIZE));

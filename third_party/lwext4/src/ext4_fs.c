@@ -1111,11 +1111,16 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 		rc = ext4_operation_require_resource(fs, EXT4_RESOURCE_INODE, index + 1);
 		if (rc != EOK) return rc;
 	}
-	if (write)
+	bool table_geometry = fs->inode_table_starts &&
+		fs->table_group_inodes == inodes_per_group && fs->table_inode_size == inode_size;
+	if (write && !initialized && table_geometry) {
+		uint32_t remaining = (inodes_per_group >> fs->table_block_shift) - block_in_table;
+		rc = ext4_trans_block_get_new_inode_range(fs->bdev, &ref->block, block_id,
+			offset_in_block, inode_size, remaining);
+	} else if (write)
 		rc = ext4_trans_block_get_range(fs->bdev, &ref->block, block_id,
 			offset_in_block, inode_size);
-	else if (initialized && fs->inode_table_starts &&
-		 fs->table_group_inodes==inodes_per_group && fs->table_inode_size==inode_size) {
+	else if (initialized && table_geometry) {
 		uint32_t remaining = (inodes_per_group >> fs->table_block_shift) - block_in_table;
 		rc = ext4_block_get_inode_range(fs->bdev, &ref->block, block_id,
 			offset_in_block, inode_size, remaining);

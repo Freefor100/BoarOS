@@ -2,6 +2,7 @@
 #define BOAROS_TEST_LWEXT4_CREATE_REF_H
 
 #include <ext4_dir.h>
+#include <ext4_ialloc.h>
 
 static struct {
     bool active, fail_after_alloc, fail_after_link;
@@ -104,6 +105,102 @@ static bool create_ref_clock(struct ext4_timestamp *now)
 {
     *now = (struct ext4_timestamp){++create_ref_seconds, 41};
     return true;
+}
+
+static unsigned create_inode_read_batches;
+static uint64_t create_inode_table_first, create_inode_table_end;
+
+static int create_inode_read_batch(struct ext4_blockdev *dev, struct block_read_span *spans,
+    unsigned count, const struct block_read_completion *completion)
+{
+    CHECK(!completion && count > 1);
+    create_inode_read_batches++;
+    int error = EOK;
+    for (unsigned i = 0; i < count; i++) {
+        struct block_read_span *span = &spans[i];
+        CHECK(span->offset >= create_inode_table_first &&
+            span->offset + span->size <= create_inode_table_end);
+        span->status = create_inode_read_batches == 1 && i == 1 ? EIO :
+            dev_read(dev, span->buffer, span->offset / 512, span->size / 512);
+        span->completed = span->status ? 0 : span->size;
+        if (span->status) error = span->status;
+    }
+    return error;
+}
+
+static void create_inode_read_ahead_test(struct ext4_fs *fs, const ext4_file *parent)
+{
+    struct ext4_blockdev *dev = fs->bdev;
+    unsigned group_inodes = ext4_get32(&fs->sb, inodes_per_group);
+    unsigned inode_size = ext4_get16(&fs->sb, inode_size);
+    struct ext4_block_group_ref group;
+    CHECK(ext4_fs_get_block_group_ref(fs, (parent->inode - 1) / group_inodes, &group) == EOK);
+    create_inode_table_first = ext4_bg_get_inode_table_first_block(group.block_group, &fs->sb) * dev->lg_bsize;
+    create_inode_table_end = create_inode_table_first + (uint64_t)group_inodes * inode_size;
+    CHECK(ext4_fs_put_block_group_ref(&group) == EOK);
+    create_inode_read_batches = 0;
+    dev->bdif->bread_batch = create_inode_read_batch;
+    for (unsigned i = 0; i < 4 * dev->lg_bsize / inode_size; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "create-table-run-%u", i);
+        ext4_file file;
+        CHECK(ext4_transaction_begin("/") == EOK);
+        CHECK(ext4_create_regular_missing(parent, name, 0640, 53, 17, &file, NULL) == EOK);
+        CHECK(ext4_transaction_end("/") == EOK);
+        CHECK(ext4_fclose(&file) == EOK);
+    }
+    dev->bdif->bread_batch = NULL;
+    CHECK(create_inode_read_batches > 0);
+    puts("PASS sequential inode allocation batches same-group reads and recovers a failed speculative neighbor");
+}
+
+static uint32_t create_inode_bitmap_file(const ext4_file *parent, const char *name)
+{
+    ext4_file file;
+    CHECK(ext4_transaction_begin("/") == EOK);
+    CHECK(ext4_create_regular_missing(parent, name, 0640, 53, 17, &file, NULL) == EOK);
+    CHECK(ext4_transaction_end("/") == EOK);
+    uint32_t inode = file.inode;
+    CHECK(ext4_fclose(&file) == EOK);
+    return inode;
+}
+
+static void create_inode_bitmap_test(struct ext4_fs *fs, const ext4_file *parent)
+{
+    const struct ext4_journal_runtime runtime = {.now_ns = group_clock};
+    CHECK(ext4_journal_group_enable("/", &runtime, 4 * 1024 * 1024) == EOK);
+    uint32_t per_group = ext4_get32(&fs->sb, inodes_per_group);
+    uint32_t group_id = (parent->inode - 1) / per_group;
+    struct ext4_block_group_ref group;
+    CHECK(ext4_fs_get_block_group_ref(fs, group_id, &group) == EOK);
+    ext4_fsblk_t lba = ext4_bg_get_inode_bitmap(group.block_group, &fs->sb);
+    CHECK(ext4_fs_put_block_group_ref(&group) == EOK);
+
+    (void)create_inode_bitmap_file(parent, "bitmap-first");
+    struct ext4_block bitmap, current;
+    CHECK(ext4_block_get(fs->bdev, &bitmap, lba) == EOK);
+    uintptr_t original = (uintptr_t)bitmap.payload;
+    uint64_t original_key = bitmap.payload->tree_verified;
+    CHECK(ext4_block_set(fs->bdev, &bitmap) == EOK);
+    uint32_t next = create_inode_bitmap_file(parent, "bitmap-next");
+    CHECK(ext4_block_get(fs->bdev, &bitmap, lba) == EOK);
+    CHECK((uintptr_t)bitmap.payload == original);
+    CHECK(bitmap.payload->tree_verified && bitmap.payload->tree_verified != original_key);
+    CHECK(ext4_bmap_is_bit_set(bitmap.data, (next - 1) % per_group));
+
+    /* A borrower must continue to see the prior bitmap after the next edit. */
+    uint32_t held = create_inode_bitmap_file(parent, "bitmap-held");
+    CHECK(ext4_block_get(fs->bdev, &current, lba) == EOK);
+    CHECK(current.payload != bitmap.payload);
+    CHECK(!ext4_bmap_is_bit_set(bitmap.data, (held - 1) % per_group));
+    CHECK(ext4_bmap_is_bit_set(current.data, (held - 1) % per_group));
+    CHECK(ext4_fs_get_block_group_ref(fs, group_id, &group) == EOK);
+    CHECK(ext4_ialloc_verify_bitmap_csum(&fs->sb, group.block_group, current.data));
+    CHECK(ext4_fs_put_block_group_ref(&group) == EOK);
+    CHECK(ext4_block_set(fs->bdev, &bitmap) == EOK);
+    CHECK(ext4_block_set(fs->bdev, &current) == EOK);
+    CHECK(ext4_journal_group_drain("/") == EOK);
+    puts("PASS joined inode bitmap patch retains an unborrowed version and preserves a borrowed version");
 }
 
 static void create_ref_test(struct ext4_fs *fs)
@@ -229,6 +326,8 @@ static void create_ref_test(struct ext4_fs *fs)
         }
         CHECK(ext4_fclose(&file) == EOK);
     }
+    create_inode_read_ahead_test(fs, &parent);
+    create_inode_bitmap_test(fs, &parent);
     CHECK(ext4_fclose(&parent) == EOK);
     CHECK(ext4_mount_setup_clock("/", NULL) == EOK);
     puts("PASS creation returns actual initial attributes without reopening; types/extra times/inheritance, failed file handles, outer abort and real OOM return owners");

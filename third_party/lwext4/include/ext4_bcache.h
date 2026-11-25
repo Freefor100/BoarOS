@@ -283,7 +283,7 @@ void ext4_bcache_publish(struct ext4_buf *, struct ext4_block_payload *, uint64_
 void ext4_bcache_begin_fresh(struct ext4_buf *);
 void ext4_bcache_cancel_fresh(struct ext4_buf *);
 bool ext4_bcache_patch_current(struct ext4_buf *, struct ext4_block_payload *,
-    unsigned owners, uint32_t offset, const void *bytes, uint32_t length);
+    unsigned owners, uint32_t offset, const void *bytes, uint32_t length, uint64_t tree_key);
 void ext4_bcache_insert_dirty_node(struct ext4_bcache *, struct ext4_buf *);
 void ext4_bcache_remove_dirty_node(struct ext4_bcache *, struct ext4_buf *);
 /* Select and detach clean victims atomically, flushing only in a write context. */

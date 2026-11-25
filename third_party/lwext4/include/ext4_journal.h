@@ -240,8 +240,8 @@ int jbd_journal_stop(struct jbd_journal *journal);
 int jbd_journal_new_trans(struct jbd_journal *journal, struct jbd_trans **out);
 int jbd_trans_set_block_dirty(struct jbd_trans *trans,
 			      struct ext4_block *block);
-int jbd_trans_set_tree_dirty(struct jbd_trans *trans,
-    struct ext4_block *block, uint64_t tree_key);
+int jbd_trans_set_tree_dirty_range(struct jbd_trans *trans,
+    struct ext4_block *block, uint32_t offset, uint32_t length, uint64_t tree_key);
 bool jbd_trans_first_tree_copy_checked(struct jbd_trans *,
     const struct ext4_block *, uint64_t tree_key);
 /* Obtain a private replacement before changing a buffer. */
