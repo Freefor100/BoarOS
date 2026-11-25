@@ -493,7 +493,13 @@ static int cursor_prepare_queue_locked(struct kernel_wait_queue *queue,
     if (!queue || queue->initialized!=KERNEL_WAIT_QUEUE_INITIALIZED || queue->borrows==UINT32_MAX)
         __builtin_trap();
     queue_shape(queue);
-    if (!allow_empty && !queue->head) return 0;
+    if (!allow_empty) {
+        struct kernel_wait_node *head=queue->head;
+        if (!head) return 0;
+        /* Poll interest is fixed for the lifetime of this registration. */
+        if (event && head==queue->tail && head->readiness_mask &&
+            !(head->readiness_mask & event)) return 0;
+    }
     queue->borrows++;
     *cursor=(struct kernel_wait_cursor){.queue=queue,.node=queue->head,
         .sequence=queue->sequence,.event=event,.recipient=recipient};

@@ -4481,6 +4481,32 @@ static void unix_write_completion_notifications(void)
             source=read_named_packet(sender,"reply");
             kernel_socket_address_release(&source);
             CHECK(readable==1 && kernel_wait_node_remove_sync(&reader)==KERNEL_SCHEDULER_STATUS_OK);
+            CHECK(write_buffer(sender,"ab",2,0)==2 && write_buffer(sender,"cd",2,0)==2);
+            uint64_t before_charge=sender->unix_memory;
+            unsigned before=notifications;
+            struct kernel_open_file_description *pin=(void *)receiver;
+            struct kernel_socket_read_request request={0};
+            char bytes[4];
+            CHECK(kernel_socket_reserve_read(receiver,NULL,&request,&pin,3,1,NULL)==3);
+            kernel_socket_copy_read(&request,0,bytes,3);
+            CHECK(!memcmp(bytes,"abc",3) && kernel_socket_finish_read(&request,0)==3);
+            CHECK(sender->unix_packets==1 && sender->unix_memory==before_charge/2 && notifications==before+1);
+            CHECK(write_buffer(sender,"ef",2,0)==2);
+            CHECK(kernel_socket_reserve_read(receiver,NULL,&request,&pin,3,1,NULL)==3);
+            kernel_socket_copy_read(&request,0,bytes,3);
+            CHECK(!memcmp(bytes,"def",3) && kernel_socket_finish_read(&request,0)==3);
+            CHECK(!sender->unix_packets && !sender->unix_memory && notifications==before+2);
+
+            unsigned async_writes=0;
+            struct kernel_wait_node subscriber={0};
+            kernel_wait_node_init_callback(&subscriber,count_space_wakeup,&async_writes);
+            kernel_wait_queue_add(&sender->async_events,&subscriber);
+            CHECK(write_buffer(sender,"gh",2,0)==2 && write_buffer(sender,"ij",2,0)==2);
+            CHECK(kernel_socket_reserve_read(receiver,NULL,&request,&pin,4,1,NULL)==4);
+            kernel_socket_copy_read(&request,0,bytes,4);
+            CHECK(!memcmp(bytes,"ghij",4) && kernel_socket_finish_read(&request,0)==4);
+            CHECK(!sender->unix_packets && !sender->unix_memory && async_writes==2);
+            CHECK(kernel_wait_node_remove_sync(&subscriber)==KERNEL_SCHEDULER_STATUS_OK);
         }
         CHECK(!kernel_socket_set_option(sender,KERNEL_SOCKET_SNDBUF,4096));
         char bytes[3000]={0};const unsigned sizes[]={sizeof(bytes),5};
