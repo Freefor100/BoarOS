@@ -85,14 +85,6 @@ struct jbd_allocation_group {
     uint32_t group, descriptor_offset, count;
 };
 
-/* A version owns both its image and the shared home-buffer budget pin. */
-static struct jbd_image *jbd_version(struct jbd_journal *journal, struct ext4_buf *buf)
-{
-    struct jbd_image *image=jbd_image_alloc(journal);
-    if (!image) return NULL;
-    if (!jbd_memory_pin_home(journal,buf)) {jbd_image_free(image);return NULL;}
-    return image;
-}
 static void jbd_unpin_version(struct jbd_journal *journal, struct ext4_buf *buf)
 { jbd_memory_unpin_home(journal,buf); }
 
@@ -1781,7 +1773,9 @@ static int jbd_group_requirements(struct jbd_journal *journal,
     uint32_t capacity = jbd_get32(&journal->jbd_fs->sb, maxlen) - journal->first;
     struct jbd_buf *jb;
     TAILQ_FOREACH(jb, &operation->buf_queue, buf_node) {
-        struct jbd_block_rec *record = jbd_trans_block_rec_lookup(journal, jb->block.lb_id);
+        /* Preparation pins existing index identities across acceptance. */
+        struct jbd_block_rec *record = jb->block_rec;
+        if (!record) record = jbd_trans_block_rec_lookup(journal, jb->block.lb_id);
         if (record && record->trans == running) continue;
         if (payloads >= capacity) return ENOSPC;
         payloads++;
@@ -2377,11 +2371,17 @@ int jbd_trans_get_write_access_range(struct jbd_trans *trans,
     }
     /* The home cache stays at its accepted version. All writable references
      * within this operation share one private replacement. */
-    jb = jbd_alloc(journal, sizeof(*jb) +
-        2 * jbd_range_map_words(journal) * sizeof(*jb->dirty_ranges));
-    if (!jb) return ENOMEM;
-    jb->after = journal->grouped ? jbd_version(journal, block->buf) : jbd_image_alloc(journal);
-    if (!jb->after) { jbd_free(jb); return ENOMEM; }
+    void *control;
+    struct jbd_image *image = jbd_image_alloc_control(journal, sizeof(*jb) +
+        2 * jbd_range_map_words(journal) * sizeof(*jb->dirty_ranges), &control);
+    if (!image) return ENOMEM;
+    if (journal->grouped && !jbd_memory_pin_home(journal, block->buf)) {
+        jbd_image_free(image);
+        jbd_free(control);
+        return ENOMEM;
+    }
+    jb = control;
+    jb->after = image;
     /* A reference can survive earlier transactions. Its read view remains
      * stable, but a new write must start from the latest accepted version. */
     jb->trans = trans;

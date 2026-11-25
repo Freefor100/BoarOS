@@ -66,6 +66,7 @@ bool jbd_budget_room(struct jbd_journal *, size_t);
 void jbd_trim_cache(struct jbd_journal *, size_t target);
 size_t jbd_image_charge(const struct jbd_journal *);
 struct jbd_image *jbd_image_alloc(struct jbd_journal *);
+struct jbd_image *jbd_image_alloc_control(struct jbd_journal *, size_t, void **);
 void jbd_image_free(struct jbd_image *);
 
 #endif

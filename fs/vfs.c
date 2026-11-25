@@ -671,7 +671,7 @@ static int vfs_open_raw(struct kernel_vfs_mount *mount,
                         uint32_t inode_mode,
                         struct kernel_vfs_file *file);
 static int vfs_create_raw(struct kernel_vfs_mount *mount,
-                          uint64_t parent_inode, const char *path,
+                          struct kernel_vfs_node *parent, const char *path,
                           uint32_t mode,
                           struct kernel_vfs_file *file,uint32_t umask);
 static int vfs_mkdir_raw(struct kernel_vfs_mount *mount,
@@ -4308,7 +4308,7 @@ static int create_at_parent(struct kernel_vfs_path **owner,const char *name,uint
     if (dentry_acquire(entry->parent)) __builtin_trap();
     entry->name=entry->initial_name;memcpy(entry->name,name,name_length+1);
     struct kernel_vfs_file *created=file ? file : &entry->file;
-    result=vfs_create_raw(mount,kernel_vfs_path_inode(parent),name,mode,created,umask);
+    result=vfs_create_raw(mount,parent->file.private_data,name,mode,created,umask);
     if (result) {dentry_release(&entry->parent);kernel_heap_release(entry->heap,entry);return result;}
     notify_child(parent,name,VFS_NOTIFY_CREATE |
         (((mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR)?VFS_NOTIFY_ISDIR:0),created,NULL);
@@ -7507,14 +7507,14 @@ static int vfs_open_raw(struct kernel_vfs_mount *mount,
 }
 
 static int vfs_create_raw(struct kernel_vfs_mount *mount,
-                          uint64_t parent_inode, const char *path,
+                          struct kernel_vfs_node *parent, const char *path,
                           uint32_t mode,
                           struct kernel_vfs_file *file,uint32_t umask)
 {
     if (!mount || !mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = mount->private_data;
     if (instance->quiescing) return -KERNEL_EIO;
-    return instance->ops->create(mount, parent_inode, path, mode, file,umask);
+    return instance->ops->create(mount, parent, path, mode, file,umask);
 }
 
 int kernel_vfs_file_atime_enabled(const struct kernel_vfs_file *file)

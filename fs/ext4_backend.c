@@ -135,7 +135,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
                         uint32_t inode_mode,
                         struct kernel_vfs_file *file);
 static int ext4_backend_create(struct kernel_vfs_mount *mount,
-                          uint64_t parent_inode, const char *path,
+                          struct kernel_vfs_node *parent, const char *path,
                           uint32_t mode,
                           struct kernel_vfs_file *file,uint32_t umask);
 static void ext4_backend_accessed(struct kernel_vfs_file *file);
@@ -2490,7 +2490,7 @@ static const struct kernel_vfs_export_ops ext4_export = {
 
 struct namespace_create {
     const char *mount, *path, *target;
-    struct kernel_vfs_node *node;
+    struct kernel_vfs_node *node, *qualified_parent;
     struct ext4_inode *initial;
     uint32_t parent, mode, type, device;
     uint32_t uid,gid,umask;
@@ -2511,10 +2511,17 @@ static int apply_namespace_create(void *context)
     }
     struct ext4_create_acl acl = {request->access_acl, request->default_acl,
         request->access_size, request->default_size};
-    int result=request->path ? ext4_create_child_acl(request->mount, request->parent, request->path,
-        request->mode | request->type, request->device, request->target, file,
-        request->initial, request->uid, request->gid, request->prepare_acl ? &acl : NULL) :
-        ext4_tmpfile_child(request->mount, request->parent, request->mode | request->type,
+    int result;
+    if (request->qualified_parent && request->type == KERNEL_VFS_S_IFREG &&
+        ext4_current_trans(lwext4_instance(request->qualified_parent->instance)->device.fs))
+        result = ext4_create_regular_missing(lwext4_node_file(request->qualified_parent),
+            request->path, request->mode, request->uid, request->gid, file, request->initial);
+    else if (request->path)
+        result = ext4_create_child_acl(request->mount, request->parent, request->path,
+            request->mode | request->type, request->device, request->target, file,
+            request->initial, request->uid, request->gid, request->prepare_acl ? &acl : NULL);
+    else
+        result = ext4_tmpfile_child(request->mount, request->parent, request->mode | request->type,
             file, request->initial, request->uid, request->gid);
     if (!result && !request->prepare_acl && request->access_acl)
         result=ext4_file_set_acl(file,EXT4_XATTR_INDEX_POSIX_ACL_ACCESS,
@@ -2550,7 +2557,8 @@ static int namespace_acl_encode(struct kernel_heap *heap,const void *acl,size_t 
 }
 static int namespace_create_execute(struct lwext4_mount_adapter *adapter,struct namespace_create *request)
 {
-    struct kernel_vfs_node *parent=kernel_vfs_node_pin(&adapter->instance,request->parent);
+    struct kernel_vfs_node *parent=request->qualified_parent;
+    if (!parent) parent=kernel_vfs_node_pin(&adapter->instance,request->parent);
     if (!parent) return EIO;
     uint32_t mode=request->mode|request->type;
     int result=EOK;void *def=NULL,*access=NULL;size_t size=0;
@@ -2584,7 +2592,7 @@ static int namespace_create_execute(struct lwext4_mount_adapter *adapter,struct 
             }
         }
     }
-    if (kernel_vfs_node_release(&parent)) __builtin_trap();
+    if (!request->qualified_parent && kernel_vfs_node_release(&parent)) __builtin_trap();
     request->mode=mode;
     if (def) kernel_heap_release(adapter->instance.heap,def);
     if (access) kernel_heap_release(adapter->instance.heap,access);
@@ -2632,8 +2640,8 @@ static int apply_namespace_link(void *context)
 }
 
 
-static int ext4_backend_create(struct kernel_vfs_mount *mount,
-                          uint64_t parent_inode, const char *path,
+static int ext4_backend_create_common(struct kernel_vfs_mount *mount,
+                          uint64_t parent_inode, struct kernel_vfs_node *parent, const char *path,
                           uint32_t mode,
                           struct kernel_vfs_file *file,uint32_t umask)
 {
@@ -2668,7 +2676,9 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     struct ext4_inode initial;
     uint32_t type=mode & KERNEL_VFS_S_IFMT;
     if (!type) type=KERNEL_VFS_S_IFREG;
-    struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.node=node,.initial=&initial,.mode=mode&07777U,.type=type,.umask=umask};
+    struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,
+        .qualified_parent=parent,.path=path,.node=node,.initial=&initial,
+        .mode=mode&07777U,.type=type,.umask=umask};
     result=namespace_create_execute(adapter,&request);
     if (result != EOK) {
         /* This unopened owner has no data or mapping; the mount owns any
@@ -2697,9 +2707,14 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     return kernel_vfs_publish_node(mount, node, file, 1);
 }
 
+static int ext4_backend_create(struct kernel_vfs_mount *mount,
+    struct kernel_vfs_node *parent, const char *path, uint32_t mode,
+    struct kernel_vfs_file *file, uint32_t umask)
+{ return ext4_backend_create_common(mount, parent->inode, parent, path, mode, file, umask); }
+
 static int ext4_backend_tmpfile(struct kernel_vfs_mount *mount, uint64_t parent,
     uint32_t mode, struct kernel_vfs_file *file, uint32_t umask)
-{ return ext4_backend_create(mount, parent, NULL, mode, file, umask); }
+{ return ext4_backend_create_common(mount, parent, NULL, NULL, mode, file, umask); }
 
 static int time_access_needed(const struct lwext4_node *node, struct ext4_timestamp now,unsigned policy)
 {

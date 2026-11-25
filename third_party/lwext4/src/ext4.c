@@ -2898,6 +2898,33 @@ static int ext4_trunc_dir(struct ext4_mountpoint *mp,
 	return ext4_fs_truncate_inode(dir, 0);
 }
 
+static int ext4_alloc_linked_child(struct ext4_mountpoint *mp,
+    struct ext4_inode_ref *parent, const char *name, uint32_t length, int type,
+    struct ext4_inode_ref *child)
+{
+    struct ext4_fs *fs = parent->fs;
+    struct ext4_sblock *sb = ext4_fs_super(fs);
+    int result = ext4_fs_alloc_inode(fs, child, type, parent->index, name, length);
+    if (result) return result;
+
+    ext4_fs_inode_blocks_init(fs, child);
+    if (ext4_inode_has_flag(parent->inode, EXT4_INODE_FLAG_NODUMP))
+        ext4_inode_set_flag(child->inode, EXT4_INODE_FLAG_NODUMP);
+    if (ext4_inode_get_mode(sb, parent->inode) & 02000U) {
+        ext4_inode_set_gid(child->inode, ext4_inode_get_gid(parent->inode));
+        if (type == EXT4_DE_DIR)
+            ext4_inode_set_mode(sb, child->inode, ext4_inode_get_mode(sb, child->inode) | 02000U);
+    }
+    ext4_touch_inode(mp, child, EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
+    result = ext4_link(mp, parent, child, name, length, false);
+    if (result) {
+        ext4_fs_free_inode(child);
+        child->dirty = false;
+        result = ext4_result(result, ext4_fs_put_inode_ref(child));
+    }
+    return result;
+}
+
 /*
  * NOTICE: if filetype is equal to EXT4_DIRENTRY_UNKNOWN,
  * any filetype of the target dir entry will be accepted.
@@ -2970,38 +2997,11 @@ static int ext4_open_relative(ext4_file *f, struct ext4_mountpoint *mp,
 			if (!(flags & O_CREAT))
 				break;
 
-			/*O_CREAT allows create new entry*/
 			struct ext4_inode_ref child_ref;
-			r = ext4_fs_alloc_inode(fs, &child_ref,
-					is_goal ? ftype : EXT4_DE_DIR, ref.index, path, len);
-
+			r = ext4_alloc_linked_child(mp, &ref, path, len,
+				is_goal ? ftype : EXT4_DE_DIR, &child_ref);
 			if (r != EOK)
 				break;
-
-			ext4_fs_inode_blocks_init(fs, &child_ref);
-			if (ext4_inode_has_flag(ref.inode, EXT4_INODE_FLAG_NODUMP))
-				ext4_inode_set_flag(child_ref.inode, EXT4_INODE_FLAG_NODUMP);
-			/* 固定 root 创建者仍从 setgid 父目录继承 group；目录继承该位。 */
-			if (ext4_inode_get_mode(sb, ref.inode) & 02000U) {
-				ext4_inode_set_gid(child_ref.inode, ext4_inode_get_gid(ref.inode));
-				uint32_t child_mode = ext4_inode_get_mode(sb, child_ref.inode);
-				if ((child_mode & 0170000U) == 0040000U)
-					ext4_inode_set_mode(sb, child_ref.inode, child_mode | 02000U);
-			}
-			ext4_touch_inode(mp, &child_ref,
-			    EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
-
-			/*Link with root dir.*/
-			r = ext4_link(mp, &ref, &child_ref, path, len, false);
-			if (r != EOK) {
-				/*Fail. Free new inode.*/
-				ext4_fs_free_inode(&child_ref);
-				/*We do not want to write new inode.
-				  But block has to be released.*/
-				child_ref.dirty = false;
-				r = ext4_result(r, ext4_fs_put_inode_ref(&child_ref));
-				break;
-			}
 
             if (parent_inode) *parent_inode = ref.index;
             imode = ext4_inode_type(sb, child_ref.inode);
@@ -7053,6 +7053,34 @@ int ext4_create_child_acl(const char *mount, uint32_t parent, const char *name,
     if (result == EOK && output) *output = file;
     else if (file.mp) result = ext4_result(result, ext4_fclose(&file));
     EXT4_MP_UNLOCK(mp);
+    return result;
+}
+
+int ext4_create_regular_missing(const ext4_file *parent, const char *name,
+    uint32_t mode, uint32_t uid, uint32_t gid, ext4_file *output,
+    struct ext4_inode *initial)
+{
+    struct ext4_mountpoint *mp = parent->mp;
+    struct ext4_fs *fs = &mp->fs;
+    struct ext4_inode_ref directory, child;
+    size_t length = strlen(name);
+    if (!ext4_rename_name_valid(name, length)) return EINVAL;
+    int result = ext4_fs_get_inode_ref(fs, parent->inode, &directory);
+    if (result) return result;
+    if (!ext4_inode_is_type(&fs->sb, directory.inode, EXT4_INODE_MODE_DIRECTORY))
+        result = ENOTDIR;
+    else if (!ext4_inode_get_links_cnt(directory.inode)) result = ENOENT;
+    else result = ext4_alloc_linked_child(mp, &directory, name, length, EXT4_DE_REG_FILE, &child);
+    int release = ext4_fs_put_inode_ref(&directory);
+    if (result) return result;
+    ext4_inode_set_mode_initial(&child, mode);
+    ext4_inode_set_uid(child.inode, uid);
+    ext4_inode_set_gid(child.inode, gid);
+    if (initial) ext4_copy_initial_inode(&child, initial);
+    ext4_file file = {.mp = mp, .inode = child.index, .flags = O_CREAT | O_EXCL | O_RDWR,
+        .fmax = ext4_inode_max_size(fs, child.inode)};
+    result = ext4_result(release, ext4_fs_put_inode_ref(&child));
+    if (!result) *output = file;
     return result;
 }
 

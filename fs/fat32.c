@@ -777,7 +777,7 @@ static int create_child(struct fat_mount *m, uint64_t parent_inode, const char *
     if (out) *out = i;
     return 0;
 }
-static int create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode, struct kernel_vfs_file *file,uint32_t umask)
+static int create(struct kernel_vfs_mount *mount, struct kernel_vfs_node *parent, const char *path, uint32_t mode, struct kernel_vfs_file *file,uint32_t umask)
 {
     mode &= ~umask;
     if ((mode & KERNEL_VFS_S_IFMT) && (mode & KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG)
@@ -786,7 +786,7 @@ static int create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const c
     {
         KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
         int r = fat_error(&m->instance); if (r) return r;
-        struct fat_inode *i; r = create_child(m, parent_inode, path, KERNEL_VFS_S_IFREG | (mode & 0777), &i);
+        struct fat_inode *i; r = create_child(m, parent->inode, path, KERNEL_VFS_S_IFREG | (mode & 0777), &i);
         if (r) return r;
         id = i->id;
     }

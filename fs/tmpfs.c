@@ -452,14 +452,14 @@ static int close_node(struct kernel_vfs_node *n)
     if (!i->handles) __builtin_trap();
     i->handles--; collect_inode(m, i); return 0;
 }
-static int create(struct kernel_vfs_mount *mount, uint64_t parent_inode, const char *path, uint32_t mode,
+static int create(struct kernel_vfs_mount *mount, struct kernel_vfs_node *parent, const char *path, uint32_t mode,
                    struct kernel_vfs_file *file,uint32_t umask)
 {
     struct tmp_mount *m = tm(mount->private_data); struct tmp_entry *e;
     uint32_t type=mode & KERNEL_VFS_S_IFMT;
     if (!type) type=KERNEL_VFS_S_IFREG;
     if (type!=KERNEL_VFS_S_IFREG && type!=KERNEL_VFS_S_IFSOCK) return -KERNEL_ENOTSUP;
-    int r = create_child(m, parent_inode, path, type | (mode & 07777), 0, &e,umask,NULL);
+    int r = create_child(m, parent->inode, path, type | (mode & 07777), 0, &e,umask,NULL);
     if (r) return r;
     struct tmp_inode *i = e->inode;
     r = open_inode(mount, 0, i->number, i->mode, file);
