@@ -865,6 +865,10 @@ static void fill_linux_vfs_stat(struct kernel_linux_stat *stat,
     stat->st_mtime_nsec = vfs_stat->mtime.nanoseconds;
     stat->st_ctime = vfs_stat->ctime.seconds;
     stat->st_ctime_nsec = vfs_stat->ctime.nanoseconds;
+    stat->st_pad1 = 0;
+    stat->st_pad2 = 0;
+    stat->st_pad4 = 0;
+    stat->st_pad5 = 0;
 }
 
 static int stat_description(
@@ -921,18 +925,19 @@ static int copy_stat_to_user(struct kernel_mm *mm,
     const void *bytes;size_t size;
     if (extra) {
         struct linux_statx *stat=&output.extended;
-        memset(stat,0,sizeof(*stat));
         stat->attributes=source->attributes;stat->attributes_mask=source->attributes_mask;
         stat->mask=0x7ff;stat->blksize=source->blksize;
         stat->nlink=source->nlink;stat->uid=source->uid;stat->gid=source->gid;
         stat->mode=source->mode;stat->ino=source->ino;stat->size=source->size;stat->blocks=source->blocks;
         stat->atime=(struct linux_statx_timestamp){source->atime.seconds,source->atime.nanoseconds,0};
+        stat->btime=(struct linux_statx_timestamp){0};
         stat->mtime=(struct linux_statx_timestamp){source->mtime.seconds,source->mtime.nanoseconds,0};
         stat->ctime=(struct linux_statx_timestamp){source->ctime.seconds,source->ctime.nanoseconds,0};
         stat->dev_major=device_major(source->dev);stat->dev_minor=device_minor(source->dev);
         stat->rdev_major=device_major(source->rdev);stat->rdev_minor=device_minor(source->rdev);
+        stat->pad=0;
+        stat->mount_id=extra->mount_id;
         if (extra->mount_id) {
-            stat->mount_id = extra->mount_id;
             stat->mask |= extra->request & KERNEL_VFS_STATX_MNT_ID_UNIQUE ?
                 KERNEL_VFS_STATX_MNT_ID_UNIQUE : KERNEL_VFS_STATX_MNT_ID;
         }
@@ -940,14 +945,11 @@ static int copy_stat_to_user(struct kernel_mm *mm,
         if ((extra->request&KERNEL_VFS_STATX_DIOALIGN) &&
             (source->mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFBLK)
             alignment=statx_dio_alignment(source->rdev,open_device);
-        if (alignment) {
-            stat->mask|=KERNEL_VFS_STATX_DIOALIGN;
-            stat->dio_mem_align=alignment;
-            stat->dio_offset_align=alignment;
-        }
+        if (alignment) stat->mask|=KERNEL_VFS_STATX_DIOALIGN;
+        stat->dio_mem_align=stat->dio_offset_align=alignment;
+        memset(stat->spare,0,sizeof(stat->spare));
         bytes=stat;size=sizeof(*stat);
     } else {
-        memset(&output.basic,0,sizeof(output.basic));
         fill_linux_vfs_stat(&output.basic,source);
         bytes=&output.basic;size=sizeof(output.basic);
     }
