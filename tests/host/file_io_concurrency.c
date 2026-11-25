@@ -1937,12 +1937,26 @@ static void mapped_range_batch_case(struct kernel_heap *heap, struct kernel_vfs_
     memset(bytes, 0x31, length);
     assert(!kernel_vfs_pwrite(&file->file, 0, bytes, length, &written) && written == length);
     assert(!kernel_vfs_sync_borrowing(&file->file, 0, &file->observed_writeback_error, NULL));
+
+    /* A data-only sync of a sole dirty page should reuse the durable mapping. */
+    memset(bytes, 0x44, BOAROS_PAGE_SIZE);
+    assert(!kernel_vfs_pwrite(&file->file, 0, bytes, BOAROS_PAGE_SIZE, &written) &&
+        written == BOAROS_PAGE_SIZE);
+    __atomic_store_n(&mapped_range_continue, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&mapped_range_inode, kernel_open_file_node(file)->inode, __ATOMIC_RELEASE);
+    assert(!kernel_vfs_sync_borrowing(&file->file, 1, &file->observed_writeback_error, NULL));
+    assert(__atomic_load_n(&mapped_range_entered, __ATOMIC_ACQUIRE));
+    __atomic_store_n(&mapped_range_inode, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&mapped_range_entered, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&mapped_range_continue, 0, __ATOMIC_RELAXED);
+
     memset(bytes, 0x62, length);
     assert(!kernel_vfs_pwrite(&file->file, 0, bytes, length, &written) && written == length);
 
     __atomic_store_n(&mapped_range_inode, kernel_open_file_node(file)->inode, __ATOMIC_RELEASE);
     assert(!kernel_vfs_sync_file_range(&file->file, 0, BOAROS_PAGE_SIZE,
-        KERNEL_SYNC_FILE_RANGE_WRITE, &file->observed_writeback_error));
+        KERNEL_SYNC_FILE_RANGE_WAIT_BEFORE | KERNEL_SYNC_FILE_RANGE_WRITE,
+        &file->observed_writeback_error));
     while (!__atomic_load_n(&mapped_range_entered, __ATOMIC_ACQUIRE)) sched_yield();
     for (unsigned page = 2; page < 7; page += 2)
         assert(!kernel_vfs_sync_file_range(&file->file, page*BOAROS_PAGE_SIZE,
@@ -1952,6 +1966,10 @@ static void mapped_range_batch_case(struct kernel_heap *heap, struct kernel_vfs_
         &file->observed_writeback_error));
     assert(__atomic_load_n(&mapped_range_batches, __ATOMIC_ACQUIRE) == 1);
     __atomic_store_n(&mapped_range_inode, 0, __ATOMIC_RELEASE);
+    assert(!kernel_vfs_sync_file_range(&file->file, BOAROS_PAGE_SIZE, 2*BOAROS_PAGE_SIZE,
+        KERNEL_SYNC_FILE_RANGE_WRITE, &file->observed_writeback_error));
+    assert(!kernel_vfs_sync_file_range(&file->file, BOAROS_PAGE_SIZE, 2*BOAROS_PAGE_SIZE,
+        KERNEL_SYNC_FILE_RANGE_WAIT_AFTER, &file->observed_writeback_error));
     assert(!kernel_open_file_release(&file));
     assert(!kernel_vfs_unlink(mount, "/mapped-range"));
     free(bytes);

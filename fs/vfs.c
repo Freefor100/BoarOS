@@ -4902,7 +4902,7 @@ static int direct_transfer(struct kernel_vfs_file *file,uint64_t offset,
     uint64_t first=offset&~BOAROS_PAGE_MASK;
     uint64_t last=(offset+size+BOAROS_PAGE_MASK)&~BOAROS_PAGE_MASK;
     kernel_file_mapping_invalidate_range(node,first,last);
-    error=kernel_page_cache_writeback_range_borrowing(cache,node,first,last,operation);
+    error=kernel_page_cache_writeback_range_borrowing(cache,node,first,last,operation,false);
     kernel_vfs_node_lock(node,&io,1);
     if (!error) {
         if (node->instance->ops->direct_io)
@@ -5339,7 +5339,7 @@ static int fallocate_borrowing(struct kernel_vfs_file *file, unsigned mode,
     /* Buffered EOF can lead persistent EOF. Publish its dirty prefix before
      * a range update changes the cached data or computes its new size. */
     result = cache ? kernel_page_cache_writeback_range_borrowing(cache,node,0,UINT64_MAX,
-        borrowed ? borrowed : &operation) : 0;
+        borrowed ? borrowed : &operation, false) : 0;
     struct kernel_page_cache_resize resize = {0};
     if (!result && cache && !(mode & KERNEL_VFS_FALLOC_KEEP_SIZE) && end > old_size)
         result = kernel_page_cache_resize_prepare(cache,node,old_size,end,&resize);
@@ -5463,7 +5463,7 @@ static int ftruncate_borrowing(struct kernel_vfs_file *file,
         /* 写操作门保留，inode保护必须在MM回调、pin排空和磁盘等待前释放。 */
         kernel_lock_release(&node_guard);
         result = size ? kernel_page_cache_writeback_range_borrowing(cache,node,0,size,
-            borrowed ? borrowed : &operation_guard) : 0;
+            borrowed ? borrowed : &operation_guard, false) : 0;
         if (result) return result;
         kernel_vfs_node_lock(node, &node_guard, 1);
         kernel_file_mapping_close(node);
@@ -5500,7 +5500,7 @@ static int ftruncate_borrowing(struct kernel_vfs_file *file,
         return result;
     }
     result = node->memory || !size ? 0 : kernel_page_cache_writeback_range_borrowing(
-        node->instance->page_cache,node,0,size,borrowed ? borrowed : &operation_guard);
+        node->instance->page_cache,node,0,size,borrowed ? borrowed : &operation_guard,false);
     if (result != 0) return result;
     uint64_t actual;
     int changed;
@@ -7046,7 +7046,8 @@ int kernel_vfs_sync_file_range(struct kernel_vfs_file *file, uint64_t start,
     if (!result && (flags & KERNEL_SYNC_FILE_RANGE_WRITE) && !node->instance->read_only)
         result = flags == KERNEL_SYNC_FILE_RANGE_ALL ?
             kernel_page_cache_writeback_range(cache, node, start, end) :
-            kernel_page_cache_submit_range(cache, node, start, end);
+            kernel_page_cache_submit_range(cache, node, start, end,
+                flags == KERNEL_SYNC_FILE_RANGE_WRITE);
     if (!result && (flags & KERNEL_SYNC_FILE_RANGE_WAIT_AFTER)) {
         kernel_page_cache_wait_range(cache, node, start, end);
         result = kernel_vfs_node_complete_data_range(node, start, end);
@@ -7140,7 +7141,7 @@ int kernel_vfs_sync_range_borrowing(struct kernel_vfs_file *file,
         .data_only = data_only && (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR};
     if (!node->instance->read_only)
         call.result = cache ? kernel_page_cache_writeback_range_borrowing(
-            cache, node, start, end, borrowed) : 0;
+            cache, node, start, end, borrowed, call.data_only) : 0;
     kernel_raw_lock_init(&request.metadata, KERNEL_RAW_RANK_OBJECT);
     if (kernel_vfs_file_metadata_requires_cpu0(file)) {
         enum kernel_page_cache_status status = kernel_page_cache_run_cpu0_borrowing(
@@ -7384,7 +7385,7 @@ int kernel_vfs_file_attributes(struct kernel_vfs_file *file,int set,uint32_t *fl
         if (result) return result;
         kernel_file_mapping_close(node);
         kernel_lock_release(&io);
-        result=kernel_page_cache_writeback_range_borrowing(node->instance->page_cache,node,0,UINT64_MAX,&operation);
+        result=kernel_page_cache_writeback_range_borrowing(node->instance->page_cache,node,0,UINT64_MAX,&operation,false);
         kernel_vfs_node_lock(node,&io,1);
     }
     if (!result) result=ops->set_flags(node,*flags&KERNEL_VFS_INODE_ATTRIBUTES);
