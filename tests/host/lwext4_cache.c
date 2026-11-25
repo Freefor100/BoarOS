@@ -216,6 +216,30 @@ static void inode_read_ahead(void)
     warm(&dev,74);
     CHECK(reads==12);
     finish(&cache);
+
+    init(&cache,&dev,&iface,32);
+    iface.bread_batch=dev_read_batch;
+    batch_calls=batch_width=0;
+    CHECK(ext4_block_get_inode_range(&dev,&block,32,256,256,32)==EOK);
+    CHECK(!batch_calls && reads==1);
+    CHECK(ext4_block_set(&dev,&block)==EOK);
+    CHECK(ext4_block_get_inode_range(&dev,&block,33,256,256,31)==EOK);
+    CHECK(batch_calls==1 && batch_width==16 && reads==17);
+    CHECK(ext4_block_set(&dev,&block)==EOK);
+    warm(&dev,48);
+    CHECK(reads==17);
+    /* A miss needs two allocations for the demand before the wide workspace. */
+    fail_allocation=allocations+3;
+    CHECK(ext4_block_get_inode_range(&dev,&block,49,256,256,15)==EOK);
+    CHECK(batch_calls==2 && reads==21);
+    CHECK(ext4_block_set(&dev,&block)==EOK);
+    fail_allocation=0;
+    CHECK(ext4_block_get_inode_range(&dev,&block,53,256,256,11)==EOK);
+    CHECK(batch_calls==3 && reads==32);
+    CHECK(ext4_block_set(&dev,&block)==EOK);
+    warm(&dev,63);
+    CHECK(reads==32);
+    finish(&cache);
     puts("PASS sequential inode table read-ahead: bounded groups, random skips and failed neighbors");
 #endif
 }

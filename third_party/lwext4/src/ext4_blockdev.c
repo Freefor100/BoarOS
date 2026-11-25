@@ -374,8 +374,9 @@ static int ext4_block_wait_loaded(struct ext4_blockdev *bdev, struct ext4_buf *b
         bdev->bdif->wait_read(buf);
     }
 }
-static __attribute__((noinline)) int block_load_read_ahead(struct ext4_blockdev *bdev,
-    struct ext4_block *demand, unsigned count, unsigned *loaded)
+static int block_load_read_ahead_into(struct ext4_blockdev *bdev,
+    struct ext4_block *demand, unsigned count, unsigned *loaded,
+    struct block_read_span *spans, struct ext4_block *neighbors)
 {
     uint64_t lba=demand->lb_id;
     uint32_t size=bdev->lg_bsize;
@@ -385,8 +386,7 @@ static __attribute__((noinline)) int block_load_read_ahead(struct ext4_blockdev 
         return ext4_blocks_get_direct(bdev,demand->data,lba,1);
 
     uint64_t offset=bdev->part_offset+lba*size;
-    struct block_read_span spans[EXT4_BLOCK_READ_AHEAD_MAX]={{offset,demand->data,size,0,EIO}};
-    struct ext4_block neighbors[EXT4_BLOCK_READ_AHEAD_MAX-1];
+    spans[0]=(struct block_read_span){offset,demand->data,size,0,EIO};
     unsigned pending=1;
     for (unsigned i=1;i<count;i++) {
         struct ext4_block *neighbor=&neighbors[pending-1];
@@ -420,6 +420,39 @@ static __attribute__((noinline)) int block_load_read_ahead(struct ext4_blockdev 
     return ext4_blocks_get_direct(bdev,demand->data,lba,1);
 }
 
+static __attribute__((noinline)) int block_load_read_ahead(struct ext4_blockdev *bdev,
+    struct ext4_block *demand, unsigned count, unsigned *loaded)
+{
+    struct block_read_span spans[EXT4_BLOCK_READ_AHEAD_MAX];
+    struct ext4_block neighbors[EXT4_BLOCK_READ_AHEAD_MAX-1];
+    return block_load_read_ahead_into(bdev,demand,count,loaded,spans,neighbors);
+}
+
+#define INODE_READ_AHEAD_MAX 16U
+#define INODE_READ_AHEAD_BYTES (64U * 1024U)
+static __attribute__((noinline)) int block_load_inode_run(struct ext4_blockdev *bdev,
+    struct ext4_block *demand, unsigned remaining, unsigned *loaded)
+{
+    unsigned count=INODE_READ_AHEAD_BYTES/bdev->lg_bsize;
+    if (count>INODE_READ_AHEAD_MAX) count=INODE_READ_AHEAD_MAX;
+    if (count>remaining) count=remaining;
+    if (count<=1) return ext4_blocks_get_direct(bdev,demand->data,demand->lb_id,1);
+    if (count>EXT4_BLOCK_READ_AHEAD_MAX) {
+        struct {
+            struct block_read_span spans[INODE_READ_AHEAD_MAX];
+            struct ext4_block neighbors[INODE_READ_AHEAD_MAX-1];
+        } *batch=ext4_malloc(sizeof(*batch));
+        if (batch) {
+            int result=block_load_read_ahead_into(bdev,demand,count,loaded,
+                batch->spans,batch->neighbors);
+            ext4_free(batch);
+            return result;
+        }
+        count=EXT4_BLOCK_READ_AHEAD_MAX;
+    }
+    return block_load_read_ahead(bdev,demand,count,loaded);
+}
+
 static inline int block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
     uint64_t lba, uint32_t offset, uint32_t length, enum ext4_block_access access,
     unsigned read_count, bool inode_table)
@@ -433,12 +466,14 @@ static inline int block_get_range(struct ext4_blockdev *bdev, struct ext4_block 
     if (read==EXT4_BCACHE_READ_LOAD) {
         bool track=inode_table && bdev->bdif->bread_batch &&
             (!bdev->fs || !ext4_current_operation(bdev->fs));
-        if (inode_table && (!track ||
-            __atomic_load_n(&bdev->inode_read_next,__ATOMIC_RELAXED)!=lba))
-            read_count=1;
         unsigned loaded=1;
-        r=read_count>1 ? block_load_read_ahead(bdev,b,read_count,track ? &loaded : NULL) :
-            ext4_blocks_get_direct(bdev,b->data,lba,1);
+        if (read_count>1 && track &&
+            __atomic_load_n(&bdev->inode_read_next,__ATOMIC_RELAXED)==lba)
+            r=block_load_inode_run(bdev,b,read_count,&loaded);
+        else if (read_count>1 && !inode_table)
+            r=block_load_read_ahead(bdev,b,read_count,NULL);
+        else
+            r=ext4_blocks_get_direct(bdev,b->data,lba,1);
         if (track) __atomic_store_n(&bdev->inode_read_next,r ? 0 : lba+loaded,__ATOMIC_RELAXED);
         ext4_block_loaded(bdev,b->buf,r);
     } else if (read==EXT4_BCACHE_READ_WAIT) r=ext4_block_wait_loaded(bdev,b->buf);
@@ -463,8 +498,7 @@ int ext4_block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
 int ext4_block_get_inode_range(struct ext4_blockdev *bdev,struct ext4_block *b,
     uint64_t lba,uint32_t offset,uint32_t length,unsigned remaining)
 {
-    unsigned count=remaining<EXT4_BLOCK_READ_AHEAD_MAX ? remaining : EXT4_BLOCK_READ_AHEAD_MAX;
-    return block_get_range(bdev,b,lba,offset,length,EXT4_BLOCK_READ,count,true);
+    return block_get_range(bdev,b,lba,offset,length,EXT4_BLOCK_READ,remaining,true);
 }
 
 int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b, uint64_t lba)
