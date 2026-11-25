@@ -74,7 +74,15 @@ static void operation_count_case(void)
     void *unchanged=(void *)(uintptr_t)1;
     assert(kernel_heap_resize(&other,object,128,&unchanged)==KERNEL_HEAP_STATUS_INVALID);
     assert(unchanged==(void *)(uintptr_t)1);
-    kernel_heap_release(&heap,object);kernel_heap_release(&heap,kept);
+    heap_acquires=order_queries=page_acquires=0;
+    count_operations=1;
+    kernel_heap_release(&heap,object);
+    count_operations=0;
+    printf("non-final slab release: heap protections=%u allocator protections=%u order queries=%u\n",
+           heap_acquires,page_acquires,order_queries);
+    fflush(stdout);
+    assert(heap_acquires==1 && !page_acquires && !order_queries);
+    kernel_heap_release(&heap,kept);
     struct kernel_heap_statistics stats;kernel_heap_get_statistics(&heap,&stats);
     assert(stats.allocation_calls==3 && !stats.allocation_failures);
     assert(!stats.live_allocations && !stats.current_pages);
