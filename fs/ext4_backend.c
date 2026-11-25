@@ -2974,7 +2974,7 @@ static int ext4_backend_stat(const struct kernel_vfs_file *file,
 
 static int ext4_backend_stat_inode(struct kernel_vfs_mount *mount,
     struct kernel_vfs_node *parent,uint64_t number,struct kernel_vfs_node *node,
-    struct kernel_vfs_stat *stat)
+    uint64_t publications,struct kernel_vfs_stat *stat)
 {
     struct kernel_vfs_instance *instance=parent->instance;
     struct lwext4_mount_adapter *adapter=lwext4_instance(instance);
@@ -2983,14 +2983,21 @@ static int ext4_backend_stat_inode(struct kernel_vfs_mount *mount,
     struct kernel_vfs_node *late=NULL;
     if (!node) {
         ext4_file *directory=lwext4_node_file(parent);
-        if (!ext4_file_copy_cached_inode(directory,(uint32_t)number,&inode)) {
+        bool cached=ext4_file_copy_cached_inode(directory,(uint32_t)number,&inode);
+        if (!cached) {
             ext4_file file={.mp=directory->mp,.inode=(uint32_t)number};
             result=ext4_fraw_inode_fill(&file,&inode);
         }
-        /* A different spelling may have opened this inode while the read
-         * waited. The live node owns delayed allocation and current EOF. */
-        late=kernel_vfs_node_pin(instance,number);
-        node=late;
+        /* A different name can publish the same inode during the read.
+         * An immutable cache hit and unchanged publication sequence reuse
+         * the resolver's earlier proof that this inode had no live node. */
+#if BOAROS_MAX_CPUS > 1
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+#endif
+        if (!cached || __atomic_load_n(&instance->node_publications,__ATOMIC_RELAXED)!=publications) {
+            late=kernel_vfs_node_pin(instance,number);
+            node=late;
+        }
     }
     if (node) {
         struct kernel_vfs_file file={.mount=mount,.private_data=node,.state=VFS_FILE_STATE_LIVE};

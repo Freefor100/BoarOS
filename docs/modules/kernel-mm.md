@@ -107,7 +107,8 @@ flowchart TD
 内核读写用户空间数据时根据场景采用两条互补路径：
 
 1. **RISC-V 本核直接用户拷贝（`arch/riscv/user_copy.S`）**：当访问当前处理器已激活线程自身的地址空间时，汇编拷贝例程仅在实际访存指令区间开启 `sstatus.SUM`（允许内核态访问用户页），采用 32 字节/8 字节展开循环直接拷贝用户虚拟地址，并将每条访存指令登记到 `.rodata.riscv_uaccess_fixups` 异常恢复表。若拷贝中途触发缺页，陷入入口立即清除 `SUM` 并跳转恢复点，返回精确的已完成字节数与异常原因，随后由外层公共拷贝逻辑在常规内核栈上调用 `kernel_mm_resolve_user_fault()` 按需装页并重试——既免去逐页查软件页表的开销，又避免在嵌套陷入帧下阻塞做磁盘 I/O。
-2. **软件页表固定借用（`kernel_mm_pin_user_page`）**：用于跨地址空间访问（如 `process_vm_readv`、`ptrace`）、原子比较交换（`futex`）、DMA 设备缓冲以及 LoongArch 常规拷贝。在 `metadata` 读锁内查询页表项、核对权限、递增物理页引用计数与 `access_pins`/`write_pins`，返回后借用页帧在释放前始终保持存活，读写结束后通过 `kernel_mm_unpin_user_page()` 成对归还。
+2. **LoongArch 单页短拷贝（`kernel_mm_copy_ready_short`）**。用户路径字符串和小型结构等数据访问已驻留的普通页面时，内核可以在页表读保护内复制最多 256 字节。映射在保护内持有物理页，调用者无需再增加和归还页引用。跨页的定长复制、缺页、写时复制和涉及文件页别名的写入继续走原有处理，秘密页使用专门的本地址空间拷贝入口。
+3. **软件页表固定借用（`kernel_mm_pin_user_page`）**。跨地址空间访问（如 `process_vm_readv`、`ptrace`）、原子比较交换（`futex`）、直接内存访问（Direct Memory Access，DMA）设备缓冲，以及需要在页表保护外完成的用户拷贝都可以固定借用物理页。内核在 `metadata` 读锁内查询页表项、核对权限、增加物理页引用计数与 `access_pins` 或 `write_pins`，在读写结束后通过 `kernel_mm_unpin_user_page()` 成对归还。
 
 ---
 

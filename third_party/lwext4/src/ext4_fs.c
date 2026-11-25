@@ -199,6 +199,13 @@ void ext4_fs_prepare_inode_locations(struct ext4_fs *fs)
 		fs->table_inode_count = ext4_get32(&fs->sb,inodes_count);
 		fs->table_group_inodes = ext4_get32(&fs->sb,inodes_per_group);
 		fs->table_inode_size = ext4_get16(&fs->sb,inode_size);
+		uint32_t per_group = fs->table_group_inodes;
+		fs->table_group_shift = (per_group & (per_group - 1U)) ? 32U : 0U;
+		if (!fs->table_group_shift)
+			for (; per_group > 1U; per_group >>= 1U) fs->table_group_shift++;
+		uint32_t per_block = fs->bdev->lg_bsize / fs->table_inode_size;
+		fs->table_block_shift = 0;
+		for (; per_block > 1U; per_block >>= 1U) fs->table_block_shift++;
 	}
 }
 
@@ -664,6 +671,11 @@ struct metadata_check {
     uint64_t schema;
     uint32_t position;
 };
+static inline uint64_t metadata_schema(uint32_t index,uint32_t position,uint32_t length,bool inode)
+{
+    /* The offset identifies a record only within this table base and stride. */
+    return (uint64_t)(index-position)<<32 | (uint64_t)length<<1 | inode;
+}
 static struct metadata_check metadata_record(uint32_t index,uint32_t offset,
     uint32_t length,bool inode)
 {
@@ -671,9 +683,7 @@ static struct metadata_check metadata_record(uint32_t index,uint32_t offset,
     uint32_t position=offset/length;
     if (position>=256 || offset!=position*length || index<position)
         return (struct metadata_check){0};
-    /* Record identities increase by one at each table stride. Keep that
-     * table's base identity, stride and type; an offset alone is not identity. */
-    return (struct metadata_check){(uint64_t)(index-position)<<32 | (uint64_t)length<<1 | inode,position};
+    return (struct metadata_check){metadata_schema(index,position,length,inode),position};
 }
 
 static bool metadata_cached(struct ext4_block_payload *payload,uint32_t index,
@@ -707,20 +717,25 @@ bool ext4_fs_copy_cached_inode(struct ext4_fs *fs,uint32_t index,struct ext4_ino
 {
     if (!index || !fs->inode_table_starts || index>fs->table_inode_count ||
         ext4_current_operation(fs)) return false;
-    uint32_t group=(index-1U)/fs->table_group_inodes;
+    uint32_t ordinal=index-1U;
+    uint32_t group=fs->table_group_shift<32 ? ordinal>>fs->table_group_shift :
+        ordinal/fs->table_group_inodes;
     if (group>=fs->inode_table_groups) return false;
-    uint32_t offset=(index-1U)%fs->table_group_inodes*fs->table_inode_size;
+    uint32_t within=ordinal-group*fs->table_group_inodes;
+    uint32_t record=within&((1U<<fs->table_block_shift)-1U);
+    uint32_t offset=record*fs->table_inode_size;
     const ext4_fsblk_t *location=&fs->inode_table_starts[group];
     ext4_fsblk_t table=__atomic_load_n(location,__ATOMIC_ACQUIRE);
     if (!table || table==UINT64_MAX) return false;
 
     struct ext4_blockdev *device=fs->bdev;
-    ext4_fsblk_t block=table+offset/device->lg_bsize;
-    offset%=device->lg_bsize;
-    struct metadata_check record=metadata_record(index,offset,fs->table_inode_size,true);
+    ext4_fsblk_t block=table+(within>>fs->table_block_shift);
+    /* The validated inode stride divides a filesystem block. The common
+     * verification bitmap only represents the first 256 records. */
+    uint64_t schema=metadata_schema(index,record,fs->table_inode_size,true);
     size_t bytes=fs->table_inode_size<sizeof(*inode) ? fs->table_inode_size : sizeof(*inode);
-    if (!record.schema || !ext4_bcache_copy_verified(device->bc,block,offset,record.schema,
-        record.position,inode,bytes) || __atomic_load_n(location,__ATOMIC_ACQUIRE)!=table)
+    if (record>=256 || !ext4_bcache_copy_verified(device->bc,block,offset,schema,
+        record,inode,bytes) || __atomic_load_n(location,__ATOMIC_ACQUIRE)!=table)
         return false;
     if (bytes<sizeof(*inode)) memset((uint8_t *)inode+bytes,0,sizeof(*inode)-bytes);
     return true;

@@ -3138,6 +3138,7 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
     }
     uint64_t inode;uint32_t mode=0;
     struct kernel_vfs_node *stat_node=NULL;
+    uint64_t node_publications=0;
     bool stat_leaf=false;
     /* Owned names retain real positive objects. A backend that initializes
      * the inode itself needs no speculative child mode read before opening. */
@@ -3165,6 +3166,7 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
                 !__atomic_load_n(&mount->paths_closing,__ATOMIC_ACQUIRE);
             if (stat_leaf) {
                 stat_node=kernel_vfs_node_find(instance,inode);
+                node_publications=__atomic_load_n(&instance->node_publications,__ATOMIC_RELAXED);
                 if (stat_node && kernel_vfs_node_acquire(stat_node)) {
                     stat_leaf=false;
                     stat_node=NULL;
@@ -3175,7 +3177,8 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
     }
     if (!entry) {
         if (stat_leaf) {
-            result=instance->ops->stat_inode(mount,parent->file.private_data,inode,stat_node,query->stat);
+            result=instance->ops->stat_inode(mount,parent->file.private_data,inode,stat_node,
+                node_publications,query->stat);
             release_node_pin(&stat_node);
             if (result!=-KERNEL_ENOTSUP) {
                 if (!result && query->extra) statx_mount_info(mount,query->stat,query->extra);
@@ -3663,17 +3666,21 @@ static void dentry_release(struct kernel_vfs_dentry **owner)
         kernel_heap_release(entry->heap,entry);entry=parent;
     }
 }
-/* Persistent locations use VFS state. A transient component may instead
- * borrow the input mount and take its dentry ref under the name lock. */
+/* Fresh locations and resolver slots start zeroed. Only a fresh persistent
+ * location can acquire index/list links, so rebinding a resolver slot need
+ * only replace its owned fields. */
 static void path_bind(struct kernel_vfs_path *path,struct kernel_vfs_mount *mount,
     struct kernel_vfs_dentry *entry,int transient,bool borrow_mount)
 {
     if ((!borrow_mount && kernel_vfs_mount_view_acquire_locked(mount)) ||
         dentry_acquire(entry)) __builtin_trap();
-    *path=(struct kernel_vfs_path){.file=entry->file,
-        .heap=((struct kernel_vfs_instance *)mount->private_data)->heap,
-        .dentry=entry,.references=1,.transient=transient,.borrow_mount=borrow_mount};
+    path->file=entry->file;
     path->file.mount=mount;path->file.location_owner=0;
+    path->heap=((struct kernel_vfs_instance *)mount->private_data)->heap;
+    path->dentry=entry;
+    path->references=1;
+    path->transient=transient;
+    path->borrow_mount=borrow_mount;
 }
 static int path_walk_wrap(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *entry,
     struct kernel_vfs_path **owner,struct vfs_path_walk *walk)
@@ -7827,6 +7834,9 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
         instance->nodes = node;
         instance->node_index = node_index_insert(instance->node_index, node);
         instance->node_count++;
+        uint64_t sequence=__atomic_load_n(&instance->node_publications,__ATOMIC_RELAXED)+1U;
+        if (!sequence) __builtin_trap();
+        __atomic_store_n(&instance->node_publications,sequence,__ATOMIC_RELEASE);
     } else if (!existing) pin_error=-KERNEL_EOVERFLOW;
     kernel_task_lock_release(&irq);
     if (existing) {

@@ -8,9 +8,13 @@
 int kernel_mm_local_secret_address(struct kernel_mm *,uint64_t address);
 
 #if defined(__loongarch__)
-enum kernel_secret_copy { SECRET_COPY_IN, SECRET_COPY_OUT, SECRET_COPY_STRING };
+enum kernel_user_copy_direction { USER_COPY_IN, USER_COPY_OUT, USER_COPY_STRING };
+#define KERNEL_MM_SHORT_COPY_BYTES 256U
+/* At most 256 bytes within one validated user page in the caller's live MM. */
+int kernel_mm_copy_ready_short(struct kernel_mm *,uint64_t address,void *buffer,
+    size_t length,enum kernel_user_copy_direction,size_t *copied);
 enum kernel_mm_status kernel_mm_copy_local_secret(struct kernel_mm *,uint64_t address,
-    void *buffer,size_t length,enum kernel_secret_copy,size_t *copied);
+    void *buffer,size_t length,enum kernel_user_copy_direction,size_t *copied);
 #endif
 
 /* Share fault/retry preparation while allowing GUP-style callers to retain
