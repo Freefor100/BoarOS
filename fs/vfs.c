@@ -315,6 +315,15 @@ static void path_topology_changed(void)
     if (++path_topology_generation==0) __builtin_trap();
 }
 
+/* VFS state protects the weak directory. Its parent references keep the
+ * chain alive to the anchor while the directory remains indexed. */
+static struct {
+    struct kernel_vfs_dentry *directory, *anchor;
+    uint64_t mount_id;
+    size_t length;
+    char name[64];
+} recent_stat_prefix;
+
 #define VFS_MUTATION_SCOPE(name, mount) KERNEL_LOCK_SCOPE(name); kernel_vfs_mutation_lock(mount,&name)
 #define VFS_FILE_MUTATION_SCOPE(name, file) KERNEL_LOCK_SCOPE(name); \
     if (!(file)->write_lease) kernel_vfs_mutation_lock((file)->mount,&name)
@@ -2821,6 +2830,10 @@ static void index_path(struct kernel_vfs_instance *instance,struct kernel_vfs_de
 static void unindex_child(struct kernel_vfs_dentry *path)
 {
     struct kernel_vfs_dentry *parent=path->parent;
+    /* Directory retirement and either form of rename remove the old edge
+     * here before a weak prefix can be used again. */
+    if ((path->file.mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR)
+        recent_stat_prefix.directory=NULL;
     if (__atomic_load_n(&parent->lookup_hint,__ATOMIC_RELAXED)==path)
         __atomic_store_n(&parent->lookup_hint,NULL,__ATOMIC_RELAXED);
     parent->children=path_index_remove(parent->children,path);
@@ -3046,7 +3059,36 @@ static struct kernel_vfs_dentry *stat_cached_prefix(struct vfs_path_walk *walk,
     struct kernel_vfs_dentry *parent=start->dentry;
     KERNEL_TASK_LOCK_SCOPE(state,&kernel_vfs_state_lock);
     if (__atomic_load_n(&mount->paths_closing,__ATOMIC_ACQUIRE)) return NULL;
-    for (unsigned i=0;i<4 && cursor<length;i++) {
+    size_t first=begin;
+    struct kernel_vfs_dentry *recent=recent_stat_prefix.directory;
+    if (recent && recent_stat_prefix.anchor==parent && recent_stat_prefix.mount_id==mount->id &&
+        recent_stat_prefix.length<length-begin &&
+        !memcmp(path+begin,recent_stat_prefix.name,recent_stat_prefix.length)) {
+        /* The name bindings are still indexed. Recheck permissions and
+         * mount boundaries for the current caller, including a changed root. */
+        struct kernel_vfs_dentry *child=recent;
+        while (child!=parent) {
+            struct kernel_vfs_dentry *ancestor=child->parent;
+            struct kernel_vfs_node *node=ancestor->file.private_data;
+            if (child==mount->root_dentry || child==walk->root->dentry ||
+                __atomic_load_n(&child->mountpoint_seen,__ATOMIC_ACQUIRE) ||
+                node->unlinked || !instance->ops->search_cached(node,cred)) break;
+            if (!__atomic_load_n(&child->recently_used,__ATOMIC_RELAXED))
+                __atomic_store_n(&child->recently_used,1,__ATOMIC_RELAXED);
+            child=ancestor;
+        }
+        if (child==parent) {
+            begin+=recent_stat_prefix.length;
+            cursor=begin;
+            while (cursor<length && path[cursor]!='/') cursor++;
+            end=cursor;
+            while (cursor<length && path[cursor]=='/') cursor++;
+            parent=recent;
+            goto Found;
+        }
+    }
+    unsigned count_dirs=0;
+    for (;count_dirs<4 && cursor<length;count_dirs++) {
         size_t count=end-begin;
         struct kernel_vfs_node *node=parent->file.private_data;
         if (count>255U || (path[begin]=='.' && (count==1 || (count==2 && path[begin+1]=='.'))) ||
@@ -3065,6 +3107,14 @@ static struct kernel_vfs_dentry *stat_cached_prefix(struct vfs_path_walk *walk,
         while (cursor<length && path[cursor]=='/') cursor++;
     }
     if (parent==start->dentry) return NULL;
+    if (count_dirs>=2 && end==length && begin-first<=sizeof(recent_stat_prefix.name)) {
+        recent_stat_prefix.directory=parent;
+        recent_stat_prefix.anchor=start->dentry;
+        recent_stat_prefix.mount_id=mount->id;
+        recent_stat_prefix.length=begin-first;
+        memcpy(recent_stat_prefix.name,path+first,begin-first);
+    }
+Found:
     if (dentry_acquire(parent)) __builtin_trap();
     *part=(struct path_component_span){begin,end,cursor};
     return parent;
