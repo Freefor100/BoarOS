@@ -72,9 +72,10 @@ typedef uint64_t ext4_fsblk_t;
 #pragma pack(push, 1)
 
 /*
- * Structure of the super block
+ * Structure of the super block. The mounted copy and journal block storage
+ * are word-aligned; the on-disk field offsets still follow the packed layout.
  */
-struct ext4_sblock {
+struct __attribute__((aligned(4))) ext4_sblock {
 	uint32_t inodes_count;		   /* I-nodes count */
 	uint32_t blocks_count_lo;	  /* Blocks count */
 	uint32_t reserved_blocks_count_lo; /* Reserved blocks count */
@@ -404,9 +405,10 @@ struct ext4_bgroup {
 #pragma pack(push, 1)
 
 /*
- * Structure of an inode on the disk
+ * Structure of an inode on the disk. The validated inode stride and aligned
+ * block payloads always place table records on a word boundary.
  */
-struct ext4_inode {
+struct __attribute__((aligned(4))) ext4_inode {
 	uint16_t mode;		    /* File mode */
 	uint16_t uid;		    /* Low 16 bits of owner uid */
 	uint32_t size_lo;	   /* Size in bytes */
@@ -455,6 +457,12 @@ struct ext4_inode {
 };
 
 #pragma pack(pop)
+
+#ifdef __cplusplus
+static_assert(sizeof(struct ext4_inode) == 156, "ext4 inode layout");
+#else
+_Static_assert(sizeof(struct ext4_inode) == 156, "ext4 inode layout");
+#endif
 
 #define EXT4_INODE_MODE_FIFO 0x1000
 #define EXT4_INODE_MODE_CHARDEV 0x2000
