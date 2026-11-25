@@ -3314,7 +3314,11 @@ static int resolve_object(struct kernel_vfs_path *start,
 {
     struct kernel_vfs_path *current;
     bool borrowed=true;
-    struct kernel_vfs_path components[2]={0};
+    /* Only the reference count is read before path_bind fills a local slot.
+     * The mount location's index, list and child-mount fields stay unused. */
+    struct kernel_vfs_path components[2];
+    components[0].references=0;
+    components[1].references=0;
     struct kernel_vfs_instance *adapter;
     char *work = 0;
     const char *pending=path;
@@ -3579,7 +3583,7 @@ Finish:
 
 static int path_resolve(struct kernel_vfs_path *start,
                             struct kernel_vfs_path *root,
-                            const char *path, int follow_final,
+                            const char *path, size_t length, int follow_final,
                             struct kernel_vfs_path **owner,
                             struct kernel_vfs_path **pathless_link,
                             struct kernel_vfs_path *terminal,const struct vfs_walk_stat *query)
@@ -3587,7 +3591,7 @@ static int path_resolve(struct kernel_vfs_path *start,
     if (!path || !start || !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
     VFS_PATH_WALK(walk,start,root);
     walk.pathless_link=pathless_link;walk.terminal=terminal;walk.stat=query;
-    return resolve_object(start, root, path, strlen(path), follow_final, 0, 0, VFS_TRAILING_FOLLOW,
+    return resolve_object(start, root, path, length, follow_final, 0, 0, VFS_TRAILING_FOLLOW,
                           owner, 0, &walk);
 }
 
@@ -3595,7 +3599,7 @@ int kernel_vfs_path_resolve(struct kernel_vfs_path *start,
                             struct kernel_vfs_path *root,
                             const char *path, int follow_final,
                             struct kernel_vfs_path **owner)
-{ return path_resolve(start,root,path,follow_final,owner,NULL,NULL,NULL); }
+{ return path_resolve(start,root,path,path ? strlen(path) : 0,follow_final,owner,NULL,NULL,NULL); }
 
 static int location_key_compare(const struct kernel_vfs_dentry *entry,const struct kernel_vfs_path *path)
 { return ((uintptr_t)entry>(uintptr_t)path->dentry)-((uintptr_t)entry<(uintptr_t)path->dentry); }
@@ -3718,9 +3722,8 @@ static void dentry_release(struct kernel_vfs_dentry **owner)
         kernel_heap_release(entry->heap,entry);entry=parent;
     }
 }
-/* Fresh locations and resolver slots start zeroed. Only a fresh persistent
- * location can acquire index/list links, so rebinding a resolver slot need
- * only replace its owned fields. */
+/* A fresh persistent location starts zeroed for index/list insertion.
+ * Resolver slots are private and only their owned fields are initialized. */
 static void path_bind(struct kernel_vfs_path *path,struct kernel_vfs_mount *mount,
     struct kernel_vfs_dentry *entry,int transient,bool borrow_mount)
 {
@@ -5605,7 +5608,7 @@ uint64_t kernel_vfs_file_size(const struct kernel_vfs_file *file)
  * real. A pathless link's mount must not stand in for a missing target mount. */
 static int stat_at_resolved(struct kernel_vfs_path *start,
                             struct kernel_vfs_path *root, const char *path,
-                            int follow_final, struct kernel_vfs_stat *stat,
+                            size_t length, int follow_final, struct kernel_vfs_stat *stat,
                             struct kernel_vfs_path **target,struct kernel_vfs_path *terminal,
                             struct kernel_vfs_statx_extra *extra)
 {
@@ -5613,7 +5616,7 @@ static int stat_at_resolved(struct kernel_vfs_path *start,
     struct kernel_vfs_path *link __attribute__((cleanup(release_path_pin))) = 0;
     struct vfs_walk_stat query={stat,extra};
     bool needs_path=target || (extra && (extra->request&KERNEL_VFS_STATX_DIOALIGN));
-    int result=path_resolve(start,root,path,follow_final,&resolved,&link,terminal,
+    int result=path_resolve(start,root,path,length,follow_final,&resolved,&link,terminal,
         needs_path ? NULL : &query);
     if (!result && resolved) {
         result = kernel_vfs_path_stat(resolved, stat);
@@ -5636,15 +5639,16 @@ int kernel_vfs_stat_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
                        int follow_final, struct kernel_vfs_stat *stat)
 {
-    struct kernel_vfs_path terminal={0};
-    return stat_at_resolved(start,root,path,follow_final,stat,NULL,&terminal,NULL);
+    return kernel_vfs_statx_at(start,root,path,path ? strlen(path) : 0,follow_final,stat,NULL);
 }
 
 int kernel_vfs_statx_at(struct kernel_vfs_path *start, struct kernel_vfs_path *root,
-    const char *path, int follow_final, struct kernel_vfs_stat *stat, struct kernel_vfs_statx_extra *extra)
+    const char *path, size_t length, int follow_final, struct kernel_vfs_stat *stat,
+    struct kernel_vfs_statx_extra *extra)
 {
-    struct kernel_vfs_path terminal={0};
-    return stat_at_resolved(start, root, path, follow_final, stat, NULL, &terminal, extra);
+    struct kernel_vfs_path terminal;
+    terminal.references=0;
+    return stat_at_resolved(start,root,path,length,follow_final,stat,NULL,&terminal,extra);
 }
 
 static int access_check(const struct kernel_vfs_stat *stat,
@@ -5690,8 +5694,10 @@ int kernel_vfs_access_at(struct kernel_vfs_path *start,
 {
     struct kernel_vfs_path *target __attribute__((cleanup(release_path_pin))) = 0;
     struct kernel_vfs_stat stat;
-    struct kernel_vfs_path terminal={0};
-    int result=stat_at_resolved(start,root,path,follow_final,&stat,&target,&terminal,NULL);
+    struct kernel_vfs_path terminal;
+    terminal.references=0;
+    int result=stat_at_resolved(start,root,path,path ? strlen(path) : 0,follow_final,
+        &stat,&target,&terminal,NULL);
     return result ? result : access_check(&stat,target ? target->file.mount : NULL,
                          target ? target->file.private_data : NULL,mode);
 }
@@ -6060,10 +6066,11 @@ int kernel_vfs_readlink_at(struct kernel_vfs_path *start,
                            char *buffer, size_t size, size_t *bytes_read)
 {
     if (!start || !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
-    struct kernel_vfs_path terminal = {0};
+    struct kernel_vfs_path terminal;
+    terminal.references=0;
     struct kernel_vfs_path *resolved = 0;
     if (!buffer || !bytes_read || !size) return -KERNEL_EINVAL;
-    int result = path_resolve(start, root, path, 0, &resolved, NULL, &terminal, NULL);
+    int result = path_resolve(start,root,path,path ? strlen(path) : 0,0,&resolved,NULL,&terminal,NULL);
     if (!result) {
         result = kernel_vfs_path_readlink(resolved, buffer, size, bytes_read);
         (void)kernel_vfs_path_release(&resolved);
