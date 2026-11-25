@@ -358,7 +358,8 @@ int kernel_vfs_stat_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
                        int follow_final, struct kernel_vfs_stat *stat);
 int kernel_vfs_statx_at(struct kernel_vfs_path *start, struct kernel_vfs_path *root,
-    const char *path, int follow_final, struct kernel_vfs_stat *, struct kernel_vfs_statx_extra *);
+    const char *path, size_t length, int follow_final, struct kernel_vfs_stat *,
+    struct kernel_vfs_statx_extra *);
 /* Both lookup and final access checks use the active actor credentials. */
 int kernel_vfs_access_at(struct kernel_vfs_path *start,
                          struct kernel_vfs_path *root, const char *path,

@@ -1,6 +1,7 @@
 #ifndef BOAROS_KERNEL_TASK_H
 #define BOAROS_KERNEL_TASK_H
 
+#include <stdbool.h>
 #include <kernel/pid.h>
 #include <kernel/rlimit.h>
 
@@ -155,6 +156,10 @@ enum kernel_task_status kernel_task_files_borrow(
 /* Borrow both caller-owned resources for scalar I/O on an installed FD. */
 enum kernel_task_status kernel_task_file_io_borrow(
     struct kernel_task *,struct kernel_files **,struct kernel_mm **);
+/* Borrow the current user task's three pathname resources together. */
+enum kernel_task_status kernel_task_file_path_borrow(struct kernel_task *,
+    struct kernel_files **,const struct kernel_fs_context **,struct kernel_mm **,
+    bool allocates_fd);
 int64_t kernel_task_close_range(struct kernel_task *, uint32_t first,
     uint32_t last, uint32_t flags);
 

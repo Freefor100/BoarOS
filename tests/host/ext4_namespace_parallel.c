@@ -281,7 +281,7 @@ static void lookup_attributes_case(struct kernel_vfs_path *root)
     assert(!instance->dentry_cache_count);
     stat_lookup_watch=1;stat_lookup_reads=stat_lookup_opens=stat_lookup_allocations=0;
     struct kernel_vfs_statx_extra extra={.request=KERNEL_VFS_STATX_MNT_ID};
-    assert(!kernel_vfs_statx_at(root,root,"stat-only",1,&stat,&extra));
+    assert(!kernel_vfs_statx_at(root,root,"stat-only",9,1,&stat,&extra));
     stat_lookup_watch=0;
     assert(stat.ino==inode && (stat.mode&0777)==0640 && !stat.size);
     assert(extra.mount_id==root->file.mount->id &&

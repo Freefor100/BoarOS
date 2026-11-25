@@ -3422,6 +3422,22 @@ enum kernel_task_status kernel_task_file_io_borrow(
     return KERNEL_TASK_STATUS_OK;
 }
 
+enum kernel_task_status kernel_task_file_path_borrow(struct kernel_task *task,
+    struct kernel_files **files,const struct kernel_fs_context **fs,struct kernel_mm **mm,
+    bool allocates_fd)
+{
+    if (!task || !files || !fs || !mm) return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    enum kernel_task_status status=validate_task_resource_borrow(task);
+    if (status) return status;
+    if (task->mm.state!=KERNEL_MM_LIVE) return KERNEL_TASK_STATUS_STATE;
+    if (allocates_fd) task->files.nofile_limit=(uint32_t)__atomic_load_n(
+        &task->limits->values[KERNEL_RLIMIT_NOFILE].current,__ATOMIC_RELAXED);
+    *files=&task->files;
+    *fs=&task->fs;
+    *mm=&task->mm;
+    return KERNEL_TASK_STATUS_OK;
+}
+
 enum kernel_task_status kernel_task_fs_context_borrow(
     const struct kernel_task *task,
     const struct kernel_fs_context **fs)

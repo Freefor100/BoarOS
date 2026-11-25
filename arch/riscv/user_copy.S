@@ -247,6 +247,30 @@ riscv_copy_page:
 riscv_copy_string_from_user:
     li t6,SUM
     csrs sstatus,t6
+    /* Stop at NUL without reading the next byte, even across a page boundary. */
+    li t1,4
+    bltu a2,t1,.Lstring_tail
+.Lstring_read0:
+    lbu t0,0(a1)
+    sb t0,0(a0)
+    beqz t0,.Lstring_done
+.Lstring_read1:
+    lbu t0,1(a1)
+    sb t0,1(a0)
+    beqz t0,.Lstring_done1
+.Lstring_read2:
+    lbu t0,2(a1)
+    sb t0,2(a0)
+    beqz t0,.Lstring_done2
+.Lstring_read3:
+    lbu t0,3(a1)
+    sb t0,3(a0)
+    beqz t0,.Lstring_done3
+    addi a0,a0,4
+    addi a1,a1,4
+    addi a2,a2,-4
+    bgeu a2,t1,.Lstring_read0
+.Lstring_tail:
     beqz a2,.Lstring_done
 .Lstring_read:
     lbu t0,0(a1)
@@ -256,18 +280,35 @@ riscv_copy_string_from_user:
     addi a1,a1,1
     addi a2,a2,-1
     bnez a2,.Lstring_read
+    j .Lstring_done
+.Lstring_done3:
+    addi a2,a2,-1
+.Lstring_done2:
+    addi a2,a2,-1
+.Lstring_done1:
+    addi a2,a2,-1
 .Lstring_done:
     mv a0,a2
     li a1,0
     li t6,SUM
     csrc sstatus,t6
     ret
+.Lstring_fault3:
+    addi a2,a2,-1
+.Lstring_fault2:
+    addi a2,a2,-1
+.Lstring_fault1:
+    addi a2,a2,-1
 .Lstring_fault:
     mv a0,a2
     mv a1,t5
     li t6,SUM
     csrc sstatus,t6
     ret
+    recover .Lstring_read0,.Lstring_fault
+    recover .Lstring_read1,.Lstring_fault1
+    recover .Lstring_read2,.Lstring_fault2
+    recover .Lstring_read3,.Lstring_fault3
     recover .Lstring_read,.Lstring_fault
     .size riscv_copy_string_from_user,.-riscv_copy_string_from_user
 
