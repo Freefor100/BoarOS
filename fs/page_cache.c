@@ -4475,6 +4475,72 @@ struct range_writeback {
     uint64_t first, sequence;
 };
 
+static bool can_writeback_mapped(struct kernel_page_cache_entry *entry, uint64_t limit)
+{
+    if (entry->aliases || entry->writeback || entry_loading(entry) ||
+        __atomic_load_n(&entry->writes, __ATOMIC_RELAXED)) return false;
+    size_t block = entry->node->instance->writeback_block_size;
+    uint64_t start = entry->page_index << BOAROS_PAGE_SHIFT;
+    if (!block || entry->dirty_begin % block || entry->dirty_end % block ||
+        entry->dirty_end > limit - start) return false;
+#if BOAROS_PAGE_CACHE_DIRTY_BLOCKS
+    if (dirty_block_size(entry) &&
+        entry->dirty_blocks != dirty_block_range(block, entry->dirty_begin, entry->dirty_end))
+        return false;
+#endif
+    return true;
+}
+
+static void close_mapped_writers(struct kernel_page_cache_record *record,
+    struct kernel_page_cache_entry **entries, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        struct kernel_page_cache_entry *entry = entries[i];
+        __atomic_store_n(&entry->writes, CACHE_WRITES_CLOSED, __ATOMIC_RELEASE);
+        entry->writeback = 1;
+        publish_cache_page_state(entry);
+    }
+    record->writeback_active += count;
+}
+
+static int submit_mapped_writeback(struct kernel_vfs_node *node,
+    struct kernel_page_cache_entry **entries, struct file_write_span *spans, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        struct kernel_page_cache_entry *entry = entries[i];
+        size_t begin = entry->dirty_begin;
+        spans[i] = (struct file_write_span){
+            .offset = (entry->page_index << BOAROS_PAGE_SHIFT) + begin,
+            .buffer = entry->data + begin, .size = entry->dirty_end - begin};
+    }
+    int result = node->instance->ops->writeback_mapped(node, spans, count);
+    if (result && result != -KERNEL_EOPNOTSUPP)
+        kernel_vfs_record_writeback_error(node, result);
+    return result;
+}
+
+static void finish_mapped_writeback(struct kernel_page_cache *cache,
+    struct kernel_page_cache_entry **entries, const struct file_write_span *spans,
+    size_t count, int result, bool keep_for_fallback)
+{
+    for (size_t i = 0; i < count; i++) {
+        struct kernel_page_cache_entry *entry = entries[i];
+        __atomic_store_n(&entry->writes, 0, __ATOMIC_RELEASE);
+        entry->retry_blocked = 0;
+        const struct prepared_writeback done = {.begin=entry->dirty_begin,.end=entry->dirty_end,
+            .generation=entry->generation,.written=spans[i].written};
+        if (result == -KERNEL_EOPNOTSUPP) {
+            entry->writeback = 0;
+            cache->record->writeback_active--;
+            publish_cache_page_state(entry);
+            if (__atomic_load_n(&entry->ready.registrations, __ATOMIC_RELAXED))
+                cache_wake(&entry->ready);
+            if (keep_for_fallback) continue;
+        } else (void)complete_writeback(cache, entry, &done, result);
+        entry_return(entry);
+    }
+}
+
 static size_t select_writeback_window(struct foreground_writeback *request, bool *mapped)
 {
     struct kernel_page_cache_record *record = request->cache->record;
@@ -4484,9 +4550,7 @@ static size_t select_writeback_window(struct foreground_writeback *request, bool
         request->selected[count++] = entry;
         entry_borrow_indexed(entry);
         COST_ADD(WRITEBACK_VISITS,1);
-        if (*mapped && (entry->aliases || entry->writeback || entry->dirty_begin ||
-            entry->dirty_end != BOAROS_PAGE_SIZE || entry_loading(entry) ||
-            __atomic_load_n(&entry->writes, __ATOMIC_RELAXED))) *mapped = false;
+        if (*mapped && !can_writeback_mapped(entry, request->end)) *mapped = false;
         entry = RB_NEXT(kernel_page_cache_dirty_tree,
             &kernel_vfs_node_dirty_pages(request->node)->tree, entry);
     }
@@ -4494,13 +4558,7 @@ static size_t select_writeback_window(struct foreground_writeback *request, bool
         entry_borrows_add(record, count);
         request->cursor = request->selected[count-1]->page_index + 1;
     }
-    if (*mapped) for (size_t i = 0; i < count; i++) {
-        entry = request->selected[i];
-        __atomic_store_n(&entry->writes, CACHE_WRITES_CLOSED, __ATOMIC_RELEASE);
-        entry->writeback = 1;
-        record->writeback_active++;
-        publish_cache_page_state(entry);
-    }
+    if (*mapped) close_mapped_writers(record, request->selected, count);
     return count;
 }
 
@@ -4520,37 +4578,14 @@ static void writeback_window(void *argument)
     int result = -KERNEL_EOPNOTSUPP;
     unsigned submitted = 0;
     unsigned mapped_windows = request->capacity > BOAROS_PAGE_CACHE_WRITEBACK_PAGES ? 1U : 4U;
+    struct file_write_span single_span;
     while (mapped && count) {
-        struct file_write_span *spans = request->workspace->spans;
-        for (size_t i = 0; i < count; i++) {
-            struct kernel_page_cache_entry *entry = request->selected[i];
-            spans[i] = (struct file_write_span){
-                .offset = entry->page_index << BOAROS_PAGE_SHIFT,
-                .buffer = entry->data, .size = BOAROS_PAGE_SIZE};
-        }
-        result = request->node->instance->ops->writeback_mapped(request->node, spans, count);
+        struct file_write_span *spans = request->workspace ? request->workspace->spans : &single_span;
+        result = submit_mapped_writeback(request->node, request->selected, spans, count);
         bool completed_batch = !result;
-        if (result && result != -KERNEL_EOPNOTSUPP)
-            kernel_vfs_record_writeback_error(request->node, result);
         {
             CACHE_SCOPE(guard,cache);
-            for (size_t i = 0; i < count; i++) {
-                struct kernel_page_cache_entry *entry = request->selected[i];
-                __atomic_store_n(&entry->writes, 0, __ATOMIC_RELEASE);
-                entry->retry_blocked = 0;
-                if (result == -KERNEL_EOPNOTSUPP) {
-                    entry->writeback = 0;
-                    cache->record->writeback_active--;
-                    publish_cache_page_state(entry);
-                    if (__atomic_load_n(&entry->ready.registrations, __ATOMIC_RELAXED))
-                        cache_wake(&entry->ready);
-                } else {
-                    const struct prepared_writeback done = {.end=BOAROS_PAGE_SIZE,
-                        .generation=entry->generation,.written=spans[i].written};
-                    (void)complete_writeback(cache, entry, &done, result);
-                    entry_return(entry);
-                }
-            }
+            finish_mapped_writeback(cache, request->selected, spans, count, result, true);
             /* Finish the current batch and qualify the next with one
              * acquisition. Keep the inode borrow bounded to four batches. */
             if (!result && ++submitted < mapped_windows && request->cursor <= request->last) {
@@ -4599,6 +4634,8 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
     size_t dirty;
     struct kernel_page_cache_entry *single=NULL;
     int multiple=0;
+    bool subpage_mapped = node->instance->ops->writeback_mapped &&
+        node->instance->writeback_block_size && node->instance->writeback_block_size < BOAROS_PAGE_SIZE;
     int dispatch=node->instance->ops->file_operation_execution==KERNEL_VFS_EXECUTION_CPU0 &&
         kernel_page_cache_needs_cpu0(cache);
 #if BOAROS_MAX_CPUS == 1
@@ -4614,7 +4651,7 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
         multiple=next && next->page_index<=last;
         first=entry->page_index;
         dirty=kernel_vfs_node_dirty_pages(node)->count;
-        if (!multiple && !dispatch) {
+        if (!multiple && !dispatch && (!subpage_mapped || !can_writeback_mapped(entry, end))) {
             /* Transfer the selection's borrow to the scalar consumer. */
             entry_borrow(entry);
             single=entry;
@@ -4662,6 +4699,7 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
             large=!writeback_workspace_init(cache,&work,large_capacity);
         if (large) capacity=large_capacity;
     }
+    mapped |= subpage_mapped;
     union foreground_workspace *lease=NULL;
     if (multiple && !large) {
         lease=foreground_workspace_take(cache);
@@ -4876,6 +4914,7 @@ int kernel_page_cache_submit_range(struct kernel_page_cache *cache,
                     .cache = cache, .node = node, .cursor = first, .last = last,
                     .end = end, .selected = work->selected, .workspace = work,
                     .capacity = record->writeback_capacity,
+                    .mapped_candidate = node->instance->ops->writeback_mapped != NULL,
                 };
                 request->first = first;
                 request->sequence = ++record->range_sequence;
@@ -4948,17 +4987,105 @@ void kernel_page_cache_wait_range(struct kernel_page_cache *cache,
     }
 }
 
+static void retire_range_requests(struct kernel_page_cache *cache,
+    struct range_writeback *first, struct range_writeback *last, unsigned count)
+{
+    struct kernel_page_cache_record *record = cache->record;
+    {
+        CACHE_SCOPE(complete, cache);
+        if (record->range_head != first || record->range_count < count)
+            __builtin_trap();
+        record->range_head = last->next;
+        if (!record->range_head) record->range_tail = &record->range_head;
+        last->next = NULL;
+        record->range_count -= count;
+        cache_wake(&record->range_progress);
+    }
+    while (first) {
+        struct range_writeback *next = first->next;
+        if (kernel_vfs_node_release(&first->window.node)) __builtin_trap();
+        kernel_heap_release(cache->heap, first);
+        first = next;
+    }
+}
+
+static struct range_writeback *run_mapped_range_batch(struct kernel_page_cache *cache,
+    struct range_writeback *first, unsigned *completed)
+{
+    struct kernel_vfs_node *node = first->window.node;
+    if (!kernel_vfs_node_writeback_allowed(node)) return NULL;
+    struct kernel_page_cache_record *record = cache->record;
+    struct writeback_workspace *work = record->writeback_workspace;
+    struct range_writeback *last = NULL;
+    unsigned requests = 0;
+    size_t pages = 0;
+    KERNEL_LOCK_SCOPE(io);
+    kernel_vfs_node_lock(node, &io, 0);
+    {
+        CACHE_SCOPE(select, cache);
+        /* Admit only complete requests from the head, retaining the exact
+         * range boundaries. A page already selected by another request or
+         * a page needing the journal ends this device batch. */
+        for (struct range_writeback *item = first; item && item->window.node == node &&
+            item->window.mapped_candidate && requests < BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
+            item = item->next) {
+            size_t selected = pages;
+            struct kernel_page_cache_entry *entry = dirty_at_or_after(node, item->window.cursor);
+            while (entry && entry->page_index <= item->window.last) {
+                if (selected == record->writeback_capacity ||
+                    (selected && work->selected[selected-1]->page_index >= entry->page_index) ||
+                    !can_writeback_mapped(entry, item->window.end)) break;
+                work->selected[selected++] = entry;
+                entry = RB_NEXT(kernel_page_cache_dirty_tree,
+                    &kernel_vfs_node_dirty_pages(node)->tree, entry);
+            }
+            if (entry && entry->page_index <= item->window.last) break;
+            pages = selected;
+            last = item;
+            requests++;
+        }
+        if (requests < 2) return NULL;
+        for (size_t i = 0; i < pages; i++) entry_borrow_indexed(work->selected[i]);
+        if (pages) {
+            COST_ADD(WRITEBACK_VISITS, pages);
+            entry_borrows_add(record, pages);
+            close_mapped_writers(record, work->selected, pages);
+        }
+    }
+    int result = 0;
+    if (pages) {
+        result = submit_mapped_writeback(node, work->selected, work->spans, pages);
+        {
+            CACHE_SCOPE(complete, cache);
+            finish_mapped_writeback(cache, work->selected, work->spans, pages, result, false);
+        }
+        if (!result) group_returned(record->group);
+    }
+    if (result == -KERNEL_EOPNOTSUPP) return NULL;
+    *completed = requests;
+    return last;
+}
+
 static void run_range_writeback(struct kernel_page_cache *cache,
-    struct range_writeback *request, int stopping)
+    struct range_writeback *request, int stopping, bool batch)
 {
     struct kernel_page_cache_record *record = cache->record;
     if (!stopping) {
         struct kernel_io_context *io = kernel_io_context_current();
         unsigned previous = io->background_reclaim;
         io->background_reclaim = 1;
+        if (batch) {
+            unsigned completed = 0;
+            struct range_writeback *last = run_mapped_range_batch(cache, request, &completed);
+            if (last) {
+                io->background_reclaim = previous;
+                retire_range_requests(cache, request, last, completed);
+                return;
+            }
+        }
         uint64_t first = request->window.cursor;
         writeback_window(&request->window);
-        if (!request->window.result && request->window.cursor > first) {
+        if (!request->window.result && !request->window.mapped_candidate && request->window.cursor > first) {
             uint64_t end = request->window.cursor << BOAROS_PAGE_SHIFT;
             if (end > request->window.end) end = request->window.end;
             request->window.result = kernel_vfs_node_complete_data_range(request->window.node,
@@ -4981,19 +5108,7 @@ static void run_range_writeback(struct kernel_page_cache *cache,
     if (stopping || request->window.result == -KERNEL_ENOMEM ||
         request->window.result == -KERNEL_EBUSY)
         kernel_vfs_record_writeback_error(request->window.node, request->window.result);
-    {
-        CACHE_SCOPE(complete, cache);
-        if (record->range_head != request || !record->range_count)
-            __builtin_trap();
-        record->range_head = request->next;
-        if (!record->range_head)
-            record->range_tail = &record->range_head;
-        record->range_count--;
-        cache_wake(&record->range_progress);
-    }
-    if (kernel_vfs_node_release(&request->window.node))
-        __builtin_trap();
-    kernel_heap_release(cache->heap, request);
+    retire_range_requests(cache, request, request, 1);
 }
 
 int kernel_page_cache_pin_dirty_nodes(struct kernel_page_cache *cache,
@@ -5557,6 +5672,7 @@ static void page_cache_worker(void *argument)
     for (;;) {
         struct cache_request *request = 0;
         struct range_writeback *range = NULL;
+        bool batch_range = false;
         struct kernel_wait_token token = {0};
         int cleanup = 0, stopping=0, park=1, waiting_batch=0;
         {
@@ -5581,6 +5697,8 @@ static void page_cache_worker(void *argument)
             if (r->range_head && (prefer_range || !r->requested || waiting_batch) &&
                 (!r->reads_head || reads >= 16)) {
                 range = r->range_head;
+                batch_range = range->window.mapped_candidate && range->next &&
+                    range->next->window.node == range->window.node;
                 reads = 0;
             } else if (r->requested && !waiting_batch && (reads>=16 || !r->reads_head)) {
                 r->requested=0; cleanup=1; reads=0;
@@ -5613,7 +5731,7 @@ static void page_cache_worker(void *argument)
         }
         if (range) {
             prefer_range=0;
-            run_range_writeback(cache, range, stopping);
+            run_range_writeback(cache, range, stopping, batch_range);
             cache_yield();
             continue;
         }

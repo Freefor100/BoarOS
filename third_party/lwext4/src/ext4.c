@@ -6134,7 +6134,7 @@ static int ext4_write_mapped(ext4_file *file, struct file_write_span *spans, uns
         !count || fs->read_only)
         return ENOTSUP;
     for (unsigned i = 0; i < count; i++)
-        if (spans[i].offset % block || spans[i].size != block) return ENOTSUP;
+        if (spans[i].offset % block || !spans[i].size || spans[i].size % block) return ENOTSUP;
 
     EXT4_MP_LOCK(file->mp);
     int result;
@@ -6153,33 +6153,40 @@ static int ext4_write_mapped(ext4_file *file, struct file_write_span *spans, uns
     if (result) goto out;
     uint64_t end = ext4_inode_get_size(ext4_fs_super(fs), ref.inode);
     struct ext4_inode_block_range range = {0};
-    uint64_t mapped = 0;
+    uint64_t mapped = 0, run_end = 0;
     for (unsigned i = 0; i < count; i++) {
         uint64_t offset = spans[i].offset;
-        if (offset > end || block > end - offset || offset / block > UINT32_MAX) {
+        size_t size = spans[i].size;
+        if (offset > end || size > end - offset || (offset + size - 1) / block > UINT32_MAX ||
+            size / block > UINT32_MAX) {
             result = ENOTSUP;
             break;
         }
-        if (!range.count || mapped != offset) {
-            unsigned consecutive = 1;
-            while (i + consecutive < count &&
-                spans[i + consecutive].offset == offset + consecutive * block)
-                consecutive++;
+        unsigned blocks = size / block;
+        if (range.count < blocks || mapped != offset) {
+            if (mapped != offset || offset >= run_end) {
+                run_end = offset + size;
+                for (unsigned j = i + 1; j < count && spans[j].offset == run_end &&
+                    spans[j].size <= end - run_end; j++)
+                    run_end += spans[j].size;
+            }
+            uint64_t consecutive = (run_end - offset) / block;
+            if (consecutive > UINT32_MAX) consecutive = UINT32_MAX;
             result = ext4_fs_get_inode_dblk_range(&ref, offset / block,
                 consecutive, false, &range);
             if (result) break;
-            if (!range.block || range.unwritten) {
+            if (!range.block || range.unwritten || range.count < blocks) {
                 result = ENOTSUP;
                 break;
             }
         }
         writes[i] = (struct ext4_block_write){
             .offset = fs->bdev->part_offset + range.block * block,
-            .data = spans[i].buffer, .size = block,
+            .data = spans[i].buffer, .size = size,
             .next = i + 1 < count ? &writes[i+1] : NULL};
-        mapped = offset + block;
-        range.block++;
-        range.count--;
+        mapped = offset + size;
+        range.block += blocks;
+        range.count -= blocks;
     }
     result = ext4_result(result, ext4_fs_put_inode_ref(&ref));
 out:
