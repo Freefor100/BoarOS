@@ -29,7 +29,7 @@ for block in 1024 4096; do
     cp "$work/disk.img" "$work/base.img"
     ordered_release_cases
     if [ "${GROUP_TEST_CASE:-}" = ordered-release ]; then continue; fi
-    for mode in group-checkpoint-background group-ordered-retire-batch group-sync-coalesce group-sync-coalesce-age group-sync-coalesce-force group-checkpoint-batching group-checkpoint-target group-checkpoint-pressure; do
+    for mode in group-checkpoint-background group-ordered-retire-batch group-sync-coalesce group-sync-coalesce-age group-sync-coalesce-force group-checkpoint-batching group-checkpoint-target group-checkpoint-pressure group-mapped-writeback; do
         cp "$work/base.img" "$work/checkpoint.img"
         "$work/probe" "$work/checkpoint.img" "$mode"
         e2fsck -fn "$work/checkpoint.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }

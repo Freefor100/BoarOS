@@ -1684,6 +1684,62 @@ static int data_phase_write(struct ext4_blockdev *bdev, const struct ext4_block_
     }
     return EOK;
 }
+
+static void group_mapped_writeback(struct ext4_fs *fs)
+{
+    struct ext4_journal_runtime runtime = {.now_ns = group_clock};
+    CHECK(ext4_journal_group_enable("/", &runtime, 4*1024*1024) == EOK);
+    ext4_file file;
+    CHECK(ext4_fopen(&file, "/mapped", "w+") == EOK);
+    size_t count;
+    const size_t size = 32768;
+    unsigned char *data = malloc(size), *readback = malloc(size);
+    CHECK(data && readback);
+    memset(data, 0x5a, size);
+    CHECK(ext4_fwrite(&file, data, size, &count) == EOK && count == size);
+    CHECK(ext4_journal_group_drain("/") == EOK);
+
+    memset(data, 0x35, size);
+    struct file_write_span spans[] = {
+        {.offset = 8192, .size = 8192, .buffer = data},
+        {.offset = 24576, .size = 8192, .buffer = data+8192},
+    };
+    fs->bdev->bdif->bwrite_phase = data_phase_write;
+    uint64_t durable = fs->jbd_journal->durable_sequence;
+    uint64_t flushes = disk.flushes;
+    CHECK(ext4_fpwrite_mapped_batch(&file, spans, 2) == EOK);
+    CHECK(spans[0].written == 8192 && spans[1].written == 8192);
+    CHECK(fs->jbd_journal->durable_sequence == durable && disk.flushes == flushes);
+    CHECK(ext4_fpread(&file, 0, readback, size, &count) == EOK && count == size);
+    for (size_t i = 0; i < size; i++)
+        CHECK(readback[i] == ((i / 8192) % 2 ? 0x35 : 0x5a));
+
+    /* Reject before submitting even the mapped prefix if a later span grows EOF. */
+    spans[0].written = spans[1].written = 0;
+    spans[1].offset = size;
+    unsigned writes = disk.writes;
+    CHECK(ext4_fpwrite_mapped_batch(&file, spans, 2) == ENOTSUP && disk.writes == writes);
+    CHECK(!spans[0].written && !spans[1].written);
+
+    /* An older accepted write to this inode must reach disk before a direct overwrite. */
+    CHECK(ext4_fpwrite(&file, 0, data, 8192, &count) == EOK && count == 8192);
+    spans[1].offset = 24576;
+    writes = disk.writes;
+    CHECK(ext4_fpwrite_mapped_batch(&file, spans, 2) == ENOTSUP && disk.writes == writes);
+    CHECK(ext4_journal_group_drain("/") == EOK);
+
+    disk.fail_write = disk.writes + 1;
+    CHECK(ext4_fpwrite_mapped_batch(&file, spans, 2) == EIO);
+    CHECK(!spans[0].written && !spans[1].written);
+    disk.fail_write = 0;
+    CHECK(ext4_fpwrite_mapped_batch(&file, spans, 2) == EOK);
+    fs->bdev->bdif->bwrite_phase = NULL;
+    CHECK(ext4_fclose(&file) == EOK);
+    free(readback);
+    free(data);
+    puts("mapped writeback: bounded multi-block spans preserve adjacent bytes without a new journal group");
+}
+
 static void group_data_batch(struct ext4_fs *fs)
 {
     struct ext4_journal_runtime runtime={.now_ns=group_clock};
@@ -3779,6 +3835,7 @@ int main(int argc,char **argv)
         bool failed=!strcmp(argv[2],"group-partial-error");group_partial_owner(dev.fs,failed);if(failed)return 0;
     }
     else if(!strcmp(argv[2],"group-data-owner"))group_data_owner(dev.fs);
+    else if(!strcmp(argv[2],"group-mapped-writeback"))group_mapped_writeback(dev.fs);
     else if(!strcmp(argv[2],"group-ordered-retire") || !strcmp(argv[2],"group-ordered-retire-error")) {
         bool fail=!strcmp(argv[2],"group-ordered-retire-error");
         group_ordered_retire(dev.fs,fail);if(fail)return 0;

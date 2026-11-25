@@ -11,6 +11,7 @@
 #include <kernel/errno.h>
 #include <kernel/futex.h>
 #include <kernel/time.h>
+#include <ext4.h>
 #include <ext4_bcache.h>
 #include "../../fs/lwext4_port.h"
 #include <kernel/file_mapping.h>
@@ -53,6 +54,25 @@ static struct kernel_vfs_node *watch_sparse_node;
 static size_t sparse_spans,sparse_source_bytes;
 static struct kernel_vfs_node *fail_range_node;
 static unsigned fail_range_writeback;
+static unsigned mapped_range_inode, mapped_range_entered, mapped_range_continue, mapped_range_batches;
+int __real_ext4_fpwrite_mapped_batch(ext4_file *, struct file_write_span *, unsigned);
+int __wrap_ext4_fpwrite_mapped_batch(ext4_file *file, struct file_write_span *spans, unsigned count)
+{
+    if (file->inode == __atomic_load_n(&mapped_range_inode, __ATOMIC_ACQUIRE)) {
+        if (!spans[0].offset) {
+            assert(count == 1);
+            __atomic_store_n(&mapped_range_entered, 1, __ATOMIC_RELEASE);
+            while (!__atomic_load_n(&mapped_range_continue, __ATOMIC_ACQUIRE)) sched_yield();
+        } else {
+            assert(count == 3);
+            for (unsigned i = 0; i < count; i++)
+                assert(spans[i].offset == (2U + 2U*i)*BOAROS_PAGE_SIZE &&
+                    spans[i].size == BOAROS_PAGE_SIZE);
+            __atomic_add_fetch(&mapped_range_batches, 1, __ATOMIC_RELAXED);
+        }
+    }
+    return __real_ext4_fpwrite_mapped_batch(file, spans, count);
+}
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct file_write_span *,size_t);
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_write_span *spans,size_t count)
 {
@@ -1903,6 +1923,41 @@ static void range_writeback_error_case(struct kernel_heap *heap, struct kernel_v
     puts("PASS range writeback: asynchronous error, distinct file cursors and successful retry");
 }
 
+static void mapped_range_batch_case(struct kernel_heap *heap, struct kernel_vfs_mount *mount)
+{
+    int error;
+    size_t written;
+    struct kernel_open_file_description *file = NULL;
+    assert(!kernel_open_file_create_mode(heap, mount, "/mapped-range", 0600, &file, &error) && !error);
+    file->open_flags = 2;
+    assert(!kernel_vfs_file_acquire_write(&file->file));
+    size_t length = 7 * BOAROS_PAGE_SIZE;
+    unsigned char *bytes = malloc(length);
+    assert(bytes);
+    memset(bytes, 0x31, length);
+    assert(!kernel_vfs_pwrite(&file->file, 0, bytes, length, &written) && written == length);
+    assert(!kernel_vfs_sync_borrowing(&file->file, 0, &file->observed_writeback_error, NULL));
+    memset(bytes, 0x62, length);
+    assert(!kernel_vfs_pwrite(&file->file, 0, bytes, length, &written) && written == length);
+
+    __atomic_store_n(&mapped_range_inode, kernel_open_file_node(file)->inode, __ATOMIC_RELEASE);
+    assert(!kernel_vfs_sync_file_range(&file->file, 0, BOAROS_PAGE_SIZE,
+        KERNEL_SYNC_FILE_RANGE_WRITE, &file->observed_writeback_error));
+    while (!__atomic_load_n(&mapped_range_entered, __ATOMIC_ACQUIRE)) sched_yield();
+    for (unsigned page = 2; page < 7; page += 2)
+        assert(!kernel_vfs_sync_file_range(&file->file, page*BOAROS_PAGE_SIZE,
+            (page+1)*BOAROS_PAGE_SIZE, KERNEL_SYNC_FILE_RANGE_WRITE, &file->observed_writeback_error));
+    __atomic_store_n(&mapped_range_continue, 1, __ATOMIC_RELEASE);
+    assert(!kernel_vfs_sync_file_range(&file->file, 0, length, KERNEL_SYNC_FILE_RANGE_WAIT_AFTER,
+        &file->observed_writeback_error));
+    assert(__atomic_load_n(&mapped_range_batches, __ATOMIC_ACQUIRE) == 1);
+    __atomic_store_n(&mapped_range_inode, 0, __ATOMIC_RELEASE);
+    assert(!kernel_open_file_release(&file));
+    assert(!kernel_vfs_unlink(mount, "/mapped-range"));
+    free(bytes);
+    puts("PASS mapped range writeback: one batch for three queued ranges, skipping dirty gaps");
+}
+
 int main(int argc,char **argv)
 {
     assert(argc==2); setvbuf(stdout,0,_IONBF,0); mm_test_attach(0); mm_test_activate_task();
@@ -1991,7 +2046,10 @@ int main(int argc,char **argv)
     else if (directories_only) directory_batch_cases(&heap,&mount,1);
     else if (paths_only) pathname_storage_case(&heap,&mount);
     else if (direct_only) ext4_direct_case(&heap,&mount);
-    else if (range_only) range_writeback_error_case(&heap,&mount,&cache);
+    else if (range_only) {
+        range_writeback_error_case(&heap,&mount,&cache);
+        mapped_range_batch_case(&heap,&mount);
+    }
     else if (transfers_only) transfer_cases(&heap,&mount);
     else if (advice_only) file_advice_case(&heap,&mount,&cache);
     else if (focused) synchronous_write_ranges(&heap,&mount);
