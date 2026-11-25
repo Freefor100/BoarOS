@@ -65,6 +65,30 @@ static void advance_version(struct ext4_buf *buf)
     if (!(buf->version=++buf->bc->next_version)) __builtin_trap();
 }
 
+static void publish_verification(struct ext4_block_payload *payload, uint64_t tree_key)
+{
+    for (unsigned i = 0; i < 4; i++)
+        __atomic_store_n(&payload->verified[i], 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&payload->metadata_schema, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&payload->tree_verified, tree_key, __ATOMIC_RELAXED);
+    __atomic_store_n(&payload->directory_layout, 0, __ATOMIC_RELAXED);
+}
+
+bool ext4_bcache_patch_current(struct ext4_buf *buf, struct ext4_block_payload *payload,
+    unsigned owners, uint32_t offset, const void *bytes, uint32_t length)
+{
+    KERNEL_TASK_LOCK_SCOPE(guard, &buf->bc->metadata);
+    if (buf->current_payload != payload ||
+        __atomic_load_n(&payload->references, __ATOMIC_ACQUIRE) != owners)
+        return false;
+    /* No other descriptor can observe the bytes while the cache lock
+     * excludes new borrows and in-lock record copies. */
+    memcpy(payload->data + offset, bytes, length);
+    publish_verification(payload, 0);
+    advance_version(buf);
+    return true;
+}
+
 void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payload,
     uint64_t tree_key)
 {
@@ -76,11 +100,7 @@ void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payloa
         if (buf->current_payload==payload) return;
         /* A private replacement is complete before publication; no writer
          * retains permission to mutate this accepted version. */
-        for (unsigned i = 0; i < 4; i++)
-            __atomic_store_n(&payload->verified[i], 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&payload->metadata_schema, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&payload->tree_verified, tree_key, __ATOMIC_RELAXED);
-        __atomic_store_n(&payload->directory_layout, 0, __ATOMIC_RELAXED);
+        publish_verification(payload, tree_key);
         ext4_block_payload_get(payload);old=buf->current_payload;
         buf->current_payload=payload;buf->data=payload->data;
         advance_version(buf);

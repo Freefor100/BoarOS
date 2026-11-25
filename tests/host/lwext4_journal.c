@@ -1052,6 +1052,34 @@ static void private_metadata_views(struct ext4_blockdev *dev,
     CHECK(ext4_block_get(dev, &visible, home) == EOK);
     CHECK(visible.data[0] == 'O' && visible.data[1] == 'B');
     CHECK(ext4_block_set(dev, &visible) == EOK);
+#ifdef TEST_JBD_RECORD_COPY
+    for (unsigned held = 0; held < 2; held++) {
+        struct ext4_block previous, edit;
+        CHECK(ext4_block_get(dev, &previous, home) == EOK);
+        uintptr_t previous_version = (uintptr_t)previous.payload;
+        uint8_t old_byte = previous.data[96];
+        if (!held) CHECK(ext4_block_set(dev, &previous) == EOK);
+        CHECK(jbd_journal_new_trans(journal, &first) == EOK);
+        CHECK(ext4_block_get(dev, &edit, home) == EOK);
+        CHECK(jbd_trans_get_write_access_range(first, &edit, 96, 32) == EOK);
+        edit.data[96] = old_byte ^ 1;
+        CHECK(jbd_trans_set_block_dirty_range(first, &edit, 96, 32) == EOK);
+        CHECK(ext4_block_set(dev, &edit) == EOK);
+        CHECK(jbd_trans_prepare_operation(first) == EOK);
+        record_copy_bytes = 0;
+        count_record_copies = true;
+        CHECK(jbd_journal_accept(journal, first, 0) == EOK);
+        count_record_copies = false;
+        CHECK(record_copy_bytes == (held ? dev->lg_bsize - 32U : 32U));
+        CHECK(ext4_block_get(dev, &visible, home) == EOK && visible.data[96] == (old_byte ^ 1));
+        CHECK(((uintptr_t)visible.payload == previous_version) == !held);
+        if (held) {
+            CHECK(previous.data[96] == old_byte);
+            CHECK(ext4_block_set(dev, &previous) == EOK);
+        }
+        CHECK(ext4_block_set(dev, &visible) == EOK);
+    }
+#endif
     CHECK(jbd_journal_new_trans(journal, &first) == EOK);
     CHECK(jbd_journal_new_trans(journal, &second) == EOK);
     CHECK(first && second);

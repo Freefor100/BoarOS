@@ -1503,6 +1503,18 @@ Finish:
 	return r;
 }
 
+static uint64_t ext4_group_age_deadline(const struct jbd_trans *running)
+{
+	const uint64_t idle_ns = 100000000;
+	if (running->ordered_count || running->revoke_count || !LIST_EMPTY(&running->quarantine))
+		return running->first_dirty_ns + idle_ns;
+	/* Metadata that keeps arriving can share its current log record. Bound
+	 * both the wait after the last edit and the lifetime of the group. */
+	uint64_t idle = running->last_dirty_ns + idle_ns;
+	uint64_t maximum = running->first_dirty_ns + 500000000;
+	return idle < maximum ? idle : maximum;
+}
+
 __unused
 static bool ext4_group_due(struct ext4_mountpoint *mp, bool force)
 {
@@ -1519,7 +1531,7 @@ static bool ext4_group_due(struct ext4_mountpoint *mp, bool force)
 		now >= journal->sync_join_deadline_ns;
 	return force || sync_due ||
 		(uint64_t)running->reserved_logs * journal->block_size >= 256 * 1024 ||
-		(now >= running->first_dirty_ns && now - running->first_dirty_ns >= 100000000);
+		now >= ext4_group_age_deadline(running);
 }
 
 __unused
@@ -1532,7 +1544,7 @@ static int ext4_group_freeze(struct ext4_mountpoint *mp, bool force)
     struct jbd_trans *running = journal->running;
     uint64_t now = mp->journal_runtime.now_ns(mp->journal_runtime.context);
     bool bytes = (uint64_t)running->reserved_logs * journal->block_size >= 256 * 1024;
-    bool age = now >= running->first_dirty_ns && now - running->first_dirty_ns >= 100000000;
+    bool age = now >= ext4_group_age_deadline(running);
     bool target = journal->seal_target >= running->sequence;
 #endif
     int result = jbd_journal_freeze(mp->fs.jbd_journal);
@@ -1972,7 +1984,7 @@ int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_pro
 		bool commit_ready = !journal->committing &&
 			(!TAILQ_EMPTY(&journal->sealed_queue) || ext4_group_due(mp, false));
 		bool checkpoint_ready = jbd_journal_checkpoint_ready(journal);
-		uint64_t deadline = running ? running->first_dirty_ns + 100000000 : 0;
+		uint64_t deadline = running ? ext4_group_age_deadline(running) : 0;
 		if (running && !journal->committing && TAILQ_EMPTY(&journal->sealed_queue) &&
 		    journal->seal_target >= running->sequence && journal->sync_join_deadline_ns &&
 		    journal->sync_join_deadline_ns < deadline)

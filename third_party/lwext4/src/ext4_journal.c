@@ -2449,6 +2449,27 @@ static int jbd_claim_versions(struct jbd_trans *trans,bool apply)
     return EOK;
 }
 
+/* The running group owns both its image and its descriptor. Together with
+ * the cache and the edit's baseline these account for all four references
+ * when neither version has an outstanding observer. */
+static bool jbd_patch_running(const struct jbd_buf *jb, const struct jbd_buf *running)
+{
+    struct ext4_block_payload *current = jb->block.payload;
+    if (current != &running->after->payload || current != running->block.payload ||
+        __atomic_load_n(&jb->after->payload.references, __ATOMIC_ACQUIRE) != 1)
+        return false;
+    uint32_t size = jb->trans->journal->block_size;
+    uint32_t end = size / 32, first = jbd_range_next(jb->dirty_ranges, 0, end, true);
+    uint32_t last = jbd_range_next(jb->dirty_ranges, first, end, false);
+    uint32_t length = (last - first) * 32U;
+    if (!length || length > 1024 || length > size / 4 ||
+        jbd_range_next(jb->dirty_ranges, last, end, true) != end)
+        return false;
+    uint32_t offset = first * 32U;
+    return ext4_bcache_patch_current(jb->block.buf, current, 4, offset,
+        (const uint8_t *)jb->after->data + offset, length);
+}
+
 /* All records and credits were reserved before publication. Validate the full
  * operation before publishing any home block; unrelated accepted bytes are
  * retained when separate records share one physical block. */
@@ -2509,16 +2530,6 @@ static int jbd_publish_private(struct jbd_trans *trans, struct jbd_trans *runnin
     struct jbd_buf *next_jb;
     TAILQ_FOREACH_SAFE(jb, &trans->buf_queue, buf_node, next_jb) {
         if (!jb->private_access || !jb->modified) continue;
-        struct ext4_block_payload *current = jb->block.buf->current_payload;
-        /* STATE keeps the latest accepted version stable through this merge. */
-        uint32_t end = journal->block_size / 32;
-        for (uint32_t unit = 0;
-             (unit = jbd_range_next(jb->dirty_ranges, unit, end, false)) < end;) {
-            uint32_t first = unit;
-            unit = jbd_range_next(jb->dirty_ranges, first, end, true);
-            memcpy((uint8_t *)jb->after->data + first * 32U,
-                current->data + first * 32U, (unit - first) * 32U);
-        }
         jbd_image_free(jb->before); jb->before = NULL;
         /* The prepare borrow prevents removal. Only an unindexed candidate
          * needs to check whether another operation published first. */
@@ -2543,19 +2554,36 @@ static int jbd_publish_private(struct jbd_trans *trans, struct jbd_trans *runnin
         jb->block_rec = rec;
         struct ext4_buf *buf = jb->block.buf;
         struct jbd_buf *old = running ? TAILQ_LAST(&rec->dirty_buf_queue, jbd_buf_dirty) : NULL;
+        bool joining = old && old->trans == running;
+        bool patched = joining && jbd_patch_running(jb, old);
+        if (!patched) {
+            /* STATE keeps the latest accepted version stable through this merge. */
+            uint32_t end = journal->block_size / 32;
+            for (uint32_t unit = 0;
+                 (unit = jbd_range_next(jb->dirty_ranges, unit, end, false)) < end;) {
+                uint32_t first = unit;
+                unit = jbd_range_next(jb->dirty_ranges, first, end, true);
+                memcpy((uint8_t *)jb->after->data + first * 32U,
+                    buf->data + first * 32U, (unit - first) * 32U);
+            }
+        }
         if (running) {
             TAILQ_REMOVE(&trans->buf_queue, jb, buf_node);
             trans->data_cnt--;
         }
-        if (old && old->trans == running) {
+        if (joining) {
             /* The running group already owns the wire record and its home
              * pin. Replace its image without publishing a second record. */
             buf->end_write = jbd_trans_end_write;
             buf->end_write_arg = old;
-            ext4_bcache_publish(buf, &jb->after->payload, jb->checked_tree);
-            ext4_block_rebind(&old->block, &jb->after->payload);
-            jbd_image_free(old->after);
-            old->after = jb->after;
+            if (patched) {
+                jbd_image_free(jb->after);
+            } else {
+                ext4_bcache_publish(buf, &jb->after->payload, jb->checked_tree);
+                ext4_block_rebind(&old->block, &jb->after->payload);
+                jbd_image_free(old->after);
+                old->after = jb->after;
+            }
             ext4_bcache_set_dirty(buf);
             jbd_unpin_version(journal, buf);
             journal->jbd_fs->bdev->cache_write_back++;
@@ -3252,6 +3280,7 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 		running = operation;
 		running->sequence = ++journal->accepted_sequence;
 		running->first_dirty_ns = now_ns;
+		running->last_dirty_ns = now_ns;
 		journal->running = running;
 	} else {
 		COST_ADD(JOURNAL_MERGED, 1);
@@ -3282,6 +3311,8 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
         running->reserved_logs += operation->reserved_logs;
         operation->reserved_logs = 0;
         jbd_free(operation);
+		if (running->last_dirty_ns < now_ns)
+			running->last_dirty_ns = now_ns;
 	}
 	unsigned images = jbd_log_images_needed(journal, running->data_cnt, running->revoke_count, true);
 	jbd_trim_reserved_logs(running, running->data_cnt + images);
