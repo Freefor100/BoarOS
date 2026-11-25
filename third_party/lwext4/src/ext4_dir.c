@@ -680,45 +680,51 @@ int ext4_dir_try_insert_entry(struct ext4_sblock *sb,
 	return ENOSPC;
 }
 
+typedef uint32_t directory_word __attribute__((__may_alias__));
+_Static_assert(offsetof(struct ext4_dir_en,entry_len)==4 &&
+	       offsetof(struct ext4_dir_en,name_len)==6 && offsetof(struct ext4_dir_en,name)==8,
+	       "directory record header layout");
+
+static inline __attribute__((always_inline)) int find_directory_record(uint8_t *data,
+		size_t remaining, uint32_t name_mask, size_t name_len, const char *name,
+		struct ext4_dir_search_result *result, bool aligned)
+{
+	struct ext4_dir_en *previous = NULL;
+	while (remaining) {
+		if (remaining < 8) return EUCLEAN;
+		struct ext4_dir_en *de = (void *)data;
+		const directory_word *words = (const void *)data;
+		uint32_t header = aligned ? to_le32(words[1]) :
+			ext4_dir_en_get_entry_len(de) | (uint32_t)de->name_len << 16 |
+			(uint32_t)de->in.name_length_high << 24;
+		uint32_t length = (uint16_t)header;
+		uint32_t bytes = (header >> 16) & name_mask;
+		if (length < 8 || length % 4 || length > remaining || bytes > length - 8)
+			return EUCLEAN;
+		if (bytes == name_len && (aligned ? words[0] : ext4_dir_en_get_inode(de)) &&
+			    !memcmp(name, de->name, name_len)) {
+			result->dentry = de;
+			result->previous = previous;
+			return EOK;
+		}
+		previous = de;
+		data += length;
+		remaining -= length;
+	}
+	return ENOENT;
+}
+
 int ext4_dir_find_in_block(struct ext4_block *block, struct ext4_sblock *sb,
 			   size_t name_len, const char *name,
 			   struct ext4_dir_search_result *result)
 {
-	/* Start from the first entry in block */
-	struct ext4_dir_en *de = (struct ext4_dir_en *)block->data;
-	struct ext4_dir_en *previous = NULL;
-
-	/* Set upper bound for cycling */
-	uint8_t *addr_limit = block->data + ext4_sb_get_block_size(sb);
-
-	/* Walk through the block and check entries */
-	while ((uint8_t *)de < addr_limit) {
-		if ((size_t)(addr_limit - (uint8_t *)de) < 8) return EUCLEAN;
-		uint16_t de_len = ext4_dir_en_get_entry_len(de);
-		if (de_len < 8 || de_len % 4 || de_len > (size_t)(addr_limit - (uint8_t *)de) ||
-		    ext4_dir_en_get_name_len(sb, de) > de_len - 8) return EUCLEAN;
-
-		/* Valid entry - check it */
-		if (ext4_dir_en_get_inode(de) != 0) {
-			/* For more efficient compare only lengths firstly*/
-			uint16_t el = ext4_dir_en_get_name_len(sb, de);
-			if (el == name_len) {
-				/* Compare names */
-				if (memcmp(name, de->name, name_len) == 0) {
-					result->dentry = de;
-					result->previous = previous;
-					return EOK;
-				}
-			}
-		}
-
-		/* Jump to next entry */
-		previous = de;
-		de = (struct ext4_dir_en *)((uint8_t *)de + de_len);
-	}
-
-	/* Entry not found */
-	return ENOENT;
+	uint32_t name_mask = ext4_get32(sb, rev_level) == 0 &&
+		ext4_get32(sb, minor_rev_level) < 5 ? UINT16_MAX : UINT8_MAX;
+	size_t size = ext4_sb_get_block_size(sb);
+	/* Every accepted record advances by a multiple of four bytes. */
+	if (!((uintptr_t)block->data & 3U))
+		return find_directory_record(block->data,size,name_mask,name_len,name,result,true);
+	return find_directory_record(block->data,size,name_mask,name_len,name,result,false);
 }
 
 int ext4_dir_destroy_result(struct ext4_inode_ref *parent,

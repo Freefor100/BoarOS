@@ -124,6 +124,43 @@ static void readonly_directory_queries(struct ext4_fs *fs, struct ext4_blockdev 
     CHECK(ext4_fs_put_inode_ref(&directory)==EOK);
 }
 
+static void directory_record_search(struct ext4_sblock *super)
+{
+    _Alignas(4) unsigned char storage[4097];
+    struct ext4_sblock legacy=*super;
+    ext4_set32(&legacy,rev_level,0);
+    ext4_set16(&legacy,minor_rev_level,0);
+    size_t size=ext4_sb_get_block_size(super);
+    CHECK(size<=4096);
+    for (unsigned offset=0;offset<=1;offset++) {
+        unsigned char *data=storage+offset;
+        memset(data,0,size);
+        struct ext4_block block={.data=data};
+        struct ext4_dir_en *empty=(void *)data,*entry=(void *)(data+12);
+        ext4_dir_en_set_entry_len(empty,12);
+        ext4_dir_en_set_entry_len(entry,size-12);
+        ext4_dir_en_set_inode(entry,13);
+        empty->name_len=entry->name_len=3;
+        memcpy(empty->name,"key",3);memcpy(entry->name,"key",3);
+        struct ext4_dir_search_result result={0};
+        CHECK(ext4_dir_find_in_block(&block,super,3,"key",&result)==EOK);
+        CHECK(result.previous==empty && result.dentry==entry);
+        CHECK(ext4_dir_find_in_block(&block,super,3,"bad",&result)==ENOENT);
+        entry->in.name_length_high=1;
+        CHECK(ext4_dir_find_in_block(&block,super,3,"key",&result)==EOK);
+        CHECK(ext4_dir_find_in_block(&block,&legacy,3,"key",&result)==ENOENT);
+        entry->in.name_length_high=UINT8_MAX;
+        CHECK(ext4_dir_find_in_block(&block,&legacy,3,"key",&result)==EUCLEAN);
+        ext4_dir_en_set_entry_len(empty,11);
+        CHECK(ext4_dir_find_in_block(&block,super,3,"key",&result)==EUCLEAN);
+        ext4_dir_en_set_entry_len(empty,4);
+        CHECK(ext4_dir_find_in_block(&block,super,3,"key",&result)==EUCLEAN);
+        ext4_dir_en_set_entry_len(empty,(uint16_t)(size+4));
+        CHECK(ext4_dir_find_in_block(&block,super,3,"key",&result)==EUCLEAN);
+    }
+    puts("PASS directory search: aligned and unaligned records preserve legacy lengths, removed entries and corrupt bounds");
+}
+
 /* More records than the old four hash slots share one accepted inode block. */
 static void metadata_record_queries(struct ext4_fs *fs)
 {
@@ -344,7 +381,7 @@ int main(int argc, char **argv)
     if (reuse || read_directory || records || extent) {
         if (extent) extent_node_queries(fs);
         else
-        if (records) metadata_record_queries(fs);
+        if (records) { directory_record_search(&fs->sb);metadata_record_queries(fs); }
         else
         if (reuse) reuse_queries(fs, &dev);
         else readonly_directory_queries(fs, &dev);

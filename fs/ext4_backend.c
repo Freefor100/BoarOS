@@ -403,9 +403,9 @@ static void ext4_name_cache_init(struct lwext4_mount_adapter *adapter)
 {
     struct kernel_heap *heap=adapter->instance.heap;
     uint64_t budget=physical_page_total(heap->page_allocator)*BOAROS_PAGE_SIZE/256U;
-    unsigned chunks=1;
-    if (budget<sizeof(union ext4_name_chunk)) return;
-    while (chunks<EXT4_NAME_CHUNKS && 2U*chunks*sizeof(union ext4_name_chunk)<=budget) chunks*=2U;
+    uint64_t chunks=budget/sizeof(union ext4_name_chunk);
+    if (!chunks) return;
+    if (chunks>EXT4_NAME_CHUNKS) chunks=EXT4_NAME_CHUNKS;
     struct ext4_name_cache *cache=NULL;
     if (!kernel_heap_allocate_zeroed_nosleep(heap,1,sizeof(*cache),(void **)&cache)) {
         cache->chunks=chunks;
@@ -445,6 +445,12 @@ static uint32_t ext4_name_hash(uint32_t parent,const char *name,size_t length)
 static uint64_t ext4_name_epoch(const struct ext4_name_cache *cache,uint32_t parent)
 { return __atomic_load_n(&cache->epochs[parent%EXT4_NAME_EPOCHS],__ATOMIC_ACQUIRE); }
 
+static inline unsigned ext4_name_bucket(const struct ext4_name_cache *cache,uint32_t hash)
+{
+    /* Map the full hash uniformly into the budgeted number of sets. */
+    return ((uint64_t)hash*(cache->chunks*EXT4_NAME_SETS))>>32;
+}
+
 static bool ext4_name_matches(const struct ext4_cached_name *entry,uint32_t parent,
     uint64_t epoch,uint32_t hash,const char *name,size_t length)
 {
@@ -455,9 +461,10 @@ static bool ext4_name_matches(const struct ext4_cached_name *entry,uint32_t pare
 static uint32_t ext4_name_cached(const struct ext4_name_cache *cache,uint32_t parent,
     uint64_t epoch,uint32_t hash,const char *name,size_t length)
 {
-    union ext4_name_chunk *chunk=cache->table[hash&(cache->chunks-1U)];
+    unsigned bucket=ext4_name_bucket(cache,hash);
+    union ext4_name_chunk *chunk=cache->table[bucket/EXT4_NAME_SETS];
     if (!chunk) return 0;
-    const struct ext4_cached_name *set=chunk->sets[(hash>>7)%EXT4_NAME_SETS];
+    const struct ext4_cached_name *set=chunk->sets[bucket%EXT4_NAME_SETS];
     for (unsigned i=0;i<EXT4_NAME_WAYS;i++)
         if (ext4_name_matches(&set[i],parent,epoch,hash,name,length)) return set[i].inode;
     return 0;
@@ -467,14 +474,15 @@ static void ext4_name_remember(struct lwext4_mount_adapter *adapter,uint32_t par
     uint64_t epoch,uint32_t hash,const char *name,size_t length,uint32_t inode)
 {
     struct ext4_name_cache *cache=adapter->name_cache;
-    union ext4_name_chunk **slot=&cache->table[hash&(cache->chunks-1U)],*candidate=NULL;
+    unsigned bucket=ext4_name_bucket(cache,hash);
+    union ext4_name_chunk **slot=&cache->table[bucket/EXT4_NAME_SETS],*candidate=NULL;
     for (;;) {
         {
             TIMESTAMP_SCOPE(guard,adapter);
             if (epoch!=ext4_name_epoch(cache,parent)) break;
             if (!*slot && candidate) { *slot=candidate;candidate=NULL; }
             if (*slot) {
-                struct ext4_cached_name *set=(*slot)->sets[(hash>>7)%EXT4_NAME_SETS];
+                struct ext4_cached_name *set=(*slot)->sets[bucket%EXT4_NAME_SETS];
                 struct ext4_cached_name *entry=NULL;
                 for (unsigned i=0;i<EXT4_NAME_WAYS;i++) {
                     if (ext4_name_matches(&set[i],parent,epoch,hash,name,length)) { entry=&set[i];break; }
