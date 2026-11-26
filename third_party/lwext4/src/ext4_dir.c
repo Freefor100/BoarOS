@@ -645,78 +645,82 @@ int ext4_dir_remove_found(struct ext4_inode_ref *parent,
 	return ext4_dir_mark_dirty(parent, &result->block);
 }
 
-int ext4_dir_try_insert_entry(struct ext4_sblock *sb,
-			      struct ext4_inode_ref *inode_ref,
-			      struct ext4_block *dst_blk,
-			      struct ext4_inode_ref *child, const char *name,
-			      uint32_t name_len)
-{
-	/* Compute required length entry and align it to 4 bytes */
-	uint32_t block_size = ext4_sb_get_block_size(sb);
-	uint16_t required_len = sizeof(struct ext4_fake_dir_entry) + name_len;
-
-	if ((required_len % 4) != 0)
-		required_len += 4 - (required_len % 4);
-
-	/* Initialize pointers, stop means to upper bound */
-	struct ext4_dir_en *start = (void *)dst_blk->data;
-	struct ext4_dir_en *stop = (void *)(dst_blk->data + block_size);
-
-	/*
-	 * Walk through the block and check for invalid entries
-	 * or entries with free space for new entry
-	 */
-	while (start < stop) {
-		uint32_t inode = ext4_dir_en_get_inode(start);
-		uint16_t rec_len = ext4_dir_en_get_entry_len(start);
-		uint8_t itype = ext4_dir_en_get_inode_type(sb, start);
-
-		/* If invalid and large enough entry, use it */
-		if ((inode == 0) && (itype != EXT4_DIRENTRY_DIR_CSUM) &&
-		    (rec_len >= required_len)) {
-			ext4_dir_write_entry(sb, start, rec_len, child, name,
-					     name_len);
-			return ext4_dir_mark_dirty(inode_ref, dst_blk);
-		}
-
-		/* Valid entry, try to split it */
-		if (inode != 0) {
-			uint16_t used_len;
-			used_len = ext4_dir_en_get_name_len(sb, start);
-
-			uint16_t sz;
-			sz = sizeof(struct ext4_fake_dir_entry) + used_len;
-
-			if ((used_len % 4) != 0)
-				sz += 4 - (used_len % 4);
-
-			uint16_t free_space = rec_len - sz;
-
-			/* There is free space for new entry */
-			if (free_space >= required_len) {
-				/* Cut tail of current entry */
-				struct ext4_dir_en * new_entry;
-				new_entry = (void *)((uint8_t *)start + sz);
-				ext4_dir_en_set_entry_len(start, sz);
-				ext4_dir_write_entry(sb, new_entry, free_space,
-						     child, name, name_len);
-
-				return ext4_dir_mark_dirty(inode_ref, dst_blk);
-			}
-		}
-
-		/* Jump to the next entry */
-		start = (void *)((uint8_t *)start + rec_len);
-	}
-
-	/* No free space found for new entry */
-	return ENOSPC;
-}
-
 typedef uint32_t directory_word __attribute__((__may_alias__));
 _Static_assert(offsetof(struct ext4_dir_en,entry_len)==4 &&
 	       offsetof(struct ext4_dir_en,name_len)==6 && offsetof(struct ext4_dir_en,name)==8,
 	       "directory record header layout");
+
+static inline uint32_t directory_name_mask(struct ext4_sblock *sb)
+{
+	return ext4_get32(sb, rev_level) == 0 &&
+		ext4_get32(sb, minor_rev_level) < 5 ? UINT16_MAX : UINT8_MAX;
+}
+
+static inline uint32_t directory_record_header(struct ext4_dir_en *entry, bool aligned)
+{
+	if (aligned) {
+		const directory_word *words = (const void *)entry;
+		return to_le32(words[1]);
+	}
+	return ext4_dir_en_get_entry_len(entry) | (uint32_t)entry->name_len << 16 |
+		(uint32_t)entry->in.name_length_high << 24;
+}
+
+static inline bool directory_record_has_inode(struct ext4_dir_en *entry, bool aligned)
+{
+	const directory_word *words = (const void *)entry;
+	return aligned ? words[0] != 0 : ext4_dir_en_get_inode(entry) != 0;
+}
+
+static inline bool directory_record_fits(uint32_t length, uint32_t bytes, size_t remaining)
+{
+	return length >= 8 && !(length % 4) && length <= remaining && bytes <= length - 8;
+}
+
+static inline __attribute__((always_inline)) int try_insert_directory_record(
+	struct ext4_sblock *sb, struct ext4_inode_ref *parent, struct ext4_block *block,
+	struct ext4_inode_ref *child, const char *name, uint32_t name_len, bool aligned)
+{
+	uint32_t required = (8U + name_len + 3U) & ~3U;
+	uint32_t name_mask = directory_name_mask(sb);
+	size_t remaining = ext4_sb_get_block_size(sb);
+	uint8_t *data = block->data;
+	while (remaining) {
+		if (remaining < 8) return EUCLEAN;
+		struct ext4_dir_en *entry = (void *)data;
+		uint32_t header = directory_record_header(entry, aligned);
+		uint32_t length = (uint16_t)header;
+		uint32_t bytes = (header >> 16) & name_mask;
+		if (!directory_record_fits(length, bytes, remaining)) return EUCLEAN;
+		if (directory_record_has_inode(entry, aligned)) {
+			uint32_t used = (8U + bytes + 3U) & ~3U;
+			if (length - used >= required) {
+				struct ext4_dir_en *slot = (void *)(data + used);
+				ext4_dir_en_set_entry_len(entry, used);
+				ext4_dir_write_entry(sb, slot, length - used, child, name, name_len);
+				return ext4_dir_mark_dirty(parent, block);
+			}
+		} else if (length >= required &&
+			   (name_mask == UINT16_MAX || header >> 24 != EXT4_DIRENTRY_DIR_CSUM)) {
+			ext4_dir_write_entry(sb, entry, length, child, name, name_len);
+			return ext4_dir_mark_dirty(parent, block);
+		}
+		data += length;
+		remaining -= length;
+	}
+	return ENOSPC;
+}
+
+int ext4_dir_try_insert_entry(struct ext4_sblock *sb, struct ext4_inode_ref *parent,
+			      struct ext4_block *block, struct ext4_inode_ref *child,
+			      const char *name, uint32_t name_len)
+{
+	if (name_len > EXT4_DIRECTORY_FILENAME_LEN) return EINVAL;
+	/* A valid record keeps every subsequent header four-byte aligned. */
+	if ((uintptr_t)block->data & 3U)
+		return try_insert_directory_record(sb, parent, block, child, name, name_len, false);
+	return try_insert_directory_record(sb, parent, block, child, name, name_len, true);
+}
 
 static inline __attribute__((always_inline)) int find_directory_record(uint8_t *data,
 		size_t remaining, uint32_t name_mask, size_t name_len, const char *name,
@@ -728,15 +732,12 @@ static inline __attribute__((always_inline)) int find_directory_record(uint8_t *
 	while (remaining) {
 		if (!checked && remaining < 8) return found ? EOK : EUCLEAN;
 		struct ext4_dir_en *de = (void *)data;
-		const directory_word *words = (const void *)data;
-		uint32_t header = aligned ? to_le32(words[1]) :
-			ext4_dir_en_get_entry_len(de) | (uint32_t)de->name_len << 16 |
-			(uint32_t)de->in.name_length_high << 24;
+		uint32_t header = directory_record_header(de, aligned);
 		uint32_t length = (uint16_t)header;
 		uint32_t bytes = (header >> 16) & name_mask;
-		if (!checked && (length < 8 || length % 4 || length > remaining || bytes > length - 8))
+		if (!checked && !directory_record_fits(length, bytes, remaining))
 			return found ? EOK : EUCLEAN;
-		if (!found && bytes == name_len && (aligned ? words[0] : ext4_dir_en_get_inode(de)) &&
+		if (!found && bytes == name_len && directory_record_has_inode(de, aligned) &&
 			    !memcmp(name, de->name, name_len)) {
 			result->dentry = de;
 			result->previous = previous;
@@ -759,8 +760,7 @@ int ext4_dir_find_in_block(struct ext4_block *block, struct ext4_sblock *sb,
 			   size_t name_len, const char *name,
 			   struct ext4_dir_search_result *result)
 {
-	uint32_t name_mask = ext4_get32(sb, rev_level) == 0 &&
-		ext4_get32(sb, minor_rev_level) < 5 ? UINT16_MAX : UINT8_MAX;
+	uint32_t name_mask = directory_name_mask(sb);
 	size_t size = ext4_sb_get_block_size(sb);
 	/* Every accepted record advances by a multiple of four bytes. */
 	if ((uintptr_t)block->data & 3U)

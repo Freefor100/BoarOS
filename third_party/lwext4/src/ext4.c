@@ -5327,46 +5327,125 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
     EXT4_MP_UNLOCK(file->mp);
     return result;
 }
-int ext4_fdata_complete(ext4_file *file,uint64_t offset,size_t size)
+struct ext4_data_completion {
+    struct jbd_data_range ranges[JBD_COMPLETE_RANGES_MAX];
+    unsigned count;
+};
+
+static int ext4_complete_physical(struct jbd_journal *journal, struct ext4_data_completion *batch)
 {
-    if (!file || !file->mp || offset>UINT64_MAX-size) return EINVAL;
-    struct ext4_fs *fs=&file->mp->fs;
+    /* The input is sorted by physical block. Even a repeated mapping must
+     * never link the same ordered record into a device phase twice. */
+    uint64_t end = 0;
+    unsigned used = 0;
+    for (unsigned i = 0; i < batch->count; i++) {
+        struct jbd_data_range range = batch->ranges[i];
+        uint64_t next = range.first + range.count;
+        if (next <= end) continue;
+        if (range.first < end) {
+            range.first = end;
+            range.count = next - end;
+        }
+        batch->ranges[used++] = range;
+        end = next;
+    }
+    batch->count = 0;
+    return jbd_journal_complete_data_batch(journal, batch->ranges, used);
+}
+
+static int ext4_complete_file_data(ext4_file *file, uint64_t offset, uint64_t end,
+    struct ext4_data_completion *batch)
+{
+    struct ext4_fs *fs = &file->mp->fs;
+    struct ext4_inode_ref ref;
+    int result = ext4_fs_get_inode_ref_read(fs, file->inode, &ref);
+    if (result) return result;
+    uint64_t eof = ext4_inode_get_size(ext4_fs_super(fs), ref.inode);
+    if (end > eof) end = eof;
+    unsigned block = fs->bdev->lg_bsize;
+    uint64_t logical = offset / block, limit = end / block + !!(end % block);
+    while (!result && logical < limit) {
+        struct ext4_inode_block_range range = {0};
+        uint64_t remaining = limit - logical;
+        result = ext4_fs_get_inode_dblk_range(&ref, logical,
+            remaining > UINT32_MAX ? UINT32_MAX : remaining, false, &range);
+        if (result) break;
+        if (!range.count) __builtin_trap();
+        logical += range.count;
+        if (!range.block || range.unwritten) continue;
+        if (!batch) {
+            result = jbd_journal_complete_data(fs->jbd_journal, range.block, range.count);
+            continue;
+        }
+        if (range.block > UINT64_MAX - range.count) {
+            result = EUCLEAN;
+            break;
+        }
+        if (batch->count == JBD_COMPLETE_RANGES_MAX) {
+            result = ext4_complete_physical(fs->jbd_journal, batch);
+            if (result) break;
+        }
+        unsigned i = batch->count++;
+        while (i && batch->ranges[i - 1].first > range.block) {
+            batch->ranges[i] = batch->ranges[i - 1];
+            i--;
+        }
+        batch->ranges[i] = (struct jbd_data_range){range.block, range.count};
+    }
+    return ext4_result(result, ext4_fs_put_inode_ref(&ref));
+}
+
+int ext4_fdata_complete(ext4_file *file, uint64_t offset, size_t size)
+{
+    if (!file || !file->mp || offset > UINT64_MAX - size) return EINVAL;
+    struct ext4_fs *fs = &file->mp->fs;
     if (!size || !fs->jbd_journal) return EOK;
     EXT4_MP_LOCK(file->mp);
     int result;
-    if (ext4_operation_depth(fs)) {result=EBUSY;goto Exit;}
-Retry:
-    result=ext4_trans_start(file->mp);
-    if (result) goto Exit;
-    result=ext4_operation_require_resource(fs,EXT4_RESOURCE_INODE,file->inode);
-    if (!result) {
-        struct ext4_inode_ref ref;
-        result=ext4_fs_get_inode_ref_read(fs,file->inode,&ref);
-        if (!result) {
-            uint64_t end=offset+size;
-            uint64_t eof=ext4_inode_get_size(ext4_fs_super(fs),ref.inode);
-            if (end>eof) end=eof;
-            unsigned block=fs->bdev->lg_bsize;
-            uint64_t logical=offset/block,limit=end/block+!!(end%block);
-            while (!result && logical<limit) {
-                struct ext4_inode_block_range range={0};
-                uint64_t remaining=limit-logical;
-                result=ext4_fs_get_inode_dblk_range(&ref,logical,
-                    remaining>UINT32_MAX?UINT32_MAX:remaining,false,&range);
-                if (result) break;
-                if (!range.count) __builtin_trap();
-                if (range.block && !range.unwritten)
-                    result=jbd_journal_complete_data(fs->jbd_journal,range.block,range.count);
-                logical+=range.count;
-            }
-            int cleanup=ext4_fs_put_inode_ref(&ref);
-            if (!result) result=cleanup;
-        }
+    if (ext4_operation_depth(fs)) { result = EBUSY; goto Exit; }
+    if (ext4_fs_serial_writer(fs)) {
+        /* The mount writer protects accepted mappings through home I/O. */
+        result = fs->super_replay_required ? EUCLEAN : fs->read_only ? EROFS :
+            jbd_journal_error(fs->jbd_journal);
+        if (!result) result = ext4_complete_file_data(file, offset, offset + size, NULL);
+        goto Exit;
     }
-    result=ext4_trans_finish(file->mp,result);
-    if (result==EAGAIN && ext4_operation_resource_retry(fs)) goto Retry;
+Retry:
+    result = ext4_trans_start(file->mp);
+    if (result) goto Exit;
+    result = ext4_operation_require_resource(fs, EXT4_RESOURCE_INODE, file->inode);
+    if (!result) result = ext4_complete_file_data(file, offset, offset + size, NULL);
+    result = ext4_trans_finish(file->mp, result);
+    if (result == EAGAIN && ext4_operation_resource_retry(fs)) goto Retry;
 Exit:
     EXT4_MP_UNLOCK(file->mp);
+    return result;
+}
+
+int ext4_fdata_complete_batch(const struct ext4_file_data_range *files, unsigned count)
+{
+    if (!files || !count || count > EXT4_SMALL_WRITEBACK_MAX ||
+        !files[0].file || !files[0].file->mp) return EINVAL;
+    struct ext4_mountpoint *mp = files[0].file->mp;
+    struct ext4_fs *fs = &mp->fs;
+    struct jbd_journal *journal = fs->jbd_journal;
+    int result = ENOTSUP;
+    EXT4_MP_LOCK(mp);
+    if (!journal || !journal->grouped || !ext4_fs_serial_writer(fs) ||
+        ext4_current_operation(fs) || !fs->bdev->bdif->bwrite_phase ||
+        fs->read_only || fs->super_replay_required) goto Unlock;
+    for (unsigned i = 0; i < count; i++)
+        if (!files[i].file || files[i].file->mp != mp || files[i].start >= files[i].end) goto Unlock;
+    struct ext4_data_completion batch = {0};
+    result = jbd_journal_error(journal);
+    for (unsigned i = 0; i < count && !result; i++)
+        result = ext4_complete_file_data(files[i].file, files[i].start, files[i].end, &batch);
+    if (!result) result = ext4_complete_physical(journal, &batch);
+    /* Retry mapping failures one file at a time so only the failed inode
+     * receives its error. A device failure is already sticky in the journal. */
+    if (result && !jbd_journal_error(journal)) result = ENOTSUP;
+Unlock:
+    EXT4_MP_UNLOCK(mp);
     return result;
 }
 

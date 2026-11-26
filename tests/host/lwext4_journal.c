@@ -293,6 +293,86 @@ static void direct_ordered_data(struct ext4_blockdev *dev,struct jbd_journal *jo
     puts("PASS direct ordered extent consumer: three versions, reversed phase completion, media reads, no added FLUSH or commit rewrite, owners returned");
 }
 
+static unsigned range_phases, range_requests;
+static void range_serial_lock(void *context) { (void)context; }
+static bool range_serial_writer(void *context) { (void)context; return true; }
+
+static int range_data_phase(struct ext4_blockdev *dev, const struct ext4_block_write *first)
+{
+    range_phases++;
+    for (const struct ext4_block_write *entry = first; entry; entry = entry->next)
+        range_requests++;
+    return reverse_data_phase(dev, first);
+}
+
+static void complete_ordered_range_batch(struct ext4_blockdev *dev, struct jbd_journal *journal,
+    ext4_file *first, ext4_fsblk_t first_home, unsigned fault)
+{
+    ext4_file second, outside;
+    CHECK(ext4_fopen(&second, "/again", "r+") == EOK);
+    CHECK(ext4_fopen(&outside, "/outside", "r+") == EOK);
+    ext4_file *files[] = {first, &second, &outside};
+    ext4_fsblk_t homes[] = {first_home, 0, 0};
+    for (unsigned i = 1; i < 3; i++) {
+        struct ext4_inode_ref ref;
+        CHECK(ext4_fs_get_inode_ref_read(dev->fs, files[i]->inode, &ref) == EOK);
+        CHECK(ext4_fs_get_inode_dblk_idx(&ref, 0, &homes[i], false) == EOK && homes[i]);
+        CHECK(ext4_fs_put_inode_ref(&ref) == EOK);
+    }
+    const struct ext4_lock locks = {.lock=range_serial_lock, .unlock=range_serial_lock,
+        .serial_writer=range_serial_writer};
+    CHECK(ext4_mount_setup_locks("/", &locks) == EOK);
+    dev->fs->jbd_journal = journal;
+    CHECK(jbd_journal_group_init(journal, 4 * 1024 * 1024) == EOK);
+    struct resource_source source[3] = {0};
+    for (unsigned version = 0; version < 3; version++) {
+        source[version].data = calloc(1, 64 * 1024);
+        CHECK(source[version].data);
+        memset(source[version].data, 'A' + version, journal->block_size);
+        for (unsigned i = 0; i < 3; i++)
+            resource_accept_data(journal, homes[i], &source[version], false);
+        if (version < 2) CHECK(jbd_journal_freeze(journal) == EOK);
+        if (!version) CHECK(jbd_journal_select_stage(journal, JBD_JOURNAL_COMMIT) == JBD_JOURNAL_COMMIT);
+    }
+    const struct ext4_file_data_range ranges[] = {{&second, 0, 8}, {first, 0, 8}};
+    dev->bdif->bwrite_phase = range_data_phase;
+    uint64_t flushes = disk.flushes;
+    if (fault) disk.fail_write = disk.writes + fault;
+    int result = ext4_fdata_complete_batch(ranges, 2);
+    CHECK(disk.flushes == flushes && !journal->durable_sequence);
+    if (fault) {
+        CHECK(result == EIO && jbd_journal_error(journal) == EIO);
+        CHECK(range_phases == 1 && range_requests == 2);
+        CHECK(ext4_fdata_complete_batch(ranges, 2) == EIO && range_phases == 1);
+        CHECK(fault_block_crash(&disk) == 0);
+        puts("PASS ordered range batch failure: sticky error and no premature commit");
+        return;
+    }
+    CHECK(result == EOK && range_phases == 3 && range_requests == 6);
+    uint8_t *data = malloc(journal->block_size);
+    CHECK(data);
+    for (unsigned i = 0; i < 3; i++) {
+        CHECK(ext4_blocks_get_direct(dev, data, homes[i], 1) == EOK);
+        CHECK(data[0] == (i == 2 ? 'O' : 'C'));
+    }
+    free(data);
+    CHECK(jbd_journal_freeze(journal) == EOK);
+    do {
+        CHECK(jbd_journal_submit(journal) == EOK);
+        CHECK(jbd_journal_retire_stage(journal, JBD_JOURNAL_COMMIT, EOK) == EOK);
+    } while (jbd_journal_select_stage(journal, JBD_JOURNAL_COMMIT) == JBD_JOURNAL_COMMIT);
+    journal->checkpoint_target = journal->durable_sequence;
+    while (jbd_journal_select_stage(journal, JBD_JOURNAL_CHECKPOINT) == JBD_JOURNAL_CHECKPOINT) {
+        CHECK(jbd_journal_checkpoint(journal) == EOK);
+        CHECK(jbd_journal_retire_stage(journal, JBD_JOURNAL_CHECKPOINT, EOK) == EOK);
+    }
+    for (unsigned i = 0; i < 3; i++) { CHECK(!source[i].references); free(source[i].data); }
+    CHECK(ext4_fclose(&second) == EOK && ext4_fclose(&outside) == EOK);
+    close_normal_journal(dev, journal);
+    CHECK(fault_block_crash(&disk) == 0);
+    puts("PASS ordered range batch: three two-file phases, excluded range intact, owners returned");
+}
+
 static void resource_reclaim(struct ext4_blockdev *dev, struct jbd_journal *journal,
     ext4_fsblk_t home)
 {
@@ -1666,6 +1746,11 @@ int main(int argc, char **argv)
     CHECK(ext4_block_cache_write_back(&dev, 1) == EOK);
     if (!strcmp(argv[2], "direct-ordered")) {
         direct_ordered_data(&dev,&journal,&file,home,argc>3?(unsigned)atoi(argv[3]):0);
+        return 0;
+    }
+    if (!strcmp(argv[2], "ordered-range-batch")) {
+        complete_ordered_range_batch(&dev, &journal, &file, home,
+            argc > 3 ? (unsigned)atoi(argv[3]) : 0);
         return 0;
     }
     if (!strcmp(argv[2], "resource-admission")) {

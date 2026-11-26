@@ -4011,6 +4011,7 @@ static void writeback_domains(struct kernel_page_cache *cache,const char *path)
 static void dirty_age_case(struct kernel_page_cache *cache,const char *path)
 {
     assert(BOAROS_PAGE_CACHE_DIRTY_AGE);
+    const uint64_t expiry=UINT64_C(30000000000);
     image_fd=open(path,O_RDWR);assert(image_fd>=0);struct stat st;assert(!fstat(image_fd,&st));
     struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
         .logical_block_size=512,.capacity_bytes=st.st_size,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
@@ -4023,10 +4024,10 @@ static void dirty_age_case(struct kernel_page_cache *cache,const char *path)
         assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
         uint64_t observed=kernel_vfs_error_sequence(&file);
         assert(!kernel_page_cache_start_worker(cache));wait_progress(&age_waits,1);
-        assert(age_deadlines[0]>=start+UINT64_C(5000000000));
+        assert(age_deadlines[0]>=start+expiry);
         assert(kernel_vfs_node_dirty_pages(kernel_vfs_file_node(&file))->count==1);
         write_error=failure;
-        __atomic_store_n(&age_clock_offset,UINT64_C(5000000001),__ATOMIC_RELAXED);
+        __atomic_fetch_add(&age_clock_offset,age_deadlines[0]-kernel_time_monotonic_ns()+1,__ATOMIC_RELAXED);
         assert(!kernel_wait_notify(&age_tokens[0],KERNEL_WAIT_TIMEOUT));
         if (failure) {
             wait_progress(&age_waits,2);
@@ -4051,12 +4052,12 @@ static void dirty_age_case(struct kernel_page_cache *cache,const char *path)
     __atomic_store_n(&age_clock_offset,UINT64_C(3000000000),__ATOMIC_RELAXED);
     assert(!kernel_vfs_pwrite(&young,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
     assert(!kernel_page_cache_start_worker(cache));wait_progress(&age_waits,1);
-    __atomic_store_n(&age_clock_offset,UINT64_C(5000000001),__ATOMIC_RELAXED);
+    __atomic_fetch_add(&age_clock_offset,age_deadlines[0]-kernel_time_monotonic_ns()+1,__ATOMIC_RELAXED);
     assert(!kernel_wait_notify(&age_tokens[0],KERNEL_WAIT_TIMEOUT));
     wait_progress(&age_waits,2);
     assert(!kernel_vfs_node_dirty_pages(kernel_vfs_file_node(&file))->count &&
         kernel_vfs_node_dirty_pages(kernel_vfs_file_node(&young))->count==1);
-    __atomic_store_n(&age_clock_offset,UINT64_C(8000000001),__ATOMIC_RELAXED);
+    __atomic_fetch_add(&age_clock_offset,age_deadlines[1]-kernel_time_monotonic_ns()+1,__ATOMIC_RELAXED);
     assert(!kernel_wait_notify(&age_tokens[1],KERNEL_WAIT_TIMEOUT));
     wait_progress(&age_empty_wait,1);kernel_page_cache_stop_worker(cache);
     age_observing=0;age_clock_offset=0;

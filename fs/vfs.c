@@ -740,7 +740,9 @@ struct vfs_path_walk {
     struct kernel_service_scope service;
     struct kernel_vfs_node *directory;
     struct kernel_vfs_path **pathless_link;
+    struct kernel_vfs_path *create_parent;
     const struct vfs_walk_stat *stat;
+    uint32_t missing_observed;
     unsigned final_write, resolve;
     bool cached_prefix;
     bool mkdir;
@@ -2884,6 +2886,7 @@ static int register_path(struct kernel_vfs_dentry **owner,size_t name_length,uin
     struct kernel_vfs_dentry *path=*owner,*existing,*retired=NULL;
     struct kernel_vfs_instance *adapter = path->file.mount->private_data;
     int result=0;
+    bool over_cache_limit;
     kernel_raw_lock_init(&path->names_lock,KERNEL_RAW_RANK_DIRECTORY_NAMES);
     {
         KERNEL_TASK_LOCK_SCOPE(state, &kernel_vfs_state_lock);
@@ -2907,9 +2910,10 @@ static int register_path(struct kernel_vfs_dentry **owner,size_t name_length,uin
                 dentry_cache_append(path);
             }
         }
+        over_cache_limit=adapter->dentry_cache_count>adapter->dentry_cache_limit;
     }
     if (retired) dentry_release(&retired);
-    dentry_cache_trim(adapter,adapter->dentry_cache_limit);
+    if (over_cache_limit) dentry_cache_trim(adapter,adapter->dentry_cache_limit);
     if (existing) {
         /* Shared lookups can prepare the same name concurrently. Only the
          * selected identity is published; candidate callbacks run lock-free. */
@@ -3237,6 +3241,8 @@ static int lookup_named_child(struct kernel_vfs_mount *mount,struct kernel_vfs_d
         if (instance->ops->lookup_node)
             result=instance->ops->lookup_node(directory,name,name_length,&inode,lookup_mode);
         else result=instance->ops->lookup(instance,directory->inode,name,name_length,&inode,lookup_mode);
+        if (result==-KERNEL_ENOENT && walk && walk->create_parent)
+            walk->missing_observed=miss;
         if (result) return result;
         if (instance->ops->entry_name) {
             result=instance->ops->entry_name(instance,inode,canonical,sizeof(canonical));
@@ -3559,6 +3565,15 @@ static int resolve_object(struct kernel_vfs_path *start,
             memcpy(missing_name, pending + begin, component_length);
             missing_name[component_length] = '\0';
             if (borrowed && (result=kernel_vfs_path_acquire(current))) goto Finish;
+            if (walk->create_parent && current->transient && current->references==1 &&
+                current!=walk->local_directory) {
+                /* The caller uses this parent until creation finishes. Move
+                 * the walk's dentry and mount ownership to caller storage. */
+                path_init(walk->create_parent,current->file.mount,current->dentry,
+                    true,current->borrow_mount);
+                current->references=0;
+                current=walk->create_parent;
+            }
             *owner = current;
             current = 0;
             result = 0;
@@ -3682,7 +3697,8 @@ HaveComponent:
     *owner = current;
     current = 0;
 Finish:
-    if (!result && *owner && (*owner)->transient && *owner!=walk->terminal) {
+    if (!result && *owner && (*owner)->transient && *owner!=walk->terminal &&
+        *owner!=walk->create_parent) {
         struct kernel_vfs_path *accepted=NULL;
         result=path_wrap((*owner)->file.mount,(*owner)->dentry,&accepted);
         release_walk_path(walk,owner);
@@ -4397,7 +4413,7 @@ int kernel_vfs_path_open_executable(struct kernel_vfs_path *path,struct kernel_v
 }
 
 static int create_at_parent(struct kernel_vfs_path **owner,const char *name,uint32_t mode,
-    struct kernel_vfs_file *file,struct kernel_vfs_path **path_owner,uint32_t umask)
+    struct kernel_vfs_file *file,struct kernel_vfs_path **path_owner,uint32_t umask,uint32_t miss)
 {
     struct kernel_vfs_path *parent=*owner;
     struct kernel_vfs_mount *mount=parent->file.mount;
@@ -4424,7 +4440,7 @@ static int create_at_parent(struct kernel_vfs_path **owner,const char *name,uint
         __atomic_fetch_add(&instance->external_files,1,__ATOMIC_RELAXED);
     } else if (entry->file.location_owner) mount_put(mount);
     entry->file.mount=&instance->backend_mount;entry->file.location_owner=0;
-    result=register_path(&entry,name_length,UINT32_MAX);
+    result=register_path(&entry,name_length,miss);
     if (!result) {
         struct kernel_vfs_path *path=NULL;result=path_wrap(mount,entry,&path);
         if (!result) {if (file) file->path=path;else *path_owner=path;}
@@ -4487,6 +4503,9 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
     int result;
     {
         VFS_PATH_WALK(walk,start,root);
+        struct kernel_vfs_path create_parent;
+        walk.create_parent=create ? &create_parent : NULL;
+        walk.missing_observed=UINT32_MAX;
         walk.final_write=create || temporary;
         walk.resolve=request->resolve;
         walk.cached_prefix=!request->resolve;
@@ -4530,7 +4549,8 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
             if (path[length-1U]=='/') result=-KERNEL_EISDIR;
             else {
                 result=create_at_parent(&resolved,missing,
-                    KERNEL_VFS_S_IFREG|(request->mode&07777U),file,NULL,request->umask);
+                    KERNEL_VFS_S_IFREG|(request->mode&07777U),file,NULL,request->umask,
+                    walk.missing_observed);
                 if (!result && opened) opened->created=1;
             }
         }
@@ -5984,7 +6004,8 @@ int kernel_vfs_socket_bind_at(struct kernel_vfs_path *start,
     int result=mutation_path(start,root,input,0,1,0,2,&parent,name,&walk);
     if (!result) {
         if (!name[0]) result=-KERNEL_EEXIST;
-        else result=create_at_parent(&parent,name,KERNEL_VFS_S_IFSOCK|(mode&07777U),NULL,owner,umask);
+        else result=create_at_parent(&parent,name,KERNEL_VFS_S_IFSOCK|(mode&07777U),NULL,owner,
+            umask,UINT32_MAX);
     }
     if (parent && kernel_vfs_path_release(&parent)) __builtin_trap();
     return result;

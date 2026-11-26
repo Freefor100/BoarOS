@@ -17,10 +17,11 @@ struct namespace_ea_actor {
     int result;
 };
 static _Thread_local struct namespace_ea_actor *namespace_ea_current;
-int __real_jbd_trans_set_tree_dirty(struct jbd_trans *,struct ext4_block *,uint64_t);
-int __wrap_jbd_trans_set_tree_dirty(struct jbd_trans *trans,struct ext4_block *block,uint64_t key)
+int __real_jbd_trans_set_tree_dirty_range(struct jbd_trans *,struct ext4_block *,uint32_t,uint32_t,uint64_t);
+int __wrap_jbd_trans_set_tree_dirty_range(struct jbd_trans *trans,struct ext4_block *block,
+    uint32_t offset,uint32_t length,uint64_t key)
 {
-    int result=__real_jbd_trans_set_tree_dirty(trans,block,key);
+    int result=__real_jbd_trans_set_tree_dirty_range(trans,block,offset,length,key);
     struct namespace_ea_actor *actor=namespace_ea_current;
     if(result || !actor || actor->entered || block->lb_id!=actor->shared)return result;
     actor->held=kernel_io_context_current()->locks;

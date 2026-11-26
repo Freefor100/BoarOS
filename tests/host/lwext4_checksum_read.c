@@ -196,6 +196,12 @@ static void directory_record_search(struct ext4_sblock *super)
         CHECK(ext4_dir_find_in_block(&block,super,3,"key",&result)==EUCLEAN);
         ext4_dir_en_set_entry_len(empty,(uint16_t)(size+4));
         CHECK(ext4_dir_find_in_block(&block,super,3,"key",&result)==EUCLEAN);
+        ext4_dir_en_set_inode(empty,12);
+        ext4_dir_en_set_entry_len(empty,12);
+        ext4_dir_en_set_inode(entry,0);
+        ext4_dir_en_set_entry_len(entry,(uint16_t)(size-8));
+        entry->in.inode_type=EXT4_DIRENTRY_DIR_CSUM;
+        CHECK(ext4_dir_try_insert_entry(super,NULL,&block,NULL,"new",3)==EUCLEAN);
     }
     memset(storage,0,size);
     struct ext4_dir_en *first=(void *)storage,*later=(void *)(storage+12);
