@@ -641,16 +641,28 @@ int virtio_block_enable_irq(struct virtio_block_device *device, uint32_t source)
     device->irq_source = source;
     return 1;
 }
-static int begin_call(struct virtio_block_device *device, int barrier)
+static int admission_available(const struct virtio_block_device *device, int barrier)
+{
+    return !device->barrier && (barrier ? !device->active : !device->barrier_waiters);
+}
+static void start_call_locked(struct virtio_block_device *device)
+{
+    if (device->active == UINT32_MAX) __builtin_trap();
+    device->active++;
+}
+static void check_io_context(const struct virtio_block_device *device)
 {
     if (device->irq_source && (!kernel_scheduler_can_sleep() || arch_external_interrupt_active())) __builtin_trap();
+}
+static int begin_call(struct virtio_block_device *device, int barrier)
+{
+    check_io_context(device);
     KERNEL_IRQ_LOCK_SCOPE(guard,&device->metadata);
     if (barrier) device->barrier_waiters++;
     for (;;) {
         if (!device_live(device)) break;
-        if (!device->barrier && (barrier ? !device->active : !device->barrier_waiters)) {
-            if (device->active == UINT32_MAX) __builtin_trap();
-            device->active++;
+        if (admission_available(device, barrier)) {
+            start_call_locked(device);
             if (barrier) { device->barrier_waiters--; device->barrier = 1; }
             return 1;
         }
@@ -660,14 +672,18 @@ static int begin_call(struct virtio_block_device *device, int barrier)
     if (barrier) device->barrier_waiters--;
     return 0;
 }
-static void end_call(struct virtio_block_device *device, int barrier)
+static void end_call_locked(struct virtio_block_device *device, int barrier)
 {
-    KERNEL_IRQ_LOCK_SCOPE(guard,&device->metadata);
     if (!device->active || (barrier && !device->barrier)) __builtin_trap();
     device->active--;
     if (barrier) device->barrier = 0;
     if (!device->active) wake(&device->idle);
     if (barrier && !device->barrier_waiters) wake(&device->admission);
+}
+static void end_call(struct virtio_block_device *device, int barrier)
+{
+    KERNEL_IRQ_LOCK_SCOPE(guard,&device->metadata);
+    end_call_locked(device, barrier);
 }
 static unsigned batch_descriptor_minimum(const struct virtio_block_device *device,
     enum kernel_block_priority priority)
@@ -734,14 +750,18 @@ static void release_request_owner(struct virtio_block_device *device, struct blo
     SLOT_CHANGE(device);
     r->state = 0; r->priority = 0; r->owner = 0; r->completion = 0;
 }
-static void release_request(struct virtio_block_device *device, struct block_request *r)
+static void release_request_locked(struct virtio_block_device *device, struct block_request *r)
 {
-    KERNEL_IRQ_LOCK_SCOPE(guard,&device->metadata);
     release_request_owner(device, r);
     wake(&device->slots);
     if (kernel_wait_queue_registrations(&device->slots_low) && low_slots_can_progress(device)) {
         wake(&device->slots_low);
     }
+}
+static void release_request(struct virtio_block_device *device, struct block_request *r)
+{
+    KERNEL_IRQ_LOCK_SCOPE(guard,&device->metadata);
+    release_request_locked(device, r);
 }
 
 static uint64_t free_descriptor_mask(const struct virtio_block_device *device)
@@ -866,10 +886,9 @@ static enum kernel_block_status finish_request(struct virtio_block_device *devic
     }
     return result;
 }
-static enum kernel_block_status wait_request(struct virtio_block_device *device,
-                                             struct block_request *r)
+static enum kernel_block_status wait_request_locked(struct virtio_block_device *device,
+    struct block_request *r, kernel_irq_lock_guard *guard)
 {
-    KERNEL_IRQ_LOCK_SCOPE(guard,&device->metadata);
     while (r->state == 2) {
         collect_used_locked(device);
         if (r->state != 2) break;
@@ -893,10 +912,16 @@ static enum kernel_block_status wait_request(struct virtio_block_device *device,
             }
             break;
         }
-        if (device->irq_source) wait_for_progress(device, &r->done, r->deadline,r,1,NULL,NULL,&guard);
+        if (device->irq_source) wait_for_progress(device, &r->done, r->deadline,r,1,NULL,NULL,guard);
     }
     enum kernel_block_status result = finish_request(device, r);
     return result;
+}
+static enum kernel_block_status wait_request(struct virtio_block_device *device,
+    struct block_request *r)
+{
+    KERNEL_IRQ_LOCK_SCOPE(guard,&device->metadata);
+    return wait_request_locked(device, r, &guard);
 }
 static enum kernel_block_status submit_request(struct virtio_block_device *device,
     struct block_request *r, uint32_t type, uint64_t sector,
@@ -1709,6 +1734,44 @@ static enum kernel_block_status virtio_block_write_batch_prio(void *context,
     const struct kernel_block_span *spans, size_t count, enum kernel_block_priority priority)
 { return transfer_batch(context, spans, NULL, count, NULL, NULL, NULL, NULL, 0, priority); }
 
+static enum kernel_block_status read_direct_span(struct virtio_block_device *device,
+    const struct block_read_span *span, uint64_t physical)
+{
+    const uint64_t sector = span->offset / VIRTIO_BLOCK_SECTOR_SIZE;
+    check_io_context(device);
+    {
+        KERNEL_IRQ_LOCK_SCOPE(guard,&device->metadata);
+        /* The admission, slot and three descriptors can be claimed together.
+         * Waiting for the device drops metadata protection before parking. */
+        uint64_t free = free_descriptor_mask(device);
+        free &= free - 1;
+        free &= free - 1;
+        if (free && admission_available(device, 0)) {
+            struct block_request *request = try_reserve_request(device, KERNEL_BLOCK_PRIO_HIGH);
+            if (request) {
+                COST_SCOPE(device_cost, OPERATION_TICKS);
+                start_call_locked(device);
+                enum kernel_block_status result = publish_request_locked(device, request,
+                    VIRTIO_BLOCK_REQUEST_IN, sector, physical, (uint32_t)span->size, 0);
+                if (result == KERNEL_BLOCK_STATUS_OK) result = wait_request_locked(device, request, &guard);
+                release_request_locked(device, request);
+                end_call_locked(device, 0);
+                return result;
+            }
+        }
+    }
+    if (!begin_call(device, 0)) return KERNEL_BLOCK_STATUS_IO;
+    struct block_request *request = reserve_request_prio(device, KERNEL_BLOCK_PRIO_HIGH);
+    enum kernel_block_status result = KERNEL_BLOCK_STATUS_IO;
+    if (request) {
+        result = submit_request(device, request, VIRTIO_BLOCK_REQUEST_IN,
+            sector, physical, (uint32_t)span->size, 0);
+        release_request(device, request);
+    }
+    end_call(device, 0);
+    return result;
+}
+
 static enum kernel_block_status virtio_block_read_batch(void *context,
     struct block_read_span *spans, size_t count, const struct block_read_completion *completion)
 {
@@ -1721,16 +1784,7 @@ static enum kernel_block_status virtio_block_read_batch(void *context,
         !(spans[0].offset%VIRTIO_BLOCK_SECTOR_SIZE) &&
         !(spans[0].size%VIRTIO_BLOCK_SECTOR_SIZE) &&
         device->dma_address(spans[0].buffer,spans[0].size,&physical)) {
-        enum kernel_block_status result=KERNEL_BLOCK_STATUS_IO;
-        if (begin_call(device,0)) {
-            struct block_request *request=reserve_request_prio(device,KERNEL_BLOCK_PRIO_HIGH);
-            if (request) {
-                result=submit_request(device,request,VIRTIO_BLOCK_REQUEST_IN,
-                    spans[0].offset/VIRTIO_BLOCK_SECTOR_SIZE,physical,(uint32_t)spans[0].size,0);
-                release_request(device,request);
-            }
-            end_call(device,0);
-        }
+        enum kernel_block_status result=read_direct_span(device,spans,physical);
         spans[0].status=result;
         spans[0].completed=result==KERNEL_BLOCK_STATUS_OK?spans[0].size:0;
         return result;
