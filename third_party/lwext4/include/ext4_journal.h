@@ -270,6 +270,10 @@ void jbd_journal_release_borrow(struct jbd_data_borrow *);
 void jbd_data_put(struct jbd_data *);
 /* Caller stabilizes the mapped inode; this completes data, not a barrier. */
 int jbd_journal_complete_data(struct jbd_journal *, ext4_fsblk_t, uint32_t);
+struct jbd_data_range { ext4_fsblk_t first; uint32_t count; };
+#define JBD_COMPLETE_RANGES_MAX 16U
+/* The physical ranges must be sorted and disjoint. */
+int jbd_journal_complete_data_batch(struct jbd_journal *, const struct jbd_data_range *, unsigned);
 int jbd_trans_revoke_block(struct jbd_trans *trans,
 			   ext4_fsblk_t lba);
 int jbd_trans_try_revoke_range(struct jbd_trans *trans,

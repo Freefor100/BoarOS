@@ -170,6 +170,10 @@ enum kernel_vfs_execution {
     KERNEL_VFS_EXECUTION_CPU0 = 0,
     KERNEL_VFS_EXECUTION_CALLER,
 };
+struct kernel_vfs_data_range {
+    struct kernel_vfs_node *node;
+    uint64_t start, end;
+};
 /* 回调返回负 errno；close_node 只释放私有 handle，不等待设备。
  * 后端分配的 node 必须位于同一堆对象首部，发布后由通用层回收。 */
 struct kernel_vfs_backend {
@@ -268,6 +272,7 @@ struct kernel_vfs_backend {
     int (*writeback_reclaim)(struct kernel_vfs_instance *instance, int memory_pressure);
     /* Complete data already accepted by writeback, without committing metadata. */
     int (*complete_data_range)(struct kernel_vfs_node *, uint64_t start, uint64_t end);
+    int (*complete_data_batch)(const struct kernel_vfs_data_range *, unsigned count);
     /* Returns after capturing/registering a fixed target. The backend completes
      * request once durable or failed, without borrowing a CPU0 executor stack.
      * NULL denotes a memory-only backend without persistent metadata. */

@@ -683,6 +683,12 @@ uint64_t ext4_ftell(ext4_file *file);
 uint64_t ext4_fsize(ext4_file *file);
 /* Complete accepted ordered data for mapped bytes, without durability. */
 int ext4_fdata_complete(ext4_file *file, uint64_t offset, size_t size);
+struct ext4_file_data_range {
+    ext4_file *file;
+    uint64_t start, end;
+};
+/* Callers hold the inode read qualifications for the entire batch. */
+int ext4_fdata_complete_batch(const struct ext4_file_data_range *, unsigned);
 
 
 /**@brief Get inode of file/directory/link.

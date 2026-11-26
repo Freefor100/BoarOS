@@ -1949,10 +1949,28 @@ static unsigned jbd_range_data(struct jbd_trans *trans,ext4_fsblk_t first,
     }
     return used;
 }
-int jbd_journal_complete_data(struct jbd_journal *journal,ext4_fsblk_t first,uint32_t count)
+
+static unsigned jbd_ranges_data(struct jbd_trans *trans, const struct jbd_data_range *ranges,
+    unsigned count, struct jbd_data **data, unsigned capacity)
+{
+    unsigned used = 0;
+    if (!trans) return 0;
+    for (unsigned i = 0; i < count && used < capacity; i++)
+        used = jbd_range_data(trans, ranges[i].first, ranges[i].count, data, used, capacity);
+    return used;
+}
+
+int jbd_journal_complete_data_batch(struct jbd_journal *journal,
+    const struct jbd_data_range *ranges, unsigned count)
 {
     if (!count) return EOK;
-    if (first>UINT64_MAX-count) return EINVAL;
+    if (count > JBD_COMPLETE_RANGES_MAX) return EINVAL;
+    uint64_t end = 0;
+    for (unsigned i = 0; i < count; i++) {
+        if (ranges[i].first < end || ranges[i].first > UINT64_MAX - ranges[i].count)
+            return EINVAL;
+        end = ranges[i].first + ranges[i].count;
+    }
     KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&journal->ordered_io,&io);
     for (;;) {
         struct jbd_data *data[16];
@@ -1960,13 +1978,13 @@ int jbd_journal_complete_data(struct jbd_journal *journal,ext4_fsblk_t first,uin
         {
             JBD_STATE_SCOPE(journal);
             if (jbd_journal_error(journal)) return jbd_journal_error(journal);
-            used=jbd_range_data(journal->committing,first,count,data,used,16);
+            used=jbd_ranges_data(journal->committing,ranges,count,data,16);
             struct jbd_trans *trans;
             TAILQ_FOREACH(trans,&journal->sealed_queue,trans_node) {
                 if (used) break;
-                used=jbd_range_data(trans,first,count,data,0,16);
+                used=jbd_ranges_data(trans,ranges,count,data,16);
             }
-            if (!used) used=jbd_range_data(journal->running,first,count,data,0,16);
+            if (!used) used=jbd_ranges_data(journal->running,ranges,count,data,16);
         }
         if (!used) return EOK;
         struct jbd_io_phase phase={0};
@@ -1979,6 +1997,12 @@ int jbd_journal_complete_data(struct jbd_journal *journal,ext4_fsblk_t first,uin
         for (unsigned i=0;i<used;i++) jbd_data_put(data[i]);
         if (error) return error;
     }
+}
+
+int jbd_journal_complete_data(struct jbd_journal *journal,ext4_fsblk_t first,uint32_t count)
+{
+    const struct jbd_data_range range = {first, count};
+    return count ? jbd_journal_complete_data_batch(journal, &range, 1) : EOK;
 }
 
 enum { JBD_METADATA_NONE, JBD_METADATA_CHECK, JBD_METADATA_FLUSH };

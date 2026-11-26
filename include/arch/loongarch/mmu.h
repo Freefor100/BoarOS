@@ -140,10 +140,11 @@ enum arch_mmu_status arch_mmu_user_next_owned(
     struct arch_mmu_user_space *, uint64_t *, uint64_t end, uint64_t *);
 enum arch_mmu_status arch_mmu_user_owned_snapshot(
     struct arch_mmu_user_space *, uint64_t, uint64_t *, int *);
-/* Fork window starts on an inherited leaf of an unpublished child. Parent
- * metadata is held by the caller. Return the first address beyond the window. */
-enum arch_mmu_status arch_mmu_user_fork_commit_window(
-    struct arch_mmu_user_space *, const struct arch_mmu_user_space *, uint64_t, uint64_t *,
+/* The caller keeps the parent page-table topology stable and owns the
+ * unpublished child. Commit takes the parent metadata lock in bounded
+ * windows. The caller completes TLB synchronization if changed. */
+enum arch_mmu_status arch_mmu_user_space_fork_commit(
+    struct arch_mmu_user_space *, struct arch_mmu_user_space *, struct kernel_raw_rwlock *,
     int (*)(void *, uint64_t), void *, int *changed);
 /* One base-leaf table. Transfer owned base-page references for returned
  * bits only, consuming the packed vector in increasing selected-bit order. */

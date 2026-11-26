@@ -2078,51 +2078,6 @@ enum riscv_sv39_status riscv_sv39_user_mark_cow_page(struct riscv_sv39_user_spac
     return mark_cow_leaf(s, leaf, order);
 }
 
-/* The child tree is still private. Bound both table walks and permission
- * writes per MM metadata critical section, even if the leaf table is dense. */
-enum riscv_sv39_status riscv_sv39_user_fork_commit_window(
-    struct riscv_sv39_user_space *parent, const struct riscv_sv39_user_space *child,
-    uint64_t first, uint64_t *next, int (*policy)(void *, uint64_t), void *context,
-    int *changed)
-{
-    uint64_t *child_slot, *parent_slot = NULL;
-    uint32_t child_order, parent_order = 0;
-    enum riscv_sv39_status result = resolve_leaf_order(child, first, &child_slot, &child_order, NULL);
-    if (result) return result;
-    unsigned count = 1;
-    uint64_t stride = BOAROS_PAGE_SIZE;
-    if (child_order) stride = RISCV_SV39_PAGE_SIZE_2M;
-    else {
-        count = (RISCV_SV39_PAGE_SIZE_2M - (first & (RISCV_SV39_PAGE_SIZE_2M-1))) / BOAROS_PAGE_SIZE;
-        if (count > 16) count = 16;
-    }
-    for (unsigned i = 0; i < count; i++) {
-        uint64_t entry = child_slot[i], address = first + i * stride;
-        if (!entry) continue;
-        if (!(valid_user_leaf_entry(entry) || valid_protected_entry(entry))) return RISCV_SV39_STATUS_STATE;
-        if (policy && policy(context, address) != RISCV_SV39_FORK_PRIVATE) continue;
-        if (!parent_slot) {
-            result = resolve_leaf_order(parent, address, &parent_slot, &parent_order, NULL);
-            if (result || parent_order != child_order) return RISCV_SV39_STATUS_STATE;
-            parent_slot -= i;
-        }
-        uint64_t *slot = parent_slot + i;
-        if (!(valid_user_leaf_entry(*slot) || valid_protected_entry(*slot))) return RISCV_SV39_STATUS_STATE;
-        /* The MM may already have copied a privately pinned child's leaf. */
-        if (entry_address(*slot) != entry_address(entry)) {
-            if (present_cow_entry(entry) || protected_cow_entry(entry)) return RISCV_SV39_STATUS_STATE;
-            continue;
-        }
-        if (!(present_cow_entry(*slot) || protected_cow_entry(*slot))) {
-            result = mark_cow_leaf(parent, slot, parent_order);
-            if (result) return result;
-            *changed = 1;
-        }
-    }
-    *next = first + count * stride;
-    return RISCV_SV39_STATUS_OK;
-}
-
 static inline __attribute__((always_inline)) unsigned publish_window(struct riscv_sv39_user_space *s,
     uint64_t *slot, unsigned pages, const uint64_t *physical, uint32_t permissions,
     int flags, int already_empty)
@@ -2827,8 +2782,14 @@ static enum riscv_sv39_status fork_leaf_entry(uint64_t old, int action, uint64_t
             return RISCV_SV39_STATUS_STATE;
         *entry = old;
     } else if (action == RISCV_SV39_FORK_PRIVATE) {
-        uint32_t permissions = valid_protected_entry(old) ? 0 : entry_permissions(old) & ~RISCV_SV39_USER;
-        *entry = encode_user_entry(entry_address(old), permissions, user_entry_flags(old) | KERNEL_MM_LEAF_COW);
+        /* Both callers have validated the leaf. Preserve its frame and file
+         * marker. A present COW leaf is accessed and has neither W nor D. */
+        const uint64_t keep = ~RISCV_SV39_PTE_FLAGS_MASK | RISCV_SV39_PTE_VALID |
+            RISCV_SV39_PTE_READ | RISCV_SV39_PTE_EXECUTE | RISCV_SV39_PTE_USER |
+            RISCV_SV39_PTE_FILE;
+        *entry = old & RISCV_SV39_PTE_VALID ?
+            (old & keep) | RISCV_SV39_PTE_ACCESSED | RISCV_SV39_PTE_COW :
+            old | RISCV_SV39_PTE_COW;
     } else return RISCV_SV39_STATUS_STATE;
     return RISCV_SV39_STATUS_OK;
 }
@@ -2909,23 +2870,6 @@ static __attribute__((noinline)) enum riscv_sv39_status share_leaf_table(
     return RISCV_SV39_STATUS_OK;
 }
 
-static enum riscv_sv39_status commit_parent_cow(
-    struct riscv_sv39_user_space *source,
-    int (*fork_leaf)(void *context, uint64_t virtual_address),
-    void *context)
-{
-    uint64_t cursor=0,address;
-    enum riscv_sv39_status status;
-    while (!(status=riscv_sv39_user_next_owned(source,&cursor,RISCV_SV39_USER_LIMIT,&address))) {
-        if (fork_leaf && fork_leaf(context,address)!=RISCV_SV39_FORK_PRIVATE) continue;
-        status=riscv_sv39_user_mark_cow_page(source,address);
-        if (status) return status;
-    }
-    if (status!=RISCV_SV39_STATUS_NOT_MAPPED) return status;
-    riscv_mmu_flush_all();
-    return RISCV_SV39_STATUS_OK;
-}
-
 enum riscv_sv39_status riscv_sv39_user_space_fork_prepare(
     struct riscv_sv39_user_space *destination,
     struct riscv_sv39_user_space *source,
@@ -2993,13 +2937,102 @@ enum riscv_sv39_status riscv_sv39_user_space_fork_prepare(
     return RISCV_SV39_STATUS_OK;
 }
 
+/* Prepare rejects COW on shared leaves. The child COW bit therefore records
+ * the private policy, and replacing a long-pinned page in the child clears it.
+ * The parent operation gate keeps the PTEs stable while we find changed slots.
+ * Publish up to 16 changes per raw lock hold, with no walk or policy callback
+ * in the critical section. */
+static enum riscv_sv39_status fork_commit_leaf_table(struct riscv_sv39_user_space *parent,
+    uint64_t *parent_entries, const uint64_t *child_entries,
+    struct kernel_raw_rwlock *metadata, int *changed)
+{
+    enum { WINDOW = 16, ENTRIES = RISCV_SV39_INDEX_MASK + 1U };
+    for (unsigned index = 0; index < ENTRIES;) {
+        index = next_table_entry(child_entries, index, ENTRIES);
+        if (index == ENTRIES) break;
+        unsigned first = index & ~(WINDOW - 1U);
+        unsigned pending = 0;
+        for (; index < first + WINDOW; index++) {
+            uint64_t inherited = child_entries[index];
+            if (!(inherited & RISCV_SV39_PTE_COW)) continue;
+            uint64_t old = parent_entries[index];
+            if (entry_address(old) != entry_address(inherited)) return RISCV_SV39_STATUS_STATE;
+            if (!(old & RISCV_SV39_PTE_COW)) pending |= 1U << (index - first);
+        }
+        if (!pending) continue;
+
+        struct kernel_raw_guard guard __attribute__((cleanup(kernel_raw_scope_release))) = {0};
+        if (metadata) kernel_raw_rwlock_write_acquire(metadata, &guard);
+        for (unsigned slot = first; pending; pending >>= 1, slot++) {
+            if (!(pending & 1U)) continue;
+            enum riscv_sv39_status status = mark_cow_leaf(parent, &parent_entries[slot], 0);
+            if (status) return status;
+        }
+        *changed = 1;
+    }
+    return RISCV_SV39_STATUS_OK;
+}
+
+enum riscv_sv39_status riscv_sv39_user_space_fork_commit(
+    struct riscv_sv39_user_space *parent, const struct riscv_sv39_user_space *child,
+    struct kernel_raw_rwlock *metadata, int *changed)
+{
+    const unsigned root_limit = RISCV_SV39_USER_ROOT_ENTRIES;
+    const unsigned middle_limit = RISCV_SV39_INDEX_MASK + 1U;
+    const uint64_t *child_root = child->root_entries;
+    const uint64_t *parent_root = parent->root_entries;
+    if (!child->cow_pages) return RISCV_SV39_STATUS_OK;
+
+    for (unsigned r = next_table_entry(child_root, 0, root_limit);
+         r < root_limit; r = next_table_entry(child_root, r + 1, root_limit)) {
+        uint64_t *parent_middle, *child_middle;
+        if (!valid_nonleaf_entry(child_root[r]) || !valid_nonleaf_entry(parent_root[r]))
+            return RISCV_SV39_STATUS_STATE;
+        enum riscv_sv39_status status = resolve_runtime_table(parent->allocator,
+            entry_address(parent_root[r]), &parent_middle);
+        if (!status) status = resolve_runtime_table(child->allocator,
+            entry_address(child_root[r]), &child_middle);
+        if (status) return status;
+
+        for (unsigned m = next_table_entry(child_middle, 0, middle_limit);
+             m < middle_limit; m = next_table_entry(child_middle, m + 1, middle_limit)) {
+            uint64_t inherited = child_middle[m], old = parent_middle[m];
+            if (valid_nonleaf_entry(inherited)) {
+                uint64_t *parent_entries, *child_entries;
+                if (!valid_nonleaf_entry(old)) return RISCV_SV39_STATUS_STATE;
+                status = resolve_runtime_table(parent->allocator, entry_address(old), &parent_entries);
+                if (!status) status = resolve_runtime_table(child->allocator,
+                    entry_address(inherited), &child_entries);
+                if (!status) status = fork_commit_leaf_table(parent, parent_entries,
+                    child_entries, metadata, changed);
+                if (status) return status;
+                continue;
+            }
+            if (!(inherited & RISCV_SV39_PTE_COW)) continue;
+            if (entry_address(inherited) != entry_address(old)) return RISCV_SV39_STATUS_STATE;
+            if (old & RISCV_SV39_PTE_COW) continue;
+
+            struct kernel_raw_guard guard __attribute__((cleanup(kernel_raw_scope_release))) = {0};
+            if (metadata) kernel_raw_rwlock_write_acquire(metadata, &guard);
+            status = mark_cow_leaf(parent, &parent_middle[m], 9);
+            if (status) return status;
+            *changed = 1;
+        }
+    }
+    return RISCV_SV39_STATUS_OK;
+}
+
 enum riscv_sv39_status riscv_sv39_user_space_fork(
     struct riscv_sv39_user_space *destination, struct riscv_sv39_user_space *source,
     int (*fork_leaf)(void *, uint64_t), void *context)
 {
     enum riscv_sv39_status status = riscv_sv39_user_space_fork_prepare(
         destination, source, fork_leaf, context);
-    return status == RISCV_SV39_STATUS_OK ? commit_parent_cow(source, fork_leaf, context) : status;
+    if (status) return status;
+    int changed = 0;
+    status = riscv_sv39_user_space_fork_commit(source, destination, NULL, &changed);
+    if (!status) riscv_mmu_flush_all();
+    return status;
 }
 
 enum riscv_sv39_status riscv_sv39_user_space_move(

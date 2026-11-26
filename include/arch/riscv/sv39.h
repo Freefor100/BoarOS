@@ -217,11 +217,12 @@ enum riscv_sv39_status riscv_sv39_user_next_owned(
     struct riscv_sv39_user_space *, uint64_t *, uint64_t end, uint64_t *);
 enum riscv_sv39_status riscv_sv39_user_owned_snapshot(
     struct riscv_sv39_user_space *, uint64_t, uint64_t *, int *);
-/* Fork window starts on an inherited leaf of an unpublished child. Parent
- * metadata is held by the caller. Return the first address beyond the window. */
-enum riscv_sv39_status riscv_sv39_user_fork_commit_window(
-    struct riscv_sv39_user_space *, const struct riscv_sv39_user_space *, uint64_t, uint64_t *,
-    int (*)(void *, uint64_t), void *, int *changed);
+/* The caller keeps the parent page-table topology stable and owns the
+ * unpublished child. Commit takes the optional parent metadata lock in
+ * bounded windows. The caller completes TLB synchronization if changed. */
+enum riscv_sv39_status riscv_sv39_user_space_fork_commit(
+    struct riscv_sv39_user_space *, const struct riscv_sv39_user_space *,
+    struct kernel_raw_rwlock *metadata, int *changed);
 /* One base-leaf table. Transfer owned base-page references for returned
  * bits only, consuming the packed vector in increasing selected-bit order. */
 unsigned riscv_sv39_user_map_owned_window(struct riscv_sv39_user_space *, uint64_t,

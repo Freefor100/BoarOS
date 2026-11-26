@@ -2033,19 +2033,11 @@ static enum kernel_mm_status mm_fork_impl(
     if (backend_status == ARCH_MMU_STATUS_OK && long_pins)
         backend_status = fork_copy_long_pins(source_record, destination_record);
     if (backend_status == ARCH_MMU_STATUS_OK) {
-        uint64_t cursor = 0, address;
         int changed = 0;
-        /* Search sparse holes in the private child tree outside the parent
-         * lock, then update a bounded window from both leaf tables. */
-        while ((backend_status = arch_mmu_user_next_owned(&destination_record->space,
-            &cursor, ARCH_MMU_USER_LIMIT, &address)) == ARCH_MMU_STATUS_OK) {
-            KERNEL_RAW_WRITE_SCOPE(guard, &source_record->metadata);
-            if (arch_mmu_user_fork_commit_window(&source_record->space,
-                &destination_record->space, address, &cursor,
-                source_record->vmas ? fork_leaf_action : NULL, &policy, &changed))
-                __builtin_trap();
-        }
-        if (backend_status != ARCH_MMU_STATUS_NOT_MAPPED) __builtin_trap();
+        if (arch_mmu_user_space_fork_commit(&source_record->space,
+            &destination_record->space, &source_record->metadata,
+            source_record->vmas ? fork_leaf_action : NULL, &policy, &changed))
+            __builtin_trap();
         if (changed) {
             struct kernel_mm_retirement batch = {0};
             uint32_t targets;
@@ -2055,7 +2047,6 @@ static enum kernel_mm_status mm_fork_impl(
             }
             finish_tlb_change(source_record, &batch, targets, 0, UINT64_MAX, 0);
         }
-        backend_status = ARCH_MMU_STATUS_OK;
     }
     if (backend_status == ARCH_MMU_STATUS_OK) {
         for (struct mm_file_resident *page = destination_record->file_residents;

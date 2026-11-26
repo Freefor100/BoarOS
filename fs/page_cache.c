@@ -1043,10 +1043,13 @@ static int drain_entries(struct kernel_page_cache *cache,
 }
 
 #if BOAROS_PAGE_CACHE_DIRTY_AGE
-static uint64_t dirty_deadline(void)
+#define DIRTY_DATA_EXPIRE_NS UINT64_C(30000000000)
+#define DIRTY_DATA_RETRY_NS UINT64_C(5000000000)
+
+static uint64_t dirty_deadline_after(uint64_t delay)
 {
-    const uint64_t age=UINT64_C(5000000000),now=kernel_time_monotonic_ns();
-    return now>UINT64_MAX-age?UINT64_MAX:now+age;
+    uint64_t now=kernel_time_monotonic_ns();
+    return now>UINT64_MAX-delay?UINT64_MAX:now+delay;
 }
 #endif
 /* The inode queue borrows its dirty entries. One offset tree replaces the
@@ -1103,7 +1106,9 @@ static inline bool dirty_mark_entry(struct kernel_page_cache_entry *entry,
         if (!dirty->count) {
             if (!RB_EMPTY(&dirty->tree) || dirty->queue_next || dirty->queue_previous) __builtin_trap();
 #if BOAROS_PAGE_CACHE_DIRTY_AGE
-            dirty->expiry=dirty_deadline();
+            /* Give ordinary buffered data time to coalesce or be discarded.
+             * Pressure and explicit sync can select it before this deadline. */
+            dirty->expiry=dirty_deadline_after(DIRTY_DATA_EXPIRE_NS);
             if (!r->dirty_head) {
                 r->dirty_deadline=dirty->expiry;
                 if (r->started && !r->stopping) cache_wake(&r->work);
@@ -4478,6 +4483,7 @@ struct range_writeback {
     struct range_writeback *next;
     struct foreground_writeback window;
     uint64_t first, sequence;
+    bool collect;
 };
 
 static bool can_writeback_mapped(struct kernel_page_cache_entry *entry, uint64_t limit)
@@ -4926,6 +4932,7 @@ int kernel_page_cache_submit_range(struct kernel_page_cache *cache,
                     .mapped_candidate = node->instance->ops->writeback_mapped != NULL,
                 };
                 request->first = first;
+                request->collect = collect;
                 request->sequence = ++record->range_sequence;
                 if (!request->sequence) __builtin_trap();
                 bool starts_queue = !record->range_head;
@@ -5090,6 +5097,107 @@ static struct range_writeback *run_mapped_range_batch(struct kernel_page_cache *
     return last;
 }
 
+static int complete_range_batch(const struct kernel_vfs_data_range *ranges, unsigned count)
+{
+    struct kernel_vfs_instance *instance = ranges[0].node->instance;
+    if (count < 2 || !instance->ops->complete_data_batch) return -KERNEL_EOPNOTSUPP;
+    struct kernel_lock_guard guards[SMALL_FILE_WRITEBACK_MAX] = {0};
+    unsigned order[SMALL_FILE_WRITEBACK_MAX];
+    for (unsigned i = 0; i < count; i++) {
+        unsigned j = i;
+        while (j && ranges[order[j - 1]].node->io_lock.key > ranges[i].node->io_lock.key) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = i;
+    }
+    unsigned locked = 0;
+    for (; locked < count; locked++)
+        if (!kernel_vfs_node_try_read(ranges[order[locked]].node, &guards[locked])) break;
+    int result = locked == count ? instance->ops->complete_data_batch(ranges, count) : -KERNEL_EOPNOTSUPP;
+    while (locked) kernel_lock_release(&guards[--locked]);
+    return result;
+}
+
+static bool writeback_range_window(struct range_writeback *request,
+    struct kernel_vfs_data_range *range)
+{
+    struct foreground_writeback *window = &request->window;
+    uint64_t first = window->cursor;
+    writeback_window(window);
+    if (window->result || window->mapped_candidate || window->cursor == first) return false;
+    uint64_t end = window->cursor << BOAROS_PAGE_SHIFT;
+    if (end > window->end) end = window->end;
+    *range = (struct kernel_vfs_data_range){window->node, first << BOAROS_PAGE_SHIFT, end};
+    return true;
+}
+
+static void report_range_window_error(struct range_writeback *request)
+{
+    /* Only failures before backend submission need a completion error here. */
+    if (request->window.result == -KERNEL_ENOMEM || request->window.result == -KERNEL_EBUSY)
+        kernel_vfs_record_writeback_error(request->window.node, request->window.result);
+}
+
+static bool run_queued_range_batch(struct kernel_page_cache *cache, struct range_writeback *first)
+{
+    struct kernel_vfs_instance *instance = first->window.node->instance;
+    if (!first->collect || !instance->ops->complete_data_batch || instance->namespace_parallel)
+        return false;
+    struct range_writeback *items[SMALL_FILE_WRITEBACK_MAX];
+    struct kernel_vfs_data_range ranges[SMALL_FILE_WRITEBACK_MAX];
+    struct range_writeback *owners[SMALL_FILE_WRITEBACK_MAX];
+    unsigned count = 0;
+    size_t pages = 0;
+    {
+        CACHE_SCOPE(select, cache);
+        for (struct range_writeback *item = first; item && count < SMALL_FILE_WRITEBACK_MAX;
+             item = item->next) {
+            if (!item->collect || item->window.node->instance != instance) break;
+            uint64_t windows = item->window.last - item->window.cursor + 1;
+            if (windows > cache->record->writeback_capacity - pages) break;
+            unsigned i = 0;
+            while (i < count && items[i]->window.node != item->window.node) i++;
+            if (i < count) break;
+            items[count++] = item;
+            pages += windows;
+        }
+    }
+    if (count < 2) return false;
+
+    /* Cache acceptance and home data completion are distinct. Leave every
+     * accepted request visible to matching range waiters until device I/O. */
+    unsigned processed = 0, ready = 0;
+    while (processed < count) {
+        struct range_writeback *item = items[processed++];
+        if (writeback_range_window(item, &ranges[ready])) owners[ready++] = item;
+        report_range_window_error(item);
+        if (!item->window.done) break;
+    }
+    if (ready) {
+        int batch_result = complete_range_batch(ranges, ready);
+        for (unsigned i = 0; i < ready; i++) {
+            struct kernel_vfs_data_range *range = &ranges[i];
+            int result = batch_result;
+            if (result == -KERNEL_EOPNOTSUPP)
+                result = kernel_vfs_node_complete_data_range(range->node, range->start, range->end);
+            else if (result) kernel_vfs_record_writeback_error(range->node, result);
+            if (result) {
+                owners[i]->window.result = result;
+                owners[i]->window.done = 1;
+            }
+        }
+    }
+    if (!items[processed - 1]->window.done) {
+        struct range_writeback *partial = items[--processed];
+        CACHE_SCOPE(progress, cache);
+        partial->first = partial->window.cursor;
+        if (!processed) cache_wake(&cache->record->range_progress);
+    }
+    if (processed) retire_range_requests(cache, first, items[processed - 1], processed);
+    return true;
+}
+
 static bool run_small_range_batch(struct kernel_page_cache *cache, struct range_writeback *first)
 {
     struct kernel_vfs_instance *instance=first->window.node->instance;
@@ -5148,13 +5256,13 @@ static void run_range_writeback(struct kernel_page_cache *cache,
             io->background_reclaim = previous;
             return;
         }
-        uint64_t first = request->window.cursor;
-        writeback_window(&request->window);
-        if (!request->window.result && !request->window.mapped_candidate && request->window.cursor > first) {
-            uint64_t end = request->window.cursor << BOAROS_PAGE_SHIFT;
-            if (end > request->window.end) end = request->window.end;
-            request->window.result = kernel_vfs_node_complete_data_range(request->window.node,
-                first << BOAROS_PAGE_SHIFT, end);
+        if (run_queued_range_batch(cache, request)) {
+            io->background_reclaim = previous;
+            return;
+        }
+        struct kernel_vfs_data_range range;
+        if (writeback_range_window(request, &range)) {
+            request->window.result = kernel_vfs_node_complete_data_range(range.node, range.start, range.end);
             if (request->window.result) request->window.done = 1;
         }
         io->background_reclaim = previous;
@@ -5719,7 +5827,7 @@ static void cache_background(struct kernel_page_cache *cache)
                 r->expire_through=0;
                 r->dirty_deadline=!r->dirty_head?0:r->dirty_head->expiry;
                 if (r->dirty_deadline && r->dirty_deadline<=expire_through)
-                    r->dirty_deadline=dirty_deadline();
+                    r->dirty_deadline=dirty_deadline_after(DIRTY_DATA_RETRY_NS);
             }
 #endif
         }

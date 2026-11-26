@@ -39,9 +39,19 @@ if [ "${JOURNAL_TEST_CASE:-}" = direct-ordered ]; then
         truncate -s 32M "$work/direct-base.img"
         mkfs.ext4 -q -F -b "$block" "$work/direct-base.img"
         debugfs -w -R "write $work/data /probe" "$work/direct-base.img" >/dev/null 2>&1
+        debugfs -w -R "write $work/data /outside" "$work/direct-base.img" >/dev/null 2>&1
+        debugfs -w -R "write $work/data /again" "$work/direct-base.img" >/dev/null 2>&1
         for fault in 0 1 2 3; do
             cp "$work/direct-base.img" "$work/direct.img"
             timeout 30 "$work/probe" "$work/direct.img" direct-ordered "$fault"
+            if [ "$fault" -ne 0 ]; then
+                timeout 30 "$work/probe" "$work/direct.img" recover-crash 79
+            fi
+            e2fsck -fn "$work/direct.img" > "$work/direct-fsck.log" 2>&1 || { cat "$work/direct-fsck.log"; exit 1; }
+        done
+        for fault in 0 1 2; do
+            cp "$work/direct-base.img" "$work/direct.img"
+            timeout 30 "$work/probe" "$work/direct.img" ordered-range-batch "$fault"
             if [ "$fault" -ne 0 ]; then
                 timeout 30 "$work/probe" "$work/direct.img" recover-crash 79
             fi

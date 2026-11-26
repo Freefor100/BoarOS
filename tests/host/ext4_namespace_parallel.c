@@ -16,6 +16,7 @@ static uint32_t directory_inode_watch;
 static unsigned directory_inode_reads,directory_inode_reject;
 static unsigned directory_name_lookups,directory_name_error;
 static unsigned borrowed_path_watch,borrowed_path_state_locks;
+static _Thread_local unsigned create_path_watch,create_path_allocations;
 struct shared_name_walk {
     const char *name;
     struct kernel_vfs_path *root,*found;
@@ -60,7 +61,19 @@ enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *,
 enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *heap,size_t n,size_t size,void **out)
 {
     if (stat_lookup_watch)stat_lookup_allocations++;
+    if (create_path_watch && n==1 && size==sizeof(struct kernel_vfs_path))
+        create_path_allocations++;
     return __real_kernel_heap_allocate_zeroed(heap,n,size,out);
+}
+int __real_ext4_create_regular_missing(const ext4_file *,const char *,uint32_t,uint32_t,
+    uint32_t,ext4_file *,struct ext4_inode *);
+int __wrap_ext4_create_regular_missing(const ext4_file *parent,const char *name,uint32_t mode,
+    uint32_t uid,uint32_t gid,ext4_file *file,struct ext4_inode *initial)
+{
+    /* Measure only the resolver, before journal records and the child path
+     * can allocate objects of the same size. */
+    create_path_watch=0;
+    return __real_ext4_create_regular_missing(parent,name,mode,uid,gid,file,initial);
 }
 void __real_kernel_rwlock_read(struct kernel_rwlock *,struct kernel_lock_guard *);
 void __wrap_kernel_rwlock_read(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
@@ -201,6 +214,13 @@ static void directory_reuse_case(struct kernel_vfs_path *root)
         assert(kernel_vfs_file_inode(&f)==before.ino);
         assert(!kernel_vfs_close(&f));
     }
+    create_path_watch=1;create_path_allocations=0;
+    assert(!kernel_vfs_create_at(root,root,"reuse-parent/child/created",0600,&f,0));
+    assert(!create_path_watch);
+    printf("nested create resolver path allocations=%u\n",create_path_allocations);
+    assert(!create_path_allocations);
+    assert(!kernel_vfs_close(&f));
+    assert(!kernel_vfs_unlink_at(root,root,"reuse-parent/child/created",0));
     stat_lookup_watch=1;stat_lookup_reads=stat_lookup_opens=stat_lookup_io_locks=stat_lookup_allocations=0;
     for(unsigned i=0;i<32;i++) {
         assert(!kernel_vfs_stat_at(root,root,"reuse-parent/child/file",1,&after));
