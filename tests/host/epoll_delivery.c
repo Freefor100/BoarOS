@@ -168,6 +168,12 @@ uint32_t kernel_open_file_poll(struct kernel_open_file_description *f,uint32_t r
     if(socket) { CHECK(scopes[actor]);kernel_socket_protocol_leave(&scope); }
     return result;
 }
+struct kernel_wait_queue *kernel_socket_wait_queue(struct kernel_socket *socket)
+{
+    if (socket==(void *)&targets[0]) return &target_wait[0];
+    CHECK(socket==(void *)&targets[1]);
+    return &target_wait[1];
+}
 uint64_t kernel_time_monotonic_ns(void) { return 1; }
 uint64_t kernel_time_select_deadline(const struct kernel_task *task,uint64_t deadline)
 { (void)task;return deadline; }
@@ -243,7 +249,7 @@ static void setup(uint32_t mode)
     CHECK(!allocations); memset(&files,0,sizeof(files));files.heap=&heap;
     epfile=(struct kernel_open_file_description){.kind=KERNEL_OPEN_FILE_KIND_EPOLL,.references=1};
     CHECK(!kernel_epoll_create(&heap,&epfile.epoll));epfile.epoll->file=&epfile;fds[0]=&epfile;
-    for(unsigned i=0;i<2;i++) { targets[i]=(struct kernel_open_file_description){.kind=KERNEL_OPEN_FILE_KIND_PIPE,.references=1};
+    for(unsigned i=0;i<2;i++) { targets[i]=(struct kernel_open_file_description){.kind=KERNEL_OPEN_FILE_KIND_PIPE,.references=1,.socket=(void *)&targets[i]};
         fds[i+1]=&targets[i];kernel_wait_queue_init(&target_wait[i]); }
     copy_remaining=SIZE_MAX;control(KERNEL_EPOLL_CTL_ADD,mode,42);
 }
@@ -541,8 +547,26 @@ static void pollfree_during_delete(void)
     puts("PASS epoll DEL detaches before a POLLFREE cursor releases its source");
 }
 
+static void socket_registration(void)
+{
+    setup(KERNEL_EPOLLET);
+    control(KERNEL_EPOLL_CTL_DEL,0,0);
+    targets[0].kind=KERNEL_OPEN_FILE_KIND_SOCKET;
+    targets[0].socket=(void *)&targets[0];
+    unsigned before=poll_calls;
+    poll_notification=1;
+    control(KERNEL_EPOLL_CTL_ADD,KERNEL_EPOLLET,81);
+    CHECK(poll_calls==before+1 && target_wait[0].head);
+    struct linux_epoll_event event;
+    CHECK(wait_events(&event,1)==1 && event.data==81);
+    CHECK(!wait_events(&event,1));
+    teardown();
+    puts("PASS epoll socket ADD registers before a single readiness query");
+}
+
 int main(int argc, char **argv)
 {
+    socket_registration();
     pollfree_during_delete();
     retiring_target();
     setup(0);struct linux_epoll_event local_event;unsigned services=service_entries;
