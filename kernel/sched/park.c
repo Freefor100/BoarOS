@@ -310,7 +310,7 @@ static int notify_locked(const struct kernel_wait_token *token,uint32_t reason,
     if (kernel_wait_state_generation(state)!=token->generation) return 0;
     unsigned phase=(unsigned)(state&3U);
 #else
-    if (!matches(token)) return 0;
+    if (record->generation!=token->generation) return 0;
     unsigned phase=record->phase;
 #endif
     if (phase==KERNEL_WAIT_FINISHED || phase==KERNEL_WAIT_NOTIFIED) return 0;
@@ -550,7 +550,7 @@ int kernel_wait_notification_prepare(struct kernel_wait_queue *queue,
     KERNEL_IRQ_LOCK_SCOPE(guard, &queue->lock);
     struct kernel_wait_node *node = queue->head;
     if (node && node == queue->tail && node->task && node->generation &&
-        !node->callback && !node->event_mask && event_accepts(node, event, NULL)) {
+        !node->callback && !node->event_mask && readiness_accepts(node, event)) {
         queue_shape(queue);
         if (node->borrow_owner != queue) __builtin_trap();
         notification->token = (struct kernel_wait_token){node->task, node->generation};
@@ -671,7 +671,9 @@ static void cursor_wake_reason(struct kernel_wait_cursor *cursor,int all,uint32_
             kernel_preempt_disable();callback(node,reason,cursor->event);kernel_preempt_enable();
             notified=1;
         }
-        if (notified && !all) break;
+        /* A borrowed node keeps its sequence until returned. Registrations
+         * after this snapshot cannot follow its last captured node. */
+        if ((notified && !all) || node->sequence==cursor->sequence) break;
         kernel_wait_cursor_advance(cursor);
     }
     kernel_wait_cursor_end(cursor);

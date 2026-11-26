@@ -5,6 +5,7 @@ set -eu
 project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 kernel=${BLOCK_TEST_KERNEL_RV:-"$project_root/build/riscv/tests/kernel-block-rv"}
 qemu=${QEMU_RISCV64:-qemu-system-riscv64}
+indirect=${BLOCK_TEST_INDIRECT:-on}
 output_dir=$(mktemp -d)
 output="$output_dir/block.log"
 disk="$output_dir/block.img"
@@ -59,7 +60,7 @@ run_case()
     fi
     set -- "$@" \
         -drive file="$disk_rw",if=none,format=raw,readonly=off,cache="$cache",id=x0 \
-        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0,config-wce=off \
+        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0,config-wce=off,indirect_desc="$indirect" \
         -drive file="$disk_ro",if=none,format=raw,readonly=on,id=x1 \
         -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
     if ! timeout -k 2s 10s "$@" </dev/null >"$output" 2>&1; then
@@ -75,6 +76,15 @@ run_case()
     if [ "$(grep -cxF 'BoarOS: block 128KiB discrete SG read/write passed' "$output" || true)" -ne 1 ]; then
         show_output
         echo "$mode VirtIO block test did not verify the 128KiB discrete SG payload" >&2
+        exit 1
+    fi
+    case $indirect in
+        on) phase_result='BoarOS: block 160KiB phase passed in one indirect request' ;;
+        off) phase_result='BoarOS: block 160KiB phase passed in two direct requests' ;;
+    esac
+    if ! grep -qxF "$phase_result" "$output"; then
+        show_output
+        echo "$mode VirtIO block test did not verify the 160KiB write phase with indirect_desc=$indirect" >&2
         exit 1
     fi
     if ! grep -qxF 'BoarOS: MBR primary partition I/O and owners passed' "$output"; then
@@ -99,6 +109,10 @@ run_case()
     fi
 }
 
+case $indirect in
+    on|off) ;;
+    *) echo 'invalid BLOCK_TEST_INDIRECT' >&2; exit 2 ;;
+esac
 case ${BLOCK_TEST_TRANSPORT:-all} in
     all) transports='legacy modern' ;;
     legacy|modern) transports=$BLOCK_TEST_TRANSPORT ;;

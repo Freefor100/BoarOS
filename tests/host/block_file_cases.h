@@ -137,9 +137,9 @@ static enum kernel_block_status phase_flush(void *context)
     __atomic_store_n(&phase_flush_done,1,__ATOMIC_RELEASE);return 0;
 }
 static enum kernel_block_status phase_write_stream(void *context,kernel_block_phase_next_fn next,
-    const void *owner,const void *cursor)
+    const void *owner,const void *cursor,int unordered)
 {
-    (void)context;struct kernel_block_span span;size_t size=0;
+    (void)context;(void)unordered;struct kernel_block_span span;size_t size=0;
     while (next(owner,&cursor,&span)) {memcpy(phase_disk+span.offset,span.buffer,span.size);size+=span.size;}
     assert(size==sizeof(phase_source));phase_calls++;
     if (phase_calls==1) {

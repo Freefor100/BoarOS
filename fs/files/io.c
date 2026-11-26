@@ -1688,12 +1688,10 @@ static enum kernel_files_status buffered_write_request(
 }
 
 static enum kernel_files_status unix_write_request(struct kernel_files *files, struct kernel_mm *mm,
-    struct kernel_open_file_description *description,
+    struct kernel_open_file_description *description, struct kernel_socket *socket,
     const struct kernel_uaccess_iovec *iov, size_t iov_count, uint64_t count,
     uint32_t flags, int64_t *linux_result, struct kernel_socket_message *socket_message)
 {
-    struct kernel_open_file_description *borrowed=description;
-    struct kernel_socket *socket=kernel_open_file_socket(description);
     struct kernel_uaccess_iov_cursor cursor={iov,iov_count,0,0};
     uint64_t total=0,target=0,timeout=(flags & KERNEL_SOCKET_MSG_DONTWAIT)?0:kernel_socket_send_timeout(socket);
     if (timeout) {
@@ -1706,14 +1704,14 @@ static enum kernel_files_status unix_write_request(struct kernel_files *files, s
             flags|KERNEL_SOCKET_MSG_DONTWAIT,&fault, socket_message);
         if (result==-KERNEL_EAGAIN && !(flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
             uint64_t now=target?kernel_time_monotonic_ns():0;
-            result=target && now>=target?-KERNEL_EAGAIN:kernel_socket_wait_ready(kernel_open_file_socket(borrowed),
+            result=target && now>=target?-KERNEL_EAGAIN:kernel_socket_wait_ready(socket,
                 KERNEL_POLLOUT,target,flags);
             if (!result) continue;
             if (total && result==-KERNEL_ERESTARTSYS)
                 kernel_signal_clear_syscall_restart(kernel_task_current());
         }
         if (result<0) {
-            if (!total && result==-KERNEL_EPIPE && kernel_socket_is_stream(kernel_open_file_socket(borrowed)) &&
+            if (!total && result==-KERNEL_EPIPE && kernel_socket_is_stream(socket) &&
                 !(flags&KERNEL_SOCKET_MSG_NOSIGNAL))
                 (void)kernel_signal_send_task(kernel_task_current(),13U,0);
             *linux_result=total?(int64_t)total:result;
@@ -1980,6 +1978,34 @@ static __attribute__((noinline)) enum kernel_files_status non_socket_write_reque
     return status;
 }
 
+static enum kernel_files_status write_socket_pinned(
+    struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description *description, struct kernel_socket *socket,
+    const struct kernel_uaccess_iovec *iov, size_t iov_count, uint64_t count,
+    uint32_t flags, int64_t *linux_result, struct kernel_socket_message *message)
+{
+    /* Snapshot blocking mode once while the description is pinned. */
+    if (!(flags & KERNEL_SOCKET_MSG_DONTWAIT) &&
+        (kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK))
+        flags |= KERNEL_SOCKET_MSG_DONTWAIT;
+    int preserves_messages=kernel_socket_preserves_messages(socket);
+    COST_SCOPE(write_cost, OPERATION_TICKS);
+    COST_IO_SCOPE(io_cost, preserves_messages ? 2 : 1);
+    COST_IO_ADD(0, 1); COST_IO_ADD(1, count);
+    enum kernel_files_status status=KERNEL_FILES_STATUS_OK;
+    if (preserves_messages)
+        *linux_result=kernel_socket_write_datagram(&description,mm,iov,iov_count,
+            count,flags,0,message);
+    else if (kernel_socket_is_tcp(socket))
+        status=tcp_write_request(files,mm,description,iov,iov_count,count,flags,linux_result);
+    else
+        status=unix_write_request(files,mm,description,socket,iov,iov_count,count,
+            flags,linux_result,message);
+    if (status==KERNEL_FILES_STATUS_OK)
+        COST_IO_ADD(2, *linux_result>0 ? (uint64_t)*linux_result : 0);
+    return status;
+}
+
 static enum kernel_files_status write_request(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description,
@@ -1989,6 +2015,12 @@ static enum kernel_files_status write_request(
 {
     if(description->device && !description->device->write && !description->device->writev){
         *linux_result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;
+    }
+    const enum kernel_open_file_kind kind = description->kind;
+    if (kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
+        if (rwf&KERNEL_RWF_NOSIGNAL) socket_flags|=KERNEL_SOCKET_MSG_NOSIGNAL;
+        return write_socket_pinned(files,mm,description,kernel_open_file_socket(description),
+            iov,iov_count,count,socket_flags,linux_result,socket_message);
     }
     struct write_options options={.flags=kernel_open_file_flags(description),
         .no_signal=!!(rwf&KERNEL_RWF_NOSIGNAL)};
@@ -2005,8 +2037,6 @@ static enum kernel_files_status write_request(
         }
         return status;
     }
-    if (options.no_signal) socket_flags|=KERNEL_SOCKET_MSG_NOSIGNAL;
-    const enum kernel_open_file_kind kind = description->kind;
     if(kind==KERNEL_OPEN_FILE_KIND_MQUEUE){
         *linux_result=kernel_open_file_writable(description)?-KERNEL_EINVAL:-KERNEL_EBADF;
         return KERNEL_FILES_STATUS_OK;
@@ -2018,16 +2048,10 @@ static enum kernel_files_status write_request(
         *linux_result=kernel_event_fd_io(description,mm,iov,iov_count,count,1);
         return KERNEL_FILES_STATUS_OK;
     }
-    /* 固定本次调用的等待资格；后续fcntl只影响下一次读写。 */
-    if (kind == KERNEL_OPEN_FILE_KIND_SOCKET &&
-        (options.flags & KERNEL_FILES_O_NONBLOCK))
-        socket_flags |= KERNEL_SOCKET_MSG_DONTWAIT;
     KERNEL_SERVICE_SCOPE_IF(service, !(description->device && description->device->stateless_io) &&
-        kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE);
+        kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_PIPE);
     COST_SCOPE(write_cost, OPERATION_TICKS);
-    COST_IO_SCOPE(io_cost,
-        kernel_socket_preserves_messages(kernel_open_file_socket(description)) ? 2 :
-        kind == KERNEL_OPEN_FILE_KIND_REGULAR ? 0 : kind == KERNEL_OPEN_FILE_KIND_SOCKET ? 1 : 3);
+    COST_IO_SCOPE(io_cost, kind == KERNEL_OPEN_FILE_KIND_REGULAR ? 0 : 3);
     COST_IO_ADD(0, 1); COST_IO_ADD(1, count);
     if (description->device && description->device->discard_writes) {
         size_t consumed=0;
@@ -2052,23 +2076,6 @@ static enum kernel_files_status write_request(
         COST_IO_ADD(2,*linux_result>0?(uint64_t)*linux_result:0);
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_socket_preserves_messages(kernel_open_file_socket(description))) {
-        *linux_result = kernel_socket_write_datagram(&description, mm, iov,
-            iov_count, count, socket_flags, 0, socket_message);
-        COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);
-        return KERNEL_FILES_STATUS_OK;
-    }
-    if (kernel_socket_is_tcp(kernel_open_file_socket(description))) {
-        enum kernel_files_status status = tcp_write_request(files, mm, description,
-            iov, iov_count, count, socket_flags, linux_result);
-        if (status == KERNEL_FILES_STATUS_OK) COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);
-        return status;
-    }
-    if (kind==KERNEL_OPEN_FILE_KIND_SOCKET) {
-        enum kernel_files_status status=unix_write_request(files,mm,description,iov,iov_count,count,socket_flags,linux_result, socket_message);
-        if (status==KERNEL_FILES_STATUS_OK) COST_IO_ADD(2,*linux_result>0?(uint64_t)*linux_result:0);
-        return status;
-    }
     enum kernel_files_status status=non_socket_write_request(files,mm,description,
         iov,iov_count,count,positioned,requested_offset,linux_result,borrowed,&options);
     return status;
@@ -2088,7 +2095,8 @@ enum kernel_files_status kernel_files_socket_iov_io(
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
     if (writing) {
         KERNEL_FILES_NOTE(files, write_calls, 1);
-        enum kernel_files_status status = write_request(files, mm, *owner, iov, iov_count, count, 0, 0, linux_result, flags,NULL, socket_message,0);
+        enum kernel_files_status status = write_socket_pinned(files, mm, *owner, socket,
+            iov, iov_count, count, flags, linux_result, socket_message);
         if (status == KERNEL_FILES_STATUS_OK) {
             if (*linux_result >= 0) KERNEL_FILES_NOTE(files, bytes_written, (uint64_t)*linux_result);
             else KERNEL_FILES_NOTE(files, write_failures, 1);

@@ -586,6 +586,7 @@ PAGE_TEST_OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(PAGE_TEST_C_SOURCES))
 BLOCK_TEST_C_SOURCES := \
 	kernel/dtb.c \
+	net/ethernet.c \
 	tests/riscv/block_main.c
 BLOCK_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \

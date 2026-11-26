@@ -52,6 +52,9 @@ struct virtio_block_statistics {
 #define VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES 2048U
 #define VIRTIO_BLOCK_BATCH_POOL_PAGES \
     ((VIRTIO_BLOCK_REQUEST_SLOTS * VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES + BOAROS_PAGE_SIZE - 1U) / BOAROS_PAGE_SIZE)
+#define VIRTIO_BLOCK_INDIRECT_TABLE_BYTES (VIRTIO_SPLIT_MAX_SIZE * 16U)
+#define VIRTIO_BLOCK_INDIRECT_POOL_PAGES \
+    ((VIRTIO_BLOCK_REQUEST_SLOTS * VIRTIO_BLOCK_INDIRECT_TABLE_BYTES + BOAROS_PAGE_SIZE - 1U) / BOAROS_PAGE_SIZE)
 
 struct virtio_block_device {
     struct kernel_block_device block;
@@ -64,6 +67,8 @@ struct virtio_block_device {
     uint16_t queue_size;
     uint64_t batch_physical[VIRTIO_BLOCK_BATCH_POOL_PAGES];
     void *batch_memory[VIRTIO_BLOCK_BATCH_POOL_PAGES];
+    uint64_t indirect_physical[VIRTIO_BLOCK_INDIRECT_POOL_PAGES];
+    void *indirect_memory[VIRTIO_BLOCK_INDIRECT_POOL_PAGES];
     unsigned batch_claimed, free_slots;
     struct kernel_raw_lock metadata;
     struct virtio_split_queue queue;
@@ -71,7 +76,7 @@ struct virtio_block_device {
     uint32_t queue_allocation_order;
     uint32_t state;
     uint32_t read_only;
-    uint32_t max_segment_size, max_segments;
+    uint32_t max_segment_size, max_segments, max_phase_segments;
     uint32_t irq_source, active, barrier_waiters, barrier;
 #if BOAROS_COST_DIAGNOSTICS
     uint64_t statistics_start, statistics_last;

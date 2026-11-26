@@ -50,6 +50,8 @@ extern "C" {
 #include <common/file_io.h>
 
 #define EXT4_BLOCK_BATCH_MAX 32U
+#define EXT4_WRITE_BATCH_BYTES (128U * 1024U)
+#define EXT4_WRITE_PHASE_SPANS 128U
 #define EXT4_CACHED_READ_BATCH 1
 /* Physical byte ranges embedded in stable journal owners. The journal builds
  * a disjoint phase before dropping its modification lock. */
@@ -90,6 +92,8 @@ struct ext4_blockdev_iface {
 		const struct kernel_block_span *spans, unsigned count);
 	int (*bwrite_phase)(struct ext4_blockdev *bdev,
 		const struct ext4_block_write *first);
+	/* Larger disjoint write arrays use the same phase transport. */
+	uint32_t write_phase_bytes;
 
 	/**@brief   Close device function.
 	 * @param   bdev block device.*/
@@ -195,12 +199,15 @@ int ext4_block_init(struct ext4_blockdev *bdev);
 int ext4_blockdev_flush(struct ext4_blockdev *bdev);
 int ext4_blocks_set_phase(struct ext4_blockdev *bdev,
 	const struct ext4_block_write *first);
-/* At most EXT4_BLOCK_BATCH_MAX disjoint whole-block byte ranges relative to the
+/* Disjoint whole-block byte ranges relative to the
  * filesystem. Borrows caller storage; all offsets are restored before return. */
 int ext4_blocks_check_batch(struct ext4_blockdev *bdev,
     const struct kernel_block_span *spans,unsigned count);
 int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
 	struct kernel_block_span *spans, unsigned count);
+/* The caller checked this exact array before preparing the device write. */
+int ext4_blocks_submit_batch(struct ext4_blockdev *bdev,
+    struct kernel_block_span *spans, unsigned count);
 
 /**@brief   Binds a bcache to block device.
  * @param   bdev block device descriptor

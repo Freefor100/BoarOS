@@ -39,7 +39,7 @@ enum virtio_status virtio_split_stage(struct virtio_split_queue *q,struct virtio
         if(d.flags&~(VIRTIO_DESC_NEXT|VIRTIO_DESC_WRITE|VIRTIO_DESC_INDIRECT))return VIRTIO_STATE;
         mask|=UINT64_C(1)<<index;
         if(d.flags&VIRTIO_DESC_INDIRECT) {
-            if(!(t->features&(UINT64_C(1)<<28)))return VIRTIO_UNSUPPORTED;
+            if(!(t->features&VIRTIO_FEATURE_INDIRECT_DESC))return VIRTIO_UNSUPPORTED;
             if(index!=head || d.flags!=VIRTIO_DESC_INDIRECT || (d.address&15) || !d.length || (d.length&15))return VIRTIO_STATE;
             break;
         }

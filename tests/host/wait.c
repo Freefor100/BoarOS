@@ -802,6 +802,36 @@ static unsigned event_calls[2];
 static uint64_t observed_event;
 static void event_callback(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
 { assert(reason==KERNEL_WAIT_WOKEN);observed_event=event;(*(unsigned *)node->context)++; }
+static void singleton_callback_wake(void)
+{
+    struct kernel_wait_queue queue;
+    struct kernel_wait_node node;
+    struct kernel_wait_notification notification;
+    struct kernel_task late={0};
+    unsigned called=0;
+    kernel_wait_queue_init(&queue);
+    kernel_wait_node_init_callback(&node,event_callback,&called);
+    kernel_wait_queue_add(&queue,&node);
+    kernel_wait_record_init(&late.wait);
+    late.wait.on_cpu=1;
+    kernel_wait_node_init(&late.node,&late);
+    assert(kernel_wait_notification_prepare(&queue,&notification,1));
+
+    measured_wake_queue=&queue;
+    wake_queue_acquisitions=0;
+    register_during_wake=&late;
+    kernel_wait_notification_wake(&notification);
+    /* Callback lookup, the later registration, and returning the cursor. */
+    assert(wake_queue_acquisitions==3);
+    assert(called==1 && observed_event==1 && !queue.borrows && !node.references);
+    assert(kernel_wait_record_phase(&late.wait)==KERNEL_WAIT_PREPARED);
+    measured_wake_queue=0;
+    selected_task=&late;
+    assert(!kernel_wait_finish(&late_wake_token));
+    selected_task=0;
+    assert(!kernel_wait_node_remove_sync(&node));
+    assert(!kernel_wait_queue_close(&queue) && !kernel_wait_queue_destroy(&queue));
+}
 static void event_filtering(void)
 {
     struct kernel_wait_queue queue;kernel_wait_queue_init(&queue);
@@ -1204,6 +1234,7 @@ int main(void)
     retired_cursor_batches();
     close_lifetime();
     pollfree_lifetime();
+    singleton_callback_wake();
     event_filtering();
     finish_waits_for_cursor_before_storage_reuse();
     if (BOAROS_MAX_CPUS>1) committed_segments();

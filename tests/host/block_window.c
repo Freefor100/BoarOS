@@ -19,9 +19,9 @@ static int next(const void *context,const void **cursor,struct kernel_block_span
     (void)context;if (!*cursor)return 0;*span=*(const struct kernel_block_span *)*cursor;*cursor=0;return 1;
 }
 static enum kernel_block_status write_phase(void *context,kernel_block_phase_next_fn produce,
-    const void *owner,const void *first)
+    const void *owner,const void *first,int unordered)
 {
-    (void)context;const void *cursor=first;struct kernel_block_span span;size_t total=0;
+    (void)context;(void)unordered;const void *cursor=first;struct kernel_block_span span;size_t total=0;
     while (produce(owner,&cursor,&span))total+=span.size;
     assert(total==sizeof(bytes));
     ++calls;

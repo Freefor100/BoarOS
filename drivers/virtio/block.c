@@ -33,6 +33,7 @@
 #define VIRTIO_BLOCK_STATUS_OK 0U
 #define VIRTIO_BLOCK_STATUS_IO_ERROR 1U
 #define VIRTIO_BLOCK_TRANSFER_BYTES (128U * 1024U)
+#define VIRTIO_BLOCK_PHASE_BYTES (512U * 1024U)
 #define VIRTIO_BLOCK_STATUS_UNSUPPORTED 2U
 #define VIRTIO_BLOCK_SECTOR_SIZE 512U
 
@@ -92,7 +93,10 @@ struct batch_transfer {
 };
 
 struct block_batch_workspace {
-    struct batch_transfer parts[KERNEL_BLOCK_BATCH_MAX];
+    union {
+        struct batch_transfer parts[KERNEL_BLOCK_BATCH_MAX];
+        struct kernel_block_span ordered_phase[KERNEL_BLOCK_BATCH_MAX];
+    };
     struct kernel_wait_queue done;
     /* Published descriptors contain the SG addresses and lengths. The same
      * workspace can then hold a capacity registration until wait_finish. */
@@ -108,6 +112,9 @@ _Static_assert(sizeof(struct block_batch_workspace) <= VIRTIO_BLOCK_BATCH_WORKSP
 
 _Static_assert(BOAROS_PAGE_SIZE >= VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES &&
     BOAROS_PAGE_SIZE % VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES == 0, "batch slots must fit whole pages");
+_Static_assert(BOAROS_PAGE_SIZE % VIRTIO_BLOCK_INDIRECT_TABLE_BYTES == 0 &&
+    VIRTIO_BLOCK_INDIRECT_TABLE_BYTES == VIRTIO_QUEUE_SIZE * sizeof(struct virtio_descriptor),
+    "indirect tables must fit within one DMA page");
 _Static_assert(sizeof(struct block_request) <= REQUEST_STRIDE, "request slot overflow");
 _Static_assert((((16U * VIRTIO_QUEUE_SIZE + 6U + 2U * VIRTIO_QUEUE_SIZE + 15U) & ~15U) +
     6U + 8U * VIRTIO_QUEUE_SIZE) <= VIRTIO_REQUEST_HEADER_OFFSET, "modern ring overlaps requests");
@@ -132,6 +139,8 @@ static unsigned slot_count(const struct virtio_block_device *device)
 { unsigned n = device->queue_size / 3; return n < REQUEST_SLOTS ? n : REQUEST_SLOTS; }
 static struct block_request *request_at(struct virtio_block_device *device, unsigned index)
 { return (void *)((unsigned char *)device->queue_memory + request_header_offset(device) + index * REQUEST_STRIDE); }
+static unsigned request_index(struct virtio_block_device *device, struct block_request *request)
+{ return ((unsigned char *)request - (unsigned char *)request_at(device, 0)) / REQUEST_STRIDE; }
 static uint64_t request_physical(struct virtio_block_device *device, struct block_request *request)
 { return device->queue_physical_address + ((unsigned char *)request - (unsigned char *)device->queue_memory); }
 static uint32_t bounce_offset(struct virtio_block_device *device, struct block_request *request)
@@ -229,14 +238,34 @@ static void device_reset(struct virtio_block_device *device)
         __builtin_trap();
 }
 
-static void release_batch_pool(struct virtio_block_device *device)
+static enum virtio_block_status allocate_pool(struct virtio_block_device *device,
+    uint64_t *physical, void **memory, unsigned count)
 {
-    for (unsigned i = 0; i < VIRTIO_BLOCK_BATCH_POOL_PAGES; i++) {
-        if (!device->batch_physical[i]) continue;
-        if (physical_page_release_order(device->page_allocator, device->batch_physical[i], 0) != PHYSICAL_PAGE_STATUS_OK)
-            __builtin_trap();
-        device->batch_physical[i] = 0; device->batch_memory[i] = NULL;
+    for (unsigned i = 0; i < count; i++) {
+        enum physical_page_status status = physical_page_allocate_order(device->page_allocator, 0, &physical[i]);
+        if (status != PHYSICAL_PAGE_STATUS_OK)
+            return status == PHYSICAL_PAGE_STATUS_EMPTY ? VIRTIO_BLOCK_DRIVER_STATUS_NO_MEMORY : VIRTIO_BLOCK_DRIVER_STATUS_STATE;
+        if (physical_page_resolve(device->page_allocator, physical[i], &memory[i]) != PHYSICAL_PAGE_STATUS_OK)
+            return VIRTIO_BLOCK_DRIVER_STATUS_STATE;
     }
+    return VIRTIO_BLOCK_DRIVER_STATUS_OK;
+}
+
+static void release_pool(struct virtio_block_device *device, uint64_t *physical, void **memory, unsigned count)
+{
+    for (unsigned i = 0; i < count; i++) {
+        if (!physical[i]) continue;
+        if (physical_page_release_order(device->page_allocator, physical[i], 0) != PHYSICAL_PAGE_STATUS_OK)
+            __builtin_trap();
+        physical[i] = 0;
+        memory[i] = NULL;
+    }
+}
+
+static void release_request_pools(struct virtio_block_device *device)
+{
+    release_pool(device, device->batch_physical, device->batch_memory, VIRTIO_BLOCK_BATCH_POOL_PAGES);
+    release_pool(device, device->indirect_physical, device->indirect_memory, VIRTIO_BLOCK_INDIRECT_POOL_PAGES);
 }
 
 static enum virtio_block_status init_failure(
@@ -252,7 +281,7 @@ static enum virtio_block_status init_failure(
         device_reset(device);
     }
     if (release_queue) {
-        release_batch_pool(device);
+        release_request_pools(device);
         enum physical_page_status page_status =
             physical_page_release_order(device->page_allocator,
                                         device->queue_physical_address,
@@ -269,7 +298,8 @@ static enum virtio_block_status negotiate_features(
     uint64_t features;
     enum virtio_status status = virtio_transport_begin(&device->transport,
         VIRTIO_BLOCK_FEATURE_RO | VIRTIO_BLOCK_FEATURE_FLUSH |
-        VIRTIO_BLOCK_FEATURE_SIZE_MAX | VIRTIO_BLOCK_FEATURE_SEG_MAX, 0, &features);
+        VIRTIO_BLOCK_FEATURE_SIZE_MAX | VIRTIO_BLOCK_FEATURE_SEG_MAX |
+        VIRTIO_FEATURE_INDIRECT_DESC, 0, &features);
     if (status != VIRTIO_OK) return status == VIRTIO_UNSUPPORTED ?
         VIRTIO_BLOCK_DRIVER_STATUS_UNSUPPORTED : VIRTIO_BLOCK_DRIVER_STATUS_DEVICE;
     device->read_only = (features & VIRTIO_BLOCK_FEATURE_RO) != 0;
@@ -283,7 +313,7 @@ static int read_segment_limits(struct virtio_block_device *device)
 {
     for (unsigned attempt = 0; attempt < 8; attempt++) {
         uint32_t generation = legacy_transport(device) ? 0 : reg_read(device, VIRTIO_REG_CONFIG_GENERATION);
-        uint32_t size = UINT32_MAX, count = KERNEL_BLOCK_BATCH_MAX;
+        uint32_t size = UINT32_MAX, count = device->queue_size - 2U;
         if ((device->transport.features & VIRTIO_BLOCK_FEATURE_SIZE_MAX) &&
             virtio_transport_config_read(&device->transport, 8, 4, &size) != VIRTIO_OK) return 0;
         if ((device->transport.features & VIRTIO_BLOCK_FEATURE_SEG_MAX) &&
@@ -293,8 +323,13 @@ static int read_segment_limits(struct virtio_block_device *device)
         size &= ~(VIRTIO_BLOCK_SECTOR_SIZE - 1U);
         if (!size || !count) return 0;
         device->max_segment_size = size;
+        if (count > device->queue_size - 2U) count = device->queue_size - 2U;
         device->max_segments = count < KERNEL_BLOCK_BATCH_MAX ? count : KERNEL_BLOCK_BATCH_MAX;
-        if (device->max_segments > device->queue_size - 2U) device->max_segments = device->queue_size - 2U;
+        if (!device->read_only && (device->transport.features & VIRTIO_FEATURE_INDIRECT_DESC)) {
+            device->max_phase_segments = count;
+            uint64_t bytes = (uint64_t)count * size;
+            device->block.write_phase_bytes = bytes < VIRTIO_BLOCK_PHASE_BYTES ? bytes : VIRTIO_BLOCK_PHASE_BYTES;
+        }
         return 1;
     }
     return 0;
@@ -694,7 +729,7 @@ static void release_request_owner(struct virtio_block_device *device, struct blo
         KERNEL_RAW_SCOPE(wait_guard,&r->done.lock);
         if (r->done.head || r->done.borrows) __builtin_trap();
     }
-    unsigned index = (unsigned)(((unsigned char *)r - (unsigned char *)request_at(device,0)) / REQUEST_STRIDE);
+    unsigned index = request_index(device, r);
     device->free_slots |= 1U << index;
     SLOT_CHANGE(device);
     r->state = 0; r->priority = 0; r->owner = 0; r->completion = 0;
@@ -734,27 +769,12 @@ static unsigned first_descriptor(uint64_t bits)
     return first + !(bits & 1U);
 }
 
-/* Device metadata protection covers descriptor selection through enqueue. Request slots own
- * header/status/bounce, while only the queue owns published descriptors. */
-static enum kernel_block_status publish_segments(struct virtio_block_device *device,
-    struct block_request *r, uint32_t type, uint64_t sector,
-    const uint64_t *addresses,const uint32_t *lengths,unsigned count,int bounce)
+/* The metadata lock covers selection through enqueue. A request slot owns its
+ * header, status, bounce buffer and optional indirect table. */
+static void enqueue_request(struct virtio_block_device *device, struct block_request *r,
+    uint32_t type, uint64_t sector, uint16_t head, uint32_t data_length, int bounce)
 {
-    if (!device_live(device)) return KERNEL_BLOCK_STATUS_IO;
-    if (r->state != 1 || r->owner != kernel_io_context_current() || count + 2 > device->queue.size) __builtin_trap();
-    uint16_t indices[VIRTIO_SPLIT_MAX_SIZE];
-    unsigned found = 0;
-    uint64_t free = free_descriptor_mask(device);
-    while (free && found < count + 2) {
-        indices[found++] = first_descriptor(free);
-        free &= free - 1;
-    }
-    if (found != count + 2) return KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
-    uint32_t data_length = 0;
-    for (unsigned i = 0; i < count; i++) {
-        if (data_length > UINT32_MAX - lengths[i]) __builtin_trap();
-        data_length += lengths[i];
-    }
+    if (r->state != 1 || r->owner != kernel_io_context_current()) __builtin_trap();
     int flushing = type == VIRTIO_BLOCK_REQUEST_FLUSH;
     r->header = (struct virtio_block_request_header){type, 0, sector};
     r->status = UINT8_MAX; r->state = 2;
@@ -783,18 +803,39 @@ static enum kernel_block_status publish_segments(struct virtio_block_device *dev
 #else
     (void)flushing;
 #endif
-    struct virtio_descriptor *d = device->queue.descriptors;
-    uint64_t physical = request_physical(device, r);
-    d[indices[0]] = (struct virtio_descriptor){physical, sizeof(r->header), VIRTQ_DESC_NEXT, indices[1]};
-    for (unsigned i = 0; i < count; i++)
-        d[indices[i + 1]] = (struct virtio_descriptor){addresses[i], lengths[i],
-            VIRTQ_DESC_NEXT | (type == VIRTIO_BLOCK_REQUEST_IN ? VIRTQ_DESC_WRITE : 0), indices[i + 2]};
-    d[indices[count + 1]] = (struct virtio_descriptor){physical + offsetof(struct block_request, status), 1, VIRTQ_DESC_WRITE, 0};
-    if (virtio_split_enqueue(&device->queue, &device->transport, indices[0], r,
+    if (virtio_split_enqueue(&device->queue, &device->transport, head, r,
         !legacy_transport(device) && type == VIRTIO_BLOCK_REQUEST_IN ? 0 : 1,
         1U + (type == VIRTIO_BLOCK_REQUEST_IN ? data_length : 0)) != VIRTIO_OK) __builtin_trap();
     DESCRIPTOR_CHANGE(device);
     if (device->queue.inflight > device->statistics.max_inflight) device->statistics.max_inflight = device->queue.inflight;
+}
+
+static enum kernel_block_status publish_segments(struct virtio_block_device *device,
+    struct block_request *r, uint32_t type, uint64_t sector,
+    const uint64_t *addresses, const uint32_t *lengths, unsigned count, int bounce)
+{
+    if (!device_live(device)) return KERNEL_BLOCK_STATUS_IO;
+    if (count + 2 > device->queue.size) __builtin_trap();
+    uint16_t indices[VIRTIO_SPLIT_MAX_SIZE];
+    unsigned found = 0;
+    uint64_t free = free_descriptor_mask(device);
+    while (free && found < count + 2) {
+        indices[found++] = first_descriptor(free);
+        free &= free - 1;
+    }
+    if (found != count + 2) return KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
+    uint32_t data_length = 0;
+    struct virtio_descriptor *d = device->queue.descriptors;
+    uint64_t physical = request_physical(device, r);
+    d[indices[0]] = (struct virtio_descriptor){physical, sizeof(r->header), VIRTQ_DESC_NEXT, indices[1]};
+    for (unsigned i = 0; i < count; i++) {
+        if (data_length > UINT32_MAX - lengths[i]) __builtin_trap();
+        data_length += lengths[i];
+        d[indices[i + 1]] = (struct virtio_descriptor){addresses[i], lengths[i],
+            VIRTQ_DESC_NEXT | (type == VIRTIO_BLOCK_REQUEST_IN ? VIRTQ_DESC_WRITE : 0), indices[i + 2]};
+    }
+    d[indices[count + 1]] = (struct virtio_descriptor){physical + offsetof(struct block_request, status), 1, VIRTQ_DESC_WRITE, 0};
+    enqueue_request(device, r, type, sector, indices[0], data_length, bounce);
     return KERNEL_BLOCK_STATUS_OK;
 }
 
@@ -1402,11 +1443,230 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
     return result;
 }
 
+struct phase_source {
+    kernel_block_phase_next_fn next;
+    const void *context, *cursor;
+    struct kernel_block_span span;
+    struct kernel_block_span *ordered;
+    unsigned ordered_index, ordered_count;
+    int input_ended, ended;
+};
+
+struct phase_write {
+    uint64_t table_address, sector;
+    uint32_t bytes;
+    uint16_t descriptors;
+    int bounce;
+};
+
+/* Refill a private window outside the metadata lock. The caller can continue
+ * building the same request if the first span of this window is adjacent. */
+static void phase_order_refill(struct phase_source *source)
+{
+    source->ordered_index = 0;
+    source->ordered_count = 0;
+    while (source->ordered_count < KERNEL_BLOCK_BATCH_MAX) {
+        struct kernel_block_span span;
+        if (!source->next(source->context, &source->cursor, &span)) {
+            source->input_ended = 1;
+            break;
+        }
+        unsigned position = source->ordered_count++;
+        while (position && source->ordered[position - 1].offset > span.offset) {
+            source->ordered[position] = source->ordered[position - 1];
+            position--;
+        }
+        source->ordered[position] = span;
+    }
+}
+
+static int phase_source_ready(struct phase_source *source)
+{
+    if (source->span.size) return 1;
+    if (source->ordered) {
+        if (source->ordered_index == source->ordered_count && !source->input_ended)
+            phase_order_refill(source);
+        if (source->ordered_index == source->ordered_count) {
+            source->ended = 1;
+            return 0;
+        }
+        source->span = source->ordered[source->ordered_index++];
+        return 1;
+    }
+    while (!source->span.size && !source->ended)
+        source->ended = !source->next(source->context, &source->cursor, &source->span);
+    return source->span.size != 0;
+}
+
+static uint32_t phase_dma_prefix(const struct virtio_block_device *device,
+    const void *buffer, uint32_t length, uint64_t *address)
+{
+    if (device->dma_address(buffer, length, address)) return length;
+    /* The whole virtual range may cross physically disjoint pages. Keep each
+     * prefix sector-aligned so a sector that straddles pages can still bounce. */
+    uint32_t first_page = BOAROS_PAGE_SIZE - ((uintptr_t)buffer % BOAROS_PAGE_SIZE);
+    first_page &= ~(VIRTIO_BLOCK_SECTOR_SIZE - 1U);
+    if (first_page && first_page < length && device->dma_address(buffer, first_page, address))
+        return first_page;
+    return 0;
+}
+
+/* A reserved request has exclusive use of its table. Build it outside the
+ * metadata lock, before publishing a head that gives the device access. */
+static struct phase_write prepare_phase_write(struct virtio_block_device *device,
+    struct block_request *request, struct phase_source *source)
+{
+    struct phase_write write = {0};
+    if (!phase_source_ready(source)) return write;
+    unsigned slot = request_index(device, request);
+    unsigned per_page = BOAROS_PAGE_SIZE / VIRTIO_BLOCK_INDIRECT_TABLE_BYTES;
+    unsigned table_offset = (slot % per_page) * VIRTIO_BLOCK_INDIRECT_TABLE_BYTES;
+    struct virtio_descriptor *table = (void *)((unsigned char *)device->indirect_memory[slot / per_page] + table_offset);
+    uint64_t offset = source->span.offset;
+    write.sector = offset / VIRTIO_BLOCK_SECTOR_SIZE;
+    write.table_address = device->indirect_physical[slot / per_page] + table_offset;
+    unsigned segments = 0;
+    uint32_t maximum = device->block.write_phase_bytes;
+    do {
+        struct kernel_block_span *span = &source->span;
+        size_t remaining = span->size;
+        if (remaining > maximum - write.bytes) remaining = maximum - write.bytes;
+        if (remaining > device->max_segment_size) remaining = device->max_segment_size;
+        uint64_t address;
+        uint32_t length = phase_dma_prefix(device, span->buffer, (uint32_t)remaining, &address);
+        if (!length) {
+            if (segments) break;
+            length = VIRTIO_BLOCK_SECTOR_SIZE;
+            address = device->queue_physical_address + bounce_offset(device, request);
+            bytes_copy(request->bounce, span->buffer, length);
+            write.bounce = 1;
+        }
+        struct virtio_descriptor *last = &table[segments];
+        if (segments && last->address + last->length == address && last->length < device->max_segment_size) {
+            uint32_t room = device->max_segment_size - last->length;
+            if (length > room) length = room;
+            last->length += length;
+        } else {
+            if (segments == device->max_phase_segments) break;
+            segments++;
+            table[segments] = (struct virtio_descriptor){address, length, VIRTQ_DESC_NEXT, segments + 1U};
+        }
+        span->offset += length;
+        span->buffer = (const unsigned char *)span->buffer + length;
+        span->size -= length;
+        write.bytes += length;
+    } while (!write.bounce && write.bytes < maximum && phase_source_ready(source) &&
+        source->span.offset == offset + write.bytes);
+    uint64_t physical = request_physical(device, request);
+    table[0] = (struct virtio_descriptor){physical, sizeof(request->header), VIRTQ_DESC_NEXT, 1};
+    table[segments + 1U] = (struct virtio_descriptor){physical + offsetof(struct block_request, status), 1, VIRTQ_DESC_WRITE, 0};
+    write.descriptors = segments + 2U;
+    return write;
+}
+
+static void wake_request_slots(struct virtio_block_device *device)
+{
+    wake(&device->slots);
+    if (kernel_wait_queue_registrations(&device->slots_low) && low_slots_can_progress(device))
+        wake(&device->slots_low);
+}
+
+static enum kernel_block_status transfer_phase_indirect(struct virtio_block_device *device,
+    struct block_batch_workspace *workspace, kernel_block_phase_next_fn next,
+    const void *context, const void *first, int unordered)
+{
+    COST_SCOPE(device_cost, OPERATION_TICKS);
+    if (!begin_call(device, 0)) return KERNEL_BLOCK_STATUS_IO;
+    kernel_wait_queue_init(&workspace->done);
+    struct phase_source source = {.next = next, .context = context, .cursor = first,
+        .ordered = unordered ? workspace->ordered_phase : NULL};
+    struct block_request *prepared = NULL;
+    struct phase_write write = {0};
+    unsigned owned = 0;
+    enum kernel_block_status result = KERNEL_BLOCK_STATUS_OK;
+    {
+        KERNEL_IRQ_LOCK_SCOPE(guard, &device->metadata);
+        for (;;) {
+            if (device_live(device)) collect_used_locked(device);
+            uint64_t deadline = 0;
+            unsigned released = 0;
+            for (unsigned pending = owned; pending; pending &= pending - 1) {
+                unsigned index = first_descriptor(pending);
+                struct block_request *request = request_at(device, index);
+                if (request->state == 3) {
+                    enum kernel_block_status status = finish_request(device, request);
+                    if (result == KERNEL_BLOCK_STATUS_OK) result = status;
+                    release_request_owner(device, request);
+                    owned &= ~(1U << index);
+                    released++;
+                } else if (!deadline || (int64_t)(request->deadline - deadline) < 0) deadline = request->deadline;
+            }
+            if (!device_live(device) && result == KERNEL_BLOCK_STATUS_OK) result = KERNEL_BLOCK_STATUS_IO;
+            if (result != KERNEL_BLOCK_STATUS_OK && prepared) {
+                release_request_owner(device, prepared);
+                prepared = NULL;
+                released++;
+            }
+            if (released) wake_request_slots(device);
+
+            /* At the deadline, recheck the device's used index before reset. */
+            if (deadline && (int64_t)(time_now() - deadline) >= 0) {
+                if (device->queue.used->index != device->queue.last_used) continue;
+                device->statistics.timeouts++;
+                fail_device(device, KERNEL_BLOCK_STATUS_TIMEOUT);
+                continue;
+            }
+
+            int published = 0, built = 0;
+            while (result == KERNEL_BLOCK_STATUS_OK && (prepared || !source.ended) && free_descriptor_mask(device)) {
+                if (!prepared) {
+                    prepared = try_reserve_request(device, KERNEL_BLOCK_PRIO_NORMAL);
+                    if (!prepared) break;
+                    prepared->completion = &workspace->done;
+                    kernel_irq_lock_release(&guard);
+                    write = prepare_phase_write(device, prepared, &source);
+                    kernel_irq_lock_acquire(&device->metadata, &guard);
+                    built = 1;
+                    if (!write.descriptors) {
+                        release_request_owner(device, prepared);
+                        prepared = NULL;
+                        wake_request_slots(device);
+                        break;
+                    }
+                    if (!device_live(device)) break;
+                }
+                uint64_t free = free_descriptor_mask(device);
+                if (!free) break;
+                uint16_t head = first_descriptor(free);
+                device->queue.descriptors[head] = (struct virtio_descriptor){write.table_address,
+                    write.descriptors * sizeof(struct virtio_descriptor), VIRTIO_DESC_INDIRECT, 0};
+                enqueue_request(device, prepared, VIRTIO_BLOCK_REQUEST_OUT, write.sector, head, write.bytes, write.bounce);
+                owned |= 1U << request_index(device, prepared);
+                prepared = NULL;
+                published = 1;
+            }
+            if (published && device_live(device) &&
+                virtio_split_notify(&device->queue, &device->transport, 0) != VIRTIO_OK) __builtin_trap();
+            /* An IRQ may have harvested a completion while the table was
+             * built. Consume it before registering a new wait. */
+            if (published || built) continue;
+            if (!owned && (result != KERNEL_BLOCK_STATUS_OK || (!prepared && source.ended))) break;
+            if (device->irq_source) {
+                struct kernel_wait_queue *capacity = !free_descriptor_mask(device) ? &device->descriptors : &device->slots;
+                wait_for_progress(device, owned ? &workspace->done : capacity, deadline, NULL, owned != 0,
+                    owned && result == KERNEL_BLOCK_STATUS_OK && (prepared || !source.ended) ? capacity : NULL,
+                    &workspace->capacity_node, &guard);
+            }
+        }
+    }
+    end_call(device, 0);
+    return result;
+}
 
 static enum kernel_block_status transfer_batch(struct virtio_block_device *device,
     const struct kernel_block_span *writes, struct block_read_span *reads, size_t count,
     kernel_block_phase_next_fn next, const void *next_context, const void *cursor,
-    const struct block_read_completion *completion,
+    const struct block_read_completion *completion, int unordered,
     enum kernel_block_priority priority)
 {
     KERNEL_IRQ_LOCK_SCOPE(guard,&device->metadata);
@@ -1428,8 +1688,9 @@ static enum kernel_block_status transfer_batch(struct virtio_block_device *devic
     unsigned per_page = BOAROS_PAGE_SIZE / VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES;
     struct block_batch_workspace *workspace = (void *)((unsigned char *)device->batch_memory[slot / per_page] +
         (slot % per_page) * VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES);
-    enum kernel_block_status status = transfer_batch_parts(device, writes, reads, count,
-        workspace,next,next_context,cursor,completion,priority);
+    enum kernel_block_status status = next && device->block.write_phase_bytes ?
+        transfer_phase_indirect(device, workspace, next, next_context, cursor, unordered) :
+        transfer_batch_parts(device, writes, reads, count, workspace, next, next_context, cursor, completion, priority);
     /* 全部本次 DMA 完成或 reset 确认后，才归还槽位供另一调用使用。 */
     kernel_irq_lock_acquire(&device->metadata,&guard);
     if (!(device->batch_claimed & (1U << slot))) __builtin_trap();
@@ -1442,11 +1703,11 @@ static enum kernel_block_status transfer_batch(struct virtio_block_device *devic
 
 static enum kernel_block_status virtio_block_write_batch(void *context,
     const struct kernel_block_span *spans, size_t count)
-{ return transfer_batch(context, spans, NULL, count, NULL, NULL, NULL, NULL, KERNEL_BLOCK_PRIO_NORMAL); }
+{ return transfer_batch(context, spans, NULL, count, NULL, NULL, NULL, NULL, 0, KERNEL_BLOCK_PRIO_NORMAL); }
 
 static enum kernel_block_status virtio_block_write_batch_prio(void *context,
     const struct kernel_block_span *spans, size_t count, enum kernel_block_priority priority)
-{ return transfer_batch(context, spans, NULL, count, NULL, NULL, NULL, NULL, priority); }
+{ return transfer_batch(context, spans, NULL, count, NULL, NULL, NULL, NULL, 0, priority); }
 
 static enum kernel_block_status virtio_block_read_batch(void *context,
     struct block_read_span *spans, size_t count, const struct block_read_completion *completion)
@@ -1474,12 +1735,15 @@ static enum kernel_block_status virtio_block_read_batch(void *context,
         spans[0].completed=result==KERNEL_BLOCK_STATUS_OK?spans[0].size:0;
         return result;
     }
-    return transfer_batch(context,NULL,spans,count,NULL,NULL,NULL,completion,KERNEL_BLOCK_PRIO_HIGH);
+    return transfer_batch(context,NULL,spans,count,NULL,NULL,NULL,completion,0,KERNEL_BLOCK_PRIO_HIGH);
 }
 
 static enum kernel_block_status virtio_block_write_phase(void *context,
-    kernel_block_phase_next_fn next, const void *next_context, const void *first)
-{ return transfer_batch(context, NULL, NULL, KERNEL_BLOCK_BATCH_MAX, next, next_context, first, NULL, KERNEL_BLOCK_PRIO_NORMAL); }
+    kernel_block_phase_next_fn next, const void *next_context, const void *first, int unordered)
+{
+    return transfer_batch(context, NULL, NULL, KERNEL_BLOCK_BATCH_MAX, next, next_context, first, NULL,
+        unordered, KERNEL_BLOCK_PRIO_NORMAL);
+}
 
 enum virtio_block_status virtio_block_init(
     struct virtio_block_device *device,const struct virtio_transport *transport,
@@ -1559,13 +1823,18 @@ enum virtio_block_status virtio_block_init(
         return init_failure(&result, VIRTIO_BLOCK_DRIVER_STATUS_UNSUPPORTED, 1, 1);
 
     unsigned pool_pages = (slot_count(&result) * VIRTIO_BLOCK_BATCH_WORKSPACE_BYTES + BOAROS_PAGE_SIZE - 1U) / BOAROS_PAGE_SIZE;
-    for (unsigned i = 0; i < pool_pages; i++) {
-        page_status = physical_page_allocate_order(page_allocator, 0, &result.batch_physical[i]);
-        if (page_status != PHYSICAL_PAGE_STATUS_OK)
-            return init_failure(&result, page_status == PHYSICAL_PAGE_STATUS_EMPTY ?
-                VIRTIO_BLOCK_DRIVER_STATUS_NO_MEMORY : VIRTIO_BLOCK_DRIVER_STATUS_STATE, 1, 1);
-        if (physical_page_resolve(page_allocator, result.batch_physical[i], &result.batch_memory[i]) != PHYSICAL_PAGE_STATUS_OK)
-            return init_failure(&result, VIRTIO_BLOCK_DRIVER_STATUS_STATE, 1, 1);
+    status = allocate_pool(&result, result.batch_physical, result.batch_memory, pool_pages);
+    if (status != VIRTIO_BLOCK_DRIVER_STATUS_OK) return init_failure(&result, status, 1, 1);
+    if (result.block.write_phase_bytes) {
+        unsigned table_pages = (slot_count(&result) * VIRTIO_BLOCK_INDIRECT_TABLE_BYTES + BOAROS_PAGE_SIZE - 1U) / BOAROS_PAGE_SIZE;
+        status = allocate_pool(&result, result.indirect_physical, result.indirect_memory, table_pages);
+        if (status != VIRTIO_BLOCK_DRIVER_STATUS_OK) {
+            /* No request has published a table. A negotiated device still
+             * accepts direct chains if the optional reservation fails. */
+            release_pool(&result, result.indirect_physical, result.indirect_memory, VIRTIO_BLOCK_INDIRECT_POOL_PAGES);
+            result.max_phase_segments = 0;
+            result.block.write_phase_bytes = 0;
+        }
     }
 
     capacity_sectors = read_capacity(&result);
@@ -1668,7 +1937,7 @@ enum virtio_block_status virtio_block_destroy(
         device_reset(device);
     }
     if (device->irq_source) { device->transport.ops.unregister_irq(device->transport.context,device->irq_source,device); device->irq_source = 0; }
-    release_batch_pool(device);
+    release_request_pools(device);
     page_status = physical_page_release_order(device->page_allocator,
                                               device->queue_physical_address,
                                               device->queue_allocation_order);
@@ -1682,6 +1951,7 @@ enum virtio_block_status virtio_block_destroy(
     device->block.write_batch = 0;
     device->block.write_batch_prio = 0;
     device->block.write_phase = 0;
+    device->block.write_phase_bytes = 0;
     device->block.flush = 0;
     device->block.cache_mode = KERNEL_BLOCK_CACHE_UNKNOWN;
     device->block.capacity_bytes = 0U;

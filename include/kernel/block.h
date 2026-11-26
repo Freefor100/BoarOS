@@ -65,8 +65,10 @@ typedef enum kernel_block_status (*kernel_block_write_batch_prio_fn)(
  * stable descriptor memory, without allocation, waiting or side effects. */
 typedef int (*kernel_block_phase_next_fn)(const void *context, const void **cursor,
     struct kernel_block_span *span);
+/* unordered identifies a phase whose ranges do not arrive in disk order. */
 typedef enum kernel_block_status (*kernel_block_write_phase_fn)(void *context,
-    kernel_block_phase_next_fn next, const void *next_context, const void *first);
+    kernel_block_phase_next_fn next, const void *next_context, const void *first,
+    int unordered);
 
 struct kernel_block_stat_operation {
     uint64_t completed, sectors, elapsed_ns;
@@ -88,6 +90,7 @@ struct kernel_block_device {
     kernel_block_write_batch_prio_fn write_batch_prio;
     kernel_block_read_batch_fn read_batch;
     kernel_block_write_phase_fn write_phase;
+    uint32_t write_phase_bytes; /* Preferred write window, zero for the default. */
     uint64_t capacity_bytes;
     uint32_t logical_block_size;
     kernel_block_flush_fn flush;
@@ -123,6 +126,7 @@ struct kernel_block_device {
 
 /* Known block-device names are shared by devtmpfs and sysfs. */
 int kernel_block_device_name(uint64_t number, char name[32]);
+uint32_t kernel_block_write_phase_bytes(const struct kernel_block_device *);
 
 static inline uint32_t kernel_block_logical_size(const struct kernel_block_device *device)
 { return __atomic_load_n(&device->logical_block_size, __ATOMIC_ACQUIRE); }

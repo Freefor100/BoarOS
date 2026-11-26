@@ -57,6 +57,18 @@ truncate -s 32M "$work/base.img"
 mkfs.ext4 -q -F -b 1024 "$work/base.img"
 printf 'Old data' > "$work/data"
 debugfs -w -R "write $work/data /probe" "$work/base.img" >/dev/null 2>&1
+if [ "${JOURNAL_TEST_CASE:-}" = wide-ordered-range ]; then
+    for block in 1024 4096; do
+        truncate -s 32M "$work/wide.img"
+        mkfs.ext4 -q -F -b "$block" "$work/wide.img"
+        head -c "$((96*block))" /dev/zero | tr '\000' 'x' > "$work/wide-data"
+        debugfs -w -R "write $work/wide-data /probe" "$work/wide.img" >/dev/null 2>&1
+        timeout 30 "$work/probe" "$work/wide.img" wide-ordered-range
+        e2fsck -fn "$work/wide.img" > "$work/wide-fsck.log" 2>&1 ||
+            { cat "$work/wide-fsck.log"; exit 1; }
+    done
+    exit 0
+fi
 if [ "${JOURNAL_TEST_CASE:-}" = direct-ordered ]; then
     for block in 1024 4096; do
         truncate -s 32M "$work/direct-base.img"
