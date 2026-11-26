@@ -3,6 +3,7 @@
 static unsigned serial_reservation_watch,serial_reserved,serial_borrowed,serial_commit_done;
 static unsigned serial_log_saved;
 static unsigned serial_bitmap_patches;
+static unsigned serial_super_mode;
 static uint64_t serial_reservation_lba;
 static unsigned serial_heap_failure, serial_heap_calls;
 void *__real_ext4_user_malloc(size_t);
@@ -17,6 +18,10 @@ int __real_jbd_trans_prepare_operation(struct jbd_trans *);
 int __wrap_jbd_trans_prepare_operation(struct jbd_trans *trans)
 {
     int result=__real_jbd_trans_prepare_operation(trans);
+    if (!result && serial_super_mode) {
+        assert(!!trans->reused_super_sequence == (serial_super_mode != 2));
+        if (serial_super_mode == 1) return ECANCELED;
+    }
     if(result || !serial_reservation_watch)return result;
     bool serial=ext4_fs_serial_writer(trans->journal->jbd_fs->inode_ref.fs);
     assert(serial==(serial_reservation_watch!=3));
@@ -290,6 +295,46 @@ static void serial_reservation_case(struct lwext4_mount_adapter *adapter,int ser
         printf("existing leaf insert journals %u bytes in %u ranges\n",
             directory_leaf_bytes,directory_leaf_updates);
         assert(directory_leaf_updates==2 && directory_leaf_bytes<=128);
+        struct ext4_fs *fs = adapter->device.fs;
+        uint64_t lba = EXT4_SUPERBLOCK_OFFSET / adapter->device.lg_bsize;
+        unsigned offset = EXT4_SUPERBLOCK_OFFSET % adapter->device.lg_bsize;
+        uint32_t available = ext4_get32(&fs->sb, free_inodes_count);
+        char probe[96];
+        snprintf(probe,sizeof(probe),"%ssuper-reuse",adapter->mount_point);
+        ext4_file opened;
+        serial_super_mode = 1;
+        assert(ext4_fopen(&opened,probe,"w+") == ECANCELED);
+        serial_super_mode = 0;
+        assert(ext4_get32(&fs->sb, free_inodes_count) == available);
+        assert(ext4_fopen(&opened,probe,"r") == ENOENT);
+
+        struct ext4_block held = EXT4_BLOCK_ZERO();
+        assert(!ext4_block_get(fs->bdev, &held, lba));
+        struct ext4_sblock *old = (void *)(held.data + offset);
+        for (uint32_t mask = 1; mask; mask <<= 1) {
+            uint32_t count = available ^ mask;
+            struct ext4_sblock changed = *old;
+            ext4_set32(&changed, free_inodes_count, count);
+            ext4_sb_set_csum(&changed);
+            assert(ext4_sb_inode_count_csum(old, count) == changed.checksum);
+        }
+        serial_super_mode = 2;
+        assert(!ext4_fopen(&opened,probe,"w+") && !ext4_fclose(&opened));
+        serial_super_mode = 0;
+        assert(ext4_get32(old, free_inodes_count) == available && ext4_sb_check(old));
+        assert(!ext4_block_set(fs->bdev, &held));
+        assert(!ext4_fremove(probe));
+
+        serial_super_mode = 3;
+        assert(!ext4_fopen(&opened,probe,"w+") && !ext4_fclose(&opened));
+        serial_super_mode = 0;
+        struct ext4_block current = EXT4_BLOCK_ZERO();
+        assert(!ext4_block_get(fs->bdev, &current, lba));
+        struct ext4_sblock *accepted = (void *)(current.data + offset);
+        assert(ext4_sb_check(accepted) && ext4_get32(accepted, free_inodes_count) == available - 1);
+        assert(!ext4_block_set(fs->bdev, &current));
+        assert(!ext4_fremove(probe));
+        puts("PASS running superblock reuse: abort, held-reader replacement and accepted checksum");
         serial_leaf_readers(adapter);
     }
     adapter->locks.read_lock(adapter->locks.context);

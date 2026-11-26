@@ -574,9 +574,10 @@ void ext4_operation_publish_super(struct ext4_operation *operation)
     struct ext4_fs *fs=operation->fs;
     uint64_t completed=delalloc_publish(operation);
     operation->published=true;
-    if (operation->super_prepared || completed || operation->reserved_blocks) {
+    bool blocks_changed = operation->super_prepared && operation->block_delta;
+    if (blocks_changed || completed || operation->reserved_blocks) {
         EXT4_SPACE_SCOPE(space,fs);
-        if (operation->super_prepared)
+        if (blocks_changed)
             ext4_sb_set_free_blocks_cnt(&fs->sb,operation->super_publish.blocks);
         if (operation->delalloc_used>completed ||
             operation->delalloc_extent_used>completed*EXT4_EXTENT_MAX_DEPTH) __builtin_trap();
@@ -624,17 +625,21 @@ int ext4_operation_prepare_super(struct ext4_operation *operation, struct ext4_s
         if (head != operation->orphan_base && head != operation->orphan_head) return EAGAIN;
         head = operation->orphan_head;
     }
-    *merged = *current;
-    ext4_sb_set_free_blocks_cnt(merged, blocks);
-    ext4_set32(merged, free_inodes_count, inodes);
-    ext4_set32(merged, features_read_only, flags);
-    ext4_set32(merged, last_orphan, head);
-    ext4_sb_set_csum(merged);
+    uint32_t checksum = current->checksum;
+    if (merged) {
+        *merged = *current;
+        ext4_sb_set_free_blocks_cnt(merged, blocks);
+        ext4_set32(merged, free_inodes_count, inodes);
+        ext4_set32(merged, features_read_only, flags);
+        ext4_set32(merged, last_orphan, head);
+        ext4_sb_set_csum(merged);
+        checksum = merged->checksum;
+    } else checksum = ext4_sb_inode_count_csum(current, (uint32_t)inodes);
     operation->super_publish.blocks = blocks;
     operation->super_publish.inodes = inodes;
     operation->super_publish.ro_flags = flags;
     operation->super_publish.orphan_head = head;
-    operation->super_publish.checksum = merged->checksum;
+    operation->super_publish.checksum = checksum;
     operation->super_prepared = true;
     return EOK;
 }
@@ -1836,6 +1841,7 @@ static int ext4_trans_record_super(struct ext4_mountpoint *mp)
 {
     struct ext4_operation *operation = ext4_current_operation(&mp->fs);
     if (!ext4_operation_super_changed(operation)) return EOK;
+    if (jbd_trans_try_reuse_superblock(operation->trans)) return EOK;
     struct ext4_block block = EXT4_BLOCK_ZERO();
     uint32_t block_size = ext4_sb_get_block_size(&mp->fs.sb);
     int result = ext4_block_get_range(mp->fs.bdev, &block,

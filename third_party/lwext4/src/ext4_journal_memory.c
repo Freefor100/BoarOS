@@ -508,22 +508,83 @@ void *jbd_journal_alloc(struct jbd_journal *journal,size_t bytes) { return jbd_a
 void jbd_journal_free(void *pointer) { jbd_free(pointer); }
 size_t jbd_image_charge(const struct jbd_journal *journal)
 { return journal->block_size+jbd_allocation_charge(sizeof(struct jbd_image)); }
+static inline bool cache_image_locked(struct jbd_memory *memory, struct jbd_image *image,
+    size_t *cached)
+{
+    size_t limit = cache_limit(memory);
+    size_t charge = memory->block_size + ((union jbd_allocation *)image - 1)->owner.bytes;
+    if (!image->active) __builtin_trap();
+    image->active = false;
+    if (memory->closing || !memory->grouped || memory->cache_disabled ||
+        charge > limit || memory->cached > limit - charge) return false;
+    image->next = memory->image_cache;
+    memory->image_cache = image;
+    memory->cached += charge;
+    *cached += charge;
+    return true;
+}
+
+static void free_image_storage(struct jbd_image *image)
+{
+    struct jbd_memory *memory = image->memory;
+    ext4_free(image->data);
+    jbd_memory_owner_uncharge(memory, memory->block_size);
+    jbd_free(image);
+}
+
 static void payload_release(struct ext4_block_payload *payload)
 {
-    struct jbd_image *image=(void *)((uint8_t *)payload-offsetof(struct jbd_image,payload));
-    struct jbd_memory *memory=image->memory;
+    struct jbd_image *image = (void *)((uint8_t *)payload - offsetof(struct jbd_image,payload));
+    struct jbd_memory *memory = image->memory;
     {
-        KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);size_t limit=cache_limit(memory);
-        if (!image->active) __builtin_trap();
-        image->active=false;
-        size_t charge=memory->block_size+((union jbd_allocation *)image-1)->owner.bytes;
-        if (!memory->closing && memory->grouped && !memory->cache_disabled &&
-            charge<=limit && memory->cached<=limit-charge) {
-            image->next=memory->image_cache;memory->image_cache=image;memory->cached+=charge;
-            account_change(memory,charge,false);return;
+        KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
+        size_t cached = 0;
+        if (cache_image_locked(memory, image, &cached)) {
+            account_change(memory, cached, false);
+            return;
         }
     }
-    ext4_free(image->data);jbd_memory_owner_uncharge(memory,memory->block_size);jbd_free(image);
+    free_image_storage(image);
+}
+
+void jbd_return_merged_buffers(struct jbd_buf *const *records, unsigned count)
+{
+    if (!count) return;
+    if (count > JBD_BUFFER_RETURN_BATCH) __builtin_trap();
+    struct jbd_memory *memory = ((union jbd_allocation *)records[0] - 1)->owner.memory;
+    for (unsigned i = 0; i < count; i++) {
+        struct jbd_image *image = records[i]->after;
+        if (!ext4_block_payload_drop(&image->payload)) records[i]->after = NULL;
+    }
+
+    struct jbd_image *retired = NULL;
+    unsigned uncached = 0;
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
+        size_t cached = 0;
+        for (unsigned i = 0; i < count; i++) {
+            struct jbd_buf *record = records[i];
+            union jbd_allocation *allocation = (union jbd_allocation *)record - 1;
+            struct jbd_image *image = record->after;
+            if (allocation->owner.memory != memory) __builtin_trap();
+            if (image && !cache_image_locked(memory, image, &cached)) {
+                image->next = retired;
+                retired = image;
+            }
+            size_t charge = allocation->owner.bytes;
+            if (cache_control_locked(memory, record, charge)) cached += charge;
+            else uncached |= 1U << i;
+        }
+        account_change(memory, cached, false);
+    }
+    while (retired) {
+        struct jbd_image *image = retired;
+        retired = image->next;
+        free_image_storage(image);
+    }
+    for (unsigned i = 0; i < count; i++)
+        if (uncached & (1U << i))
+            free_allocation((union jbd_allocation *)records[i] - 1, false);
 }
 static void start_image(struct jbd_image *image)
 {

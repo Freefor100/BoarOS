@@ -93,12 +93,12 @@ static inline void journal_publication_locked(struct ext4_buf *buf, struct ext4_
     redundant->payload = NULL;
 }
 
-bool ext4_bcache_patch_current(struct ext4_block *redundant, unsigned owners,
-    const uint8_t *bytes, const struct ext4_block_patch *patches,
-    unsigned count, uint64_t tree_key)
+bool ext4_bcache_patch_current(struct ext4_block *block, unsigned owners,
+    const struct ext4_block_patch *patches, unsigned count, uint64_t tree_key,
+    bool return_duplicate)
 {
-    struct ext4_buf *buf = redundant->buf;
-    struct ext4_block_payload *payload = redundant->payload;
+    struct ext4_buf *buf = block->buf;
+    struct ext4_block_payload *payload = block->payload;
     {
         KERNEL_TASK_LOCK_SCOPE(guard, &buf->bc->metadata);
         if (buf->current_payload != payload ||
@@ -106,12 +106,12 @@ bool ext4_bcache_patch_current(struct ext4_block *redundant, unsigned owners,
             return false;
         /* The lock excludes new borrows and in-lock record copies. */
         for (unsigned i = 0; i < count; i++)
-            memcpy(payload->data + patches[i].offset, bytes + patches[i].offset, patches[i].length);
+            memcpy(payload->data + patches[i].offset, patches[i].data, patches[i].length);
         publish_verification(payload, tree_key);
         advance_version(buf);
-        journal_publication_locked(buf, redundant);
+        journal_publication_locked(buf, return_duplicate ? block : NULL);
     }
-    ext4_block_payload_put(payload);
+    if (return_duplicate) ext4_block_payload_put(payload);
     return true;
 }
 

@@ -80,6 +80,7 @@ struct jbd_buf {
 	bool modified;
 	bool fresh_copy;
 	bool fresh_block;
+	bool accepted_super; /* Typed publication put the accepted fs->sb here. */
 	struct ext4_block block;
 	struct jbd_trans *trans;
 	/* Prepare borrows the index identity; accepted access is queued in it. */
@@ -168,6 +169,7 @@ struct jbd_trans {
 	LIST_HEAD(jbd_trans_block_rec, jbd_block_rec) tbrec_list;
 	uint64_t last_dirty_ns;
 	TAILQ_ENTRY(jbd_trans) trans_node;
+	uint64_t reused_super_sequence;
 };
 
 struct jbd_journal {
@@ -259,6 +261,7 @@ int jbd_trans_prepare_unowned_range(struct jbd_trans *, struct ext4_block *,
 int jbd_trans_prepare_checked_patch(struct jbd_trans *, struct ext4_block *,
     uint32_t offset, uint32_t length, uint32_t checksum_offset);
 int jbd_trans_reserve_superblock(struct jbd_trans *, struct ext4_block *);
+bool jbd_trans_try_reuse_superblock(struct jbd_trans *);
 int jbd_trans_get_new_access(struct jbd_trans *, struct ext4_block *);
 int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t block,
 	uint32_t offset, const void *data, uint32_t length, bool initialize,

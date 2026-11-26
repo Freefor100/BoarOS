@@ -570,6 +570,8 @@ static void publication_owners(struct ext4_blockdev *dev, struct jbd_journal *jo
 #ifdef TEST_JBD_RECORD_COPY
         private_rebind_cache = &original.buf->bc->metadata;
         private_rebind_cache_locks = 0;
+        count_journal_pool_locks = true;
+        journal_pool_locks = 0;
 #endif
         CHECK(jbd_journal_accept(journal, operation, 0) == EOK && !publication_owner.buffer);
         CHECK(original.buf->current_payload == accepted ? patch : !patch);
@@ -577,9 +579,13 @@ static void publication_owners(struct ext4_blockdev *dev, struct jbd_journal *jo
         CHECK(original.buf->refctr == block_refs - (round != 0));
 #ifdef TEST_JBD_RECORD_COPY
         private_rebind_cache = NULL;
+        count_journal_pool_locks = false;
         printf("publication cache locks: running-group merge=%u count=%u\n",
             round, private_rebind_cache_locks);
         CHECK(private_rebind_cache_locks == 1);
+        printf("publication pool locks: running-group merge=%u count=%u\n",
+            round, journal_pool_locks);
+        if (patch) CHECK(journal_pool_locks == 2);
 #endif
         publication_owner.rebind_buffer = NULL;
         printf("publication image rebinds: running-group merge=%u count=%u\n",
@@ -792,6 +798,39 @@ static void private_record_prepare(struct ext4_blockdev *dev,
     jbd_image_free(image);
     jbd_free(reused);
     CHECK(jbd_memory_cached(journal) == cached);
+
+    /* A held reader keeps its own image, including when cache retention is
+     * disabled and the other records must physically return their storage. */
+    for (unsigned disabled = 0; disabled < 2; disabled++) {
+        enum { records = 3 };
+        struct jbd_buf *retired[records];
+        for (unsigned i = 0; i < records; i++) {
+            struct jbd_image *data = jbd_image_alloc_control(journal,
+                sizeof(struct jbd_buf), &control);
+            CHECK(data && control);
+            retired[i] = control;
+            retired[i]->after = data;
+        }
+        struct jbd_image *held = retired[1]->after;
+        ((uint8_t *)held->data)[0] = 'H';
+        ext4_block_payload_get(&held->payload);
+        jbd_memory_set_cache_disabled(journal, disabled);
+        used = jbd_memory_used(journal);
+        cached = jbd_memory_cached(journal);
+        size_t returned = records * jbd_allocation_charge(sizeof(struct jbd_buf)) +
+            (records - 1) * jbd_image_charge(journal);
+        journal_pool_locks = 0;
+        count_journal_pool_locks = true;
+        jbd_return_merged_buffers(retired, records);
+        count_journal_pool_locks = false;
+        CHECK(jbd_memory_used(journal) == used - (disabled ? returned : 0));
+        CHECK(jbd_memory_cached(journal) == cached + (disabled ? 0 : returned));
+        CHECK(disabled || journal_pool_locks == 1);
+        CHECK(held->payload.references == 1 && ((uint8_t *)held->data)[0] == 'H');
+        jbd_image_free(held);
+    }
+    jbd_memory_set_cache_disabled(journal, false);
+    puts("PASS merged buffer retirement: shared pool lock, held reader and cache-disabled release");
 #endif
     for (unsigned round = 0; round < 3; round++) {
         struct jbd_trans *operation;

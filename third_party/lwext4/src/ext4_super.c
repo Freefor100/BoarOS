@@ -130,6 +130,35 @@ void ext4_sb_set_csum(struct ext4_sblock *s)
 	s->checksum = to_le32(ext4_sb_csum(s));
 }
 
+/* Derive the on-disk checksum after replacing only free_inodes_count.
+ * The accepted superblock already carries a valid checksum. CRC linearity
+ * cancels every unchanged byte, including the prefix and the initial seed. */
+uint32_t ext4_sb_inode_count_csum(struct ext4_sblock *s, uint32_t inodes)
+{
+	if (!ext4_sb_feature_ro_com(s, EXT4_FRO_COM_METADATA_CSUM))
+		return s->checksum;
+#if CONFIG_META_CSUM_ENABLE
+	_Static_assert(offsetof(struct ext4_sblock, checksum) -
+		(offsetof(struct ext4_sblock, free_inodes_count) + sizeof(uint32_t))
+		== 1000, "CRC32C zero suffix");
+	uint32_t changed = s->free_inodes_count ^ to_le32(inodes);
+	uint32_t residue = ext4_crc32c(0, &changed, sizeof(changed));
+	/* crc32c(0x80000000, 1000 zero bytes) represents the suffix shift
+	 * in the reflected Castagnoli polynomial. */
+	uint32_t suffix = UINT32_C(0x443d3eb3);
+	uint32_t delta = 0;
+	while (suffix) {
+		if (suffix & UINT32_C(0x80000000)) delta ^= residue;
+		residue = (residue >> 1) ^ ((0U - (residue & 1U)) & UINT32_C(0x82f63b78));
+		suffix <<= 1;
+	}
+	return s->checksum ^ to_le32(delta);
+#else
+	(void)inodes;
+	return 0;
+#endif
+}
+
 int ext4_sb_write(struct ext4_blockdev *bdev, struct ext4_sblock *s)
 {
 	ext4_sb_set_csum(s);
