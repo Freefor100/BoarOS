@@ -42,7 +42,11 @@ enum kernel_files_status kernel_files_copy_user_path(struct kernel_mm *, uint64_
 #define KERNEL_FILES_FD_CLOEXEC UINT32_C(1)
 #define KERNEL_FILES_FD_RESERVED UINT32_C(2)
 struct kernel_files_fd_reservation { struct kernel_files *files; uint32_t fd; };
-void kernel_files_cancel_reservation(struct kernel_files_fd_reservation *reservation);
+void kernel_files_cancel_reserved_fd(struct kernel_files_fd_reservation *reservation);
+static inline void kernel_files_cancel_reservation(struct kernel_files_fd_reservation *reservation)
+{
+    if (reservation->files) kernel_files_cancel_reserved_fd(reservation);
+}
 #define KERNEL_FILES_RESERVATION_SCOPE(name) \
     struct kernel_files_fd_reservation name __attribute__((cleanup(kernel_files_cancel_reservation))) = {0}
 enum kernel_files_status kernel_files_install_pair_reserved(

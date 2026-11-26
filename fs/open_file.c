@@ -577,7 +577,10 @@ enum kernel_open_file_status kernel_open_file_create_at(
     int result = path ? kernel_vfs_open_at(start,root,path,request,&file->file,opened) :
         kernel_vfs_open_resolved(start, &file->file, request);
     if (!result) {
-        memset((uint8_t *)file + sizeof(file->file), 0, sizeof(*file) - sizeof(file->file));
+        /* The owner initializer sets heap and constructs the offset lock. */
+        file->cleanup_next = NULL;
+        const size_t tail = offsetof(struct kernel_open_file_description, offset);
+        memset((uint8_t *)file + tail, 0, sizeof(*file) - tail);
         if (request->flags & KERNEL_VFS_OPEN_PATH_ONLY) file->kind=KERNEL_OPEN_FILE_KIND_PATH;
         result = finish_path_open(file, heap);
     }
