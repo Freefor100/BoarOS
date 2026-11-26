@@ -15,6 +15,7 @@ import time
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'tests/diff-abi'))
 import harness
+from arch_profiles import PROFILES
 from sdcard import preliminary_image
 
 def digest(path):
@@ -173,7 +174,7 @@ def main():
                     snapshots.append({'name':window,'values':cost_report.parse(body,int(epoch))})
                 passed=passed and len(snapshots)==6 and 'NETWORK PROTOCOL DRAIN' in raw
             elif 'COST SNAPSHOT' in raw:passed=False
-            if name=='boaros':passed=passed and 'exited status=0x0 ' in raw and 'heap-live=0x0; shutting down' in raw
+            if name=='boaros':passed=passed and PROFILES['riscv'].root_poweroff_success(raw)
             protocol=[]
             for window,phase,body in re.findall(r'^NETWORK PROTOCOL name=(\S+) phase=(\S+)\n(.*?)^NETWORK PROTOCOL END$',raw,re.M|re.S):
                 protocol.append({'name':window,'phase':phase,'values':dict((k,int(v)) for k,v in re.findall(r'^(\w+)=(\d+)$',body,re.M))})

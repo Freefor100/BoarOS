@@ -257,6 +257,36 @@ static void ready_wait_case(int nice, int policy, unsigned queued, int should_pr
     if (should_preempt) assert(selected == &peer);
 }
 
+static void fair_peer_wake_case(int nice, unsigned competitors, uint32_t slice)
+{
+    setup(KERNEL_SCHED_OTHER,0,0);
+    kernel_sched_dequeue(&scheduler.runqueue,&peer.ready_node);
+    running.arch.user_mode=peer.arch.user_mode=1;
+    running.ready_node.fair.key=2*KERNEL_SCHED_WAKE_NS;
+    running.scheduling.fair_slice_ns=slice;
+    peer.accounted=1;
+    peer.scheduling.nice=nice;
+    ready_append(&peer);
+    static struct kernel_task queued[9];
+    for (unsigned i=0;i<competitors;i++) {
+        queued[i]=(struct kernel_task){.accounted=1,.arch.user_mode=1,
+            .state=KERNEL_THREAD_STATE_READY,.fair_queue=&scheduler.runqueue};
+        queued[i].ready_node.fair.key=3*KERNEL_SCHED_WAKE_NS+i;
+        ready_append(&queued[i]);
+    }
+
+    assert(!scheduler_reschedule(0,0,0));
+    if (!nice && !competitors) {
+        assert(!switches && cpu.current==&running);
+        assert(timer_request==1+(slice ? slice : 2*KERNEL_SCHED_WAKE_NS));
+        uint64_t elapsed=slice ? slice : KERNEL_SCHED_WAKE_NS;
+        now=1+elapsed;
+        running.usage.user_ns=elapsed;
+        assert(!scheduler_reschedule(0,0,0));
+    }
+    assert(switches==1 && selected==&peer);
+}
+
 static void deferred_slice_case(void)
 {
     for (unsigned rr=0;rr<2;rr++) {
@@ -358,6 +388,11 @@ int main(int argc,char **argv)
     ready_wait_case(5,KERNEL_SCHED_OTHER,0,0);
     ready_wait_case(0,KERNEL_SCHED_BATCH,0,0);
     puts("ready wait: short same-nice queues preempt earlier; crowded queues and BATCH keep ordinary timeslices");
+    fair_peer_wake_case(0,0,0);
+    fair_peer_wake_case(0,0,100000);
+    fair_peer_wake_case(-1,0,0);
+    fair_peer_wake_case(0,9,0);
+    puts("wake preemption: short equal-weight execution, sub-ms slice, higher weight and a crowded queue");
     setup(KERNEL_SCHED_OTHER,0,0);
     running.scheduling.fair_slice_ns=100000;running.scheduling.fair_slice_used=5000000;
     scheduler_rearm_timer();assert(timer_request==2);

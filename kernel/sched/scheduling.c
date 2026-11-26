@@ -75,6 +75,12 @@ static int ready_wait_user(const struct kernel_task *task)
     return task->scheduling.policy==KERNEL_SCHED_OTHER;
 }
 
+static uint32_t fair_run_minimum(const struct kernel_sched_policy *policy)
+{
+    uint32_t slice=kernel_sched_fair_slice(policy);
+    return slice<KERNEL_SCHED_WAKE_NS?slice:KERNEL_SCHED_WAKE_NS;
+}
+
 /* Each nice bucket is a FIFO in actual runqueue insertion order.
  * The same runqueue lock protects it and the virtual-runtime tree. */
 static void ready_wait_append(struct kernel_sched_runqueue *queue,struct kernel_task *task)
@@ -131,8 +137,7 @@ static uint64_t ready_wait_delay(struct kernel_cpu *cpu,const struct kernel_task
     uint64_t now=cpu->rt_bandwidth.last_account_ns;
     uint64_t delay=oldest->ready_wait_deadline>now?oldest->ready_wait_deadline-now:0;
     const struct kernel_sched_policy *running=&cpu->current->scheduling;
-    uint32_t slice=kernel_sched_fair_slice(running);
-    uint32_t minimum=slice<KERNEL_SCHED_WAKE_NS?slice:KERNEL_SCHED_WAKE_NS;
+    uint32_t minimum=fair_run_minimum(running);
     uint32_t used=running->fair_slice_used;
     if (used<minimum && delay<minimum-used) delay=minimum-used;
     return delay;
@@ -157,13 +162,20 @@ static void fair_place(struct kernel_task *task,struct kernel_cpu *cpu)
     kernel_sched_fair_place(queue,&task->ready_node,task->fair_queue);
     task->fair_queue=queue;
 }
-static int fair_preempts(const struct kernel_task *task,const struct kernel_task *current)
+static int fair_preempts(const struct kernel_task *task,const struct kernel_task *current,
+    const struct kernel_sched_runqueue *queue)
 {
     if(!task || !current || task->scheduling.priority || current->scheduling.priority)return 0;
     if(current->idle)return 1;
     if(current->scheduling.policy==KERNEL_SCHED_IDLE && task->scheduling.policy!=KERNEL_SCHED_IDLE)return 1;
-    if(task->scheduling.policy!=KERNEL_SCHED_OTHER || current->ready_node.fair.key<=task->ready_node.fair.key)return 0;
-    return current->ready_node.fair.key-task->ready_node.fair.key>KERNEL_SCHED_WAKE_NS;
+    if(task->scheduling.policy!=KERNEL_SCHED_OTHER || current->ready_node.fair.key<=task->ready_node.fair.key ||
+        current->ready_node.fair.key-task->ready_node.fair.key<=KERNEL_SCHED_WAKE_NS)return 0;
+    /* 同档用户任务先取得一小段连续执行时间。短队列的就绪等待
+     * 期限仍会推进另一方，阻塞与实际时间片耗尽照常交接。 */
+    if (ready_wait_short_queue(queue) && task->scheduling.nice==current->scheduling.nice &&
+        ready_wait_user(task) && ready_wait_user(current))
+        return current->scheduling.fair_slice_used>=fair_run_minimum(&current->scheduling);
+    return 1;
 }
 
 static int is_rt(const struct kernel_task *task)
@@ -981,7 +993,7 @@ static void ready_enqueue_at_locked(struct kernel_task *task, int flags
     ready_wait_append(queue,task);
     int preempt=!target->current || target->current->idle ||
         task->scheduling.priority>target->current->scheduling.priority ||
-        fair_preempts(task,target->current);
+        fair_preempts(task,target->current,queue);
     /* A first waiter can bring an unarmed or later timer forward. */
     if (!task->ready_node.priority && task->ready_wait_next==task && ready_wait_short_queue(queue) &&
         ready_wait_user(target->current) &&
@@ -1397,7 +1409,7 @@ static int select_local_locked(struct kernel_cpu *cpu,struct kernel_task *curren
         if(expired)current->scheduling.fair_slice_used=0;
         int due=head && current->ready_node.fair.key>=head->fair.key;
         if (head && (current->idle || voluntary || ((rotate||expired)&&due) ||
-                     age_due || fair_preempts(normal,current))) {
+                     age_due || fair_preempts(normal,current,&cpu->runqueue))) {
             if (current->idle) cpu->idle_context_saved=1;
             else {
                 if (current->wait.ready_pending) __builtin_trap();
@@ -1510,7 +1522,8 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
     struct kernel_task *next = ready_best_locked();
     struct kernel_task *oldest=ready_wait_head(cpu,next);
     int higher = next && (ready_wait_preempts(cpu,oldest) || current == cpu->idle ||
-                         next->scheduling.priority > current->scheduling.priority || fair_preempts(next,current));
+                         next->scheduling.priority > current->scheduling.priority ||
+                         fair_preempts(next,current,cpu_queue(cpu)));
     int fair_expired=!is_rt(current) && current->scheduling.fair_slice_used>=kernel_sched_fair_slice(&current->scheduling);
     if(fair_expired)current->scheduling.fair_slice_used=0;
     int rotate=voluntary||expired||((rotate_other||fair_expired)&&!is_rt(current)&&next&&

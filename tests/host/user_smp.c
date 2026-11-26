@@ -906,7 +906,20 @@ static void ordinary_local_slice(void)
         assert(!tasks[0].scheduling.fair_slice_used && tasks[0].wait.ready_pending);
         assert(scheduler_finish_local(active));assert_ready_owner(&tasks[0],active);
     }
-    puts("PASS ordinary local selection rotates at each thread's short/long fair slice");
+    reset_two_queues();active=&cpus[1];
+    tasks[0]=(struct kernel_task){.accounted=1,.arch.user_mode=1,.cpu_mask=2,.cpu=active,
+        .state=KERNEL_THREAD_STATE_RUNNING,.wait.on_cpu=1};
+    tasks[0].ready_node.fair.key=2*KERNEL_SCHED_WAKE_NS;
+    active->current=&tasks[0];idles[1].wait.on_cpu=0;
+    tasks[1]=(struct kernel_task){.accounted=1,.arch.user_mode=1,.cpu_mask=2,.cpu=active,
+        .state=KERNEL_THREAD_STATE_READY};
+    { KERNEL_RAW_SCOPE(g,&kernel_wait_domain);ready_enqueue_locked(&tasks[1],SCHED_READY_LOCAL); }
+    struct kernel_task *next=0;uint64_t deadline;
+    assert(scheduler_select_local(0,0,0,&next,&deadline) && !next);
+    tasks[0].scheduling.fair_slice_used=KERNEL_SCHED_WAKE_NS;
+    assert(scheduler_select_local(0,0,0,&next,&deadline) && next==&tasks[1]);
+    assert(scheduler_finish_local(active));assert_ready_owner(&tasks[0],active);
+    puts("PASS ordinary local selection honors short/long fair slices and equal-weight minimum execution");
 }
 
 static void fair_enqueue(struct kernel_task *task,unsigned mask,int nice,uint64_t lag)
