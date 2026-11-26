@@ -327,29 +327,37 @@ void ext4_bcache_record_verified(struct ext4_bcache *bc,uint64_t lba,uint64_t sc
     __atomic_fetch_or(&payload->verified[record/64],UINT64_C(1)<<(record%64),__ATOMIC_RELEASE);
 }
 
-void ext4_bcache_prepare_private(struct ext4_block *client, struct ext4_block *accepted,
-    struct ext4_block_payload *private_payload)
+struct ext4_block_payload *ext4_bcache_bind_private_locked(struct ext4_block *client,
+    struct ext4_block *accepted, struct ext4_block_payload *private_payload)
 {
     if (!client || !client->buf || !client->payload || !accepted || client==accepted ||
         !private_payload || !private_payload->data) __builtin_trap();
-    ext4_block_payload_write(private_payload);
     struct ext4_buf *buf=client->buf;
     struct ext4_block_payload *old=NULL;
+    if (!buf->refctr || (buf->loading && !buf->fresh_load) || buf->refctr==UINT32_MAX)
+        __builtin_trap();
+    struct ext4_block_payload *current=buf->current_payload;
+    if (client->payload!=current) {
+        ext4_block_payload_get(current);
+        old=client->payload;
+    }
+    /* 当前版本的原有 loan 直接交给 accepted；两份 descriptor 仍各持
+     * 一个 buf 引用，client 另借已经分配好的私有 payload。 */
+    buf->refctr++;
+    *accepted=(struct ext4_block){buf->lba,buf,buf->data,current};
+    ext4_block_payload_get(private_payload);
+    client->data=private_payload->data;client->payload=private_payload;
+    return old;
+}
+
+void ext4_bcache_prepare_private(struct ext4_block *client, struct ext4_block *accepted,
+    struct ext4_block_payload *private_payload)
+{
+    ext4_block_payload_write(private_payload);
+    struct ext4_block_payload *old;
     {
-        KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
-        if (!buf->refctr || (buf->loading && !buf->fresh_load) || buf->refctr==UINT32_MAX)
-            __builtin_trap();
-        struct ext4_block_payload *current=buf->current_payload;
-        if (client->payload!=current) {
-            ext4_block_payload_get(current);
-            old=client->payload;
-        }
-        /* 当前版本的原有 loan 直接交给 accepted；两份 descriptor 仍各持
-         * 一个 buf 引用，client 另借已经分配好的私有 payload。 */
-        buf->refctr++;
-        *accepted=(struct ext4_block){buf->lba,buf,buf->data,current};
-        ext4_block_payload_get(private_payload);
-        client->data=private_payload->data;client->payload=private_payload;
+        KERNEL_TASK_LOCK_SCOPE(guard,&client->buf->bc->metadata);
+        old=ext4_bcache_bind_private_locked(client, accepted, private_payload);
     }
     if (old) ext4_block_payload_put(old);
 }

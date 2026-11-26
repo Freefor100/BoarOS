@@ -290,7 +290,7 @@ int ext4_block_cache_shake(struct ext4_blockdev *bdev)
 
 static int block_get_reference(struct ext4_blockdev *bdev, struct ext4_block *b,
     uint64_t lba, uint32_t offset, uint32_t length, enum ext4_block_access access,
-    enum ext4_bcache_read_state *read, bool *private)
+    enum ext4_bcache_read_state *read, bool *private, struct jbd_trans **unowned)
 {
 	int r;
 
@@ -304,20 +304,19 @@ static int block_get_reference(struct ext4_blockdev *bdev, struct ext4_block *b,
 
 	b->lb_id = lba;
 	if (private) *private = false;
+    if (unowned) *unowned = NULL;
 #if CONFIG_JOURNALING_ENABLE
-    if (bdev->fs) {
-        struct jbd_trans *trans = ext4_current_trans(bdev->fs);
-        if (trans) {
-            bool found;
-            r = jbd_trans_borrow_private(trans, b, lba, offset, length, access, &found);
-            if (found) {
-                COST_ADD(BLOCK_CACHE_HITS, 1);
-                if (!r) {
-                    if (read) *read = EXT4_BCACHE_READ_READY;
-                    if (private) *private = true;
-                }
-                return r;
+    struct jbd_trans *trans = bdev->fs ? ext4_current_trans(bdev->fs) : NULL;
+    if (trans) {
+        bool found;
+        r = jbd_trans_borrow_private(trans, b, lba, offset, length, access, &found);
+        if (found) {
+            COST_ADD(BLOCK_CACHE_HITS, 1);
+            if (!r) {
+                if (read) *read = EXT4_BCACHE_READ_READY;
+                if (private) *private = true;
             }
+            return r;
         }
     }
 #else
@@ -327,6 +326,11 @@ static int block_get_reference(struct ext4_blockdev *bdev, struct ext4_block *b,
 	/* 命中先取得引用：无需新分配的访问不能因回收而淘汰自身。 */
 	if (ext4_bcache_find_get(bdev->bc, b, lba, read)) {
 		COST_ADD(BLOCK_CACHE_HITS, 1);
+#if CONFIG_JOURNALING_ENABLE
+        /* A ready hit took only the cache guard. No code has entered this
+         * task's private operation since its missing-record lookup. */
+        if (unowned && *read == EXT4_BCACHE_READ_READY) *unowned = trans;
+#endif
 		return EOK;
 	}
 	COST_ADD(BLOCK_CACHE_MISSES, 1);
@@ -349,7 +353,7 @@ static int block_get_reference(struct ext4_blockdev *bdev, struct ext4_block *b,
 int ext4_block_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
     uint64_t lba)
 {
-    return block_get_reference(bdev,b,lba,0,bdev->lg_bsize,EXT4_BLOCK_READ,NULL,NULL);
+    return block_get_reference(bdev,b,lba,0,bdev->lg_bsize,EXT4_BLOCK_READ,NULL,NULL,NULL);
 }
 static void ext4_block_loaded(struct ext4_blockdev *bdev, struct ext4_buf *buf, int error)
 {
@@ -477,7 +481,9 @@ static inline int block_get_range(struct ext4_blockdev *bdev, struct ext4_block 
 Retry:;
     enum ext4_bcache_read_state read;
     bool private;
-    int r=block_get_reference(bdev,b,lba,offset,length,access,&read,&private);
+    struct jbd_trans *unowned;
+    int r=block_get_reference(bdev,b,lba,offset,length,access,&read,&private,
+        access == EXT4_BLOCK_WRITE ? &unowned : NULL);
     if (r) return r;
     if (private) return EOK;
     if (read==EXT4_BCACHE_READ_LOAD) {
@@ -502,6 +508,7 @@ Retry:;
     }
     if (access != EXT4_BLOCK_WRITE) return EOK;
 #if CONFIG_JOURNALING_ENABLE
+    if (unowned) return jbd_trans_prepare_unowned_range(unowned,b,offset,length);
     if (bdev->fs) {
         struct jbd_trans *trans=ext4_current_trans(bdev->fs);
         if (trans) return jbd_trans_get_write_access_range(trans,b,offset,length);
@@ -522,7 +529,7 @@ int ext4_block_get_new(struct ext4_blockdev *bdev, struct ext4_block *block, uin
         enum ext4_bcache_read_state read;
         bool owned;
         int result = block_get_reference(bdev, block, lba, 0, bdev->lg_bsize,
-            EXT4_BLOCK_WRITE, &read, &owned);
+            EXT4_BLOCK_WRITE, &read, &owned, NULL);
         if (result || owned) return result;
         if (read == EXT4_BCACHE_READ_LOAD) {
             ext4_bcache_begin_fresh(block->buf);
@@ -627,7 +634,7 @@ int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,
 	for (unsigned i = 0; i < count; i++) {
 		enum ext4_bcache_read_state read;
 		errors[i] = block_get_reference(bdev, &blocks[i], lbas[i], 0, bdev->lg_bsize,
-            EXT4_BLOCK_READ, &read, NULL);
+            EXT4_BLOCK_READ, &read, NULL, NULL);
 		if (errors[i]) continue;
 		if (read==EXT4_BCACHE_READ_WAIT) { waiters|=UINT32_C(1)<<i;continue; }
 		if (read==EXT4_BCACHE_READ_READY) continue;

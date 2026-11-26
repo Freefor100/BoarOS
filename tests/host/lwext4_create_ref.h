@@ -122,6 +122,16 @@ int __wrap_jbd_trans_get_write_access_range(struct jbd_trans *trans, struct ext4
     return __real_jbd_trans_get_write_access_range(trans, block, offset, length);
 }
 
+int __real_jbd_trans_prepare_unowned_range(struct jbd_trans *, struct ext4_block *,
+    uint32_t, uint32_t);
+int __wrap_jbd_trans_prepare_unowned_range(struct jbd_trans *trans, struct ext4_block *block,
+    uint32_t offset, uint32_t length)
+{
+    if (watched_inode_bitmap && block->lb_id == watched_inode_bitmap)
+        watched_inode_bitmap_bytes += length;
+    return __real_jbd_trans_prepare_unowned_range(trans, block, offset, length);
+}
+
 static int create_inode_read_batch(struct ext4_blockdev *dev, struct block_read_span *spans,
     unsigned count, const struct block_read_completion *completion)
 {

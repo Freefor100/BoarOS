@@ -12,6 +12,8 @@ struct jbd_source;
 struct jbd_data;
 struct file_data_source;
 struct ext4_buf;
+struct ext4_block;
+struct ext4_block_payload;
 /* Allocation accounting is independent of the journal's retention quota.
  * The callback is bounded/nonblocking; its retained owner can outlive stop. */
 struct jbd_memory_account {
@@ -56,6 +58,8 @@ bool jbd_source_estimate(struct jbd_journal *,const struct file_data_source *con
     unsigned,size_t *);
 void jbd_memory_owner_uncharge(struct jbd_memory *, size_t);
 bool jbd_memory_pin_home(struct jbd_journal *, struct ext4_buf *);
+bool jbd_memory_bind_private(struct jbd_journal *, struct ext4_block *client,
+    struct ext4_block *accepted, struct ext4_block_payload *private_payload);
 void jbd_memory_unpin_home(struct jbd_journal *, struct ext4_buf *);
 size_t jbd_allocation_charge(size_t);
 void *jbd_alloc(struct jbd_journal *, size_t);

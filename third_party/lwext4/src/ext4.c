@@ -1836,13 +1836,13 @@ static int ext4_trans_record_super(struct ext4_mountpoint *mp)
     if (!ext4_operation_super_changed(operation)) return EOK;
     struct ext4_block block = EXT4_BLOCK_ZERO();
     uint32_t block_size = ext4_sb_get_block_size(&mp->fs.sb);
-    int result = ext4_trans_block_get_range(mp->fs.bdev, &block,
+    int result = ext4_block_get_range(mp->fs.bdev, &block,
         EXT4_SUPERBLOCK_OFFSET / block_size, EXT4_SUPERBLOCK_OFFSET % block_size,
-        sizeof(mp->fs.sb));
+        sizeof(mp->fs.sb), EXT4_BLOCK_READ);
     if (result) return result;
-    /* Credits and this exact range are reserved now. Acceptance merges the
-     * counters into the latest superblock and computes its checksum once. */
-    result = ext4_trans_set_block_dirty_range(&block, EXT4_SUPERBLOCK_OFFSET % block_size, sizeof(mp->fs.sb));
+    /* Commit accounting still reserves this block. Acceptance initializes
+     * the superblock range from the latest counters and checksum. */
+    result = jbd_trans_reserve_superblock(operation->trans, &block);
     int cleanup = ext4_block_set(mp->fs.bdev, &block);
     return result ? result : cleanup;
 }

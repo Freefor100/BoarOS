@@ -797,6 +797,21 @@ static void private_access_oom(struct ext4_blockdev *dev, struct jbd_journal *jo
         CHECK(after.used==baseline && !after.reserved && !after.cached);
         jbd_memory_set_cache_disabled(journal,false);
     }
+#ifdef TEST_JBD_RECORD_COPY
+    struct jbd_trans *operation;
+    CHECK(jbd_journal_new_trans(journal, &operation) == EOK);
+    test_operation_bind(dev->fs, operation);
+    struct ext4_block client;
+    CHECK(ext4_block_get(dev, &client, home) == EOK && !client.buf->journal_pending);
+    private_rebind_cache = &client.buf->bc->metadata;
+    private_rebind_cache_locks = 0;
+    CHECK(jbd_trans_get_write_access_range(operation, &client, 0, 32) == EOK);
+    private_rebind_cache = NULL;
+    CHECK(private_rebind_cache_locks == 1 && client.buf->journal_pending == 1);
+    CHECK(ext4_block_set(dev, &client) == EOK);
+    test_operation_bind(dev->fs, NULL);
+    jbd_journal_free_trans(journal, operation, true);
+#endif
 }
 
 static void private_prepare_oom(struct ext4_blockdev *dev, struct jbd_journal *journal,
@@ -855,9 +870,25 @@ static struct ext4_block private_super_interleave(struct ext4_blockdev *dev,
         operation->operation.block_delta = actor == 2 ? 2 : -1;
         struct ext4_block block;
         uint32_t offset = EXT4_SUPERBLOCK_OFFSET % dev->lg_bsize;
-        CHECK(ext4_trans_block_get_range(dev, &block, EXT4_SUPERBLOCK_OFFSET / dev->lg_bsize,
-              offset, sizeof(struct ext4_sblock)) == EOK);
-        CHECK(jbd_trans_set_block_dirty_range(operation, &block, offset, sizeof(struct ext4_sblock)) == EOK);
+        uint64_t lba = EXT4_SUPERBLOCK_OFFSET / dev->lg_bsize;
+        CHECK(ext4_block_get_range(dev, &block, lba, offset,
+              sizeof(struct ext4_sblock), EXT4_BLOCK_READ) == EOK);
+#ifdef TEST_JBD_RECORD_COPY
+        record_copy_bytes = 0;
+        count_record_copies = true;
+#endif
+        CHECK(jbd_trans_reserve_superblock(operation, &block) == EOK);
+#ifdef TEST_JBD_RECORD_COPY
+        count_record_copies = false;
+        CHECK(!record_copy_bytes);
+#endif
+        if (!actor) {
+            struct ext4_block reader;
+            CHECK(ext4_block_get_range(dev, &reader, lba, offset,
+                  sizeof(struct ext4_sblock), EXT4_BLOCK_READ) == EOK);
+            CHECK(ext4_sb_get_free_blocks_cnt((void *)(reader.data + offset)) == baseline);
+            CHECK(ext4_block_set(dev, &reader) == EOK);
+        }
         CHECK(jbd_trans_prepare_operation(operation) == EOK);
         CHECK(TAILQ_FIRST(&operation->buf_queue)->block.payload != block.payload);
         test_operation_bind(dev->fs, NULL);

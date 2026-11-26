@@ -250,6 +250,10 @@ int jbd_trans_get_write_access(struct jbd_trans *trans,
 			       struct ext4_block *block);
 int jbd_trans_get_write_access_range(struct jbd_trans *trans,
     struct ext4_block *block, uint32_t offset, uint32_t length);
+/* No intervening work in this operation since checking that LBA has no private owner. */
+int jbd_trans_prepare_unowned_range(struct jbd_trans *, struct ext4_block *,
+    uint32_t offset, uint32_t length);
+int jbd_trans_reserve_superblock(struct jbd_trans *, struct ext4_block *);
 int jbd_trans_get_new_access(struct jbd_trans *, struct ext4_block *);
 int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t block,
 	uint32_t offset, const void *data, uint32_t length, bool initialize,

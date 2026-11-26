@@ -2359,8 +2359,10 @@ int jbd_trans_borrow_private(struct jbd_trans *trans, struct ext4_block *block,
     return result;
 }
 
+enum jbd_private_init { JBD_COPY, JBD_FRESH, JBD_DEFER_SUPER };
+
 static int jbd_prepare_private(struct jbd_trans *trans, struct ext4_block *block,
-    uint32_t offset, uint32_t length, bool fresh)
+    uint32_t offset, uint32_t length, enum jbd_private_init init)
 {
     struct jbd_journal *journal = trans->journal;
     struct jbd_buf *jb;
@@ -2370,38 +2372,54 @@ static int jbd_prepare_private(struct jbd_trans *trans, struct ext4_block *block
     struct jbd_image *image = jbd_image_alloc_control(journal, sizeof(*jb) +
         2 * jbd_range_map_words(journal) * sizeof(*jb->dirty_ranges), &control);
     if (!image) return ENOMEM;
-    if (journal->grouped && !jbd_memory_pin_home(journal, block->buf)) {
+    jb = control;
+    /* Charge the home loan and give the private image to the client under
+     * one cache guard. A quota denial leaves the original descriptor intact. */
+    if (!jbd_memory_bind_private(journal, block, &jb->block, &image->payload)) {
         jbd_image_free(image);
         jbd_free(control);
         return ENOMEM;
     }
-    jb = control;
     jb->after = image;
     /* A reference can survive earlier transactions. Its read view remains
      * stable, but a new write must start from the latest accepted version. */
     jb->trans = trans;
-    ext4_bcache_prepare_private(block, &jb->block, &jb->after->payload);
     jb->private_access = true;
-    jb->fresh_block = fresh;
-    jb->fresh_copy = !fresh;
-    if (fresh) jbd_range_fill(jbd_initialized_ranges(jb), 0, length / 32);
-    else if (jbd_initialize_range(jb, jb->block.payload, offset, length, true)) __builtin_trap();
+    jb->fresh_block = init == JBD_FRESH;
+    jb->fresh_copy = init == JBD_COPY;
+    if (init == JBD_FRESH) jbd_range_fill(jbd_initialized_ranges(jb), 0, length / 32);
+    else if (init == JBD_COPY && jbd_initialize_range(jb, jb->block.payload, offset, length, true))
+        __builtin_trap();
     TAILQ_INSERT_HEAD(&trans->buf_queue, jb, buf_node);
     trans->data_cnt++;
     return EOK;
+}
+
+static inline int write_range_status(struct jbd_trans *trans, uint32_t offset, uint32_t length)
+{
+    struct jbd_journal *journal = trans->journal;
+    if (offset > journal->block_size || !length || length > journal->block_size - offset)
+        return EINVAL;
+    int error = jbd_journal_error(journal);
+    return error ? error : trans->error;
+}
+
+int jbd_trans_prepare_unowned_range(struct jbd_trans *trans, struct ext4_block *block,
+    uint32_t offset, uint32_t length)
+{
+    COST_SCOPE(prepare_cost, JOURNAL_RECORD_PREPARE_TICKS);
+    int error = write_range_status(trans, offset, length);
+    return error ? error : jbd_prepare_private(trans, block, offset, length, JBD_COPY);
 }
 
 int jbd_trans_get_write_access_range(struct jbd_trans *trans,
     struct ext4_block *block, uint32_t offset, uint32_t length)
 {
     COST_SCOPE(prepare_cost, JOURNAL_RECORD_PREPARE_TICKS);
-    struct jbd_journal *journal = trans->journal;
-    if (offset > journal->block_size || !length || length > journal->block_size - offset)
-        return EINVAL;
-    int error = jbd_journal_error(journal);
-    if (error || trans->error) return error ? error : trans->error;
+    int error = write_range_status(trans, offset, length);
+    if (error) return error;
     struct jbd_buf *jb = jbd_trans_find_buf(trans, block->lb_id);
-    if (!jb) return jbd_prepare_private(trans, block, offset, length, false);
+    if (!jb) return jbd_prepare_private(trans, block, offset, length, JBD_COPY);
     int result = jbd_rebind_private_range(jb, block, offset, length);
     if (!result) {
         jb->checked_tree = 0;
@@ -2410,12 +2428,30 @@ int jbd_trans_get_write_access_range(struct jbd_trans *trans,
     return result;
 }
 
+int jbd_trans_reserve_superblock(struct jbd_trans *trans, struct ext4_block *block)
+{
+    COST_SCOPE(prepare_cost, JOURNAL_RECORD_PREPARE_TICKS);
+    uint32_t offset = EXT4_SUPERBLOCK_OFFSET % trans->journal->block_size;
+    uint32_t length = sizeof(struct ext4_sblock);
+    int result = write_range_status(trans, offset, length);
+    if (result) return result;
+    if (jbd_trans_find_buf(trans, block->lb_id)) {
+        result = jbd_trans_get_write_access_range(trans, block, offset, length);
+        return result ? result : jbd_mark_dirty(trans, block, offset, length, 0);
+    }
+    result = jbd_prepare_private(trans, block, offset, length, JBD_DEFER_SUPER);
+    /* Reserve a wire record now. An earlier read still borrows the old bytes
+     * because the range is clean until the typed update is materialized. */
+    if (!result) TAILQ_FIRST(&trans->buf_queue)->modified = true;
+    return result;
+}
+
 int jbd_trans_get_new_access(struct jbd_trans *trans, struct ext4_block *block)
 {
     COST_SCOPE(prepare_cost, JOURNAL_RECORD_PREPARE_TICKS);
     int error = jbd_journal_error(trans->journal);
     if (error || trans->error) return error ? error : trans->error;
-    return jbd_prepare_private(trans, block, 0, trans->journal->block_size, true);
+    return jbd_prepare_private(trans, block, 0, trans->journal->block_size, JBD_FRESH);
 }
 
 int jbd_trans_get_write_access(struct jbd_trans *trans, struct ext4_block *block)
@@ -2513,6 +2549,9 @@ static int jbd_publish_private(struct jbd_trans *trans, struct jbd_trans *runnin
         struct ext4_sblock *merged = (void *)((uint8_t *)super->after->data + offset);
         int result = ext4_operation_prepare_super(op, merged);
         if (result) return result;
+        uint32_t first = offset / 32, end = (offset + sizeof(*merged)) / 32;
+        jbd_range_fill(jbd_initialized_ranges(super), first, end);
+        jbd_range_fill(super->dirty_ranges, first, end);
     }
     if (trans->allocation_groups) (void)jbd_claim_versions(trans,false);
     TAILQ_FOREACH(jb, &trans->buf_queue, buf_node) {
