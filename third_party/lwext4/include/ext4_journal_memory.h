@@ -8,6 +8,7 @@
 struct jbd_journal;
 struct jbd_memory;
 struct jbd_image;
+struct jbd_buf;
 struct jbd_source;
 struct jbd_data;
 struct file_data_source;
@@ -64,6 +65,9 @@ void jbd_memory_unpin_home(struct jbd_journal *, struct ext4_buf *);
 size_t jbd_allocation_charge(size_t);
 void *jbd_alloc(struct jbd_journal *, size_t);
 void jbd_free(void *);
+enum { JBD_BUFFER_RETURN_BATCH = 8 };
+/* Consume detached merge controls and their retired image owner references. */
+void jbd_return_merged_buffers(struct jbd_buf *const *, unsigned count);
 /* Consume a detached ordered-data list and return its controls in bounded batches. */
 void jbd_data_free_list(struct jbd_data *,unsigned);
 bool jbd_budget_room(struct jbd_journal *, size_t);

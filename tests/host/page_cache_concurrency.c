@@ -476,8 +476,17 @@ int __wrap_ext4_file_sync_metadata_mode(ext4_file *file,bool data_only)
     return __real_ext4_file_sync_metadata_mode(file,data_only);
 }
 static ext4_file *small_files_scalar_failure;
+static struct {
+    ext4_file *file, *independent;
+    uint64_t offset;
+    unsigned entered, resume, independent_entered, independent_resume;
+} held_range_window;
 int __wrap_ext4_fpwrite_batch(ext4_file *file,struct file_write_span *spans,unsigned count)
 {
+    if (file==held_range_window.file && count && spans[0].offset==held_range_window.offset) {
+        __atomic_store_n(&held_range_window.entered,1,__ATOMIC_RELEASE);
+        wait_progress(&held_range_window.resume,1);
+    }
     if (file==small_files_scalar_failure) {
         for (unsigned i=0;i<count;i++) spans[i].written=0;
         return KERNEL_EIO;
@@ -540,6 +549,10 @@ int __real_ext4_fpwrite_files(ext4_file *const *,const struct file_write_set *,u
 int __wrap_ext4_fpwrite_files(ext4_file *const *files,const struct file_write_set *sets,
     unsigned count,int *data_result)
 {
+    if (files[0]==held_range_window.independent) {
+        __atomic_store_n(&held_range_window.independent_entered,1,__ATOMIC_RELEASE);
+        wait_progress(&held_range_window.independent_resume,1);
+    }
     small_files_active=small_files_watch;
     int result=__real_ext4_fpwrite_files(files,sets,count,data_result);
     small_files_active=0;
@@ -1098,6 +1111,102 @@ static void *small_range_producer(void *argument)
     return NULL;
 }
 
+struct range_head_client {
+    struct kernel_page_cache *cache;
+    struct kernel_vfs_node *node;
+    uint64_t end;
+    unsigned actor, done;
+    bool wait;
+};
+
+static void *range_head_client_run(void *argument)
+{
+    struct range_head_client *client=argument;
+    cache_test_attach(client->actor);
+    if (client->wait) kernel_page_cache_wait_range(client->cache,client->node,0,client->end);
+    else assert(!kernel_page_cache_submit_range(client->cache,client->node,0,client->end,true));
+    __atomic_store_n(&client->done,1,__ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void range_head_progress(struct kernel_page_cache *cache,struct kernel_vfs_mount *mount)
+{
+    const uint64_t window=BOAROS_PAGE_CACHE_WRITEBACK_PAGES*BOAROS_PAGE_SIZE;
+    const size_t long_end=2*window+BOAROS_PAGE_SIZE;
+    const size_t long_size=long_end+BOAROS_PAGE_SIZE;
+    struct kernel_vfs_file files[5]={{0}};
+    unsigned char *bytes=malloc(long_size);
+    assert(bytes);
+    memset(bytes,0x6d,long_size);
+    for (unsigned i=0;i<5;i++) {
+        char name[32];
+        snprintf(name,sizeof(name),"/range-head-%u",i);
+        size_t done, size=i==0 || i==4 ? long_size : 512;
+        assert(!kernel_vfs_create(mount,name,0600,&files[i]));
+        assert(!kernel_vfs_pwrite(&files[i],0,bytes,size,&done) && done==size);
+    }
+    free(bytes);
+
+    struct small_range_setup setup={.cache=cache};
+    pthread_t executor,waiter,submitter;
+    assert(!pthread_create(&executor,NULL,small_range_producer,&setup));
+    wait_progress(&setup.entered,1);
+
+    struct kernel_vfs_node *long_node=kernel_vfs_file_node(&files[0]);
+    struct kernel_vfs_node *filler=kernel_vfs_file_node(&files[3]);
+    assert(!kernel_page_cache_submit_range(cache,long_node,0,long_end,true));
+    struct range_head_client old={.cache=cache,.node=long_node,.end=long_end,.actor=6,.wait=true};
+    unsigned waiter_parked=mm_test_parked(old.actor);
+    assert(!pthread_create(&waiter,NULL,range_head_client_run,&old));
+    while (mm_test_parked(old.actor)==waiter_parked) sched_yield();
+
+    assert(!kernel_page_cache_submit_range(cache,long_node,long_end,long_size,true));
+    struct kernel_vfs_node *other_long=kernel_vfs_file_node(&files[4]);
+    assert(!kernel_page_cache_submit_range(cache,other_long,0,long_size,true));
+    for (unsigned i=1;i<3;i++)
+        assert(!kernel_page_cache_submit_range(cache,kernel_vfs_file_node(&files[i]),0,
+            BOAROS_PAGE_SIZE,true));
+    for (unsigned i=5;i<32;i++)
+        assert(!kernel_page_cache_submit_range(cache,filler,0,BOAROS_PAGE_SIZE,true));
+
+    struct range_head_client extra={.cache=cache,.node=filler,.end=BOAROS_PAGE_SIZE,.actor=7};
+    unsigned submitter_parked=mm_test_parked(extra.actor);
+    assert(!pthread_create(&submitter,NULL,range_head_client_run,&extra));
+    while (mm_test_parked(extra.actor)==submitter_parked) sched_yield();
+
+    held_range_window.file=lwext4_node_file(long_node);
+    held_range_window.independent=lwext4_node_file(kernel_vfs_file_node(&files[1]));
+    held_range_window.offset=window;
+    __atomic_store_n(&setup.resume,1,__ATOMIC_RELEASE);
+    while (!__atomic_load_n(&held_range_window.independent_entered,__ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&held_range_window.entered,__ATOMIC_ACQUIRE)) sched_yield();
+    assert(__atomic_load_n(&held_range_window.independent_entered,__ATOMIC_ACQUIRE));
+    /* The earlier waiter must find its original request behind newer
+     * requests while those newer requests are still queued. */
+    while (mm_test_parked(old.actor)<=waiter_parked+1 &&
+           !__atomic_load_n(&old.done,__ATOMIC_ACQUIRE)) sched_yield();
+    assert(!__atomic_load_n(&old.done,__ATOMIC_ACQUIRE));
+    __atomic_store_n(&held_range_window.independent_resume,1,__ATOMIC_RELEASE);
+    wait_progress(&held_range_window.entered,1);
+    for (unsigned i=1;i<3;i++)
+        assert(ext4_fsize(lwext4_node_file(kernel_vfs_file_node(&files[i])))==512);
+    assert(ext4_fsize(held_range_window.file)==window);
+    assert(!ext4_fsize(lwext4_node_file(other_long)));
+    wait_progress(&extra.done,1);
+    __atomic_store_n(&held_range_window.resume,1,__ATOMIC_RELEASE);
+
+    assert(!pthread_join(executor,NULL) && !pthread_join(submitter,NULL) && !pthread_join(waiter,NULL));
+    for (unsigned i=0;i<5;i++) {
+        uint64_t observed=kernel_vfs_error_sequence(&files[i]);
+        assert(!kernel_vfs_sync_file_range(&files[i],0,UINT64_MAX,KERNEL_SYNC_FILE_RANGE_WAIT_AFTER,&observed));
+        assert(ext4_fsize(lwext4_node_file(kernel_vfs_file_node(&files[i])))==
+            (i==0 || i==4 ? long_size : 512));
+    }
+    held_range_window.file=held_range_window.independent=NULL;
+    for (unsigned i=0;i<5;i++) assert(!kernel_vfs_close(&files[i]));
+    puts("PASS full range queue: independent files returned slots, inode order and the older wait snapshot held");
+}
+
 static void small_files_sync_case(struct kernel_page_cache *cache,const char *path)
 {
     image_fd=open(path,O_RDWR);assert(image_fd>=0);
@@ -1205,6 +1314,7 @@ static void small_files_sync_case(struct kernel_page_cache *cache,const char *pa
     }
     small_files_completion_error=false;
     free(bytes);
+    range_head_progress(cache,&mount);
     kernel_page_cache_stop_worker(cache);
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(cache) && !close(image_fd));
     puts("PASS multi-file writeback: one transaction, reused mappings, sparse fallback, rollback and independent retry");

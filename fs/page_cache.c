@@ -4483,7 +4483,7 @@ enum { RANGE_WRITEBACK_SLOTS = 32, RANGE_COLLECT_REQUESTS = 4 };
 struct range_writeback {
     struct range_writeback *next;
     struct foreground_writeback window;
-    uint64_t first, sequence;
+    uint64_t first, sequence, next_bypass_page;
     bool collect;
 };
 
@@ -4998,10 +4998,13 @@ void kernel_page_cache_wait_range(struct kernel_page_cache *cache,
                 sampled = 1;
             }
             struct range_writeback *item = record->range_head;
-            for (; item && item->sequence <= sequence; item = item->next)
-                if (item->window.node == node && item->first <= last && item->window.last >= first)
+            /* Service order may differ from admission order. The snapshot
+             * still covers every older overlapping request in this queue. */
+            for (; item; item = item->next)
+                if (item->sequence <= sequence && item->window.node == node &&
+                    item->first <= last && item->window.last >= first)
                     break;
-            if (item && item->sequence <= sequence) {
+            if (item) {
                 if (record->range_collect_until) {
                     record->range_collect_until = 0;
                     cache_wake(&record->work);
@@ -5035,6 +5038,54 @@ void kernel_page_cache_wait_range(struct kernel_page_cache *cache,
             entry_return(inflight);
         }
     }
+}
+
+static void advance_range_request(struct kernel_page_cache *cache,
+    struct range_writeback *request, bool notify)
+{
+    struct kernel_page_cache_record *record = cache->record;
+    CACHE_SCOPE(progress, cache);
+    request->first = request->window.cursor;
+    /* A completed prefix will publish this progress when it retires. */
+    if (!notify) return;
+    if (record->range_head != request) __builtin_trap();
+    if (request->collect && request->first >= request->next_bypass_page &&
+        !record->stopping && record->range_count == RANGE_WRITEBACK_SLOTS &&
+        __atomic_load_n(&record->range_slots.registrations, __ATOMIC_ACQUIRE)) {
+        /* A skipped file keeps the order of all its remaining requests.
+         * Pay back each promoted slot with one head window before the next
+         * promotion, so newly arriving work cannot repeatedly split a run. */
+        struct kernel_vfs_node *skipped[RANGE_WRITEBACK_SLOTS];
+        skipped[0] = request->window.node;
+        struct kernel_vfs_instance *instance = request->window.node->instance;
+        struct range_writeback **source = &request->next;
+        struct range_writeback **destination = &record->range_head;
+        unsigned skipped_count = 1, picked = 0;
+        size_t pages = record->writeback_capacity;
+        while (*source && pages && picked < SMALL_FILE_WRITEBACK_MAX) {
+            struct range_writeback *next = *source;
+            struct kernel_vfs_node *node = next->window.node;
+            if (!next->collect || node->instance != instance) break;
+            unsigned i = 0;
+            while (i < skipped_count && skipped[i] != node) i++;
+            uint64_t needed = next->window.last - next->window.cursor + 1;
+            if (i < skipped_count || needed > pages) {
+                if (i == skipped_count) skipped[skipped_count++] = node;
+                source = &next->next;
+                continue;
+            }
+            *source = next->next;
+            if (!next->next) record->range_tail = source;
+            next->next = request;
+            *destination = next;
+            destination = &next->next;
+            pages -= needed;
+            picked++;
+        }
+        if (picked)
+            request->next_bypass_page = request->first + picked * record->writeback_capacity;
+    }
+    cache_wake(&record->range_progress);
 }
 
 static void retire_range_requests(struct kernel_page_cache *cache,
@@ -5235,11 +5286,7 @@ static bool run_queued_range_batch(struct kernel_page_cache *cache, struct range
         }
     }
     struct range_writeback *last = items[processed - 1];
-    if (!last->window.done) {
-        CACHE_SCOPE(progress, cache);
-        last->first = last->window.cursor;
-        if (!--processed) cache_wake(&cache->record->range_progress);
-    }
+    if (!last->window.done) advance_range_request(cache, last, --processed == 0);
     if (processed) retire_range_requests(cache, first, items[processed - 1], processed);
     return true;
 }
@@ -5247,7 +5294,6 @@ static bool run_queued_range_batch(struct kernel_page_cache *cache, struct range
 static void run_range_writeback(struct kernel_page_cache *cache,
     struct range_writeback *request, int stopping, bool batch)
 {
-    struct kernel_page_cache_record *record = cache->record;
     if (!stopping) {
         struct kernel_io_context *io = kernel_io_context_current();
         unsigned previous = io->background_reclaim;
@@ -5276,9 +5322,7 @@ static void run_range_writeback(struct kernel_page_cache *cache,
         request->window.done = 1;
     }
     if (!request->window.done) {
-        CACHE_SCOPE(progress, cache);
-        request->first = request->window.cursor;
-        cache_wake(&record->range_progress);
+        advance_range_request(cache, request, true);
         return;
     }
     /* Backend failures already have a publication in kernel_vfs_node_writeback.

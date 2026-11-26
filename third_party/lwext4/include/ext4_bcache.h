@@ -81,16 +81,18 @@ static inline __attribute__((always_inline)) void ext4_block_payload_get(struct 
     uint32_t before=__atomic_fetch_add(&payload->references,1,__ATOMIC_RELAXED);
     if (!before || before==UINT32_MAX) __builtin_trap();
 }
-static inline __attribute__((always_inline)) void ext4_block_payload_put(struct ext4_block_payload *payload)
+/* A final owner may defer disposal to return several payloads together. */
+static inline __attribute__((always_inline)) bool ext4_block_payload_drop(struct ext4_block_payload *payload)
 {
     if (!payload) __builtin_trap();
     uint32_t before=__atomic_fetch_sub(&payload->references,1,__ATOMIC_RELEASE);
     if (!before) __builtin_trap();
-    if (before==1) {
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        if (payload->release) payload->release(payload);
-    }
+    if (before!=1) return false;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return true;
 }
+static inline __attribute__((always_inline)) void ext4_block_payload_put(struct ext4_block_payload *payload)
+{ if (ext4_block_payload_drop(payload) && payload->release) payload->release(payload); }
 
 /**@brief   Single block descriptor*/
 struct ext4_block {
@@ -289,11 +291,14 @@ void ext4_bcache_publish_journal(struct ext4_block *, struct ext4_block_payload 
     uint64_t tree_key, bool merged);
 void ext4_bcache_begin_fresh(struct ext4_buf *);
 void ext4_bcache_cancel_fresh(struct ext4_buf *);
-struct ext4_block_patch { uint32_t offset, length; };
-/* A successful patch consumes the duplicate journal loan. */
-bool ext4_bcache_patch_current(struct ext4_block *redundant, unsigned owners,
-    const uint8_t *bytes, const struct ext4_block_patch *patches,
-    unsigned count, uint64_t tree_key);
+struct ext4_block_patch {
+    uint32_t offset, length;
+    const void *data;
+};
+/* A merge may also return the duplicate loan after publishing the patch. */
+bool ext4_bcache_patch_current(struct ext4_block *block, unsigned owners,
+    const struct ext4_block_patch *patches, unsigned count, uint64_t tree_key,
+    bool return_duplicate);
 void ext4_bcache_insert_dirty_node(struct ext4_bcache *, struct ext4_buf *);
 void ext4_bcache_remove_dirty_node(struct ext4_bcache *, struct ext4_buf *);
 /* Select and detach clean victims atomically, flushing only in a write context. */

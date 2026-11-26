@@ -212,6 +212,7 @@ uint32_t ext4_inodes_in_group_cnt(struct ext4_sblock *s, uint32_t bgid);
 int ext4_sb_write(struct ext4_blockdev *bdev, struct ext4_sblock *s);
 /* Update the checksum before copying the superblock into a transaction. */
 void ext4_sb_set_csum(struct ext4_sblock *s);
+uint32_t ext4_sb_inode_count_csum(struct ext4_sblock *s, uint32_t inodes);
 /* Bounded bootstrap checks, independent of the whole-superblock checksum. */
 bool ext4_sb_check_geometry(struct ext4_sblock *s);
 
