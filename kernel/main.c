@@ -955,6 +955,8 @@ static void kernel_main_high(void)
         shutdown_for_scheduler_error(scheduler_status);
     }
 
+    riscv_hwprobe_measure_scalar(0, &page_allocator, boot_info.timebase_frequency);
+
     if (boot_storage_present(&boot_info)) {
         scheduler_status = kernel_thread_create(storage_cleanup_worker, 0);
         if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) shutdown_for_scheduler_error(scheduler_status);
@@ -1087,7 +1089,7 @@ static void kernel_main_high(void)
 #if BOAROS_MAX_CPUS > 1
     riscv_smp_start(&boot_cpus, (UINT64_C(8) << 60) |
                     (transition_page_table.root_address >> 12),
-                    riscv_sv39_current_satp(), boot_info.timebase_frequency);
+                    riscv_sv39_current_satp(), boot_info.timebase_frequency, &page_allocator);
 #if BOAROS_USER_SMP
     if (root_started && root_boot.network && kernel_socket_start_tcp_owners()!=0)
         shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_RESOURCES);

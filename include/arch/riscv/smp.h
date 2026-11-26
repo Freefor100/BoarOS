@@ -9,8 +9,9 @@
 #define RISCV_IPI_STOP 8U
 #define RISCV_IPI_DROP_ROOT 16U
 #if BOAROS_MAX_CPUS > 1
+struct physical_page_allocator;
 void riscv_smp_start(const struct dtb_cpu_info *, uint64_t transition_satp,
-                     uint64_t final_satp, uint32_t frequency);
+                     uint64_t final_satp, uint32_t frequency, struct physical_page_allocator *);
 void riscv_smp_handle_ipi(void);
 void riscv_smp_timer_seen(void);
 void riscv_smp_idle(void);

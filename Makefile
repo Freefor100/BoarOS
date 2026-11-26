@@ -517,6 +517,7 @@ ASM_SOURCES := \
 	arch/riscv/fpu.S \
 	arch/riscv/vector_state.S \
 	arch/riscv/trap_entry.S \
+	arch/riscv/hwprobe_copy.S \
 	arch/riscv/user_copy.S \
 	arch/riscv/signal_trampoline.S
 # 无根模块测试复用生产运行时，由各目标追加测试入口。

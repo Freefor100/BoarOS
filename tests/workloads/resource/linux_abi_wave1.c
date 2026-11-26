@@ -232,6 +232,10 @@ static int hwprobe_contract(void)
     CHECK(syscall(258, NULL, 0, 0, NULL, 2) == -1 && errno == EINVAL);
     unsigned long mask = 0;
     CHECK(syscall(258, entries, 1, sizeof(mask), &mask, 1) == 0 && mask);
+    unsigned long online = mask;
+    struct hwprobe_pair no_required_base_bits = {3, 0};
+    CHECK(syscall(258, &no_required_base_bits, 1, sizeof(mask), &mask, 1) == 0);
+    CHECK(mask == online);
     mask = 0;
     CHECK(syscall(258, entries, 1, sizeof(mask), &mask, 0) == -1 && errno == EINVAL);
     puts("WAVE1 PASS riscv_hwprobe");
