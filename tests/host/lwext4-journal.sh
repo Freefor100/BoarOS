@@ -9,7 +9,7 @@ cc=${HOST_CC:-cc}
     -Wno-stringop-truncation -DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 ${JOURNAL_TEST_CFLAGS:-} \
     -DTEST_JBD_RECORD_COPY -DTEST_JBD_CREDIT_PARALLEL -fno-builtin-memcpy \
     -Wl,--wrap=memcpy -Wl,--wrap=calloc -Wl,--wrap=malloc -Wl,--wrap=free -Wl,--wrap=ext4_crc32c \
-    -Wl,--wrap=kernel_raw_lock_acquire,--wrap=ext4_bcache_find_get,--wrap=ext4_bcache_publish,--wrap=ext4_block_rebind \
+    -Wl,--wrap=kernel_raw_lock_acquire,--wrap=ext4_bcache_find_get,--wrap=ext4_bcache_publish_journal,--wrap=ext4_block_rebind \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_journal.c" \
     "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"

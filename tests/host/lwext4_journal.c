@@ -37,10 +37,12 @@ void __wrap_ext4_block_rebind(struct ext4_block *block, struct ext4_block_payloa
     if (block->buf == publication_owner.rebind_buffer) publication_owner.rebinds++;
     __real_ext4_block_rebind(block, next);
 }
-void __real_ext4_bcache_publish(struct ext4_buf *, struct ext4_block_payload *, uint64_t);
-void __wrap_ext4_bcache_publish(struct ext4_buf *buffer, struct ext4_block_payload *next,
-    uint64_t tree_key)
+void __real_ext4_bcache_publish_journal(struct ext4_block *, struct ext4_block_payload *,
+    uint64_t, bool);
+void __wrap_ext4_bcache_publish_journal(struct ext4_block *block, struct ext4_block_payload *next,
+    uint64_t tree_key, bool merged)
 {
+    struct ext4_buf *buffer = block->buf;
     if (buffer == publication_owner.buffer) {
         CHECK(credit_state_depth && buffer->current_payload == publication_owner.current);
         uint32_t references = __atomic_load_n(&publication_owner.current->references, __ATOMIC_ACQUIRE);
@@ -50,7 +52,7 @@ void __wrap_ext4_bcache_publish(struct ext4_buf *buffer, struct ext4_block_paylo
         publication_owner.buffer = NULL;
         publication_owner.observed++;
     }
-    __real_ext4_bcache_publish(buffer, next, tree_key);
+    __real_ext4_bcache_publish_journal(block, next, tree_key, merged);
 }
 static void publication_watch(struct ext4_buf *buffer, unsigned extra)
 {
@@ -329,8 +331,10 @@ static void complete_ordered_range_batch(struct ext4_blockdev *dev, struct jbd_j
         source[version].data = calloc(1, 64 * 1024);
         CHECK(source[version].data);
         memset(source[version].data, 'A' + version, journal->block_size);
-        for (unsigned i = 0; i < 3; i++)
+        for (unsigned i = 0; i < 3; i++) {
+            if ((version == 0 && i == 1) || (version == 1 && i == 0)) continue;
             resource_accept_data(journal, homes[i], &source[version], false);
+        }
         if (version < 2) CHECK(jbd_journal_freeze(journal) == EOK);
         if (!version) CHECK(jbd_journal_select_stage(journal, JBD_JOURNAL_COMMIT) == JBD_JOURNAL_COMMIT);
     }
@@ -348,7 +352,7 @@ static void complete_ordered_range_batch(struct ext4_blockdev *dev, struct jbd_j
         puts("PASS ordered range batch failure: sticky error and no premature commit");
         return;
     }
-    CHECK(result == EOK && range_phases == 3 && range_requests == 6);
+    CHECK(result == EOK && range_phases == 2 && range_requests == 4);
     uint8_t *data = malloc(journal->block_size);
     CHECK(data);
     for (unsigned i = 0; i < 3; i++) {
@@ -370,7 +374,7 @@ static void complete_ordered_range_batch(struct ext4_blockdev *dev, struct jbd_j
     CHECK(ext4_fclose(&second) == EOK && ext4_fclose(&outside) == EOK);
     close_normal_journal(dev, journal);
     CHECK(fault_block_crash(&disk) == 0);
-    puts("PASS ordered range batch: three two-file phases, excluded range intact, owners returned");
+    puts("PASS ordered range batch: independent generations share a phase, repeated blocks stay ordered, excluded range intact");
 }
 
 static void resource_reclaim(struct ext4_blockdev *dev, struct jbd_journal *journal,
@@ -546,25 +550,43 @@ static void publication_owners(struct ext4_blockdev *dev, struct jbd_journal *jo
     CHECK(jbd_journal_group_init(journal, 4 * 1024 * 1024) == EOK);
     struct ext4_block original, older, private, visible;
     CHECK(ext4_block_get(dev, &original, home) == EOK && original.data[0] == 'O');
-    for (unsigned round = 0; round < 2; round++) {
+    for (unsigned round = 0; round < 3; round++) {
         struct jbd_trans *operation;
         CHECK(jbd_journal_new_trans(journal, &operation) == EOK);
         CHECK(ext4_block_get(dev, &private, home) == EOK);
         CHECK(jbd_trans_get_write_access_range(operation, &private, 0, 32) == EOK);
-        private.data[0] = 'A' + round;
+        unsigned char value = round < 2 ? 'A' + round : 'P';
+        private.data[0] = value;
         CHECK(jbd_trans_set_block_dirty_range(operation, &private, 0, 32) == EOK);
         CHECK(ext4_block_set(dev, &private) == EOK);
         CHECK(jbd_trans_prepare_operation(operation) == EOK);
-        publication_watch(original.buf, 0);
+        bool patch = round == 2;
+        if (!patch) publication_watch(original.buf, 0);
+        struct ext4_block_payload *accepted = original.buf->current_payload;
+        unsigned home_pins = original.buf->journal_pending;
+        unsigned block_refs = original.buf->refctr;
         publication_owner.rebind_buffer = original.buf;
         publication_owner.rebinds = 0;
+#ifdef TEST_JBD_RECORD_COPY
+        private_rebind_cache = &original.buf->bc->metadata;
+        private_rebind_cache_locks = 0;
+#endif
         CHECK(jbd_journal_accept(journal, operation, 0) == EOK && !publication_owner.buffer);
+        CHECK(original.buf->current_payload == accepted ? patch : !patch);
+        CHECK(original.buf->journal_pending == home_pins - (round != 0));
+        CHECK(original.buf->refctr == block_refs - (round != 0));
+#ifdef TEST_JBD_RECORD_COPY
+        private_rebind_cache = NULL;
+        printf("publication cache locks: running-group merge=%u count=%u\n",
+            round, private_rebind_cache_locks);
+        CHECK(private_rebind_cache_locks == 1);
+#endif
         publication_owner.rebind_buffer = NULL;
         printf("publication image rebinds: running-group merge=%u count=%u\n",
             round, publication_owner.rebinds);
-        CHECK(publication_owner.rebinds == 1);
+        CHECK(publication_owner.rebinds == !patch);
         CHECK(original.data[0] == 'O');
-        CHECK(ext4_block_get(dev, &visible, home) == EOK && visible.data[0] == 'A' + round);
+        CHECK(ext4_block_get(dev, &visible, home) == EOK && visible.data[0] == value);
         if (!round) older = visible;
         else CHECK(ext4_block_set(dev, &visible) == EOK && older.data[0] == 'A');
     }

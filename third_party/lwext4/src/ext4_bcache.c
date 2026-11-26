@@ -74,45 +74,91 @@ static void publish_verification(struct ext4_block_payload *payload, uint64_t tr
     __atomic_store_n(&payload->directory_layout, 0, __ATOMIC_RELAXED);
 }
 
-bool ext4_bcache_patch_current(struct ext4_buf *buf, struct ext4_block_payload *payload,
-    unsigned owners, const uint8_t *bytes, const struct ext4_block_patch *patches,
+static inline void scope_track_locked(struct ext4_buf *buf);
+
+static inline void journal_publication_locked(struct ext4_buf *buf, struct ext4_block *redundant)
+{
+    scope_track_locked(buf);
+    (void)__atomic_fetch_or(&buf->flags, (1 << BC_UPTODATE) | (1 << BC_DIRTY), __ATOMIC_RELAXED);
+    if (!redundant) return;
+    /* The running record keeps a descriptor and a journal home pin.
+     * Neither count can reach zero here, so there is no idle, quota or
+     * writeback work. Return the payload reference after unlocking. */
+    if (!redundant->payload || buf->journal_pending < 2 || buf->refctr < 2)
+        __builtin_trap();
+    buf->journal_pending--;
+    buf->refctr--;
+    redundant->lb_id = 0;
+    redundant->data = NULL;
+    redundant->payload = NULL;
+}
+
+bool ext4_bcache_patch_current(struct ext4_block *redundant, unsigned owners,
+    const uint8_t *bytes, const struct ext4_block_patch *patches,
     unsigned count, uint64_t tree_key)
 {
-    KERNEL_TASK_LOCK_SCOPE(guard, &buf->bc->metadata);
-    if (buf->current_payload != payload ||
-        __atomic_load_n(&payload->references, __ATOMIC_ACQUIRE) != owners)
-        return false;
-    /* No other descriptor can observe the bytes while the cache lock
-     * excludes new borrows and in-lock record copies. */
-    for (unsigned i = 0; i < count; i++)
-        memcpy(payload->data + patches[i].offset, bytes + patches[i].offset, patches[i].length);
-    publish_verification(payload, tree_key);
-    advance_version(buf);
+    struct ext4_buf *buf = redundant->buf;
+    struct ext4_block_payload *payload = redundant->payload;
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard, &buf->bc->metadata);
+        if (buf->current_payload != payload ||
+            __atomic_load_n(&payload->references, __ATOMIC_ACQUIRE) != owners)
+            return false;
+        /* The lock excludes new borrows and in-lock record copies. */
+        for (unsigned i = 0; i < count; i++)
+            memcpy(payload->data + patches[i].offset, bytes + patches[i].offset, patches[i].length);
+        publish_verification(payload, tree_key);
+        advance_version(buf);
+        journal_publication_locked(buf, redundant);
+    }
+    ext4_block_payload_put(payload);
     return true;
 }
 
-void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payload,
-    uint64_t tree_key)
+static inline struct ext4_block_payload *publish_locked(struct ext4_buf *buf,
+    struct ext4_block_payload *payload, uint64_t tree_key)
+{
+    if (!payload || !payload->data || !buf->refctr || (buf->loading && !buf->fresh_load))
+        __builtin_trap();
+    if (buf->current_payload==payload) return NULL;
+    /* The private replacement is complete and has no remaining writer. */
+    publish_verification(payload, tree_key);
+    ext4_block_payload_get(payload);
+    struct ext4_block_payload *old = buf->current_payload;
+    buf->current_payload=payload;buf->data=payload->data;
+    advance_version(buf);
+    if (buf->fresh_load) {
+        ext4_bcache_set_flag(buf, BC_UPTODATE);
+        buf->fresh_load = buf->loading = false;
+        if (buf->bc->bdev->bdif->wake_read) buf->bc->bdev->bdif->wake_read(buf);
+    }
+    return old;
+}
+
+void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payload, uint64_t tree_key)
 {
     struct ext4_block_payload *old;
-    if (!buf || !payload || !payload->data) __builtin_trap();
+    if (!buf) __builtin_trap();
     {
         KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
-        if (!buf->refctr || (buf->loading && !buf->fresh_load)) __builtin_trap();
-        if (buf->current_payload==payload) return;
-        /* A private replacement is complete before publication; no writer
-         * retains permission to mutate this accepted version. */
-        publish_verification(payload, tree_key);
-        ext4_block_payload_get(payload);old=buf->current_payload;
-        buf->current_payload=payload;buf->data=payload->data;
-        advance_version(buf);
-        if (buf->fresh_load) {
-            ext4_bcache_set_flag(buf, BC_UPTODATE);
-            buf->fresh_load = buf->loading = false;
-            if (buf->bc->bdev->bdif->wake_read) buf->bc->bdev->bdif->wake_read(buf);
-        }
+        old = publish_locked(buf, payload, tree_key);
     }
-    ext4_block_payload_put(old);
+    if (old) ext4_block_payload_put(old);
+}
+
+void ext4_bcache_publish_journal(struct ext4_block *block, struct ext4_block_payload *payload,
+    uint64_t tree_key, bool merged)
+{
+    struct ext4_buf *buf = block->buf;
+    struct ext4_block_payload *returned = merged ? block->payload : NULL;
+    struct ext4_block_payload *old;
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
+        old = publish_locked(buf, payload, tree_key);
+        journal_publication_locked(buf, merged ? block : NULL);
+    }
+    if (old) ext4_block_payload_put(old);
+    if (returned) ext4_block_payload_put(returned);
 }
 
 static int ext4_bcache_lba_compare(struct ext4_buf *a, struct ext4_buf *b)
@@ -602,14 +648,18 @@ void ext4_bcache_scope_begin(struct ext4_bcache *bc, struct ext4_writeback_scope
     if (!bc->writeback_scope) bc->writeback_scope=scope;
     bc->bdev->cache_write_back++;
 }
-void ext4_bcache_scope_track(struct ext4_buf *buf)
+static inline void scope_track_locked(struct ext4_buf *buf)
 {
-    KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
     struct ext4_writeback_scope *scope=buf->bc->writeback_scope;
     if (!scope || buf->writeback_scope) return;
     if (!buf->refctr || buf->refctr==UINT32_MAX) __builtin_trap();
     buf->writeback_scope=scope;buf->writeback_next=scope->head;scope->head=buf;
     buf->refctr++;
+}
+void ext4_bcache_scope_track(struct ext4_buf *buf)
+{
+    KERNEL_TASK_LOCK_SCOPE(guard,&buf->bc->metadata);
+    scope_track_locked(buf);
 }
 int ext4_bcache_scope_end(struct ext4_bcache *bc, struct ext4_writeback_scope *scope)
 {

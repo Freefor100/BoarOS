@@ -1933,31 +1933,36 @@ static void jbd_data_free(struct jbd_data *data)
 
 /* Ordered versions are submitted oldest first. A snapshot reference keeps
  * replaced running records alive without holding STATE across device I/O. */
-static unsigned jbd_range_data(struct jbd_trans *trans,ext4_fsblk_t first,
-    uint32_t count,struct jbd_data **data,unsigned used,unsigned capacity)
+static void jbd_collect_range_data(struct jbd_trans *trans,
+    const struct jbd_data_range *ranges, unsigned count, struct jbd_data **data,
+    unsigned *used, bool *more)
 {
-    if (!trans) return used;
-    struct jbd_data key={.block.lb_id=first};
-    struct jbd_data *entry=RB_NFIND(jbd_data_tree,&trans->data_root,&key);
-    while (entry && entry->block.lb_id-first<count && used<capacity) {
-        if (!__atomic_load_n(&entry->completed,__ATOMIC_ACQUIRE)) {
-            unsigned old=__atomic_fetch_add(&entry->references,1,__ATOMIC_RELAXED);
-            if (!old || old==UINT32_MAX) __builtin_trap();
-            data[used++]=entry;
+    if (!trans) return;
+    unsigned position = 0;
+    for (unsigned i = 0; i < count && *used < EXT4_BLOCK_BATCH_MAX; i++) {
+        struct jbd_data key = {.block.lb_id=ranges[i].first};
+        struct jbd_data *entry = RB_NFIND(jbd_data_tree, &trans->data_root, &key);
+        for (; entry && entry->block.lb_id-ranges[i].first < ranges[i].count;
+             entry = RB_NEXT(jbd_data_tree, &trans->data_root, entry)) {
+            if (__atomic_load_n(&entry->completed, __ATOMIC_ACQUIRE)) continue;
+            /* The device may complete the whole phase out of order. Select
+             * at most the oldest pending version of each physical block. */
+            while (position < *used && data[position]->block.lb_id < entry->block.lb_id)
+                position++;
+            if (position < *used && data[position]->block.lb_id == entry->block.lb_id) {
+                *more = true;
+                continue;
+            }
+            unsigned old = __atomic_fetch_add(&entry->references, 1, __ATOMIC_RELAXED);
+            if (!old || old == UINT32_MAX) __builtin_trap();
+            for (unsigned n = *used; n > position; n--) data[n] = data[n - 1];
+            data[position++] = entry;
+            if (++*used == EXT4_BLOCK_BATCH_MAX) {
+                *more = true;
+                return;
+            }
         }
-        entry=RB_NEXT(jbd_data_tree,&trans->data_root,entry);
     }
-    return used;
-}
-
-static unsigned jbd_ranges_data(struct jbd_trans *trans, const struct jbd_data_range *ranges,
-    unsigned count, struct jbd_data **data, unsigned capacity)
-{
-    unsigned used = 0;
-    if (!trans) return 0;
-    for (unsigned i = 0; i < count && used < capacity; i++)
-        used = jbd_range_data(trans, ranges[i].first, ranges[i].count, data, used, capacity);
-    return used;
 }
 
 int jbd_journal_complete_data_batch(struct jbd_journal *journal,
@@ -1972,19 +1977,23 @@ int jbd_journal_complete_data_batch(struct jbd_journal *journal,
         end = ranges[i].first + ranges[i].count;
     }
     KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&journal->ordered_io,&io);
+    bool serial = ext4_fs_serial_writer(journal->jbd_fs->inode_ref.fs);
     for (;;) {
-        struct jbd_data *data[16];
+        /* Use the filesystem's bounded block batch. The device refills its
+         * existing slots during a phase and may combine adjacent buffers. */
+        struct jbd_data *data[EXT4_BLOCK_BATCH_MAX];
         unsigned used=0;
+        bool more=false;
         {
             JBD_STATE_SCOPE(journal);
             if (jbd_journal_error(journal)) return jbd_journal_error(journal);
-            used=jbd_ranges_data(journal->committing,ranges,count,data,16);
+            jbd_collect_range_data(journal->committing,ranges,count,data,&used,&more);
             struct jbd_trans *trans;
             TAILQ_FOREACH(trans,&journal->sealed_queue,trans_node) {
-                if (used) break;
-                used=jbd_ranges_data(trans,ranges,count,data,16);
+                if (used == EXT4_BLOCK_BATCH_MAX) break;
+                jbd_collect_range_data(trans,ranges,count,data,&used,&more);
             }
-            if (!used) used=jbd_ranges_data(journal->running,ranges,count,data,16);
+            jbd_collect_range_data(journal->running,ranges,count,data,&used,&more);
         }
         if (!used) return EOK;
         struct jbd_io_phase phase={0};
@@ -1995,7 +2004,9 @@ int jbd_journal_complete_data_batch(struct jbd_journal *journal,
         else for (unsigned i=0;i<used;i++)
             __atomic_store_n(&data[i]->completed,true,__ATOMIC_RELEASE);
         for (unsigned i=0;i<used;i++) jbd_data_put(data[i]);
-        if (error) return error;
+        /* Concurrent writers can replace an accepted running version while
+         * this phase owns its snapshot. A serial mount has excluded them. */
+        if (error || (serial && !more)) return error;
     }
 }
 
@@ -2440,9 +2451,14 @@ int jbd_trans_prepare_checked_patch(struct jbd_trans *trans, struct ext4_block *
     uint32_t offset, uint32_t length, uint32_t checksum_offset)
 {
     COST_SCOPE(prepare_cost, JOURNAL_RECORD_PREPARE_TICKS);
-    if ((offset | length | checksum_offset) & 31U) return EINVAL;
+    bool separate_checksum=checksum_offset!=UINT32_MAX &&
+        (checksum_offset<offset || checksum_offset-offset>=length);
+    if (((offset | length) & 31U) || (checksum_offset!=UINT32_MAX && (checksum_offset&31U)))
+        return EINVAL;
     int result = write_range_status(trans, offset, length);
-    if (!result) result = write_range_status(trans, checksum_offset, 32);
+    if (!result && separate_checksum) {
+        result = write_range_status(trans, checksum_offset, 32);
+    }
     if (result) return result;
     if (jbd_trans_find_buf(trans, block->lb_id)) return ENOTSUP;
     /* Binding transfers the current payload loan to the accepted block.
@@ -2452,7 +2468,7 @@ int jbd_trans_prepare_checked_patch(struct jbd_trans *trans, struct ext4_block *
     if (!result) {
         struct jbd_buf *record = TAILQ_FIRST(&trans->buf_queue);
         if ((uintptr_t)record->block.payload != baseline) result = EAGAIN;
-        else if (checksum_offset < offset || checksum_offset >= offset + length)
+        else if (separate_checksum)
             result = jbd_initialize_range(record, record->block.payload, checksum_offset, 32, true);
     }
     return result;
@@ -2558,10 +2574,11 @@ static int jbd_claim_versions(struct jbd_trans *trans,bool apply)
 /* The running group owns both its image and its descriptor. Together with
  * the cache and the edit's baseline these account for all four references
  * when neither version has an outstanding observer. */
-static bool jbd_patch_running(const struct jbd_buf *jb, const struct jbd_buf *running)
+static bool jbd_patch_running(struct jbd_buf *jb, const struct jbd_buf *running)
 {
     struct ext4_block_payload *current = jb->block.payload;
     if (current != &running->after->payload || current != running->block.payload ||
+        __atomic_load_n(&current->references, __ATOMIC_ACQUIRE) != 4 ||
         __atomic_load_n(&jb->after->payload.references, __ATOMIC_ACQUIRE) != 1)
         return false;
     uint32_t size = jb->trans->journal->block_size, end = size / 32;
@@ -2578,7 +2595,7 @@ static bool jbd_patch_running(const struct jbd_buf *jb, const struct jbd_buf *ru
         patches[count++] = (struct ext4_block_patch){first * 32U, length};
         first = jbd_range_next(jb->dirty_ranges, last, end, true);
     }
-    return count && ext4_bcache_patch_current(jb->block.buf, current, 4,
+    return count && ext4_bcache_patch_current(&jb->block, 4,
         jb->after->data, patches, count, jb->checked_tree);
 }
 
@@ -2700,16 +2717,11 @@ static int jbd_publish_private(struct jbd_trans *trans, struct jbd_trans *runnin
             if (patched) {
                 jbd_image_free(jb->after);
             } else {
-                ext4_bcache_publish(buf, &jb->after->payload, jb->checked_tree);
+                ext4_bcache_publish_journal(&jb->block, &jb->after->payload, jb->checked_tree, true);
                 ext4_block_rebind(&old->block, &jb->after->payload);
                 jbd_image_free(old->after);
                 old->after = jb->after;
             }
-            ext4_bcache_set_dirty(buf);
-            jbd_unpin_version(journal, buf);
-            journal->jbd_fs->bdev->cache_write_back++;
-            ext4_block_set(journal->jbd_fs->bdev, &jb->block);
-            journal->jbd_fs->bdev->cache_write_back--;
             jbd_free(jb);
             continue;
         }
@@ -2721,10 +2733,9 @@ static int jbd_publish_private(struct jbd_trans *trans, struct jbd_trans *runnin
         TAILQ_INSERT_TAIL(&rec->dirty_buf_queue, jb, dirty_buf_node);
         buf->end_write = jbd_trans_end_write;
         buf->end_write_arg = jb;
-        ext4_bcache_publish(buf, &jb->after->payload, jb->checked_tree);
+        ext4_bcache_publish_journal(&jb->block, &jb->after->payload, jb->checked_tree, false);
         ext4_block_rebind(&jb->block, &jb->after->payload);
         jb->private_access = false;
-        ext4_bcache_set_dirty(buf);
     }
     jbd_discard_allocation_claims(trans);
     return EOK;

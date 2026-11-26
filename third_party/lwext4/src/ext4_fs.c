@@ -1035,9 +1035,6 @@ static bool ext4_fs_verify_inode_csum(struct ext4_inode_ref *inode_ref)
 
 static int inode_table_start(struct ext4_fs *fs, uint32_t group, ext4_fsblk_t *output)
 {
-	struct ext4_sblock *sb = ext4_fs_super(fs);
-	if (group >= ext4_block_group_cnt(sb))
-		return EUCLEAN;
 	ext4_fsblk_t *fact = fs->inode_table_starts && group < fs->inode_table_groups ?
 		&fs->inode_table_starts[group] : NULL;
 	uint64_t cached = fact ? __atomic_load_n(fact, __ATOMIC_ACQUIRE) : 0;
@@ -1045,6 +1042,9 @@ static int inode_table_start(struct ext4_fs *fs, uint32_t group, ext4_fsblk_t *o
 		*output = cached;
 		return EOK;
 	}
+	struct ext4_sblock *sb = ext4_fs_super(fs);
+	if (group >= ext4_block_group_cnt(sb))
+		return EUCLEAN;
 	struct ext4_block_group_ref ref;
 	int result = ext4_fs_get_block_group_ref(fs, group, &ref);
 	if (result)
@@ -1079,40 +1079,45 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 			bool initialized, bool write)
 {
 	COST_PHASE_SCOPE(read_source, 6);
-	if (index == 0 || index > ext4_get32(ext4_fs_super(fs), inodes_count))
+	struct ext4_sblock *sb = ext4_fs_super(fs);
+	if (index == 0 || index > ext4_get32(sb, inodes_count))
 		return EUCLEAN;
-	/* Compute number of i-nodes, that fits in one data block */
-	uint32_t inodes_per_group = ext4_get32(ext4_fs_super(fs), inodes_per_group);
+	uint32_t inodes_per_group = ext4_get32(sb, inodes_per_group);
+	uint16_t inode_size = ext4_get16(sb, inode_size);
+	bool table_geometry = fs->inode_table_starts &&
+		fs->table_group_inodes == inodes_per_group && fs->table_inode_size == inode_size;
 
 	/*
 	 * Inode numbers are 1-based, but it is simpler to work with 0-based
 	 * when computing indices
 	 */
 	index -= 1;
-	uint32_t block_group = index / inodes_per_group;
-	uint32_t offset_in_group = index % inodes_per_group;
+	uint32_t block_group = table_geometry && fs->table_group_shift < 32 ?
+		index >> fs->table_group_shift : index / inodes_per_group;
+	uint32_t offset_in_group = index - block_group * inodes_per_group;
 
 	ext4_fsblk_t table_start;
 	int rc = inode_table_start(fs, block_group, &table_start);
 	if (rc != EOK)
 		return rc;
 
-	/* Compute position of i-node in the block group */
-	uint16_t inode_size = ext4_get16(ext4_fs_super(fs), inode_size);
-	uint32_t block_size = ext4_sb_get_block_size(ext4_fs_super(fs));
-	uint32_t byte_offset_in_group = offset_in_group * inode_size;
-
-	/* Compute block address */
-	uint32_t block_in_table = byte_offset_in_group / block_size;
+	uint32_t block_in_table, offset_in_block;
+	if (table_geometry) {
+		block_in_table = offset_in_group >> fs->table_block_shift;
+		offset_in_block = (offset_in_group - (block_in_table << fs->table_block_shift)) *
+			inode_size;
+	} else {
+		uint32_t block_size = ext4_sb_get_block_size(sb);
+		uint32_t byte_offset = offset_in_group * inode_size;
+		block_in_table = byte_offset / block_size;
+		offset_in_block = byte_offset % block_size;
+	}
 	ext4_fsblk_t block_id = table_start + block_in_table;
 
-	uint32_t offset_in_block = byte_offset_in_group % block_size;
 	if (write && initialized && ext4_current_trans(fs)) {
 		rc = ext4_operation_require_resource(fs, EXT4_RESOURCE_INODE, index + 1);
 		if (rc != EOK) return rc;
 	}
-	bool table_geometry = fs->inode_table_starts &&
-		fs->table_group_inodes == inodes_per_group && fs->table_inode_size == inode_size;
 	if (write && !initialized && table_geometry) {
 		uint32_t remaining = (inodes_per_group >> fs->table_block_shift) - block_in_table;
 		rc = ext4_trans_block_get_new_inode_range(fs->bdev, &ref->block, block_id,

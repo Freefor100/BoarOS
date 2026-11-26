@@ -2,6 +2,7 @@
 
 static unsigned serial_reservation_watch,serial_reserved,serial_borrowed,serial_commit_done;
 static unsigned serial_log_saved;
+static unsigned serial_bitmap_patches;
 static uint64_t serial_reservation_lba;
 static unsigned serial_heap_failure, serial_heap_calls;
 void *__real_ext4_user_malloc(size_t);
@@ -22,6 +23,14 @@ int __wrap_jbd_trans_prepare_operation(struct jbd_trans *trans)
     struct jbd_buf *record;
     TAILQ_FOREACH(record,&trans->buf_queue,buf_node) {
         assert(record->private_access && record->modified);
+        if (serial_reservation_watch==1 &&
+            (record->checked_tree&7U)==EXT4_TREE_INODE_BITMAP) {
+            unsigned words=(trans->journal->block_size/32U+63U)/64U, units=0;
+            for (unsigned i=0;i<words;i++)
+                units+=(unsigned)__builtin_popcountll(record->dirty_ranges[words+i]);
+            assert(units==1);
+            serial_bitmap_patches++;
+        }
         if(serial_reservation_watch==1 || record->block.lb_id==serial_reservation_lba) {
             if(record->reserved_rec)serial_reserved++;
             else {assert(record->block_rec && record->block_rec->private_refs);serial_borrowed++;}
@@ -268,6 +277,7 @@ static void serial_reservation_case(struct lwext4_mount_adapter *adapter,int ser
     ext4_file file;
     if(serial) {
         serial_reservation_watch=1;
+        serial_bitmap_patches=0;
         directory_leaf_watch=1;
         directory_leaf_updates=directory_leaf_bytes=0;
     }
@@ -276,6 +286,7 @@ static void serial_reservation_case(struct lwext4_mount_adapter *adapter,int ser
     if(serial) {
         directory_leaf_watch=0;
         assert(serial_reserved);
+        assert(serial_bitmap_patches==1);
         printf("existing leaf insert journals %u bytes in %u ranges\n",
             directory_leaf_bytes,directory_leaf_updates);
         assert(directory_leaf_updates==2 && directory_leaf_bytes<=128);
