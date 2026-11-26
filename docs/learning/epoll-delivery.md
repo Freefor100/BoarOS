@@ -13,7 +13,7 @@
 设计上刻意解决了两个底层同步难题：
 
 1. **同核重入安全**：在单核无锁调试构建（`BOAROS_MAX_CPUS == 1`）中，通过 `epoll_state_active` 指针允许同一调用链内的嵌套辅助函数复用外层中断保护守卫；在多核或开启锁调试的构建中，通过检查 `kernel_cpu_current()->raw_locks` 识别当前核已持有 `epoll_state_lock`，避免嵌套回调重入死锁。
-2. **锁外延迟唤醒（Deferred Wakeup）**：在临界区内调用 `epoll_state_notify()` 时，并不立即唤醒等待队列中的线程（避免持对象锁进入调度器队列锁），而是通过 `kernel_wait_cursor_prepare()` 在守卫中记录待唤醒游标；等到最外层守卫释放 `epoll_state_lock` 之后、恢复中断之前，再执行 `kernel_wait_cursor_wake()` 完成实际唤醒。
+2. **锁外唤醒**：`epoll_state_notify()` 在发布就绪的同时，用 `kernel_wait_notification_prepare()` 记录通知对象。若队列里只有一个普通等待线程，通知持有该线程的等待令牌和任务引用。多个等待者或上层 `epoll` 回调仍由队列游标遍历。最外层守卫释放 `epoll_state_lock` 后，在恢复中断前调用 `kernel_wait_notification_wake()`。等待令牌记录等待代次，线程如果已经结束本次等待，旧通知无法唤醒它的下一次等待。
 
 ---
 

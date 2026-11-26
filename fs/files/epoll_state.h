@@ -6,7 +6,7 @@ static struct kernel_raw_lock epoll_state_lock={.rank=KERNEL_RAW_RANK_OBJECT,.in
 struct epoll_state_guard {
     kernel_irq_lock_guard raw;
     struct epoll_state_guard *owner;
-    struct kernel_wait_cursor notification;
+    struct kernel_wait_notification notification;
 };
 #if BOAROS_MAX_CPUS == 1 && !BOAROS_LOCK_DEBUG && !BOAROS_COST_DIAGNOSTICS
 /* UP 的嵌套 helper 共用 IRQ 保护内的栈 guard，沿用轻量 task/IRQ 原语。 */
@@ -37,7 +37,7 @@ static void epoll_state_release(struct epoll_state_guard *guard)
     if(!guard->notification.queue){kernel_irq_lock_release(&guard->raw);return;}
     uintptr_t interrupts=guard->raw.interrupts;guard->raw.interrupts=0;
     kernel_irq_lock_release(&guard->raw);
-    kernel_wait_cursor_wake(&guard->notification,1);
+    kernel_wait_notification_wake(&guard->notification);
     arch_interrupt_restore(interrupts);
 }
 #define EPOLL_STATE(name) \
@@ -57,7 +57,7 @@ static void epoll_state_notify(struct kernel_wait_queue *queue)
         if(owner->notification.queue!=queue)__builtin_trap();
         return;
     }
-    (void)kernel_wait_cursor_prepare(queue,&owner->notification);
+    (void)kernel_wait_notification_prepare(queue,&owner->notification,0);
 }
 static uintptr_t epoll_state_unlock_wait(struct epoll_state_guard *guard)
 {
