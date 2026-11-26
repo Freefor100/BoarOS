@@ -45,14 +45,28 @@ static void epoll_pending_add(struct kernel_epoll *epoll, struct kernel_epoll_it
     item->on_pending_list = 1;
 }
 
-static void epoll_item_put(struct kernel_epoll_item *item)
+static int epoll_item_put_locked(struct kernel_epoll_item *item)
+{
+    if (!item->references) __builtin_trap();
+    return !--item->references;
+}
+
+static void epoll_item_put_or_recycle(struct kernel_epoll_item *item, struct kernel_epoll *reuse)
 {
     EPOLL_STATE(irq);
-    if (!item->references) __builtin_trap();
-    int release = !--item->references;
+    int release = epoll_item_put_locked(item);
     epoll_state_release(&irq);
-    if (release) kernel_heap_release(item->heap, item);
+    if (!release) return;
+    if (reuse) {
+        struct kernel_epoll_item *empty = NULL;
+        if (__atomic_compare_exchange_n(&reuse->socket_spare,&empty,item,0,
+                                         __ATOMIC_RELEASE,__ATOMIC_RELAXED)) return;
+    }
+    kernel_heap_release(item->heap, item);
 }
+
+static void epoll_item_put(struct kernel_epoll_item *item)
+{ epoll_item_put_or_recycle(item, NULL); }
 
 static void epoll_notify(struct kernel_epoll *epoll)
 {
@@ -244,9 +258,11 @@ static enum kernel_files_status epoll_item_unlink_and_destroy(
     /* 与POLLFREE自摘共用状态保护；登记撤销后不再访问可能已释放的source。 */
     item->linked = 0;
     kernel_wait_queue_remove(&item->wait_node);
-    epoll_state_release(&irq);
-    if (kernel_wait_node_remove_sync(&item->wait_node) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-    epoll_state_acquire(&irq);
+    if (kernel_wait_node_references(&item->wait_node)) {
+        epoll_state_release(&irq);
+        if (kernel_wait_node_remove_sync(&item->wait_node) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        epoll_state_acquire(&irq);
+    }
 
     if (epoll != 0) {
         epoll_remove_from_ready_list(epoll, item);
@@ -270,8 +286,9 @@ static enum kernel_files_status epoll_item_unlink_and_destroy(
 
     item->linked = 0;
     item->epoll = 0;
+    int release = epoll_item_put_locked(item);
     epoll_state_release(&irq);
-    epoll_item_put(item);
+    if (release) kernel_heap_release(item->heap, item);
     return KERNEL_FILES_STATUS_OK;
 }
 
@@ -293,6 +310,7 @@ enum kernel_files_status kernel_epoll_destroy(struct kernel_epoll *epoll)
         __builtin_trap();
     if (kernel_wait_queue_destroy(&epoll->wait_queue) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
 
+    if (epoll->socket_spare) kernel_heap_release(epoll->heap, epoll->socket_spare);
     kernel_heap_release(epoll->heap, epoll);
     return KERNEL_FILES_STATUS_OK;
 }
@@ -521,34 +539,10 @@ enum kernel_files_status kernel_files_epoll_ctl(
     uint32_t current_revents;
     enum kernel_files_status pin_status;
 
-    if (!kernel_files_is_live(files) || linux_result == 0) {
-        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    }
-    pin_status = kernel_files_pin_data(files, epfd, &epoll_file, linux_result);
-    if (pin_status != KERNEL_FILES_STATUS_OK || *linux_result != 0 || epoll_file == 0) {
+    pin_status = kernel_files_pin_epoll_control(files, epfd, fd, &epoll_file, &target_file, linux_result);
+    if (pin_status != KERNEL_FILES_STATUS_OK || *linux_result) {
+        if (epoll_file) (void)kernel_open_file_release(&epoll_file);
         return pin_status;
-    }
-    if (kernel_open_file_kind(epoll_file) != KERNEL_OPEN_FILE_KIND_EPOLL ||
-        epoll_file->epoll == 0) {
-        (void)kernel_open_file_release(&epoll_file);
-        *linux_result = -KERNEL_EINVAL;
-        return KERNEL_FILES_STATUS_OK;
-    }
-    if (epfd == fd) {
-        (void)kernel_open_file_release(&epoll_file);
-        *linux_result = -KERNEL_EINVAL;
-        return KERNEL_FILES_STATUS_OK;
-    }
-    pin_status = kernel_files_pin_data(files, fd, &target_file, linux_result);
-    if (pin_status != KERNEL_FILES_STATUS_OK || *linux_result != 0 || target_file == 0) {
-        (void)kernel_open_file_release(&epoll_file);
-        return pin_status;
-    }
-    if (target_file == epoll_file) {
-        (void)kernel_open_file_release(&target_file);
-        (void)kernel_open_file_release(&epoll_file);
-        *linux_result = -KERNEL_EINVAL;
-        return KERNEL_FILES_STATUS_OK;
     }
     epoll = epoll_file->epoll;
 
@@ -559,10 +553,17 @@ enum kernel_files_status kernel_files_epoll_ctl(
             break;
         }
         /* 分配允许换任务；候选尚未发布，图与重复key必须在它之后检查。 */
-        heap_status = kernel_heap_allocate_zeroed(epoll->heap, 1U, sizeof(*item), (void **)&item);
-        if (heap_status != KERNEL_HEAP_STATUS_OK) {
-            *linux_result = -KERNEL_ENOMEM;
-            break;
+        int socket_target = target_file->kind == KERNEL_OPEN_FILE_KIND_SOCKET;
+        item = NULL;
+        if (socket_target && __atomic_load_n(&epoll->socket_spare,__ATOMIC_RELAXED))
+            item = __atomic_exchange_n(&epoll->socket_spare,NULL,__ATOMIC_ACQUIRE);
+        if (item) *item = (struct kernel_epoll_item){0};
+        else {
+            heap_status = kernel_heap_allocate_zeroed(epoll->heap, 1U, sizeof(*item), (void **)&item);
+            if (heap_status != KERNEL_HEAP_STATUS_OK) {
+                *linux_result = -KERNEL_ENOMEM;
+                break;
+            }
         }
         item->heap = epoll->heap;
         item->references = 1;
@@ -573,7 +574,6 @@ enum kernel_files_status kernel_files_epoll_ctl(
         item->data = data;
         kernel_wait_node_init_callback(&item->wait_node, kernel_epoll_wait_callback, item);
         item->wait_node.event_mask=kernel_signal_fd_mask(target_file);
-        int socket_target = target_file->kind == KERNEL_OPEN_FILE_KIND_SOCKET;
         if (socket_target)
             item->wait_node.readiness_mask = events | KERNEL_POLLERR | KERNEL_POLLHUP;
         kernel_preempt_disable();
@@ -656,7 +656,10 @@ enum kernel_files_status kernel_files_epoll_ctl(
         item = epoll_find_item(epoll, (int)fd, target_file);
         if (item) item->references++;
         epoll_state_release(&irq);
-        if (item) { epoll_item_unlink_and_destroy(item); epoll_item_put(item); }
+        if (item) {
+            epoll_item_unlink_and_destroy(item);
+            epoll_item_put_or_recycle(item,target_file->kind == KERNEL_OPEN_FILE_KIND_SOCKET ? epoll : NULL);
+        }
         *linux_result = item ? 0 : -KERNEL_ENOENT;
         break;
     }
@@ -716,6 +719,7 @@ static void epoll_scan_finish(struct kernel_epoll_wait_request *request)
         return;
     }
     EPOLL_STATE(irq);
+    struct kernel_epoll_item *release = NULL;
     if (epoll->scan_owner == request) {
         /* 尚未交付的项目仍由扫描引用保活；DEL只撤销注册引用。 */
         if (request->current) {
@@ -723,9 +727,7 @@ static void epoll_scan_finish(struct kernel_epoll_wait_request *request)
             request->current = 0;
             item->in_scan = 0;
             epoll_ready_add(epoll, item);
-            epoll_state_release(&irq);
-            epoll_item_put(item);
-            epoll_state_acquire(&irq);
+            if (epoll_item_put_locked(item)) release = item;
         }
         while (epoll->pending_head) {
             struct kernel_epoll_item *item = epoll->pending_head;
@@ -736,6 +738,7 @@ static void epoll_scan_finish(struct kernel_epoll_wait_request *request)
         if (epoll->ready_head) epoll_notify(epoll);
     }
     epoll_state_release(&irq);
+    if (release) kernel_heap_release(release->heap, release);
 }
 
 static void epoll_request_finish(struct kernel_epoll_wait_request *request)
@@ -838,14 +841,13 @@ static int epoll_candidate_finish(struct kernel_epoll_wait_request *request,
                             candidate->notification != item->notification_generation))
             epoll_pending_add(epoll, item);
     }
-    epoll_state_release(&irq);
-    /* 最后OFD关闭可能执行后端操作，不能在IRQ或协议scope内执行。 */
-    if (request->target && kernel_open_file_release(&request->target) != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
-    epoll_state_acquire(&irq);
     request->current = 0;
     if (!request->observing) item->in_scan = 0;
+    int release = epoll_item_put_locked(item);
     epoll_state_release(&irq);
-    epoll_item_put(item);
+    if (release) kernel_heap_release(item->heap, item);
+    /* The target's final put can run backend code and reenter epoll. */
+    if (request->target && kernel_open_file_release(&request->target) != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
     return pruned;
 }
 

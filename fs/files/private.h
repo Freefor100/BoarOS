@@ -105,6 +105,8 @@ static inline void kernel_files_scope_release(struct kernel_raw_guard *guard)
     __atomic_fetch_add(&(files)->record->statistics.field, (uint64_t)(value), __ATOMIC_RELAXED)
 int kernel_files_fd_matches(struct kernel_files *, int64_t,
     const struct kernel_open_file_description *);
+enum kernel_files_status kernel_files_pin_epoll_control(struct kernel_files *, int64_t, int64_t,
+    struct kernel_open_file_description **, struct kernel_open_file_description **, int64_t *);
 #define KERNEL_POLL_STACK_CAPACITY 4U
 int kernel_files_scan_select(struct kernel_files *,unsigned nfds,const uint64_t *readfds,
     const uint64_t *writefds,const uint64_t *exceptfds,unsigned *count,int *ready,

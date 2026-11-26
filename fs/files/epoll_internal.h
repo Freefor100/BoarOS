@@ -85,6 +85,7 @@ struct kernel_epoll {
     struct kernel_epoll_item *ready_head;
     struct kernel_epoll_item *ready_tail;
     struct kernel_epoll_item *pending_head, *pending_tail;
+    struct kernel_epoll_item *socket_spare;
     struct kernel_epoll_wait_request *scan_owner;
     uint64_t notification_sequence;
 };
