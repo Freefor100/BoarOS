@@ -125,10 +125,10 @@ int ext4_trans_block_get_range(struct ext4_blockdev *bdev,
 }
 
 int ext4_trans_block_get_new_inode_range(struct ext4_blockdev *bdev, struct ext4_block *block,
-    uint64_t lba, uint32_t offset, uint32_t length, unsigned remaining)
+    uint64_t lba, uint32_t offset, uint32_t length, unsigned remaining, bool *cleared)
 {
     block->payload = NULL;
-    int result = ext4_block_get_new_inode_range(bdev, block, lba, offset, length, remaining);
+    int result = ext4_block_get_new_inode_range(bdev, block, lba, offset, length, remaining, cleared);
     if (result && block->payload) ext4_bcache_free_read(bdev->bc, block);
     return trans_error(bdev, result);
 }

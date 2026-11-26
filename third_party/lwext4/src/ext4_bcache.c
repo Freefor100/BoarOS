@@ -65,13 +65,15 @@ static void advance_version(struct ext4_buf *buf)
     if (!(buf->version=++buf->bc->next_version)) __builtin_trap();
 }
 
-static void publish_verification(struct ext4_block_payload *payload, uint64_t tree_key)
+static void publish_verification(struct ext4_block_payload *payload, uint64_t tree_key,
+    uint32_t directory_layout)
 {
     for (unsigned i = 0; i < 4; i++)
         __atomic_store_n(&payload->verified[i], 0, __ATOMIC_RELAXED);
     __atomic_store_n(&payload->metadata_schema, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&payload->tree_verified, tree_key, __ATOMIC_RELAXED);
-    __atomic_store_n(&payload->directory_layout, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&payload->directory_layout,
+        directory_layout == UINT32_MAX ? 0 : directory_layout, __ATOMIC_RELAXED);
 }
 
 static inline void scope_track_locked(struct ext4_buf *buf);
@@ -95,7 +97,7 @@ static inline void journal_publication_locked(struct ext4_buf *buf, struct ext4_
 
 bool ext4_bcache_patch_current(struct ext4_block *block, unsigned owners,
     const struct ext4_block_patch *patches, unsigned count, uint64_t tree_key,
-    bool return_duplicate)
+    uint32_t directory_layout, bool return_duplicate)
 {
     struct ext4_buf *buf = block->buf;
     struct ext4_block_payload *payload = block->payload;
@@ -107,7 +109,7 @@ bool ext4_bcache_patch_current(struct ext4_block *block, unsigned owners,
         /* The lock excludes new borrows and in-lock record copies. */
         for (unsigned i = 0; i < count; i++)
             memcpy(payload->data + patches[i].offset, patches[i].data, patches[i].length);
-        publish_verification(payload, tree_key);
+        publish_verification(payload, tree_key, directory_layout);
         advance_version(buf);
         journal_publication_locked(buf, return_duplicate ? block : NULL);
     }
@@ -122,7 +124,9 @@ static inline struct ext4_block_payload *publish_locked(struct ext4_buf *buf,
         __builtin_trap();
     if (buf->current_payload==payload) return NULL;
     /* The private replacement is complete and has no remaining writer. */
-    publish_verification(payload, tree_key);
+    uint32_t directory = tree_key ?
+        __atomic_load_n(&payload->directory_layout, __ATOMIC_RELAXED) : 0;
+    publish_verification(payload, tree_key, directory);
     ext4_block_payload_get(payload);
     struct ext4_block_payload *old = buf->current_payload;
     buf->current_payload=payload;buf->data=payload->data;

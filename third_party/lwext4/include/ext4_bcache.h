@@ -57,7 +57,7 @@ extern "C" {
 struct ext4_block_payload {
 	uint8_t *data;
 	uint32_t references;
-	uint32_t directory_layout; /* Checked directory record geometry, or MAX when writable. */
+	uint32_t directory_layout; /* Directory geometry and first possible insertion offset. */
 	void (*release)(struct ext4_block_payload *);
 	/* Bits identify records of one checked table layout in these exact bytes.
 	 * MAX in metadata_schema permanently disables in-place-write versions. */
@@ -298,7 +298,7 @@ struct ext4_block_patch {
 /* A merge may also return the duplicate loan after publishing the patch. */
 bool ext4_bcache_patch_current(struct ext4_block *block, unsigned owners,
     const struct ext4_block_patch *patches, unsigned count, uint64_t tree_key,
-    bool return_duplicate);
+    uint32_t directory_layout, bool return_duplicate);
 void ext4_bcache_insert_dirty_node(struct ext4_bcache *, struct ext4_buf *);
 void ext4_bcache_remove_dirty_node(struct ext4_bcache *, struct ext4_buf *);
 /* Select and detach clean victims atomically, flushing only in a write context. */

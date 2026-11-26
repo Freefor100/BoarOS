@@ -10,6 +10,7 @@ static struct {
     unsigned count, gets, puts, searches;
     uint32_t inodes[8];
 } create_ref;
+static bool in_create_inode_alloc;
 
 static struct {
     bool active;
@@ -30,7 +31,9 @@ int __real_ext4_fs_alloc_inode(struct ext4_fs *, struct ext4_inode_ref *, int,
 int __wrap_ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *ref,
     int type, uint32_t parent, const char *name, uint32_t length)
 {
+    in_create_inode_alloc = true;
     int result = __real_ext4_fs_alloc_inode(fs, ref, type, parent, name, length);
+    in_create_inode_alloc = false;
     if (create_ref.active && !result) {
         CHECK(create_ref.count < 8);
         create_ref.inodes[create_ref.count++] = ref->index;
@@ -109,6 +112,8 @@ static bool create_ref_clock(struct ext4_timestamp *now)
 
 static unsigned create_inode_read_batches;
 static uint64_t create_inode_table_first, create_inode_table_end;
+static unsigned create_inode_slot_copies;
+static bool watch_create_inode_slots;
 static ext4_fsblk_t watched_inode_bitmap;
 static unsigned watched_inode_bitmap_bytes;
 
@@ -129,6 +134,12 @@ int __wrap_jbd_trans_prepare_unowned_range(struct jbd_trans *trans, struct ext4_
 {
     if (watched_inode_bitmap && block->lb_id == watched_inode_bitmap)
         watched_inode_bitmap_bytes += length;
+    if (watch_create_inode_slots && in_create_inode_alloc &&
+        length == ext4_get16(&trans->operation.fs->sb, inode_size)) {
+        uint64_t byte = block->lb_id * trans->journal->block_size;
+        if (byte >= create_inode_table_first && byte < create_inode_table_end)
+            create_inode_slot_copies++;
+    }
     return __real_jbd_trans_prepare_unowned_range(trans, block, offset, length);
 }
 
@@ -161,18 +172,47 @@ static void create_inode_read_ahead_test(struct ext4_fs *fs, const ext4_file *pa
     create_inode_table_end = create_inode_table_first + (uint64_t)group_inodes * inode_size;
     CHECK(ext4_fs_put_block_group_ref(&group) == EOK);
     create_inode_read_batches = 0;
+    create_inode_slot_copies = 0;
     dev->bdif->bread_batch = create_inode_read_batch;
-    for (unsigned i = 0; i < 4 * dev->lg_bsize / inode_size; i++) {
+    unsigned count = 4 * dev->lg_bsize / inode_size;
+    uint32_t previous_inode = 0;
+    bool compared_snapshot = false;
+    watch_create_inode_slots = true;
+    for (unsigned i = 0; i < count; i++) {
         char name[32];
         snprintf(name, sizeof(name), "create-table-run-%u", i);
         ext4_file file;
+        struct ext4_inode_ref previous = {0};
+        struct ext4_inode original, created;
+        struct ext4_inode *old_slot = NULL;
+        size_t compared = inode_size < sizeof(original) ? inode_size : sizeof(original);
+        if (previous_inode && !compared_snapshot) {
+            CHECK(ext4_fs_get_inode_ref_read(fs, previous_inode, &previous) == EOK);
+            size_t next = (uint8_t *)previous.inode - previous.block.data + inode_size;
+            if (next <= dev->lg_bsize - inode_size) {
+                old_slot = (void *)(previous.block.data + next);
+                memcpy(&original, old_slot, compared);
+            }
+        }
         CHECK(ext4_transaction_begin("/") == EOK);
-        CHECK(ext4_create_regular_missing(parent, name, 0640, 53, 17, &file, NULL) == EOK);
+        CHECK(ext4_create_regular_missing(parent, name, 0640, 53, 17, &file, &created) == EOK);
         CHECK(ext4_transaction_end("/") == EOK);
+        if (old_slot && file.inode == previous_inode + 1) {
+            uint32_t generation = ext4_inode_get_generation(&original) + 1U;
+            CHECK(ext4_inode_get_generation(&created) == (generation ? generation : 1U));
+            CHECK(!memcmp(&original, old_slot, compared));
+            compared_snapshot = true;
+        }
+        if (previous.block.data) CHECK(ext4_fs_put_inode_ref(&previous) == EOK);
+        previous_inode = file.inode;
         CHECK(ext4_fclose(&file) == EOK);
     }
+    watch_create_inode_slots = false;
     dev->bdif->bread_batch = NULL;
-    CHECK(create_inode_read_batches > 0);
+    CHECK(create_inode_read_batches > 0 && compared_snapshot);
+    printf("sequential allocation copied old inode records on ready table hits: %u/%u\n",
+        create_inode_slot_copies, count);
+    CHECK(create_inode_slot_copies <= 2);
     puts("PASS sequential inode allocation batches same-group reads and recovers a failed speculative neighbor");
 }
 

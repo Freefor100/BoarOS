@@ -255,6 +255,10 @@ int jbd_trans_get_write_access_range(struct jbd_trans *trans,
 /* No intervening work in this operation since checking that LBA has no private owner. */
 int jbd_trans_prepare_unowned_range(struct jbd_trans *, struct ext4_block *,
     uint32_t offset, uint32_t length);
+/* The caller has reserved this inode and ruled out an existing record for
+ * the same block in the operation. Preserve the generation in a zero slot. */
+int jbd_trans_prepare_inode_replacement(struct jbd_trans *, struct ext4_block *,
+    uint32_t offset, uint32_t length);
 /* On success the operation still pins the caller's original checked bytes
  * and the rebound block contains only the requested ranges. A checksum
  * stored in another block uses UINT32_MAX for the second range. */

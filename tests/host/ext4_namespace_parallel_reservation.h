@@ -264,6 +264,7 @@ static void serial_leaf_readers(struct lwext4_mount_adapter *adapter)
     adapter->locks.read_lock(adapter->locks.context);
     assert(!ext4_fs_get_inode_ref_read(fs,EXT4_ROOT_INO,&root));
     assert(!ext4_block_get(fs->bdev,&latest,lba));
+    assert(latest.payload->directory_layout != 0 && latest.payload->directory_layout != UINT32_MAX);
     struct ext4_dir_search_result found;
     assert(ext4_dir_find_in_block(&old,&fs->sb,sizeof(name)-1,name,&found)==ENOENT);
     assert(!ext4_dir_find_in_block(&latest,&fs->sb,sizeof(name)-1,name,&found));
@@ -274,6 +275,44 @@ static void serial_leaf_readers(struct lwext4_mount_adapter *adapter)
     adapter->locks.unlock(adapter->locks.context);
     assert(!ext4_fremove(path));
     puts("PASS sparse directory edit: rollback preserves absence and both views retain valid checksums");
+}
+
+static size_t serial_leaf_offset(struct lwext4_mount_adapter *adapter, const char *name)
+{
+    struct ext4_fs *fs = adapter->device.fs;
+    struct ext4_inode_ref root;
+    struct ext4_dir_search_result found;
+    adapter->locks.read_lock(adapter->locks.context);
+    assert(!ext4_fs_get_inode_ref_read(fs, EXT4_ROOT_INO, &root));
+    assert(!ext4_dir_find_entry(&found, &root, name, strlen(name), false));
+    size_t offset = (uint8_t *)found.dentry - found.block.data;
+    assert(ext4_dir_csum_verify(&root, (void *)found.block.data));
+    assert(!ext4_dir_destroy_result(&root, &found));
+    assert(!ext4_fs_put_inode_ref(&root));
+    adapter->locks.unlock(adapter->locks.context);
+    return offset;
+}
+
+static void serial_leaf_first_fit(struct lwext4_mount_adapter *adapter)
+{
+    char long_name[200];
+    memset(long_name, 'w', sizeof(long_name) - 1);
+    long_name[sizeof(long_name) - 1] = 0;
+    const char *names[] = {"gap", "anchor", long_name, "fit"};
+    char paths[4][256];
+    ext4_file file;
+    for (unsigned i = 0; i < 4; i++)
+        snprintf(paths[i], sizeof(paths[i]), "%s%s", adapter->mount_point, names[i]);
+    assert(!ext4_fopen(&file, paths[0], "w+") && !ext4_fclose(&file));
+    assert(!ext4_fopen(&file, paths[1], "w+") && !ext4_fclose(&file));
+    size_t gap = serial_leaf_offset(adapter, names[0]);
+    assert(!ext4_fremove(paths[0]));
+    assert(!ext4_fopen(&file, paths[2], "w+") && !ext4_fclose(&file));
+    assert(serial_leaf_offset(adapter, names[2]) > gap);
+    assert(!ext4_fopen(&file, paths[3], "w+") && !ext4_fclose(&file));
+    assert(serial_leaf_offset(adapter, names[3]) == gap);
+    for (unsigned i = 1; i < 4; i++) assert(!ext4_fremove(paths[i]));
+    puts("PASS sparse directory first-fit: a long insertion leaves the earlier short hole reusable");
 }
 
 static void serial_reservation_case(struct lwext4_mount_adapter *adapter,int serial)
@@ -336,6 +375,7 @@ static void serial_reservation_case(struct lwext4_mount_adapter *adapter,int ser
         assert(!ext4_fremove(probe));
         puts("PASS running superblock reuse: abort, held-reader replacement and accepted checksum");
         serial_leaf_readers(adapter);
+        serial_leaf_first_fit(adapter);
     }
     adapter->locks.read_lock(adapter->locks.context);
     struct ext4_inode_ref inode;

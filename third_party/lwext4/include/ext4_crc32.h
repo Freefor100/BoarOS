@@ -61,6 +61,12 @@ uint32_t ext4_crc32(uint32_t crc, const void *buf, uint32_t size);
  * @return	updated crc32c value*/
 uint32_t ext4_crc32c(uint32_t crc, const void *buf, uint32_t size);
 
+/* Replace one range of a checksummed record. The factor advances its CRC
+ * difference across the unchanged suffix. */
+uint32_t ext4_crc32c_replace(uint32_t crc, const uint8_t *before,
+			  const uint8_t *after, uint32_t length, uint32_t factor);
+uint32_t ext4_crc32c_change_byte(uint32_t crc, uint8_t changed, uint16_t suffix);
+
 /* Normalize one or two 16-bit fields without modifying buf. Fields must be
  * ordered and contained in size; second == size means no second field.
  * Invalid internal layout is a fatal programming error. */
