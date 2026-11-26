@@ -222,8 +222,7 @@ static int hwprobe(struct kernel_mm *mm, const uint64_t args[6])
                 if (probe_copy(mm,pairs,&unknown,sizeof(unknown),1)) return -KERNEL_EFAULT;
                 continue;
             }
-            /* Linux 保留旧性能键 5 的位掩码匹配，新性能键 9 按枚举值匹配。 */
-            int bitmask = requested.key == 3 || requested.key == 4 || requested.key == 5;
+            int bitmask = requested.key == 3 || requested.key == 4;
             unsigned candidates = (unsigned)mask;
             while (candidates) {
                 unsigned cpu = kernel_cpu_first_in_mask(candidates);
