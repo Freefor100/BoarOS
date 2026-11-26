@@ -15,6 +15,38 @@ ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
 check_fs() {
     e2fsck -fn "$1" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log"; exit 1; }
 }
+linked_tail() {
+    base="$work/linked-base.img"
+    truncate -s 32M "$base"
+    mkfs.ext4 -q -F -b "$1" "$base"
+    for mode in normal memory space; do
+        cp "$base" "$work/linked.img"
+        observed=$(timeout 30 "$work/probe" "$work/linked.img" linked-tail 0 "$mode")
+        printf '%s\n' "$observed"
+        if [ "$mode" = normal ]; then
+            boundaries=${observed##*attempts, }
+            boundaries=${boundaries% boundaries}
+            test "$boundaries" -gt 0
+        fi
+        check_fs "$work/linked.img"
+    done
+    for reorder in 0 1; do
+        for cut in $(seq "$boundaries"); do
+            cp "$base" "$work/linked-cut.img"
+            result=0
+            timeout 30 "$work/probe" "$work/linked-cut.img" linked-tail 0 normal "$cut" "$reorder" || result=$?
+            test "$result" -eq 75
+            timeout 30 "$work/probe" "$work/linked-cut.img" linked-tail-recover 0 normal
+            check_fs "$work/linked-cut.img"
+        done
+    done
+    printf 'PASS linked tail: %s-byte blocks, %s crash positions with and without reorder\n' "$1" "$boundaries"
+}
+if [ "${1:-all}" = linked-tail ]; then
+    linked_tail 1024
+    linked_tail 4096
+    exit 0
+fi
 if [ "${1:-all}" = single-reap ]; then
     for features in orphan_file '^orphan_file'; do
         for kind in empty mapped sparse; do
@@ -27,6 +59,7 @@ if [ "${1:-all}" = single-reap ]; then
     exit 0
 fi
 for blocksize in 1024 4096; do
+    linked_tail "$blocksize"
     for mapping in extent indirect; do
         features=orphan_file
         [ "$mapping" != indirect ] || features='^extent,^64bit,^orphan_file'

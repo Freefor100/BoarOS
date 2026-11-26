@@ -2025,7 +2025,7 @@ int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
     return ext4_extent_remove_space_path(inode_ref, from, to, NULL, false);
 }
 
-#define EXT4_UNLINK_EXTENT_RUN 256U
+#define EXT4_RECLAIM_EXTENT_RUN 256U
 
 int ext4_extent_remove_tail(struct ext4_inode_ref *inode_ref, uint64_t keep,
     uint32_t window, bool *expanded, bool *done)
@@ -2055,7 +2055,8 @@ int ext4_extent_remove_tail(struct ext4_inode_ref *inode_ref, uint64_t keep,
 
     uint64_t first = end > window ? end - window : 0;
     if (first < keep) first = keep;
-    if (expanded && first > start && first > keep) {
+    if (expanded && first > start && first > keep &&
+        (ext4_ext_is_unwritten(extent) || (!keep && !ext4_inode_get_links_cnt(inode_ref->inode)))) {
         struct ext4_fs *fs = inode_ref->fs;
         ext4_fsblk_t physical = ext4_ext_pblock(extent) + length - 1;
         if (physical >= fs->bdev->lg_bcnt) { result = EUCLEAN; goto Release; }
@@ -2063,7 +2064,7 @@ int ext4_extent_remove_tail(struct ext4_inode_ref *inode_ref, uint64_t keep,
          * qualification. Do not add more extent records or groups to the
          * ordinary window. The journal bounds each revoke lookup's lock hold. */
         uint32_t run = ext4_fs_addr_to_idx_bg(ext4_fs_super(fs), physical) + 1;
-        if (run > EXT4_UNLINK_EXTENT_RUN) run = EXT4_UNLINK_EXTENT_RUN;
+        if (run > EXT4_RECLAIM_EXTENT_RUN) run = EXT4_RECLAIM_EXTENT_RUN;
         if (run > length) run = length;
         uint64_t candidate = end - run;
         if (candidate < keep) candidate = keep;

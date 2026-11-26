@@ -121,6 +121,63 @@ static void single_reap(struct ext4_fs *fs, const char *kind)
     CHECK(ext4_fs_available_inodes(fs) == free_inodes && ext4_fs_available_blocks(fs) == free_blocks);
     CHECK(ext4_fopen(&file, "/victim", "r") == ENOENT);
 }
+
+static void trim_unwritten_tail(struct ext4_fs *fs, const char *mode,
+                                unsigned interrupt_at, bool persist_last)
+{
+    uint32_t block = fs->bdev->lg_bsize;
+    const unsigned tail = 96;
+    unsigned char data[4096], readback[4096];
+    CHECK(block <= sizeof(data));
+    memset(data, 0x7d, block);
+    ext4_file file;
+    size_t count;
+    bool committed;
+    CHECK(ext4_fopen(&file, "/victim", "w+") == EOK);
+    CHECK(ext4_fwrite(&file, data, block, &count) == EOK && count == block);
+    CHECK(ext4_fallocate(&file, EXT4_FALLOC_KEEP_SIZE, block, tail * block,
+        &committed, UINT32_MAX) == EOK && committed && ext4_fsize(&file) == block);
+    CHECK(ext4_file_sync_metadata(&file) == EOK);
+    event = 0;
+    cut = interrupt_at;
+    reorder = persist_last;
+
+    reaped_inode = file.inode;
+    uint64_t free_blocks = ext4_fs_available_blocks(fs);
+    if (!strcmp(mode, "memory")) reclaim_injected_error = ENOMEM;
+    if (!strcmp(mode, "space")) reclaim_injected_error = ENOSPC;
+    CHECK(ext4_ftruncate_prune_tail(&file, block, UINT32_MAX) == EOK);
+    if (reclaim_injected_error)
+        CHECK(expanded_attempts == 1 && narrow_attempts == 3 && reap_tail_calls == 4);
+    else CHECK(reap_tail_calls == 1);
+    CHECK(ext4_fs_available_blocks(fs) == free_blocks + tail);
+    CHECK(ext4_fsize(&file) == block && ext4_fseek(&file, 0, SEEK_SET) == EOK);
+    CHECK(ext4_fread(&file, readback, block, &count) == EOK && count == block &&
+        !memcmp(data, readback, block));
+    CHECK(ext4_file_sync_metadata(&file) == EOK && ext4_fclose(&file) == EOK);
+    printf("linked unwritten tail: %u-byte blocks, %s, %u reclaim attempts, %u boundaries\n",
+        block, mode, reap_tail_calls, event);
+    cut = 0;
+}
+
+static void verify_unwritten_tail(struct ext4_fs *fs)
+{
+    uint32_t block = fs->bdev->lg_bsize;
+    unsigned char bytes[4096];
+    CHECK(block <= sizeof(bytes));
+    CHECK(ext4_orphan_recover("/") == EOK);
+    ext4_file file;
+    size_t size;
+    CHECK(ext4_fopen(&file, "/victim", "r+") == EOK && ext4_fsize(&file) == block);
+    struct ext4_inode inode;
+    CHECK(ext4_fraw_inode_fill(&file, &inode) == EOK);
+    uint64_t allocated = ext4_inode_get_blocks_count(&fs->sb, &inode);
+    CHECK(allocated == block / 512 || allocated == 97U * block / 512);
+    CHECK(ext4_fread(&file, bytes, block, &size) == EOK && size == block);
+    for (size_t i = 0; i < size; i++) CHECK(bytes[i] == 0x7d);
+    CHECK(ext4_ftruncate_prune_tail(&file, block, UINT32_MAX) == EOK);
+    CHECK(ext4_file_sync_metadata(&file) == EOK && ext4_fclose(&file) == EOK);
+}
 #endif
 
 static void boundary(void)
@@ -328,6 +385,15 @@ int main(int argc, char **argv)
     replay(dev.fs);
     CHECK(ext4_journal_start("/") == EOK);
 #if TEST_TRUNCATE_FALLBACK
+    if (!strcmp(argv[2], "linked-tail") || !strcmp(argv[2], "linked-tail-recover")) {
+        if (!strcmp(argv[2], "linked-tail"))
+            trim_unwritten_tail(dev.fs, argv[4], argc > 5 ? strtoul(argv[5], NULL, 10) : 0,
+                argc > 6 && atoi(argv[6]));
+        else verify_unwritten_tail(dev.fs);
+        CHECK(ext4_journal_stop("/") == EOK && ext4_umount("/") == EOK);
+        fault_block_close(&disk);
+        return 0;
+    }
     if (!strcmp(argv[2], "single-reap")) {
         single_reap(dev.fs, argv[4]);
         CHECK(ext4_journal_stop("/") == EOK && ext4_umount("/") == EOK);

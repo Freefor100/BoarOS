@@ -2871,7 +2871,7 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 			       bool release_inode)
 {
 	bool done = false;
-	bool expand = release_inode;
+	bool expand = true;
 	int r;
 	if (!mp->fs.jbd_journal) return EOK;
 	if (jbd_journal_error(mp->fs.jbd_journal)) return jbd_journal_error(mp->fs.jbd_journal);
