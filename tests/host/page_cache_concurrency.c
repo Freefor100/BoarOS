@@ -81,6 +81,7 @@ static _Thread_local unsigned fail_lane_backend;
 #endif
 static uint64_t age_clock_offset,age_deadlines[2];
 static struct kernel_wait_token age_tokens[2];
+static struct kernel_wait_queue *age_queue;
 uint64_t __real_kernel_time_monotonic_ns(void);
 uint64_t __wrap_kernel_time_monotonic_ns(void)
 { return __real_kernel_time_monotonic_ns()+__atomic_load_n(&age_clock_offset,__ATOMIC_RELAXED); }
@@ -400,9 +401,11 @@ enum kernel_scheduler_status __wrap_kernel_wait_prepare(struct kernel_wait_queue
     if (!status && fixed_target_client && journal_wait_owner && queue==&journal_wait_owner->journal_progress)
         __atomic_store_n(&fixed_target_waiting,1,__ATOMIC_RELEASE);
     if (!status && progress_writeback_caller && queue) __atomic_store_n(&progress_writeback_waiting,1,__ATOMIC_RELEASE);
-    if (!status && age_observing && kernel_page_cache_is_executor(current_cache)) {
+    if (!status && age_observing && kernel_page_cache_is_executor(current_cache) &&
+        (!age_queue || queue==age_queue)) {
         if (deadline) {
             unsigned index=age_waits;assert(index<2);
+            age_queue=queue;
             age_tokens[index]=*token;age_deadlines[index]=deadline;
             __atomic_store_n(&age_waits,index+1,__ATOMIC_RELEASE);
         } else if (age_waits) __atomic_store_n(&age_empty_wait,1,__ATOMIC_RELEASE);
@@ -1063,6 +1066,26 @@ static void read_borrow_retirement(struct kernel_page_cache *cache,const char *p
 static uint64_t small_files_now(void *context)
 { (void)context;return 1; }
 
+struct small_range_setup {
+    struct kernel_page_cache *cache;
+    unsigned entered, resume;
+};
+
+static void hold_small_range_executor(void *argument)
+{
+    struct small_range_setup *setup=argument;
+    __atomic_store_n(&setup->entered,1,__ATOMIC_RELEASE);
+    wait_progress(&setup->resume,1);
+}
+
+static void *small_range_producer(void *argument)
+{
+    struct small_range_setup *setup=argument;
+    cache_test_attach(1);
+    assert(!kernel_page_cache_run_cpu0(setup->cache,hold_small_range_executor,setup));
+    return NULL;
+}
+
 static void small_files_sync_case(struct kernel_page_cache *cache,const char *path)
 {
     image_fd=open(path,O_RDWR);assert(image_fd>=0);
@@ -1123,8 +1146,41 @@ static void small_files_sync_case(struct kernel_page_cache *cache,const char *pa
             assert(!kernel_vfs_close(&files[i]));
         }
     }
+    assert(!kernel_page_cache_start_worker(cache));
+    for (unsigned fault=0;fault<2;fault++) {
+        struct kernel_vfs_file files[3]={{0}};
+        struct small_range_setup setup={.cache=cache};
+        pthread_t producer;
+        assert(!pthread_create(&producer,NULL,small_range_producer,&setup));
+        wait_progress(&setup.entered,1);
+        small_files_committed=small_files_aborted=0;
+        small_files_watch=1;small_files_fault=fault?2:0;
+        for (unsigned i=0;i<3;i++) {
+            char name[32];snprintf(name,sizeof(name),"/small-range-%u-%u",fault,i);
+            unsigned char bytes[512];memset(bytes,0x71+i,sizeof(bytes));size_t done;
+            assert(!kernel_vfs_create(&mount,name,0600,&files[i]));
+            assert(!kernel_vfs_pwrite(&files[i],0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+            uint64_t observed=kernel_vfs_error_sequence(&files[i]);
+            assert(!kernel_vfs_sync_file_range(&files[i],0,UINT64_MAX,KERNEL_SYNC_FILE_RANGE_WRITE,&observed));
+        }
+        __atomic_store_n(&setup.resume,1,__ATOMIC_RELEASE);
+        assert(!pthread_join(producer,NULL));
+        for (unsigned i=0;i<3;i++) {
+            uint64_t observed=kernel_vfs_error_sequence(&files[i]);
+            assert(!kernel_vfs_sync_file_range(&files[i],0,UINT64_MAX,KERNEL_SYNC_FILE_RANGE_WAIT_AFTER,&observed));
+            assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&files[i])));
+            unsigned char bytes[512];size_t done;
+            assert(!kernel_vfs_pread(&files[i],0,bytes,sizeof(bytes),&done,NULL) && done==sizeof(bytes));
+            for (size_t j=0;j<done;j++) assert(bytes[j]==0x71+i);
+            assert(!kernel_vfs_close(&files[i]));
+        }
+        small_files_watch=0;
+        if (fault) assert(small_files_aborted==1 && !small_files_fault && !small_files_committed);
+        else assert(small_files_committed==3 && !small_files_aborted);
+    }
+    kernel_page_cache_stop_worker(cache);
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(cache) && !close(image_fd));
-    puts("PASS mount writeback: grouped acceptance, private abort across block groups, independent retry errors and durable contents");
+    puts("PASS small-file writeback: grouped sync and asynchronous ranges, private abort, independent retry and durable contents");
 }
 
 static void snapshot_copy_case(struct kernel_page_cache *cache,const char *path)
@@ -3961,7 +4017,7 @@ static void dirty_age_case(struct kernel_page_cache *cache,const char *path)
     struct kernel_vfs_mount mount={0};struct kernel_vfs_file file={0};
     assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0) && !kernel_vfs_create(&mount,"/aged",0600,&file));
     for (unsigned failure=0;failure<2;failure++) {
-        age_waits=age_empty_wait=0;age_clock_offset=0;age_observing=1;current_cache=cache;
+        age_waits=age_empty_wait=0;age_clock_offset=0;age_observing=1;age_queue=NULL;current_cache=cache;
         unsigned char bytes[BOAROS_PAGE_SIZE];memset(bytes,(int)(0x60+failure),sizeof(bytes));size_t done;
         uint64_t start=kernel_time_monotonic_ns();
         assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
@@ -3977,7 +4033,7 @@ static void dirty_age_case(struct kernel_page_cache *cache,const char *path)
             assert(!write_error && age_deadlines[1]>age_deadlines[0]+UINT64_C(5000000000) &&
                 kernel_vfs_node_dirty_pages(kernel_vfs_file_node(&file))->count==1 &&
                 kernel_vfs_error_sequence(&file)==observed+1);
-            __atomic_store_n(&age_clock_offset,UINT64_C(10000000002),__ATOMIC_RELAXED);
+            __atomic_fetch_add(&age_clock_offset,age_deadlines[1]-kernel_time_monotonic_ns()+1,__ATOMIC_RELAXED);
             assert(!kernel_wait_notify(&age_tokens[1],KERNEL_WAIT_TIMEOUT));
         }
         wait_progress(&age_empty_wait,1);kernel_page_cache_stop_worker(cache);
@@ -3987,9 +4043,27 @@ static void dirty_age_case(struct kernel_page_cache *cache,const char *path)
         assert(kernel_vfs_sync(&file,0,&observed)==(failure?-KERNEL_EIO:0));
         assert(!kernel_vfs_sync(&file,0,&observed));
     }
-    assert(!kernel_vfs_close(&file) && !kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(cache) && !close(image_fd));
+    struct kernel_vfs_file young={0};
+    assert(!kernel_vfs_create(&mount,"/young",0600,&young));
+    age_waits=age_empty_wait=0;age_clock_offset=0;age_observing=1;age_queue=NULL;current_cache=cache;
+    unsigned char bytes[BOAROS_PAGE_SIZE];memset(bytes,0x73,sizeof(bytes));size_t done;
+    assert(!kernel_vfs_pwrite(&file,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    __atomic_store_n(&age_clock_offset,UINT64_C(3000000000),__ATOMIC_RELAXED);
+    assert(!kernel_vfs_pwrite(&young,0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
+    assert(!kernel_page_cache_start_worker(cache));wait_progress(&age_waits,1);
+    __atomic_store_n(&age_clock_offset,UINT64_C(5000000001),__ATOMIC_RELAXED);
+    assert(!kernel_wait_notify(&age_tokens[0],KERNEL_WAIT_TIMEOUT));
+    wait_progress(&age_waits,2);
+    assert(!kernel_vfs_node_dirty_pages(kernel_vfs_file_node(&file))->count &&
+        kernel_vfs_node_dirty_pages(kernel_vfs_file_node(&young))->count==1);
+    __atomic_store_n(&age_clock_offset,UINT64_C(8000000001),__ATOMIC_RELAXED);
+    assert(!kernel_wait_notify(&age_tokens[1],KERNEL_WAIT_TIMEOUT));
+    wait_progress(&age_empty_wait,1);kernel_page_cache_stop_worker(cache);
+    age_observing=0;age_clock_offset=0;
+    assert(!kernel_vfs_node_dirty_pages(kernel_vfs_file_node(&young))->count);
+    assert(!kernel_vfs_close(&young) && !kernel_vfs_close(&file) && !kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(cache) && !close(image_fd));
     current_cache=NULL;
-    puts("PASS dirty-age deadline: five-second registration, controlled expiry, bounded error retry, idle wait and owners");
+    puts("PASS dirty-age deadline: files expire in order, bounded error retry, idle wait and owners");
 }
 
 struct progress_sync_request { struct kernel_vfs_file *file; int result; unsigned done; };

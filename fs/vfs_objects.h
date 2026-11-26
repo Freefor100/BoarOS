@@ -231,6 +231,9 @@ struct kernel_vfs_backend {
     int (*control)(struct kernel_vfs_node *node, void *open_context, int write, uint64_t *offset,
         char *buffer, size_t size, size_t *count);
     int (*truncate)(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed);
+    /* Called with inode write ownership for a shrink or same-size truncate.
+     * The backend may accept the resize with whole retained pages still dirty. */
+    bool (*truncate_preserves_dirty_prefix)(struct kernel_vfs_node *node, uint64_t size);
     bool fallocate_zero_range;
     /* Called with inode write ownership for a page-aligned extension
      * that starts at or beyond the old logical EOF. */

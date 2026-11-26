@@ -583,6 +583,9 @@ int ext4_fclose(ext4_file *file);
  *
  * @return  Standard error code.*/
 int ext4_ftruncate(ext4_file *file, uint64_t size, uint32_t privilege_mode);
+/* Shrink a journaled file's logical EOF when its backing size is smaller
+ * than the target. Extents past the new EOF still require orphan reclamation. */
+int ext4_ftruncate_prune_tail(ext4_file *file, uint64_t size, uint32_t privilege_mode);
 #define EXT4_FALLOC_KEEP_SIZE 1U
 #define EXT4_FALLOC_PUNCH_HOLE 2U
 #define EXT4_FALLOC_ZERO_RANGE 0x10U
