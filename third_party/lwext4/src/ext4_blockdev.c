@@ -475,7 +475,7 @@ static __attribute__((noinline)) int block_load_inode_run(struct ext4_blockdev *
 
 static inline int block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
     uint64_t lba, uint32_t offset, uint32_t length, enum ext4_block_access access,
-    unsigned read_count, bool inode_table)
+    unsigned read_count, bool inode_table, bool *cleared __unused)
 {
     if (offset > bdev->lg_bsize || !length || length > bdev->lg_bsize - offset) return EINVAL;
 Retry:;
@@ -508,6 +508,11 @@ Retry:;
     }
     if (access != EXT4_BLOCK_WRITE) return EOK;
 #if CONFIG_JOURNALING_ENABLE
+    if (unowned && cleared) {
+        int result = jbd_trans_prepare_inode_replacement(unowned, b, offset, length);
+        if (!result) *cleared = true;
+        return result;
+    }
     if (unowned) return jbd_trans_prepare_unowned_range(unowned,b,offset,length);
     if (bdev->fs) {
         struct jbd_trans *trans=ext4_current_trans(bdev->fs);
@@ -519,7 +524,7 @@ Retry:;
 }
 int ext4_block_get_range(struct ext4_blockdev *bdev, struct ext4_block *b,
     uint64_t lba, uint32_t offset, uint32_t length, enum ext4_block_access access)
-{ return block_get_range(bdev,b,lba,offset,length,access,1,false); }
+{ return block_get_range(bdev,b,lba,offset,length,access,1,false,NULL); }
 
 int ext4_block_get_new(struct ext4_blockdev *bdev, struct ext4_block *block, uint64_t lba)
 {
@@ -547,13 +552,15 @@ int ext4_block_get_new(struct ext4_blockdev *bdev, struct ext4_block *block, uin
 int ext4_block_get_inode_range(struct ext4_blockdev *bdev,struct ext4_block *b,
     uint64_t lba,uint32_t offset,uint32_t length,unsigned remaining)
 {
-    return block_get_range(bdev,b,lba,offset,length,EXT4_BLOCK_READ,remaining,true);
+    return block_get_range(bdev,b,lba,offset,length,EXT4_BLOCK_READ,remaining,true,NULL);
 }
 
 int ext4_block_get_new_inode_range(struct ext4_blockdev *bdev, struct ext4_block *block,
-    uint64_t lba, uint32_t offset, uint32_t length, unsigned remaining)
+    uint64_t lba, uint32_t offset, uint32_t length, unsigned remaining, bool *cleared)
 {
-    return block_get_range(bdev, block, lba, offset, length, EXT4_BLOCK_WRITE, remaining, true);
+    *cleared = false;
+    return block_get_range(bdev, block, lba, offset, length, EXT4_BLOCK_WRITE, remaining, true,
+        cleared);
 }
 
 int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b, uint64_t lba)
@@ -563,7 +570,7 @@ int ext4_block_get_read_ahead(struct ext4_blockdev *bdev,struct ext4_block *b,
     uint64_t lba,unsigned count)
 {
     if (!count || count>EXT4_BLOCK_READ_AHEAD_MAX) return EINVAL;
-    return block_get_range(bdev,b,lba,0,bdev->lg_bsize,EXT4_BLOCK_READ,count,false);
+    return block_get_range(bdev,b,lba,0,bdev->lg_bsize,EXT4_BLOCK_READ,count,false,NULL);
 }
 
 static void ext4_bread_completed(void *context, unsigned index, const struct block_read_span *span)

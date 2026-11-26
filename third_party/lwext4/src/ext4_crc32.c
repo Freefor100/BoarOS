@@ -991,6 +991,42 @@ uint32_t ext4_crc32c(uint32_t crc, const void *buf, uint32_t size)
 	return crc32c(crc, buf, size);
 }
 
+static uint32_t crc32c_multiply(uint32_t residue, uint32_t factor)
+{
+	/* Multiply in the reflected Castagnoli polynomial. 0x80000000 is
+	 * the identity and the advancing factors are its CRC over zero bytes. */
+	uint32_t result = 0;
+	while (factor) {
+		if (factor & 0x80000000U) result ^= residue;
+		residue = (residue >> 1) ^ ((0U - (residue & 1U)) & 0x82f63b78U);
+		factor <<= 1;
+	}
+	return result;
+}
+
+uint32_t ext4_crc32c_replace(uint32_t crc, const uint8_t *before,
+			  const uint8_t *after, uint32_t length, uint32_t factor)
+{
+	uint32_t delta = crc32c(0, before, length) ^ crc32c(0, after, length);
+	return crc ^ crc32c_multiply(delta, factor);
+}
+
+uint32_t ext4_crc32c_change_byte(uint32_t crc, uint8_t changed, uint16_t suffix)
+{
+	/* Each entry advances the residue by 2^i zero bytes. A 64 KiB
+	 * filesystem block has at most 65535 bytes after the edited byte. */
+	static const uint32_t powers[] = {
+		0x00800000U, 0x00008000U, 0x82f63b78U, 0x6ea2d55cU,
+		0x18b8ea18U, 0x510ac59aU, 0xb82be955U, 0xb8fdb1e7U,
+		0x88e56f72U, 0x74c360a4U, 0xe4172b16U, 0x0d65762aU,
+		0x35d73a62U, 0x28461564U, 0xbf455269U, 0xe2ea32dcU,
+	};
+	uint32_t delta = crc32c_slices[0][changed];
+	for (unsigned i = 0; suffix; i++, suffix >>= 1)
+		if (suffix & 1U) delta = crc32c_multiply(delta, powers[i]);
+	return crc ^ delta;
+}
+
 static inline uint32_t crc32c_zero16(uint32_t crc)
 {
 	crc = crc32c_slices[0][crc & 0xFF] ^ (crc >> 8);

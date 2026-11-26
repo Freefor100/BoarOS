@@ -265,10 +265,10 @@ int ext4_block_get_new(struct ext4_blockdev *, struct ext4_block *, uint64_t lba
  * remaining blocks of the inode table, and only in the published view. */
 int ext4_block_get_inode_range(struct ext4_blockdev *, struct ext4_block *,
     uint64_t lba, uint32_t offset, uint32_t length, unsigned remaining);
-/* A new inode still needs its previous generation. Read ahead into the
- * published cache and grant write access only to the requested record. */
+/* Grant write access to one new inode slot. A ready, unowned journal
+ * record may arrive cleared except for its previous generation. */
 int ext4_block_get_new_inode_range(struct ext4_blockdev *, struct ext4_block *,
-    uint64_t lba, uint32_t offset, uint32_t length, unsigned remaining);
+    uint64_t lba, uint32_t offset, uint32_t length, unsigned remaining, bool *cleared);
 /* Cache-aware reads. Successful blocks retain one caller reference each,
  * failed blocks are released. Duplicate LBAs share content and loading. */
 int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,

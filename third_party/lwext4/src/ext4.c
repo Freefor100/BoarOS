@@ -5976,7 +5976,8 @@ Retry:
     struct ext4_direct_write_batch *direct = NULL;
     bool fresh_ordered = journal && journal->grouped && outer && file->delalloc &&
 #if BOAROS_MAX_CPUS == 1
-        (file->mp->journal_runtime.prewrite_fresh || blocks > (128U * 1024U) / block_size) &&
+        /* A full page-cache window can use one existing device batch. */
+        (file->mp->journal_runtime.prewrite_fresh || blocks >= (128U * 1024U) / block_size) &&
         source_count &&
 #else
         file->mp->journal_runtime.prewrite_fresh && source_count &&

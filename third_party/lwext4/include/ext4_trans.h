@@ -83,7 +83,7 @@ int ext4_trans_block_get(struct ext4_blockdev *bdev,
 int ext4_trans_block_get_range(struct ext4_blockdev *bdev,
     struct ext4_block *b, uint64_t lba, uint32_t offset, uint32_t length);
 int ext4_trans_block_get_new_inode_range(struct ext4_blockdev *, struct ext4_block *,
-    uint64_t lba, uint32_t offset, uint32_t length, unsigned remaining);
+    uint64_t lba, uint32_t offset, uint32_t length, unsigned remaining, bool *cleared);
 
 struct kernel_block_span;
 /* Synchronous non-journal stable blocks; explicit bcache borrows remain coherent. */

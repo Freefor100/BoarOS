@@ -699,15 +699,24 @@ static inline bool directory_record_fits(uint32_t length, uint32_t bytes, size_t
 	return length >= 8 && !(length % 4) && length <= remaining && bytes <= length - 8;
 }
 
-struct directory_insert_slot { uint32_t offset, length, split; };
+enum {
+	DIRECTORY_LAYOUT_MASK = 0x1fffU,
+	DIRECTORY_LAYOUT_CHECKED = 0x2000U,
+	DIRECTORY_SLOT_SHIFT = 14,
+};
+
+struct directory_insert_slot { uint32_t offset, length, split, first_possible; };
 static inline __attribute__((always_inline)) int find_insert_slot(
 	struct ext4_sblock *sb, uint8_t *data, uint32_t name_len, bool aligned,
-	struct directory_insert_slot *slot)
+	uint32_t start, struct directory_insert_slot *slot)
 {
 	uint32_t required = (8U + name_len + 3U) & ~3U;
 	uint32_t name_mask = directory_name_mask(sb);
-	size_t remaining = ext4_sb_get_block_size(sb);
+	uint32_t size = ext4_sb_get_block_size(sb);
 	uint8_t *begin = data;
+	uint32_t first_possible = size;
+	data += start;
+	size_t remaining = size - start;
 	while (remaining) {
 		if (remaining < 8) return EUCLEAN;
 		struct ext4_dir_en *entry = (void *)data;
@@ -715,15 +724,14 @@ static inline __attribute__((always_inline)) int find_insert_slot(
 		uint32_t length = (uint16_t)header;
 		uint32_t bytes = (header >> 16) & name_mask;
 		if (!directory_record_fits(length, bytes, remaining)) return EUCLEAN;
-		if (directory_record_has_inode(entry, aligned)) {
-			uint32_t used = (8U + bytes + 3U) & ~3U;
-			if (length - used >= required) {
-				*slot = (struct directory_insert_slot){data - begin, length, used};
-				return EOK;
-			}
-		} else if (length >= required &&
-			   (name_mask == UINT16_MAX || header >> 24 != EXT4_DIRENTRY_DIR_CSUM)) {
-			*slot = (struct directory_insert_slot){data - begin, length, 0};
+		uint32_t split = directory_record_has_inode(entry, aligned) ?
+			(8U + bytes + 3U) & ~3U : 0;
+		bool tail = !split && name_mask != UINT16_MAX &&
+			header >> 24 == EXT4_DIRENTRY_DIR_CSUM;
+		if (!tail && length - split >= 8 && first_possible == size)
+			first_possible = data - begin;
+		if (!tail && length - split >= required) {
+			*slot = (struct directory_insert_slot){data - begin, length, split, first_possible};
 			return EOK;
 		}
 		data += length;
@@ -733,12 +741,12 @@ static inline __attribute__((always_inline)) int find_insert_slot(
 }
 
 static int directory_slot(struct ext4_sblock *sb, uint8_t *data, uint32_t name_len,
-	struct directory_insert_slot *slot)
+	uint32_t start, struct directory_insert_slot *slot)
 {
 	if (name_len > EXT4_DIRECTORY_FILENAME_LEN) return EINVAL;
 	/* A valid record keeps every subsequent header four-byte aligned. */
-	if ((uintptr_t)data & 3U) return find_insert_slot(sb, data, name_len, false, slot);
-	return find_insert_slot(sb, data, name_len, true, slot);
+	if ((uintptr_t)data & 3U) return find_insert_slot(sb, data, name_len, false, start, slot);
+	return find_insert_slot(sb, data, name_len, true, start, slot);
 }
 
 static void write_directory_slot(struct ext4_sblock *sb, uint8_t *data,
@@ -756,13 +764,41 @@ int ext4_dir_try_insert_entry(struct ext4_sblock *sb, struct ext4_inode_ref *par
 			      const char *name, uint32_t name_len)
 {
 	struct directory_insert_slot slot;
-	int result = directory_slot(sb, block->data, name_len, &slot);
+	int result = directory_slot(sb, block->data, name_len, 0, &slot);
 	if (result) return result;
 	write_directory_slot(sb, block->data, &slot, child, name, name_len);
 	return ext4_dir_mark_dirty(parent, block);
 }
 
 #if CONFIG_JOURNALING_ENABLE && CONFIG_META_CSUM_ENABLE
+/* Reflected CRC-32C factors for suffixes of 20 + 32 * index zero bytes.
+ * The edit ends at a journal unit boundary and the final 12-byte directory
+ * tail is outside the checksum. One table serves 1, 2 and 4 KiB leaves. */
+static const uint32_t directory_crc_suffix[128] = {
+	0x790606ffU, 0x0e148e82U, 0x041d3776U, 0x156c8e18U, 0x3f484024U, 0x78e87aafU,
+	0x42316c00U, 0x7fec2963U, 0x79be2d77U, 0x8eae5107U, 0x478ac00aU, 0xc440ad59U,
+	0x74d6fbcbU, 0xf282c2d0U, 0x94899a1fU, 0x271b7858U, 0xca12e5ddU, 0x260a2499U,
+	0x51e379bdU, 0x31ef6835U, 0xc9c2df97U, 0xa7393cc0U, 0x2d9cbb98U, 0xb209bc78U,
+	0x05fc06e9U, 0x3522e959U, 0x6f43c036U, 0xaf1f3bf7U, 0xec0241a4U, 0x6b9e3df5U,
+	0xc5045adeU, 0xb4e7cf58U, 0x06c1b9d0U, 0x14f9345aU, 0x0b0a79cbU, 0x35f5eb9eU,
+	0x7c64ed3dU, 0xf5b732a3U, 0xe4946ba4U, 0x0e56a229U, 0xe059842dU, 0x946db8dcU,
+	0x3c889938U, 0xc683a57bU, 0x38cb8eaeU, 0x4fd9dde0U, 0x6716fbb4U, 0x5f30548dU,
+	0x476291cbU, 0x23ac2352U, 0x6e0d0b06U, 0x03d63723U, 0x8f002916U, 0xf2a72c6cU,
+	0x8189ff06U, 0xb22d497dU, 0xc68d315aU, 0x84daae92U, 0xbb93c515U, 0xe33d8574U,
+	0x39eda602U, 0x9d9744b9U, 0xe553c60fU, 0x5708bae1U, 0x70431f2bU, 0x8221dbdfU,
+	0x627593d9U, 0xfbba839fU, 0xb071401aU, 0x04e10536U, 0x96c0b335U, 0xa6c62f56U,
+	0x85f33341U, 0x74ddfb24U, 0x7597dc4dU, 0x138e7da0U, 0xcd4f84b9U, 0x3ca6e879U,
+	0x45cdf118U, 0x5cfc9de8U, 0x62e5219dU, 0x3dac49b9U, 0x07cbe348U, 0x0a0f4289U,
+	0x5678918bU, 0x188b84dcU, 0xc2b84cf7U, 0x65172f69U, 0x0e25a5b3U, 0xd7021a10U,
+	0xa8937d96U, 0xbf74bbf9U, 0x195565a0U, 0x906a362cU, 0x4819586dU, 0xa4e4b1f6U,
+	0x2d7c36fcU, 0x534b0eeeU, 0x655187dbU, 0xd2f3ca34U, 0xf8dfdf9fU, 0xd502e359U,
+	0x06897fdcU, 0x01ee033fU, 0xb6f9155dU, 0xcc3262f7U, 0x79c17941U, 0x11768634U,
+	0x4ef66ed1U, 0x1d1cb968U, 0xff43ec2cU, 0xfcf5f0bfU, 0x14876727U, 0x1e92fec8U,
+	0xf2eedd03U, 0xeaa29fb5U, 0x7e378b28U, 0x6cb0828dU, 0x37e58074U, 0x33a13823U,
+	0x013caec7U, 0xc892c69dU, 0xc1fb983fU, 0x8b467c51U, 0x85f814f7U, 0xe12d244aU,
+	0x4362e151U, 0xfe70ba71U,
+};
+
 static int insert_checked_linear_leaf(struct ext4_inode_ref *parent, ext4_fsblk_t lba,
 	struct ext4_inode_ref *child, const char *name, uint32_t name_len, struct jbd_trans *trans)
 {
@@ -773,11 +809,15 @@ static int insert_checked_linear_leaf(struct ext4_inode_ref *parent, ext4_fsblk_
 	int result = directory_leaf_get(parent, &block, lba, false, key);
 	if (result) return result;
 	uint8_t *baseline = block.data;
+	const uint32_t size = ext4_sb_get_block_size(&fs->sb);
+	const uint32_t layout = size | (directory_name_mask(&fs->sb) == UINT8_MAX);
+	uint32_t hint = __atomic_load_n(&block.payload->directory_layout, __ATOMIC_ACQUIRE);
+	bool matched_hint = size <= 4096U && (hint & DIRECTORY_LAYOUT_MASK) == layout;
+	uint32_t first = matched_hint ? hint >> DIRECTORY_SLOT_SHIFT : 0;
 	struct directory_insert_slot slot;
-	result = directory_slot(&fs->sb, baseline, name_len, &slot);
+	result = directory_slot(&fs->sb, baseline, name_len, first, &slot);
 	if (result) goto Finish;
 
-	const uint32_t size = ext4_sb_get_block_size(&fs->sb);
 	const uint32_t records_end = size - sizeof(struct ext4_dir_entry_tail);
 	const uint32_t checksum_offset = size - 32U;
 	const uint32_t start = slot.offset + (slot.split ? offsetof(struct ext4_dir_en, entry_len) : 0);
@@ -788,17 +828,39 @@ static int insert_checked_linear_leaf(struct ext4_inode_ref *parent, ext4_fsblk_
 	result = jbd_trans_prepare_checked_patch(trans, &block, offset, length, checksum_offset);
 	if (result) goto Finish;
 
-	/* The operation owns the unchanged accepted bytes until publication.
-	 * Feed those bytes directly to the checksum instead of cloning them. */
+	/* The operation retains the verified baseline until publication. */
 	write_directory_slot(&fs->sb, block.data, &slot, child, name, name_len);
-	uint32_t checksum = ext4_dir_csum_seed(parent);
-	checksum = ext4_crc32c(checksum, baseline, start);
-	checksum = ext4_crc32c(checksum, block.data + start, end - start);
-	checksum = ext4_crc32c(checksum, baseline + end, records_end - end);
+	uint32_t checksum;
+	if (size <= 4096U) {
+		uint32_t limit = offset + length;
+		if (limit > records_end) limit = records_end;
+		uint32_t suffix = records_end - limit;
+		uint32_t factor = suffix ? directory_crc_suffix[suffix / 32U] : 0x80000000U;
+		uint32_t accepted = to_le32(EXT4_DIRENT_TAIL(baseline, size)->checksum);
+		checksum = ext4_crc32c_replace(accepted, baseline + offset, block.data + offset,
+			limit - offset, factor);
+	} else {
+		checksum = ext4_crc32c(ext4_dir_csum_seed(parent), baseline, start);
+		checksum = ext4_crc32c(checksum, block.data + start, end - start);
+		checksum = ext4_crc32c(checksum, baseline + end, records_end - end);
+	}
 	EXT4_DIRENT_TAIL(block.data, size)->checksum = to_le32(checksum);
 	result = ext4_trans_set_tree_dirty_range(&block, offset, length, key);
 	if (!result && checksum_offset >= offset + length)
 		result = ext4_trans_set_tree_dirty_range(&block, checksum_offset, 32U, key);
+	if (!result && size <= 4096U) {
+		/* Move the first possible slot forward only when this edit used it.
+		 * A skipped short hole can still fit a subsequent shorter name. */
+		uint32_t next = slot.first_possible;
+		if (next == slot.offset) {
+			uint32_t used = (8U + name_len + 3U) & ~3U;
+			next += slot.length - slot.split - used >= 8 ?
+				slot.split : slot.length;
+		}
+		uint32_t checked = matched_hint ? hint & DIRECTORY_LAYOUT_CHECKED : 0;
+		__atomic_store_n(&block.payload->directory_layout,
+			layout | checked | (next << DIRECTORY_SLOT_SHIFT), __ATOMIC_RELAXED);
+	}
 Finish:;
 	int release = ext4_block_set(fs->bdev, &block);
 	return result ? result : release;
@@ -808,10 +870,12 @@ Finish:;
 static inline __attribute__((always_inline)) int find_directory_record(uint8_t *data,
 		size_t remaining, uint32_t name_mask, size_t name_len, const char *name,
 		struct ext4_dir_search_result *result, bool aligned, bool checked,
-		struct ext4_block_payload *learn, uint32_t layout)
+		struct ext4_block_payload *learn, uint32_t layout, uint32_t observed)
 {
 	struct ext4_dir_en *previous = NULL;
 	bool found = false;
+	const uint8_t *begin = data;
+	uint32_t first_possible = remaining;
 	while (remaining) {
 		if (!checked && remaining < 8) return found ? EOK : EUCLEAN;
 		struct ext4_dir_en *de = (void *)data;
@@ -820,7 +884,14 @@ static inline __attribute__((always_inline)) int find_directory_record(uint8_t *
 		uint32_t bytes = (header >> 16) & name_mask;
 		if (!checked && !directory_record_fits(length, bytes, remaining))
 			return found ? EOK : EUCLEAN;
-		if (!found && bytes == name_len && directory_record_has_inode(de, aligned) &&
+		bool used = directory_record_has_inode(de, aligned);
+		if (learn && first_possible >= (layout & ~1U)) {
+			uint32_t split = used ? (8U + bytes + 3U) & ~3U : 0;
+			bool tail = !used && name_mask != UINT16_MAX &&
+				header >> 24 == EXT4_DIRENTRY_DIR_CSUM;
+			if (!tail && length - split >= 8) first_possible = data - begin;
+		}
+		if (!found && bytes == name_len && used &&
 			    !memcmp(name, de->name, name_len)) {
 			result->dentry = de;
 			result->previous = previous;
@@ -832,9 +903,10 @@ static inline __attribute__((always_inline)) int find_directory_record(uint8_t *
 		remaining -= length;
 	}
 	if (learn) {
-		uint32_t old = 0;
-		(void)__atomic_compare_exchange_n(&learn->directory_layout, &old,
-			layout, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+		uint32_t learned = layout | DIRECTORY_LAYOUT_CHECKED |
+			(first_possible << DIRECTORY_SLOT_SHIFT);
+		(void)__atomic_compare_exchange_n(&learn->directory_layout, &observed,
+			learned, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
 	}
 	return found ? EOK : ENOENT;
 }
@@ -847,19 +919,20 @@ int ext4_dir_find_in_block(struct ext4_block *block, struct ext4_sblock *sb,
 	size_t size = ext4_sb_get_block_size(sb);
 	/* Every accepted record advances by a multiple of four bytes. */
 	if ((uintptr_t)block->data & 3U)
-		return find_directory_record(block->data,size,name_mask,name_len,name,result,false,false,NULL,0);
+		return find_directory_record(block->data,size,name_mask,name_len,name,result,false,false,NULL,0,0);
 	if (block->payload && size<=4096U) {
 		uint32_t layout=size | (name_mask==UINT8_MAX);
 		uint32_t observed=__atomic_load_n(&block->payload->directory_layout,__ATOMIC_ACQUIRE);
-		if (observed==layout)
-			return find_directory_record(block->data,size,name_mask,name_len,name,result,true,true,NULL,0);
+		bool matched = (observed & DIRECTORY_LAYOUT_MASK) == layout;
+		if (matched && (observed & DIRECTORY_LAYOUT_CHECKED))
+			return find_directory_record(block->data,size,name_mask,name_len,name,result,true,true,NULL,0,0);
 		/* A lookup can succeed before a malformed later record. Keep that
 		 * result, and publish a reusable layout only after checking every record. */
-		if (!observed)
+		if (!observed || matched)
 			return find_directory_record(block->data,size,name_mask,name_len,name,result,
-				true,false,block->payload,layout);
+				true,false,block->payload,layout,observed);
 	}
-	return find_directory_record(block->data,size,name_mask,name_len,name,result,true,false,NULL,0);
+	return find_directory_record(block->data,size,name_mask,name_len,name,result,true,false,NULL,0,0);
 }
 
 int ext4_dir_destroy_result(struct ext4_inode_ref *parent,

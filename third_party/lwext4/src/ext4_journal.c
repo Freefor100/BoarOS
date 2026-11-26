@@ -2389,12 +2389,16 @@ int jbd_trans_borrow_private(struct jbd_trans *trans, struct ext4_block *block,
     if (result) ext4_bcache_free_read(block->buf->bc, block);
     else {
         jb->fresh_copy = false;
-        if (access == EXT4_BLOCK_WRITE) jb->checked_tree = 0;
+        if (access == EXT4_BLOCK_WRITE) {
+            if (jb->checked_tree)
+                __atomic_store_n(&jb->after->payload.directory_layout, UINT32_MAX, __ATOMIC_RELAXED);
+            jb->checked_tree = 0;
+        }
     }
     return result;
 }
 
-enum jbd_private_init { JBD_COPY, JBD_FRESH, JBD_DEFER_SUPER };
+enum jbd_private_init { JBD_COPY, JBD_FRESH, JBD_DEFER_SUPER, JBD_REPLACE_INODE };
 
 static int jbd_prepare_private(struct jbd_trans *trans, struct ext4_block *block,
     uint32_t offset, uint32_t length, enum jbd_private_init init)
@@ -2447,6 +2451,28 @@ int jbd_trans_prepare_unowned_range(struct jbd_trans *trans, struct ext4_block *
     return error ? error : jbd_prepare_private(trans, block, offset, length, JBD_COPY);
 }
 
+int jbd_trans_prepare_inode_replacement(struct jbd_trans *trans, struct ext4_block *block,
+    uint32_t offset, uint32_t length)
+{
+    COST_SCOPE(prepare_cost, JOURNAL_RECORD_PREPARE_TICKS);
+    if (((offset | length) & 31U) ||
+        length < offsetof(struct ext4_inode, generation) + sizeof(uint32_t)) return EINVAL;
+    int result = write_range_status(trans, offset, length);
+    if (!result)
+        result = jbd_prepare_private(trans, block, offset, length, JBD_REPLACE_INODE);
+    if (result) return result;
+
+    /* Binding acquired the exact accepted baseline for conflict detection.
+     * Only its generation survives allocation of this slot. */
+    struct jbd_buf *record = TAILQ_FIRST(&trans->buf_queue);
+    const struct ext4_inode *previous = (const void *)(record->block.data + offset);
+    struct ext4_inode *inode = (void *)(block->data + offset);
+    memset(inode, 0, length);
+    inode->generation = previous->generation;
+    jbd_range_fill(jbd_initialized_ranges(record), offset / 32, (offset + length) / 32);
+    return EOK;
+}
+
 int jbd_trans_prepare_checked_patch(struct jbd_trans *trans, struct ext4_block *block,
     uint32_t offset, uint32_t length, uint32_t checksum_offset)
 {
@@ -2484,6 +2510,8 @@ int jbd_trans_get_write_access_range(struct jbd_trans *trans,
     if (!jb) return jbd_prepare_private(trans, block, offset, length, JBD_COPY);
     int result = jbd_rebind_private_range(jb, block, offset, length);
     if (!result) {
+        if (jb->checked_tree)
+            __atomic_store_n(&jb->after->payload.directory_layout, UINT32_MAX, __ATOMIC_RELAXED);
         jb->checked_tree = 0;
         jb->fresh_copy = false;
     }
@@ -2628,7 +2656,10 @@ static bool jbd_patch_running(struct jbd_buf *jb, const struct jbd_buf *running)
             (const uint8_t *)jb->after->data + offset};
         first = jbd_range_next(jb->dirty_ranges, last, end, true);
     }
-    return count && ext4_bcache_patch_current(&jb->block, 4, patches, count, jb->checked_tree, true);
+    uint32_t directory = jb->checked_tree ?
+        __atomic_load_n(&jb->after->payload.directory_layout, __ATOMIC_RELAXED) : 0;
+    return count && ext4_bcache_patch_current(&jb->block, 4, patches, count,
+        jb->checked_tree, directory, true);
 }
 
 static int jbd_publish_reused_super(struct jbd_trans *trans, struct jbd_trans *running)
@@ -2648,7 +2679,7 @@ static int jbd_publish_reused_super(struct jbd_trans *trans, struct jbd_trans *r
         {offset + offsetof(struct ext4_sblock, checksum), sizeof(operation->super_publish.checksum),
             &operation->super_publish.checksum},
     };
-    return ext4_bcache_patch_current(&buffer->block, 3, patches, 2, 0, false) ? EOK : EAGAIN;
+    return ext4_bcache_patch_current(&buffer->block, 3, patches, 2, 0, 0, false) ? EOK : EAGAIN;
 }
 
 /* All records and credits were reserved before publication. Validate the full

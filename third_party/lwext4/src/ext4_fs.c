@@ -1076,9 +1076,10 @@ static int inode_table_start(struct ext4_fs *fs, uint32_t group, ext4_fsblk_t *o
 static int
 __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 			struct ext4_inode_ref *ref,
-			bool initialized, bool write)
+			bool write, bool *cleared)
 {
 	COST_PHASE_SCOPE(read_source, 6);
+	bool initialized = !cleared;
 	struct ext4_sblock *sb = ext4_fs_super(fs);
 	if (index == 0 || index > ext4_get32(sb, inodes_count))
 		return EUCLEAN;
@@ -1121,7 +1122,7 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 	if (write && !initialized && table_geometry) {
 		uint32_t remaining = (inodes_per_group >> fs->table_block_shift) - block_in_table;
 		rc = ext4_trans_block_get_new_inode_range(fs->bdev, &ref->block, block_id,
-			offset_in_block, inode_size, remaining);
+			offset_in_block, inode_size, remaining, cleared);
 	} else if (write)
 		rc = ext4_trans_block_get_range(fs->bdev, &ref->block, block_id,
 			offset_in_block, inode_size);
@@ -1165,12 +1166,12 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 int ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 			  struct ext4_inode_ref *ref)
 {
-	return __ext4_fs_get_inode_ref(fs, index, ref, true, true);
+	return __ext4_fs_get_inode_ref(fs, index, ref, true, NULL);
 }
 
 int ext4_fs_get_inode_ref_read(struct ext4_fs *fs, uint32_t index,
     struct ext4_inode_ref *ref)
-{ return __ext4_fs_get_inode_ref(fs, index, ref, true, false); }
+{ return __ext4_fs_get_inode_ref(fs, index, ref, false, NULL); }
 
 int ext4_fs_inode_ref_write(struct ext4_inode_ref *ref)
 {
@@ -1270,7 +1271,8 @@ int ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *inode_ref,
 		return rc;
 
 	/* Load i-node from on-disk i-node table */
-	rc = __ext4_fs_get_inode_ref(fs, index, inode_ref, false, true);
+	bool cleared = false;
+	rc = __ext4_fs_get_inode_ref(fs, index, inode_ref, true, &cleared);
 	if (rc != EOK) {
 		ext4_ialloc_free_inode(fs, index, is_dir);
 		return rc;
@@ -1289,7 +1291,7 @@ int ext4_fs_alloc_inode(struct ext4_fs *fs, struct ext4_inode_ref *inode_ref,
 	uint32_t generation = ext4_inode_get_generation(inode) + 1U;
 	if (!generation)
 		generation = 1;
-	memset(inode, 0, inode_size);
+	if (!cleared) memset(inode, 0, inode_size);
 
 	uint32_t mode;
 	if (is_dir) {

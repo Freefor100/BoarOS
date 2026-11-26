@@ -38,6 +38,11 @@ int jbd_trans_prepare_unowned_range(struct jbd_trans *trans,struct ext4_block *b
 {
     (void)trans;(void)block;(void)offset;(void)length;abort();
 }
+int jbd_trans_prepare_inode_replacement(struct jbd_trans *trans,struct ext4_block *block,
+    uint32_t offset,uint32_t length)
+{
+    (void)trans;(void)block;(void)offset;(void)length;abort();
+}
 int jbd_trans_get_new_access(struct jbd_trans *trans,struct ext4_block *block)
 { (void)trans;(void)block;abort(); }
 static void release_payload(struct ext4_block_payload *payload)
