@@ -1587,6 +1587,7 @@ static void journal_checkpoint_worker(void *context)
 {
     struct lwext4_mount_adapter *adapter = context;
     if(!journal_await_start(adapter,1))return;
+    const uint64_t window_ns = 100000000;
     uint64_t pending_deadline = 0;
     kernel_io_context_current()->background_reclaim = 1;
     for (;;) {
@@ -1607,19 +1608,24 @@ static void journal_checkpoint_worker(void *context)
         struct ext4_journal_progress progress;
         if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
         if (!progress.checkpoint_pending) pending_deadline = 0;
-        else if (!pending_deadline) pending_deadline = kernel_time_monotonic_ns() + 100000000;
+        else if (!pending_deadline) pending_deadline = kernel_time_monotonic_ns() + window_ns;
         int result = progress.error;
         int deferred = 0;
         if (!result && (progress.checkpoint_ready || (pending_deadline &&
             kernel_time_monotonic_ns() >= pending_deadline))) {
+            uint64_t previous = progress.checkpoint;
             result = ext4_journal_group_checkpoint_background(adapter->mount_point);
             if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
             if (result == EAGAIN && !progress.error) { result = EOK; deferred = 1; }
             if (!progress.checkpoint_pending) pending_deadline = 0;
+            /* Transactions committed during home I/O belong to the next
+             * batch. The retired prefix no longer owns their age deadline. */
+            else if (progress.checkpoint != previous)
+                pending_deadline = kernel_time_monotonic_ns() + window_ns;
         }
         if (!result && progress.checkpoint_ready) continue;
         uint64_t deadline = 0;
-        /* Keep the first group's age. A deferred pass waits for real progress;
+        /* Keep the current batch's age across wakeups. A deferred pass waits for real progress;
          * do not keep waking on the already expired checkpoint deadline. */
         if (!result && pending_deadline && !deferred &&
             kernel_time_deadline_from_monotonic(pending_deadline, &deadline) == KERNEL_TIME_STATUS_DEADLINE_PASSED)
