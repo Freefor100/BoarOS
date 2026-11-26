@@ -80,24 +80,16 @@ ext4_dir_get_tail(struct ext4_inode_ref *inode_ref,
 }
 
 #if CONFIG_META_CSUM_ENABLE
+static uint32_t ext4_dir_csum_seed(struct ext4_inode_ref *inode_ref)
+{
+	struct ext4_sblock *sb = &inode_ref->fs->sb;
+	uint32_t identity[] = {to_le32(inode_ref->index),
+		to_le32(ext4_inode_get_generation(inode_ref->inode))};
+	return ext4_crc32c(ext4_sb_get_csum_seed(sb), identity, sizeof(identity));
+}
 static uint32_t ext4_dir_csum(struct ext4_inode_ref *inode_ref,
 			      struct ext4_dir_en *dirent, int size)
-{
-	uint32_t csum;
-	struct ext4_sblock *sb = &inode_ref->fs->sb;
-	uint32_t ino_index = to_le32(inode_ref->index);
-	uint32_t ino_gen = to_le32(ext4_inode_get_generation(inode_ref->inode));
-
-	/* Start with the filesystem metadata checksum seed. */
-	csum = ext4_sb_get_csum_seed(sb);
-	/* Then calculate crc32 checksum against inode number
-	 * and inode generation */
-	csum = ext4_crc32c(csum, &ino_index, sizeof(ino_index));
-	csum = ext4_crc32c(csum, &ino_gen, sizeof(ino_gen));
-	/* Finally calculate crc32 checksum against directory entries */
-	csum = ext4_crc32c(csum, dirent, size);
-	return csum;
-}
+{ return ext4_crc32c(ext4_dir_csum_seed(inode_ref), dirent, size); }
 #else
 #define ext4_dir_csum(...) 0
 #endif
@@ -128,9 +120,9 @@ bool ext4_dir_csum_verify(struct ext4_inode_ref *inode_ref,
 }
 
 
-bool ext4_dir_block_csum_verify(struct ext4_inode_ref *inode, const struct ext4_block *block)
+static bool directory_leaf_verified(struct ext4_inode_ref *inode,
+    const struct ext4_block *block, uint64_t key)
 {
-    uint64_t key = ext4_fs_tree_check_key(inode, EXT4_TREE_DIRECTORY_LEAF);
     uint64_t observed = __atomic_load_n(&block->payload->tree_verified, __ATOMIC_ACQUIRE);
     if (key && observed == key) return true;
     if (!ext4_dir_csum_verify(inode, (void *)block->data)) return false;
@@ -140,8 +132,14 @@ bool ext4_dir_block_csum_verify(struct ext4_inode_ref *inode, const struct ext4_
     return true;
 }
 
-int ext4_dir_leaf_get(struct ext4_inode_ref *dir, struct ext4_block *block,
-    ext4_fsblk_t lba, bool write)
+bool ext4_dir_block_csum_verify(struct ext4_inode_ref *inode, const struct ext4_block *block)
+{
+    return directory_leaf_verified(inode, block,
+        ext4_fs_tree_check_key(inode, EXT4_TREE_DIRECTORY_LEAF));
+}
+
+static int directory_leaf_get(struct ext4_inode_ref *dir, struct ext4_block *block,
+    ext4_fsblk_t lba, bool write, uint64_t key)
 {
     struct ext4_blockdev *dev = dir->fs->bdev;
     int result = write ? ext4_trans_block_get(dev, block, lba) : ext4_block_get(dev, block, lba);
@@ -149,16 +147,22 @@ int ext4_dir_leaf_get(struct ext4_inode_ref *dir, struct ext4_block *block,
 #if CONFIG_JOURNALING_ENABLE
     if (write) {
         struct jbd_trans *trans = ext4_current_trans(dir->fs);
-        uint64_t key = ext4_fs_tree_check_key(dir, EXT4_TREE_DIRECTORY_LEAF);
         if (trans && key && jbd_trans_first_tree_copy_checked(trans, block, key, dev->lg_bsize))
             return EOK;
     }
 #endif
-    if (ext4_dir_block_csum_verify(dir, block)) return EOK;
+    if (directory_leaf_verified(dir, block, key)) return EOK;
     ext4_dbg(DEBUG_DIR, DBG_WARN "Leaf block checksum failed. Inode: %" PRIu32
         ", physical block: %" PRIu64 "\n", dir->index, (uint64_t)lba);
     ext4_block_set(dev, block);
     return EUCLEAN;
+}
+
+int ext4_dir_leaf_get(struct ext4_inode_ref *dir, struct ext4_block *block,
+    ext4_fsblk_t lba, bool write)
+{
+    return directory_leaf_get(dir, block, lba, write,
+        ext4_fs_tree_check_key(dir, EXT4_TREE_DIRECTORY_LEAF));
 }
 
 void ext4_dir_init_entry_tail(struct ext4_dir_entry_tail *t)
@@ -452,6 +456,11 @@ int ext4_dir_init_child(struct ext4_inode_ref *dir, struct ext4_inode_ref *paren
 	return result ? result : release;
 }
 
+#if CONFIG_JOURNALING_ENABLE && CONFIG_META_CSUM_ENABLE
+static int insert_checked_linear_leaf(struct ext4_inode_ref *parent, ext4_fsblk_t lba,
+	struct ext4_inode_ref *child, const char *name, uint32_t name_len, struct jbd_trans *trans);
+#endif
+
 int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 		       uint32_t name_len, struct ext4_inode_ref *child)
 {
@@ -478,6 +487,13 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 	uint32_t block_size = ext4_sb_get_block_size(sb);
 	uint64_t inode_size = ext4_inode_get_size(sb, parent->inode);
 	uint32_t total_blocks = (uint32_t)(inode_size / block_size);
+	struct jbd_trans *trans = ext4_current_trans(fs);
+	bool can_promote __unused = CONFIG_DIR_INDEX_ENABLE && total_blocks == 1 && trans &&
+		ext4_sb_feature_com(sb, EXT4_FCOM_DIR_INDEX);
+#if CONFIG_JOURNALING_ENABLE && CONFIG_META_CSUM_ENABLE
+	bool checked_write = trans && ext4_fs_serial_writer(fs) &&
+		ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM);
+#endif
 
 	/* Find block, where is space for new entry and try to add */
 	for (iblock = 0; iblock < total_blocks; ++iblock) {
@@ -485,6 +501,13 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 		if (r != EOK)
 			return r;
 
+#if CONFIG_JOURNALING_ENABLE && CONFIG_META_CSUM_ENABLE
+		if (checked_write) {
+			r = insert_checked_linear_leaf(parent, fblock, child, name, name_len, trans);
+			if (r == ENOSPC && !can_promote) continue;
+			if (r != ENOTSUP && r != ENOSPC) return r;
+		}
+#endif
 		struct ext4_block block;
 		r = ext4_dir_leaf_get(parent, &block, fblock, true);
 		if (r != EOK)
@@ -494,8 +517,7 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 		r = ext4_dir_try_insert_entry(sb, parent, &block, child,
 						name, name_len);
 #if CONFIG_DIR_INDEX_ENABLE
-		if (r == ENOSPC && total_blocks == 1 && ext4_current_trans(fs) &&
-		    ext4_sb_feature_com(sb, EXT4_FCOM_DIR_INDEX)) {
+		if (r == ENOSPC && can_promote) {
 			r = ext4_dir_dx_promote(parent, &block);
 			int release = ext4_block_set(fs->bdev, &block);
 			if (r) return r;
@@ -677,14 +699,15 @@ static inline bool directory_record_fits(uint32_t length, uint32_t bytes, size_t
 	return length >= 8 && !(length % 4) && length <= remaining && bytes <= length - 8;
 }
 
-static inline __attribute__((always_inline)) int try_insert_directory_record(
-	struct ext4_sblock *sb, struct ext4_inode_ref *parent, struct ext4_block *block,
-	struct ext4_inode_ref *child, const char *name, uint32_t name_len, bool aligned)
+struct directory_insert_slot { uint32_t offset, length, split; };
+static inline __attribute__((always_inline)) int find_insert_slot(
+	struct ext4_sblock *sb, uint8_t *data, uint32_t name_len, bool aligned,
+	struct directory_insert_slot *slot)
 {
 	uint32_t required = (8U + name_len + 3U) & ~3U;
 	uint32_t name_mask = directory_name_mask(sb);
 	size_t remaining = ext4_sb_get_block_size(sb);
-	uint8_t *data = block->data;
+	uint8_t *begin = data;
 	while (remaining) {
 		if (remaining < 8) return EUCLEAN;
 		struct ext4_dir_en *entry = (void *)data;
@@ -695,15 +718,13 @@ static inline __attribute__((always_inline)) int try_insert_directory_record(
 		if (directory_record_has_inode(entry, aligned)) {
 			uint32_t used = (8U + bytes + 3U) & ~3U;
 			if (length - used >= required) {
-				struct ext4_dir_en *slot = (void *)(data + used);
-				ext4_dir_en_set_entry_len(entry, used);
-				ext4_dir_write_entry(sb, slot, length - used, child, name, name_len);
-				return ext4_dir_mark_dirty(parent, block);
+				*slot = (struct directory_insert_slot){data - begin, length, used};
+				return EOK;
 			}
 		} else if (length >= required &&
 			   (name_mask == UINT16_MAX || header >> 24 != EXT4_DIRENTRY_DIR_CSUM)) {
-			ext4_dir_write_entry(sb, entry, length, child, name, name_len);
-			return ext4_dir_mark_dirty(parent, block);
+			*slot = (struct directory_insert_slot){data - begin, length, 0};
+			return EOK;
 		}
 		data += length;
 		remaining -= length;
@@ -711,16 +732,78 @@ static inline __attribute__((always_inline)) int try_insert_directory_record(
 	return ENOSPC;
 }
 
+static int directory_slot(struct ext4_sblock *sb, uint8_t *data, uint32_t name_len,
+	struct directory_insert_slot *slot)
+{
+	if (name_len > EXT4_DIRECTORY_FILENAME_LEN) return EINVAL;
+	/* A valid record keeps every subsequent header four-byte aligned. */
+	if ((uintptr_t)data & 3U) return find_insert_slot(sb, data, name_len, false, slot);
+	return find_insert_slot(sb, data, name_len, true, slot);
+}
+
+static void write_directory_slot(struct ext4_sblock *sb, uint8_t *data,
+	const struct directory_insert_slot *slot, struct ext4_inode_ref *child,
+	const char *name, uint32_t name_len)
+{
+	uint8_t *record = data + slot->offset;
+	if (slot->split) ext4_dir_en_set_entry_len((void *)record, slot->split);
+	ext4_dir_write_entry(sb, (void *)(record + slot->split), slot->length - slot->split,
+		child, name, name_len);
+}
+
 int ext4_dir_try_insert_entry(struct ext4_sblock *sb, struct ext4_inode_ref *parent,
 			      struct ext4_block *block, struct ext4_inode_ref *child,
 			      const char *name, uint32_t name_len)
 {
-	if (name_len > EXT4_DIRECTORY_FILENAME_LEN) return EINVAL;
-	/* A valid record keeps every subsequent header four-byte aligned. */
-	if ((uintptr_t)block->data & 3U)
-		return try_insert_directory_record(sb, parent, block, child, name, name_len, false);
-	return try_insert_directory_record(sb, parent, block, child, name, name_len, true);
+	struct directory_insert_slot slot;
+	int result = directory_slot(sb, block->data, name_len, &slot);
+	if (result) return result;
+	write_directory_slot(sb, block->data, &slot, child, name, name_len);
+	return ext4_dir_mark_dirty(parent, block);
 }
+
+#if CONFIG_JOURNALING_ENABLE && CONFIG_META_CSUM_ENABLE
+static int insert_checked_linear_leaf(struct ext4_inode_ref *parent, ext4_fsblk_t lba,
+	struct ext4_inode_ref *child, const char *name, uint32_t name_len, struct jbd_trans *trans)
+{
+	struct ext4_fs *fs = parent->fs;
+	uint64_t key = ext4_fs_tree_check_key(parent, EXT4_TREE_DIRECTORY_LEAF);
+	if (!key) return ENOTSUP;
+	struct ext4_block block;
+	int result = directory_leaf_get(parent, &block, lba, false, key);
+	if (result) return result;
+	uint8_t *baseline = block.data;
+	struct directory_insert_slot slot;
+	result = directory_slot(&fs->sb, baseline, name_len, &slot);
+	if (result) goto Finish;
+
+	const uint32_t size = ext4_sb_get_block_size(&fs->sb);
+	const uint32_t records_end = size - sizeof(struct ext4_dir_entry_tail);
+	const uint32_t checksum_offset = size - 32U;
+	const uint32_t start = slot.offset + (slot.split ? offsetof(struct ext4_dir_en, entry_len) : 0);
+	const uint32_t end = slot.offset + slot.split + 8U + name_len;
+	if (end > records_end) { result = EUCLEAN; goto Finish; }
+	const uint32_t offset = start & ~31U;
+	const uint32_t length = ((end + 31U) & ~31U) - offset;
+	result = jbd_trans_prepare_checked_patch(trans, &block, offset, length, checksum_offset);
+	if (result) goto Finish;
+
+	/* The operation owns the unchanged accepted bytes until publication.
+	 * Feed those bytes directly to the checksum instead of cloning them. */
+	write_directory_slot(&fs->sb, block.data, &slot, child, name, name_len);
+	uint32_t checksum = ext4_dir_csum_seed(parent);
+	checksum = ext4_crc32c(checksum, baseline, start);
+	checksum = ext4_crc32c(checksum, block.data + start, end - start);
+	checksum = ext4_crc32c(checksum, baseline + end, records_end - end);
+	EXT4_DIRENT_TAIL(block.data, size)->checksum = to_le32(checksum);
+	result = ext4_trans_set_tree_dirty_range(&block, offset, length, key);
+	if (!result && checksum_offset >= offset + length)
+		result = ext4_trans_set_tree_dirty_range(&block, checksum_offset, 32U, key);
+Finish:;
+	int release = ext4_block_set(fs->bdev, &block);
+	return result ? result : release;
+}
+#endif
 
 static inline __attribute__((always_inline)) int find_directory_record(uint8_t *data,
 		size_t remaining, uint32_t name_mask, size_t name_len, const char *name,

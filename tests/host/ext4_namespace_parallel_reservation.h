@@ -1,3 +1,5 @@
+#include <ext4_dir.h>
+
 static unsigned serial_reservation_watch,serial_reserved,serial_borrowed,serial_commit_done;
 static unsigned serial_log_saved;
 static uint64_t serial_reservation_lba;
@@ -222,14 +224,63 @@ static void *serial_commit(void *argument)
     __atomic_store_n(&serial_commit_done,1,__ATOMIC_RELEASE);
     mm_test_finish();return NULL;
 }
+static void serial_leaf_readers(struct lwext4_mount_adapter *adapter)
+{
+    struct ext4_fs *fs=adapter->device.fs;
+    struct ext4_inode_ref root;
+    ext4_fsblk_t lba;
+    struct ext4_block old, latest;
+    adapter->locks.read_lock(adapter->locks.context);
+    assert(!ext4_fs_get_inode_ref_read(fs,EXT4_ROOT_INO,&root));
+    assert(!ext4_fs_get_inode_dblk_idx(&root,0,&lba,false));
+    assert(!ext4_block_get(fs->bdev,&old,lba));
+    assert(!ext4_fs_put_inode_ref(&root));
+    adapter->locks.unlock(adapter->locks.context);
+
+    static const char name[]="serial-leaf-reader";
+    char path[96];
+    snprintf(path,sizeof(path),"%s%s",adapter->mount_point,name);
+    ext4_file file;
+    directory_leaf_abort=true;
+    assert(ext4_fopen(&file,path,"w+")==ECANCELED);
+    directory_leaf_abort=false;
+    assert(ext4_fopen(&file,path,"r")==ENOENT);
+    assert(!ext4_fopen(&file,path,"w+") && !ext4_fclose(&file));
+
+    adapter->locks.read_lock(adapter->locks.context);
+    assert(!ext4_fs_get_inode_ref_read(fs,EXT4_ROOT_INO,&root));
+    assert(!ext4_block_get(fs->bdev,&latest,lba));
+    struct ext4_dir_search_result found;
+    assert(ext4_dir_find_in_block(&old,&fs->sb,sizeof(name)-1,name,&found)==ENOENT);
+    assert(!ext4_dir_find_in_block(&latest,&fs->sb,sizeof(name)-1,name,&found));
+    assert(old.payload!=latest.payload &&
+        ext4_dir_csum_verify(&root,(void *)old.data) && ext4_dir_csum_verify(&root,(void *)latest.data));
+    assert(!ext4_block_set(fs->bdev,&latest) && !ext4_block_set(fs->bdev,&old));
+    assert(!ext4_fs_put_inode_ref(&root));
+    adapter->locks.unlock(adapter->locks.context);
+    assert(!ext4_fremove(path));
+    puts("PASS sparse directory edit: rollback preserves absence and both views retain valid checksums");
+}
+
 static void serial_reservation_case(struct lwext4_mount_adapter *adapter,int serial)
 {
     char path[96];snprintf(path,sizeof(path),"%sserial-reservation",adapter->mount_point);
     ext4_file file;
-    if(serial)serial_reservation_watch=1;
+    if(serial) {
+        serial_reservation_watch=1;
+        directory_leaf_watch=1;
+        directory_leaf_updates=directory_leaf_bytes=0;
+    }
     assert(!ext4_fopen(&file,path,serial?"w+":"r+"));
     serial_reservation_watch=0;
-    if(serial)assert(serial_reserved);
+    if(serial) {
+        directory_leaf_watch=0;
+        assert(serial_reserved);
+        printf("existing leaf insert journals %u bytes in %u ranges\n",
+            directory_leaf_bytes,directory_leaf_updates);
+        assert(directory_leaf_updates==2 && directory_leaf_bytes<=128);
+        serial_leaf_readers(adapter);
+    }
     adapter->locks.read_lock(adapter->locks.context);
     struct ext4_inode_ref inode;
     assert(!ext4_fs_get_inode_ref(adapter->device.fs,file.inode,&inode));

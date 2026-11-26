@@ -532,18 +532,30 @@ int __real_ext4_trans_write_data(struct ext4_blockdev *,uint64_t,uint32_t,
     const void *,uint32_t,bool,const struct file_data_source *);
 static unsigned small_files_watch,small_files_active,small_files_fault;
 static unsigned small_files_committed,small_files_aborted;
+static unsigned small_files_completed;
+static bool small_files_completion_error;
 static bool small_files_check_groups,small_files_crossed_group;
 static uint32_t small_files_first_group;
-int __real_ext4_fpwrite_small_files(ext4_file *const *,struct file_write_span *,unsigned);
-int __wrap_ext4_fpwrite_small_files(ext4_file *const *files,struct file_write_span *spans,unsigned count)
+int __real_ext4_fpwrite_files(ext4_file *const *,const struct file_write_set *,unsigned,int *);
+int __wrap_ext4_fpwrite_files(ext4_file *const *files,const struct file_write_set *sets,
+    unsigned count,int *data_result)
 {
     small_files_active=small_files_watch;
-    int result=__real_ext4_fpwrite_small_files(files,spans,count);
+    int result=__real_ext4_fpwrite_files(files,sets,count,data_result);
     small_files_active=0;
     if (small_files_watch && result==KERNEL_EIO) {
-        for (unsigned i=0;i<count;i++) assert(!ext4_fsize(files[i]) && !spans[i].written);
+        for (unsigned i=0;i<count;i++) {
+            assert(!ext4_fsize(files[i]));
+            for (unsigned j=0;j<sets[i].count;j++) assert(!sets[i].spans[j].written);
+        }
         small_files_aborted++;
-    } else if (small_files_watch && !result) small_files_committed+=count;
+    } else if (small_files_watch && !result) {
+        small_files_committed+=count;
+        if (data_result && !*data_result) {
+            small_files_completed+=count;
+            if (small_files_completion_error) *data_result=KERNEL_EIO;
+        }
+    }
     return result;
 }
 int __wrap_ext4_trans_write_data(struct ext4_blockdev *bdev,uint64_t lba,uint32_t offset,
@@ -1118,7 +1130,7 @@ static void small_files_sync_case(struct kernel_page_cache *cache,const char *pa
             size_t done=0;
             assert(!kernel_vfs_pwrite(&files[i],0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
         }
-        small_files_committed=small_files_aborted=0;
+        small_files_committed=small_files_aborted=small_files_completed=0;
         small_files_watch=1;small_files_fault=fault==3?4:fault?2:0;
         small_files_check_groups=fault==3;
         small_files_first_group=UINT32_MAX;
@@ -1147,40 +1159,55 @@ static void small_files_sync_case(struct kernel_page_cache *cache,const char *pa
         }
     }
     assert(!kernel_page_cache_start_worker(cache));
-    for (unsigned fault=0;fault<2;fault++) {
+    const size_t lengths[]={512,BOAROS_PAGE_SIZE+513,2*BOAROS_PAGE_SIZE+17};
+    unsigned char *bytes=malloc(lengths[2]);
+    assert(bytes);
+    for (unsigned mode=0;mode<4;mode++) {
         struct kernel_vfs_file files[3]={{0}};
+        uint64_t observed[3];
         struct small_range_setup setup={.cache=cache};
         pthread_t producer;
         assert(!pthread_create(&producer,NULL,small_range_producer,&setup));
         wait_progress(&setup.entered,1);
-        small_files_committed=small_files_aborted=0;
-        small_files_watch=1;small_files_fault=fault?2:0;
+        small_files_committed=small_files_aborted=small_files_completed=0;
+        small_files_watch=1;small_files_fault=mode==1?2:0;
+        small_files_completion_error=mode==3;
         for (unsigned i=0;i<3;i++) {
-            char name[32];snprintf(name,sizeof(name),"/small-range-%u-%u",fault,i);
-            unsigned char bytes[512];memset(bytes,0x71+i,sizeof(bytes));size_t done;
+            char name[32];snprintf(name,sizeof(name),"/small-range-%u-%u",mode,i);
+            size_t done;
+            size_t offset=mode==2 && i==2?BOAROS_PAGE_SIZE:0;
+            size_t length=lengths[i]-offset;
+            memset(bytes,0x71+i,length);
             assert(!kernel_vfs_create(&mount,name,0600,&files[i]));
-            assert(!kernel_vfs_pwrite(&files[i],0,bytes,sizeof(bytes),&done) && done==sizeof(bytes));
-            uint64_t observed=kernel_vfs_error_sequence(&files[i]);
-            assert(!kernel_vfs_sync_file_range(&files[i],0,UINT64_MAX,KERNEL_SYNC_FILE_RANGE_WRITE,&observed));
+            assert(!kernel_vfs_pwrite(&files[i],offset,bytes,length,&done) && done==length);
+            observed[i]=kernel_vfs_error_sequence(&files[i]);
+            assert(!kernel_vfs_sync_file_range(&files[i],0,UINT64_MAX,KERNEL_SYNC_FILE_RANGE_WRITE,&observed[i]));
         }
         __atomic_store_n(&setup.resume,1,__ATOMIC_RELEASE);
         assert(!pthread_join(producer,NULL));
         for (unsigned i=0;i<3;i++) {
-            uint64_t observed=kernel_vfs_error_sequence(&files[i]);
-            assert(!kernel_vfs_sync_file_range(&files[i],0,UINT64_MAX,KERNEL_SYNC_FILE_RANGE_WAIT_AFTER,&observed));
+            int result=kernel_vfs_sync_file_range(&files[i],0,UINT64_MAX,
+                KERNEL_SYNC_FILE_RANGE_WAIT_AFTER,&observed[i]);
+            assert(result==(mode==3?-KERNEL_EIO:0));
+            if (mode==3)
+                assert(!kernel_vfs_sync_file_range(&files[i],0,UINT64_MAX,
+                    KERNEL_SYNC_FILE_RANGE_WAIT_AFTER,&observed[i]));
             assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&files[i])));
-            unsigned char bytes[512];size_t done;
-            assert(!kernel_vfs_pread(&files[i],0,bytes,sizeof(bytes),&done,NULL) && done==sizeof(bytes));
-            for (size_t j=0;j<done;j++) assert(bytes[j]==0x71+i);
+            size_t done;
+            assert(!kernel_vfs_pread(&files[i],0,bytes,lengths[i],&done,NULL) && done==lengths[i]);
+            for (size_t j=0;j<done;j++)
+                assert(bytes[j]==(mode==2 && i==2 && j<BOAROS_PAGE_SIZE?0:0x71+i));
             assert(!kernel_vfs_close(&files[i]));
         }
         small_files_watch=0;
-        if (fault) assert(small_files_aborted==1 && !small_files_fault && !small_files_committed);
-        else assert(small_files_committed==3 && !small_files_aborted);
+        if (mode==1) assert(small_files_aborted==1 && !small_files_fault && !small_files_committed);
+        else assert(small_files_committed==3 && small_files_completed==(mode==2?0:3) && !small_files_aborted);
     }
+    small_files_completion_error=false;
+    free(bytes);
     kernel_page_cache_stop_worker(cache);
     assert(!kernel_vfs_unmount(&mount) && !kernel_page_cache_destroy(cache) && !close(image_fd));
-    puts("PASS small-file writeback: grouped sync and asynchronous ranges, private abort, independent retry and durable contents");
+    puts("PASS multi-file writeback: one transaction, reused mappings, sparse fallback, rollback and independent retry");
 }
 
 static void snapshot_copy_case(struct kernel_page_cache *cache,const char *path)

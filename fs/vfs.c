@@ -4494,7 +4494,7 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
     if (opened) *opened=(struct kernel_vfs_open_result){0};
     if (!start || !root || !path || !request || !file || file->state || file->private_data || file->path ||
         !start->file.mount || !start->file.mount->private_data) return -KERNEL_EINVAL;
-    size_t length=strlen(path);
+    size_t length=request->path_length ? request->path_length : strlen(path);
     unsigned flags=request->flags;
     int temporary=!!(flags & KERNEL_VFS_OPEN_TMPFILE);
     int create=!!(flags & KERNEL_VFS_OPEN_CREATE);
