@@ -60,7 +60,8 @@
 #define arch_mmu_user_cow_replace_prepared riscv_sv39_user_cow_replace_prepared
 #define arch_mmu_user_next_owned riscv_sv39_user_next_owned
 #define arch_mmu_user_owned_snapshot riscv_sv39_user_owned_snapshot
-#define arch_mmu_user_fork_commit_window riscv_sv39_user_fork_commit_window
+#define arch_mmu_user_space_fork_commit(parent, child, metadata, policy, context, changed) \
+    riscv_sv39_user_space_fork_commit((parent), (child), (metadata), (changed))
 #define arch_mmu_user_map_owned_window riscv_sv39_user_map_owned_window
 #define arch_mmu_user_map_required_window riscv_sv39_user_map_required_window
 #define arch_mmu_user_mark_cow_page riscv_sv39_user_mark_cow_page

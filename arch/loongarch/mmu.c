@@ -877,7 +877,7 @@ enum arch_mmu_status arch_mmu_user_mark_cow_page(struct arch_mmu_user_space *s, 
 
 /* The child tree is still private. Bound both table walks and permission
  * writes per MM metadata critical section, even if the leaf table is dense. */
-enum arch_mmu_status arch_mmu_user_fork_commit_window(
+static enum arch_mmu_status fork_commit_window(
     struct arch_mmu_user_space *parent, const struct arch_mmu_user_space *child,
     uint64_t first, uint64_t *next, int (*policy)(void *, uint64_t), void *context,
     int *changed)
@@ -918,6 +918,21 @@ enum arch_mmu_status arch_mmu_user_fork_commit_window(
     }
     *next = first + count * stride;
     return ARCH_MMU_STATUS_OK;
+}
+
+enum arch_mmu_status arch_mmu_user_space_fork_commit(
+    struct arch_mmu_user_space *parent, struct arch_mmu_user_space *child,
+    struct kernel_raw_rwlock *metadata, int (*policy)(void *, uint64_t), void *context,
+    int *changed)
+{
+    uint64_t cursor = 0, address;
+    enum arch_mmu_status status;
+    while (!(status = arch_mmu_user_next_owned(child, &cursor, ARCH_MMU_USER_LIMIT, &address))) {
+        KERNEL_RAW_WRITE_SCOPE(guard, metadata);
+        status = fork_commit_window(parent, child, address, &cursor, policy, context, changed);
+        if (status) return status;
+    }
+    return status == ARCH_MMU_STATUS_NOT_MAPPED ? ARCH_MMU_STATUS_OK : status;
 }
 
 static unsigned map_owned_window(struct arch_mmu_user_space *s, uint64_t address,
