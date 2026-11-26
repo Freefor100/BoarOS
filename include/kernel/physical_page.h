@@ -159,6 +159,10 @@ enum physical_page_status physical_page_allocate_order(
 enum physical_page_status physical_page_allocate_order_nosleep(
     struct physical_page_allocator *, uint32_t order, uint64_t *address);
 
+/* Allocate one base page with two references for a backing and its consumer. */
+enum physical_page_status physical_page_allocate_two_references(
+    struct physical_page_allocator *, uint64_t *address);
+
 /* Allocate 2^order contiguous pages, each with its own order-zero reference.
  * mmap backing can share/release each page independently. No owners escape on
  * failure; success must be released page-by-page, not with release_order. */

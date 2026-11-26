@@ -2309,7 +2309,8 @@ __unused static void print_path(struct ext4_extent_path *path)
 }
 
 static int extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
-    uint32_t max_blocks, bool create, bool reserve, struct ext4_inode_block_range *range)
+    uint32_t max_blocks, bool create, bool reserve, uint32_t overwritten_blocks,
+    struct ext4_inode_block_range *range)
 {
 	struct ext4_extent_path *path = NULL;
 	struct ext4_extent newex, *ex;
@@ -2372,8 +2373,11 @@ static int extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock
 				zero_range = max_blocks;
 
 			newblock = iblock - ee_block + ee_start;
-			err = ext4_ext_zero_unwritten_range(inode_ref, newblock,
-							    zero_range);
+			/* Complete payloads in this operation order the converted
+			 * prefix. Partial blocks still need their original zeros. */
+			uint32_t skip = overwritten_blocks < zero_range ? overwritten_blocks : zero_range;
+			err = ext4_ext_zero_unwritten_range(inode_ref, newblock + skip,
+							    zero_range - skip);
 			if (err != EOK)
 				goto out2;
 
@@ -2457,13 +2461,20 @@ out2:
 int ext4_extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
     uint32_t max_blocks, bool create, struct ext4_inode_block_range *range)
 {
-    return extent_get_range(inode_ref, iblock, max_blocks, create, false, range);
+    return extent_get_range(inode_ref, iblock, max_blocks, create, false, 0, range);
+}
+
+int ext4_extent_write_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
+    uint32_t max_blocks, uint32_t overwritten_blocks, struct ext4_inode_block_range *range)
+{
+    if (!ext4_current_trans(inode_ref->fs)) overwritten_blocks = 0;
+    return extent_get_range(inode_ref, iblock, max_blocks, true, false, overwritten_blocks, range);
 }
 
 int ext4_extent_reserve_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
     uint32_t max_blocks, struct ext4_inode_block_range *range)
 {
-    return extent_get_range(inode_ref, iblock, max_blocks, true, true, range);
+    return extent_get_range(inode_ref, iblock, max_blocks, true, true, 0, range);
 }
 
 int ext4_extent_zero_range(struct ext4_inode_ref *ref, ext4_lblk_t first,

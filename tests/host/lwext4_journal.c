@@ -166,6 +166,141 @@ struct resource_source { unsigned references; void *data; };
 static void resource_retain(void *context) { ((struct resource_source *)context)->references++; }
 static void resource_release(void *context)
 { CHECK(((struct resource_source *)context)->references); ((struct resource_source *)context)->references--; }
+
+#ifdef TEST_WRITEBACK_REGRESSIONS
+static struct {
+    bool watch, fail;
+    unsigned zeroes, writes;
+} unwritten_write;
+
+int __real_ext4_trans_write_data(struct ext4_blockdev *, uint64_t, uint32_t,
+    const void *, uint32_t, bool, const struct file_data_source *);
+int __wrap_ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
+    uint32_t offset, const void *data, uint32_t length, bool initialize,
+    const struct file_data_source *source)
+{
+    int result = __real_ext4_trans_write_data(bdev, lba, offset, data, length, initialize, source);
+    if (!result && unwritten_write.watch) {
+        if (!data && initialize) unwritten_write.zeroes++;
+        if (data && ++unwritten_write.writes == 1 && unwritten_write.fail) result = EIO;
+    }
+    return result;
+}
+
+static void write_unwritten_range(struct ext4_blockdev *dev)
+{
+    CHECK(ext4_journal_start("/") == EOK);
+    const struct ext4_journal_runtime runtime = {.now_ns = resource_now};
+    CHECK(ext4_journal_group_enable("/", &runtime, 4 * 1024 * 1024) == EOK);
+    ext4_file file;
+    CHECK(ext4_fopen(&file, "/probe", "r+") == EOK);
+    const size_t block = dev->lg_bsize, length = 3 * block + 19;
+    unsigned char *input = malloc(length), *output = malloc(5 * block);
+    CHECK(input && output);
+    memset(input, 0x5a, length);
+    struct resource_source resource = {.data = input};
+    struct file_data_source source = {
+        .context = &resource, .bytes = length, .retain = resource_retain, .release = resource_release,
+    };
+    struct file_write_span spans[] = {
+        {.offset = block, .buffer = input, .size = block, .source = source},
+        {.offset = 2 * block, .buffer = input + block, .size = length - block, .source = source},
+    };
+    bool changed;
+    CHECK(ext4_fallocate(&file, 0, block, 5 * block, &changed, UINT32_MAX) == EOK && changed);
+    CHECK(ext4_journal_group_commit("/", true) == EOK);
+    unwritten_write.watch = unwritten_write.fail = true;
+    CHECK(ext4_fpwrite_batch(&file, spans, 2) == EIO);
+    CHECK(!spans[0].written && !spans[1].written && !resource.references);
+    size_t read;
+    CHECK(ext4_fpread(&file, block, output, 5 * block, &read) == EOK && read == 5 * block);
+    for (size_t i = 0; i < read; i++) CHECK(output[i] == 0);
+
+    unwritten_write.fail = false;
+    unwritten_write.zeroes = unwritten_write.writes = 0;
+    CHECK(ext4_fpwrite_batch(&file, spans, 2) == EOK);
+    unwritten_write.watch = false;
+    CHECK(spans[0].written == block && spans[1].written == length - block);
+    CHECK(unwritten_write.writes == 4 && unwritten_write.zeroes == 1);
+    CHECK(ext4_fpread(&file, block, output, 5 * block, &read) == EOK && read == 5 * block);
+    CHECK(!memcmp(input, output, length));
+    for (size_t i = length; i < read; i++) CHECK(output[i] == 0);
+    CHECK(ext4_fclose(&file) == EOK);
+    CHECK(ext4_journal_stop("/") == EOK);
+    CHECK(ext4_umount("/") == EOK);
+    CHECK(!resource.references);
+    CHECK(fault_block_crash(&disk) == 0);
+    CHECK(ext4_mount("journal-test", "/", true) == EOK);
+    CHECK(ext4_fopen(&file, "/probe", "r") == EOK);
+    CHECK(ext4_fpread(&file, block, output, 5 * block, &read) == EOK && read == 5 * block);
+    CHECK(!memcmp(input, output, length));
+    for (size_t i = length; i < read; i++) CHECK(output[i] == 0);
+    CHECK(ext4_fclose(&file) == EOK);
+    CHECK(ext4_umount("/") == EOK);
+    free(output);
+    free(input);
+    CHECK(fault_block_crash(&disk) == 0);
+    puts("PASS: full unwritten blocks use supplied data, partial tail stays zero, aborted conversion remains unwritten");
+}
+
+static uint64_t ordered_now;
+static uint64_t ordered_clock(void *context) { (void)context; return ordered_now; }
+
+static void ordered_idle_test(struct ext4_blockdev *dev)
+{
+    CHECK(ext4_journal_start("/") == EOK);
+    ext4_file file;
+    CHECK(ext4_fopen(&file,"/probe","r+") == EOK);
+    unsigned block = dev->lg_bsize;
+    CHECK(ext4_ftruncate(&file,block,UINT32_MAX) == EOK);
+    const struct ext4_journal_runtime runtime = {.now_ns = ordered_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024) == EOK);
+    unsigned char *bytes = malloc(block);
+    CHECK(bytes);
+    struct ext4_journal_progress p;
+    size_t written;
+    uint64_t start = 1;
+    uint64_t group = 0;
+    for (unsigned i = 0; i <= 5; i++) {
+        ordered_now = start + UINT64_C(90000000) * i;
+        memset(bytes, 'A' + i, block);
+        CHECK(ext4_fpwrite(&file,0,bytes,block,&written) == EOK && written == block);
+        CHECK(ext4_journal_group_progress("/",&p) == EOK);
+        if (!i) group = p.accepted;
+        uint64_t expected = start + (i < 5 ? UINT64_C(90000000) * i + UINT64_C(100000000) :
+            UINT64_C(500000000));
+        CHECK(p.accepted == group && p.durable < group && !p.commit_ready && p.deadline_ns == expected);
+        CHECK(ext4_journal_group_commit("/",false) == EOK);
+    }
+    ordered_now = start + UINT64_C(500000000);
+    CHECK(ext4_journal_group_progress("/",&p) == EOK && p.commit_ready);
+    CHECK(ext4_journal_group_commit("/",false) == EOK);
+    CHECK(ext4_journal_group_progress("/",&p) == EOK && p.durable == group);
+
+    memset(bytes,'S',block);
+    CHECK(ext4_fpwrite(&file,0,bytes,block,&written) == EOK && written == block);
+    CHECK(ext4_journal_group_progress("/",&p) == EOK && !p.commit_ready);
+    uint64_t target;
+    CHECK(ext4_file_sync_metadata_prepare(&file,true,&target) == EOK && target == group + 1);
+    CHECK(ext4_journal_group_progress("/",&p) == EOK && p.commit_ready);
+    CHECK(ext4_journal_group_commit("/",false) == EOK);
+    CHECK(ext4_journal_group_progress("/",&p) == EOK && p.durable == target);
+
+    memset(bytes,'P',block);
+    CHECK(ext4_fpwrite(&file,0,bytes,block,&written) == EOK && written == block);
+    CHECK(ext4_journal_group_progress("/",&p) == EOK && !p.commit_ready);
+    CHECK(ext4_journal_group_reclaim("/",true) == EOK);
+    CHECK(ext4_journal_group_progress("/",&p) == EOK && p.durable == target + 1);
+    CHECK(ext4_fpread(&file,0,bytes,block,&written) == EOK && written == block);
+    for (unsigned i = 0; i < block; i++) CHECK(bytes[i] == 'P');
+    free(bytes);
+    CHECK(ext4_fclose(&file) == EOK);
+    CHECK(ext4_journal_stop("/") == EOK);
+    CHECK(ext4_umount("/") == EOK && fault_block_crash(&disk) == 0);
+    puts("PASS rolling ordered idle, 500ms hard age, explicit sync and real reclaim targets");
+}
+#endif
+
 static void resource_accept_data(struct jbd_journal *journal, ext4_fsblk_t home,
     struct resource_source *source, bool quarantine)
 {
@@ -1703,6 +1838,16 @@ int main(int argc, char **argv)
         ext4_mount_ext3("journal-test", "/", read_only) :
         ext4_mount("journal-test", "/", read_only);
     CHECK(mounted == EOK);
+#ifdef TEST_WRITEBACK_REGRESSIONS
+    if (!strcmp(argv[2], "write-unwritten")) {
+        write_unwritten_range(&dev);
+        return 0;
+    }
+    if (!strcmp(argv[2], "ordered-idle")) {
+        ordered_idle_test(&dev);
+        return 0;
+    }
+#endif
     struct jbd_fs jfs;
     struct jbd_journal journal;
     CHECK(jbd_get_fs(dev.fs, &jfs) == EOK);

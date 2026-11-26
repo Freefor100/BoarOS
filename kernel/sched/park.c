@@ -203,7 +203,8 @@ enum kernel_scheduler_status kernel_wait_node_bind(struct kernel_wait_queue *que
     return kernel_wait_node_bind_locked(queue,node,token);
 }
 static enum kernel_scheduler_status prepare_owner(struct kernel_wait_queue *queue,
-    uint64_t deadline, int interruptible, struct kernel_wait_token *token)
+    uint64_t deadline, int interruptible, uint32_t readiness_mask,
+    struct kernel_wait_token *token)
 {
     struct kernel_task *task=kernel_wait_current_task();
     if (!task) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
@@ -231,13 +232,14 @@ static enum kernel_scheduler_status prepare_owner(struct kernel_wait_queue *queu
         struct kernel_wait_node *node=kernel_wait_default_node(task);
         if (node->generation || node->queue || kernel_wait_node_references(node) ||
             (node->task && node->task!=task)) __builtin_trap();
-        node->task=task;node->generation=generation;record->nodes=node;
+        node->task=task;node->generation=generation;node->readiness_mask=readiness_mask;
+        record->nodes=node;
         kernel_wait_node_add_locked(queue,node);
     }
     return KERNEL_SCHEDULER_STATUS_OK;
 }
-enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *queue,
-    uint64_t deadline,int interruptible,struct kernel_wait_token *token)
+static enum kernel_scheduler_status wait_prepare(struct kernel_wait_queue *queue,
+    uint64_t deadline,int interruptible,uint32_t readiness_mask,struct kernel_wait_token *token)
 {
     if (!token || (unsigned)interruptible>KERNEL_WAIT_BLOCK_IO ||
         (queue && queue->initialized!=KERNEL_WAIT_QUEUE_INITIALIZED))
@@ -245,26 +247,38 @@ enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *queue
     if (!kernel_wait_backend_initialized()) return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     if (queue) {
         KERNEL_IRQ_LOCK_SCOPE(guard,&queue->lock);
-        return prepare_owner(queue,deadline,interruptible,token);
+        return prepare_owner(queue,deadline,interruptible,readiness_mask,token);
     }
     KERNEL_IRQ_SCOPE(irq);
-    return prepare_owner(0,deadline,interruptible,token);
+    return prepare_owner(NULL,deadline,interruptible,0,token);
 }
-enum kernel_scheduler_status kernel_wait_prepare_clock(struct kernel_wait_queue *queue,
-    uint64_t ns,int interruptible,struct kernel_wait_token *token,
+enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *queue,
+    uint64_t deadline,int interruptible,struct kernel_wait_token *token)
+{
+    return wait_prepare(queue,deadline,interruptible,0,token);
+}
+static enum kernel_scheduler_status wait_prepare_clock(struct kernel_wait_queue *queue,
+    uint64_t ns,int interruptible,uint32_t readiness_mask,struct kernel_wait_token *token,
     enum kernel_time_status (*convert)(uint64_t,uint64_t *))
 {
     uint64_t deadline;
     enum kernel_time_status time=convert(ns,&deadline);
     if (time==KERNEL_TIME_STATUS_DEADLINE_PASSED) deadline=1;
     else if (time!=KERNEL_TIME_STATUS_OK) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    enum kernel_scheduler_status status=kernel_wait_prepare(queue,deadline,interruptible,token);
+    enum kernel_scheduler_status status=wait_prepare(queue,deadline,interruptible,readiness_mask,token);
     if (!status) {
         struct kernel_wait_record *record=kernel_wait_record_of(token->task);
         record->clock_deadline=ns;
         record->convert_deadline=convert;
     }
     return status;
+}
+
+enum kernel_scheduler_status kernel_wait_prepare_clock(struct kernel_wait_queue *queue,
+    uint64_t ns,int interruptible,struct kernel_wait_token *token,
+    enum kernel_time_status (*convert)(uint64_t,uint64_t *))
+{
+    return wait_prepare_clock(queue,ns,interruptible,0,token,convert);
 }
 
 enum kernel_scheduler_status kernel_wait_prepare_realtime(struct kernel_wait_queue *queue,
@@ -276,6 +290,15 @@ enum kernel_scheduler_status kernel_wait_prepare_monotonic(struct kernel_wait_qu
     uint64_t ns,int interruptible,struct kernel_wait_token *token)
 {
     return kernel_wait_prepare_clock(queue,ns,interruptible,token,kernel_time_deadline_from_monotonic);
+}
+
+enum kernel_scheduler_status kernel_wait_prepare_poll(struct kernel_wait_queue *queue,
+    uint64_t deadline, uint32_t mask, struct kernel_wait_token *token)
+{
+    if (!queue || !mask) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    return deadline ? wait_prepare_clock(queue,deadline,KERNEL_WAIT_INTERRUPTIBLE,
+        mask,token,kernel_time_deadline_from_monotonic) :
+        wait_prepare(queue,0,KERNEL_WAIT_INTERRUPTIBLE,mask,token);
 }
 static int notify_locked(const struct kernel_wait_token *token,uint32_t reason,
     int committed_locked)
@@ -480,10 +503,15 @@ void kernel_wait_switch_finish_locked(struct kernel_task *task)
         kernel_wait_backend_ready(task);
     }
 }
+static int readiness_accepts(const struct kernel_wait_node *node,uint64_t event)
+{
+    uint32_t mask = __atomic_load_n(&node->readiness_mask, __ATOMIC_RELAXED);
+    return !event || !mask || (mask & event);
+}
 static int event_accepts(const struct kernel_wait_node *node,uint64_t event,struct kernel_task *recipient)
 {
     if (!event) return 1;
-    if (node->readiness_mask && !(node->readiness_mask & event)) return 0;
+    if (!readiness_accepts(node,event)) return 0;
     if (!node->event_mask) return 1;
     return (__atomic_load_n(node->event_mask,__ATOMIC_ACQUIRE) & event) && (!node->task || !recipient || node->task==recipient);
 }
@@ -496,9 +524,7 @@ static int cursor_prepare_queue_locked(struct kernel_wait_queue *queue,
     if (!allow_empty) {
         struct kernel_wait_node *head=queue->head;
         if (!head) return 0;
-        /* Poll interest is fixed for the lifetime of this registration. */
-        if (event && head==queue->tail && head->readiness_mask &&
-            !(head->readiness_mask & event)) return 0;
+        if (event && head==queue->tail && !readiness_accepts(head,event)) return 0;
     }
     queue->borrows++;
     *cursor=(struct kernel_wait_cursor){.queue=queue,.node=queue->head,

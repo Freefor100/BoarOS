@@ -560,6 +560,8 @@ static unsigned copy_cached_pages(struct kernel_mm *mm, struct kernel_uaccess_io
         }
         if (prepared<2) break;
         unsigned copied=kernel_mm_copy_to_ready_user_pages(mm,address,source,prepared);
+        if (!copied && !done)
+            copied=kernel_mm_copy_to_missing_anon_pages(mm,address,source,prepared);
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
         for (unsigned i=0;i<copied && !*miss;i++) *miss=pages[done+i].cache_miss;
 #else
@@ -803,6 +805,88 @@ static enum kernel_files_status read_file_data(struct kernel_files *files, struc
     return disk_read(files, mm, description, cursor, request, position, 1, linux_result);
 }
 
+static enum kernel_files_status read_socket_pinned(
+    struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description **description_owner, struct kernel_socket *socket,
+    const struct kernel_uaccess_iovec *iov, size_t iov_count, uint64_t count, int scalar,
+    int64_t *linux_result, uint32_t socket_flags, struct kernel_socket_address *peer,
+    uint32_t *message_size, struct kernel_socket_message *socket_message)
+{
+    /* Snapshot blocking mode once while the description is pinned. */
+    if (!(socket_flags & KERNEL_SOCKET_MSG_DONTWAIT) &&
+        (kernel_open_file_flags(*description_owner) & KERNEL_FILES_O_NONBLOCK))
+        socket_flags |= KERNEL_SOCKET_MSG_DONTWAIT;
+    struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0U, 0U};
+    uint64_t total = 0U;
+    if ((socket_flags & KERNEL_SOCKET_MSG_PEEK) && !socket_message) __builtin_trap();
+    struct kernel_socket_read_request read_request = {
+        .waitall = (socket_flags & KERNEL_SOCKET_MSG_WAITALL) &&
+            kernel_socket_is_tcp(socket)
+    };
+    int received = 0;
+    uint64_t target = 0;
+    int timeout_captured = 0;
+    if (scalar && kernel_user_range_check(iov[0].base,count)) {
+        *linux_result=-KERNEL_EFAULT;
+        KERNEL_FILES_NOTE(files,read_failures,1);
+        return KERNEL_FILES_STATUS_OK;
+    }
+    int message = (socket_flags & KERNEL_SOCKET_IO_MESSAGE) != 0;
+    /* read(0)可直接返回；recv(0)仍须检查协议状态和等待条件。 */
+    int discard = (socket_flags & KERNEL_SOCKET_MSG_TRUNC) &&
+        kernel_socket_discard_receive(socket, socket_flags);
+    if (count == 0U && !message) {
+        *linux_result = 0;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (read_request.waitall && !(socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
+        uint64_t timeout = kernel_socket_receive_timeout(socket);
+        if (timeout) {
+            uint64_t now = kernel_time_monotonic_ns();
+            target = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
+        }
+        timeout_captured = 1;
+    }
+    while (total < count || (message && total == 0)) {
+        uint64_t remaining = count - total;
+        received = kernel_socket_reserve_read(
+            socket, kernel_task_current(),
+            &read_request, description_owner,
+            remaining > UINT32_MAX ? UINT32_MAX : (uint32_t)remaining,
+            socket_flags & KERNEL_SOCKET_MSG_DONTWAIT, socket_message);
+        if (received == -KERNEL_EAGAIN && (total == 0U || read_request.waitall) && !(socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
+            /* ready后数据仍可能被另一reader取走，本次调用只取得一次预算。 */
+            if (!timeout_captured) {
+                uint64_t timeout = kernel_socket_receive_timeout(socket);
+                if (timeout) {
+                    uint64_t now = kernel_time_monotonic_ns();
+                    target = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
+                }
+                timeout_captured = 1;
+            }
+            int waited = target && kernel_time_monotonic_ns() >= target ? -KERNEL_EAGAIN :
+                kernel_socket_wait_read(socket, &read_request, target, socket_flags);
+            if (waited == 0) continue;
+            received = waited;
+        }
+        if (received < 0 || read_request.socket == 0) break;
+        int datagram = read_request.datagram;
+        if (datagram || (peer && kernel_socket_is_unix(socket)))
+            kernel_socket_read_info(&read_request, peer, datagram ? message_size : 0);
+        int fault = !discard && kernel_socket_read_user(&read_request, mm, &cursor);
+        KERNEL_FILES_NOTE(files, read_chunks, 1);
+        total += kernel_socket_finish_read(&read_request, fault);
+        if (fault) { received = -KERNEL_EFAULT; break; }
+        /* Ordinary reads stop at the ready prefix. WAITALL releases the
+         * reservation and receive credit before waiting for more data. */
+        if (!read_request.waitall || !received) break;
+    }
+    *linux_result = total != 0U ? (int64_t)total : received;
+    if (*linux_result < 0) KERNEL_FILES_NOTE(files, read_failures, 1);
+    else KERNEL_FILES_NOTE(files, bytes_read, total);
+    return KERNEL_FILES_STATUS_OK;
+}
+
 static enum kernel_files_status read_pinned(
     struct kernel_files *files,
     struct kernel_mm *mm,
@@ -830,6 +914,9 @@ static enum kernel_files_status read_pinned(
         return status;
     }
     const enum kernel_open_file_kind kind = kernel_open_file_kind(description);
+    if (kind == KERNEL_OPEN_FILE_KIND_SOCKET)
+        return read_socket_pinned(files, mm, description_owner, description->socket, iov,
+            iov_count, count, scalar, linux_result, socket_flags, peer, message_size, socket_message);
     if (kind == KERNEL_OPEN_FILE_KIND_SECRETMEM || kind == KERNEL_OPEN_FILE_KIND_IO_URING) {
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
@@ -868,13 +955,9 @@ static enum kernel_files_status read_pinned(
         else KERNEL_FILES_NOTE(files,bytes_read,(uint64_t)*linux_result);
         return KERNEL_FILES_STATUS_OK;
     }
-    /* 固定本次调用的等待资格；后续fcntl只影响下一次读写。 */
-    if (kind == KERNEL_OPEN_FILE_KIND_SOCKET &&
-        (kernel_open_file_flags(description) & KERNEL_FILES_O_NONBLOCK))
-        socket_flags |= KERNEL_SOCKET_MSG_DONTWAIT;
     KERNEL_SERVICE_SCOPE_IF(service, !description->proc_page_stream &&
         !(description->device && description->device->stateless_io) && kind != KERNEL_OPEN_FILE_KIND_INOTIFY &&
-        kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_SOCKET && kind != KERNEL_OPEN_FILE_KIND_PIPE);
+        kind != KERNEL_OPEN_FILE_KIND_REGULAR && kind != KERNEL_OPEN_FILE_KIND_PIPE);
     uint64_t total = 0U;
     struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0U, 0U};
 
@@ -887,75 +970,6 @@ static enum kernel_files_status read_pinned(
         *linux_result = -KERNEL_EBADF;
         KERNEL_FILES_NOTE(files, read_failures, 1);
         return KERNEL_FILES_STATUS_OK;
-    }
-    if (kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
-        if ((socket_flags & KERNEL_SOCKET_MSG_PEEK) && !socket_message) __builtin_trap();
-        struct kernel_socket_read_request read_request = {
-            .waitall = (socket_flags & KERNEL_SOCKET_MSG_WAITALL) &&
-                kernel_socket_is_tcp(kernel_open_file_socket(description))
-        };
-        int received = 0;
-        uint64_t target = 0;
-        int timeout_captured = 0;
-        enum kernel_files_status result = KERNEL_FILES_STATUS_OK;
-        if (scalar && kernel_user_range_check(iov[0].base,count)) {
-            *linux_result=-KERNEL_EFAULT;
-            KERNEL_FILES_NOTE(files,read_failures,1);
-            return KERNEL_FILES_STATUS_OK;
-        }
-        int message = (socket_flags & KERNEL_SOCKET_IO_MESSAGE) != 0;
-        /* read(0)可直接返回；recv(0)仍须检查协议状态和等待条件。 */
-        int discard = kernel_socket_discard_receive(kernel_open_file_socket(description),socket_flags);
-        if (count == 0U && !message) {
-            *linux_result = 0;
-            return KERNEL_FILES_STATUS_OK;
-        }
-        if (read_request.waitall && !(socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
-            uint64_t timeout = kernel_socket_receive_timeout(kernel_open_file_socket(description));
-            if (timeout) {
-                uint64_t now = kernel_time_monotonic_ns();
-                target = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
-            }
-            timeout_captured = 1;
-        }
-        while (total < count || (message && total == 0)) {
-            uint64_t remaining = count - total;
-            received = kernel_socket_reserve_read(
-                kernel_open_file_socket(description), kernel_task_current(),
-                &read_request, description_owner,
-                remaining > UINT32_MAX ? UINT32_MAX : (uint32_t)remaining,
-                socket_flags & KERNEL_SOCKET_MSG_DONTWAIT, socket_message);
-            if (received == -KERNEL_EAGAIN && (total == 0U || read_request.waitall) && !(socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)) {
-                /* ready后数据仍可能被另一reader取走，本次调用只取得一次预算。 */
-                if (!timeout_captured) {
-                    uint64_t timeout = kernel_socket_receive_timeout(kernel_open_file_socket(description));
-                    if (timeout) {
-                        uint64_t now = kernel_time_monotonic_ns();
-                        target = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
-                    }
-                    timeout_captured = 1;
-                }
-                int waited = target && kernel_time_monotonic_ns() >= target ? -KERNEL_EAGAIN :
-                    kernel_socket_wait_read(kernel_open_file_socket(description), &read_request, target, socket_flags);
-                if (waited == 0) continue;
-                received = waited;
-            }
-            if (received < 0 || read_request.socket == 0) break;
-            int datagram = read_request.datagram;
-            if (datagram || (peer && kernel_socket_is_unix(read_request.socket)))
-                kernel_socket_read_info(&read_request, peer, datagram ? message_size : 0);
-            int fault = !discard && kernel_socket_read_user(&read_request, mm, &cursor);
-            KERNEL_FILES_NOTE(files, read_chunks, 1);
-            total += kernel_socket_finish_read(&read_request, fault);
-            if (fault) { received = -KERNEL_EFAULT; break; }
-            /* Ordinary reads stop at the ready prefix. WAITALL releases the
-             * reservation and receive credit before waiting for more data. */
-            if (!read_request.waitall || !received) break;
-        }
-        *linux_result = total != 0U ? (int64_t)total : received;
-        if (*linux_result < 0) KERNEL_FILES_NOTE(files, read_failures, 1);
-        else KERNEL_FILES_NOTE(files, bytes_read, total);
-        return result;
     }
     if (description->device) {
         const struct kernel_char_device *device = description->device;
@@ -2067,9 +2081,10 @@ enum kernel_files_status kernel_files_socket_iov_io(
     uint32_t flags, int writing, struct kernel_socket_address *peer,
     uint32_t *message_size, int64_t *linux_result, struct kernel_socket_message *socket_message)
 {
-    if (!kernel_files_is_live(files) || mm == 0 || owner == 0 || *owner == 0 ||
-        kernel_open_file_socket(*owner) == 0 || linux_result == 0)
+    if (!kernel_files_is_live(files) || mm == 0 || owner == 0 || *owner == 0 || linux_result == 0)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    struct kernel_socket *socket = kernel_open_file_socket(*owner);
+    if (!socket) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
     if (writing) {
         KERNEL_FILES_NOTE(files, write_calls, 1);
@@ -2081,7 +2096,8 @@ enum kernel_files_status kernel_files_socket_iov_io(
         return status;
     }
     KERNEL_FILES_NOTE(files, read_calls, 1);
-    return read_pinned(files, mm, owner, iov, iov_count, count, 0, linux_result, flags, peer, message_size, socket_message, NULL);
+    return read_socket_pinned(files, mm, owner, socket, iov, iov_count, count, 0,
+        linux_result, flags, peer, message_size, socket_message);
 }
 enum kernel_files_status kernel_files_socket_io(
     struct kernel_files *files, struct kernel_mm *mm,

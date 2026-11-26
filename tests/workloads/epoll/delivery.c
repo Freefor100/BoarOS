@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { dprintf(2, "epoll failure line=%d errno=%d: %s\n", __LINE__, errno, #x); exit(1); } } while (0)
@@ -48,6 +49,40 @@ static void delivery(unsigned mode, const char *name, unsigned prefix)
     printf("EPOLL PASS %s prefix=%u\n", name, prefix);
 }
 
+static void socket_event_interest(void)
+{
+    int pair[2], ep = epoll_create1(0);
+    CHECK(ep >= 0);
+    CHECK(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair));
+    struct epoll_event watch = {.events = EPOLLIN | EPOLLET, .data.u64 = 42};
+    struct epoll_event event;
+    char byte;
+    CHECK(!epoll_ctl(ep, EPOLL_CTL_ADD, pair[0], &watch));
+    CHECK(send(pair[1], "a", 1, 0) == 1);
+    CHECK(epoll_wait(ep, &event, 1, 0) == 1 && event.events == EPOLLIN);
+
+    /* Leave the first input unread. Returning the sender's output space
+     * cannot deliver a second input edge. */
+    CHECK(send(pair[0], "b", 1, 0) == 1);
+    CHECK(recv(pair[1], &byte, 1, 0) == 1 && byte == 'b');
+    CHECK(epoll_wait(ep, &event, 1, 0) == 0);
+    CHECK(send(pair[1], "c", 1, 0) == 1);
+    CHECK(epoll_wait(ep, &event, 1, 0) == 1 && event.events == EPOLLIN);
+
+    watch.events = EPOLLOUT | EPOLLET;
+    CHECK(!epoll_ctl(ep, EPOLL_CTL_MOD, pair[0], &watch));
+    CHECK(epoll_wait(ep, &event, 1, 0) == 1 && event.events == EPOLLOUT);
+    CHECK(send(pair[1], "d", 1, 0) == 1);
+    CHECK(epoll_wait(ep, &event, 1, 0) == 0);
+    CHECK(send(pair[0], "e", 1, 0) == 1);
+    CHECK(recv(pair[1], &byte, 1, 0) == 1 && byte == 'e');
+    CHECK(epoll_wait(ep, &event, 1, 0) == 1 && event.events == EPOLLOUT);
+    CHECK(!shutdown(pair[0], SHUT_RDWR));
+    CHECK(epoll_wait(ep, &event, 1, 0) == 1 && (event.events & EPOLLHUP));
+    CHECK(!close(pair[0]) && !close(pair[1]) && !close(ep));
+    puts("EPOLL PASS socket interest");
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -58,6 +93,7 @@ int main(void)
         delivery(modes[i], names[i], 8);
         delivery(modes[i], names[i], sizeof(struct epoll_event));
     }
+    socket_event_interest();
     puts("EPOLL PASS delivery");
     return 0;
 }

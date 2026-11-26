@@ -169,6 +169,8 @@ uint32_t kernel_open_file_poll(struct kernel_open_file_description *f,uint32_t r
     return result;
 }
 uint64_t kernel_time_monotonic_ns(void) { return 1; }
+uint64_t kernel_time_select_deadline(const struct kernel_task *task,uint64_t deadline)
+{ (void)task;return deadline; }
 uint64_t kernel_socket_next_timer_deadline(void) { return 0; }
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t t,uint64_t *d)
 { *d=t;return KERNEL_TIME_STATUS_OK; }

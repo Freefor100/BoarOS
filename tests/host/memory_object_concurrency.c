@@ -31,7 +31,6 @@ static void *access(uint64_t p) { return (void *)(uintptr_t)p; }
 static int address_of(const void *p, uint64_t *out) { *out = (uintptr_t)p; return 1; }
 static void barrier(pthread_barrier_t *b)
 { int r = pthread_barrier_wait(b); assert(!r || r == PTHREAD_BARRIER_SERIAL_THREAD); }
-enum physical_page_status __real_physical_page_acquire(struct physical_page_allocator *, uint64_t);
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *, uint64_t *);
 enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *p, uint64_t *a)
 {
@@ -44,11 +43,15 @@ enum physical_page_status __wrap_physical_page_resolve(const struct physical_pag
     __atomic_fetch_add(&resolutions,1,__ATOMIC_RELAXED);
     return __real_physical_page_resolve(p,a,out);
 }
-enum physical_page_status __wrap_physical_page_acquire(struct physical_page_allocator *p, uint64_t a)
+enum physical_page_status __real_physical_page_allocate_two_references(
+    struct physical_page_allocator *, uint64_t *);
+enum physical_page_status __wrap_physical_page_allocate_two_references(
+    struct physical_page_allocator *p, uint64_t *a)
 {
-    enum physical_page_status r = __real_physical_page_acquire(p, a);
-    /* 每个对象都完成自己的页owner准备后才竞争共用预算；不观察私有布局。 */
-    if (charging && p == &pages) barrier(&prepared);
+    __atomic_fetch_add(&data_allocations,1,__ATOMIC_RELAXED);
+    enum physical_page_status r=__real_physical_page_allocate_two_references(p,a);
+    /* Synchronize after both page references exist and before budget admission. */
+    if (!r && charging && p == &pages) barrier(&prepared);
     return r;
 }
 enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *, size_t, size_t, void **);

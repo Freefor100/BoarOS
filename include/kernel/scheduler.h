@@ -195,7 +195,9 @@ struct kernel_wait_node {
     struct kernel_wait_queue *borrow_owner;
     uint64_t generation, sequence;
     uint32_t references;
-    uint32_t readiness_mask; /* poll event bits, or zero to accept all events */
+    /* Poll event bits, or zero to accept all events. Changes to a linked
+     * callback's interest must use an atomic store. */
+    uint32_t readiness_mask;
     /* Optional source interest, protected by its queue. The registration
      * owner keeps this mask storage alive through all cursor borrows. */
     const uint64_t *event_mask;
@@ -251,6 +253,10 @@ enum kernel_scheduler_status kernel_wait_prepare_realtime(struct kernel_wait_que
     uint64_t nanoseconds, int interruptible, struct kernel_wait_token *);
 enum kernel_scheduler_status kernel_wait_prepare_monotonic(struct kernel_wait_queue *,
     uint64_t nanoseconds, int interruptible, struct kernel_wait_token *);
+/* Register the task's default node for one readiness source. The deadline
+ * is absolute monotonic nanoseconds, or zero for an unbounded wait. */
+enum kernel_scheduler_status kernel_wait_prepare_poll(struct kernel_wait_queue *,
+    uint64_t deadline, uint32_t mask, struct kernel_wait_token *);
 int kernel_scheduler_set_realtime(uint64_t nanoseconds);
 enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *,
     enum kernel_wait_wake_reason *);

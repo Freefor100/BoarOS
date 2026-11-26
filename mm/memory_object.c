@@ -1,3 +1,4 @@
+#include <arch/mmu.h>
 #include <kernel/heap.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -227,19 +228,18 @@ static enum kernel_memory_object_status allocate_backing(struct kernel_memory_ob
         return KERNEL_MEMORY_OBJECT_NO_MEMORY;
     if (heap_status != KERNEL_HEAP_STATUS_OK)
         return KERNEL_MEMORY_OBJECT_STATE;
-    page_status = physical_page_allocate(object->allocator,
-                                         &page->physical_address);
+    page_status = pin ? physical_page_allocate_two_references(object->allocator,
+        &page->physical_address) : physical_page_allocate(object->allocator,&page->physical_address);
     if (page_status != PHYSICAL_PAGE_STATUS_OK) {
         kernel_heap_release(object->heap, page);
         return page_status == PHYSICAL_PAGE_STATUS_EMPTY
                    ? KERNEL_MEMORY_OBJECT_NO_MEMORY
                    : KERNEL_MEMORY_OBJECT_STATE;
     }
-    if (physical_page_resolve(object->allocator, page->physical_address,
-                              &bytes) != PHYSICAL_PAGE_STATUS_OK)
+    if (physical_page_map_owned(object->allocator, page->physical_address,
+                                &bytes) != PHYSICAL_PAGE_STATUS_OK)
         __builtin_trap();
-    memset(bytes, 0, BOAROS_PAGE_SIZE);
-    if (pin && physical_page_acquire(object->allocator,page->physical_address)) __builtin_trap();
+    arch_zero_owned_memory(bytes, BOAROS_PAGE_SIZE);
     /* Charge only the actual zeroed backing, including private range staging. */
     if (object->budget && !charge(&object->budget->used, object->budget->limit)) {
         if (pin) physical_page_release(object->allocator,page->physical_address);
@@ -253,20 +253,13 @@ static enum kernel_memory_object_status allocate_backing(struct kernel_memory_ob
     return KERNEL_MEMORY_OBJECT_OK;
 }
 
-static enum kernel_memory_object_status get_page(
+static enum kernel_memory_object_status get_page_locked(
     struct kernel_memory_object *object, uint64_t page_index,
     uint64_t *physical_address, int *created, int preparing)
 {
-    KERNEL_NO_RECLAIM_IO;
     struct kernel_memory_object_page *page;
     enum kernel_memory_object_status status;
-    size_t bucket;
-
-    if (object == 0 || physical_address == 0 || created == 0 ||
-        __atomic_load_n(&object->references, __ATOMIC_ACQUIRE) == 0U) return KERNEL_MEMORY_OBJECT_STATE;
-    KERNEL_LOCK_SCOPE(guard);
-    kernel_mutex_lock(&object->lock, &guard);
-    bucket = bucket_for(page_index, object->bucket_count);
+    size_t bucket = bucket_for(page_index, object->bucket_count);
     for (page = object->buckets[bucket]; page != 0; page = page->next) {
         if (page->index != page_index) continue;
         if (physical_page_acquire(object->allocator,
@@ -288,19 +281,34 @@ static enum kernel_memory_object_status get_page(
     if (object->budget && object->budget->limit &&
         __atomic_load_n(&object->budget->used,__ATOMIC_ACQUIRE)>=object->budget->limit)
         return KERNEL_MEMORY_OBJECT_NO_SPACE;
-    status = grow_buckets(object,object->page_count);
-    if (status != KERNEL_MEMORY_OBJECT_OK) return status;
+    size_t pages=object->page_count;
+    if (pages/2U>=object->bucket_count) {
+        status = grow_buckets(object,pages);
+        if (status != KERNEL_MEMORY_OBJECT_OK) return status;
+        bucket = bucket_for(page_index, object->bucket_count);
+    }
     status = allocate_backing(object,page_index,1,&page);
     if (status != KERNEL_MEMORY_OBJECT_OK) return status;
     page->preparations = preparing != 0;
     page->publication = preparing ? PAGE_PREPARING : PAGE_DIRECT;
-    bucket = bucket_for(page_index, object->bucket_count);
     page->next = object->buckets[bucket];
     object->buckets[bucket] = page;
-    __atomic_fetch_add(&object->page_count, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&object->page_count,pages+1,__ATOMIC_RELEASE);
     *physical_address = page->physical_address;
     *created = 1;
     return KERNEL_MEMORY_OBJECT_OK;
+}
+
+static enum kernel_memory_object_status get_page(struct kernel_memory_object *object,
+    uint64_t index, uint64_t *address, int *created, int preparing)
+{
+    if (!object || !address || !created ||
+        !__atomic_load_n(&object->references, __ATOMIC_ACQUIRE))
+        return KERNEL_MEMORY_OBJECT_STATE;
+    KERNEL_NO_RECLAIM_IO;
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_mutex_lock(&object->lock, &guard);
+    return get_page_locked(object,index,address,created,preparing);
 }
 
 /* Publish the range once, rather than get/pin/unpin and relock each page.
@@ -395,12 +403,9 @@ unsigned kernel_memory_object_try_borrow_adopted(struct kernel_memory_object *ob
     return ready;
 }
 
-void kernel_memory_object_finish_page(struct kernel_memory_object *object,
+static void finish_page_locked(struct kernel_memory_object *object,
     uint64_t index, uint64_t address, int accepted)
 {
-    if (!object || !__atomic_load_n(&object->references, __ATOMIC_ACQUIRE)) __builtin_trap();
-    KERNEL_LOCK_SCOPE(guard);
-    kernel_mutex_lock(&object->lock, &guard);
     struct kernel_memory_object_page **link = &object->buckets[bucket_for(index, object->bucket_count)];
     while (*link && (*link)->index != index) link = &(*link)->next;
     if (!*link || (*link)->physical_address != address) {
@@ -431,6 +436,40 @@ void kernel_memory_object_finish_page(struct kernel_memory_object *object,
         __builtin_trap();
     kernel_heap_release(object->heap, page);
 }
+
+void kernel_memory_object_finish_page(struct kernel_memory_object *object,
+    uint64_t index, uint64_t address, int accepted)
+{
+    if (!object || !__atomic_load_n(&object->references, __ATOMIC_ACQUIRE)) __builtin_trap();
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_mutex_lock(&object->lock, &guard);
+    finish_page_locked(object,index,address,accepted);
+}
+
+#if defined(__riscv) && BOAROS_MAX_CPUS == 1
+unsigned kernel_memory_object_prepare_page_run(struct kernel_memory_object *object,
+    uint64_t first, uint64_t *physical, unsigned count)
+{
+    KERNEL_NO_RECLAIM_IO;
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_mutex_lock(&object->lock, &guard);
+    unsigned ready=0;
+    for (;ready<count;ready++) {
+        int created;
+        if (get_page_locked(object,first+ready,&physical[ready],&created,1)) break;
+    }
+    return ready;
+}
+
+void kernel_memory_object_finish_page_run(struct kernel_memory_object *object,
+    uint64_t first, const uint64_t *physical, unsigned count, unsigned installed)
+{
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_mutex_lock(&object->lock, &guard);
+    for (unsigned i=0;i<count;i++)
+        finish_page_locked(object,first+i,physical[i],installed&(1U<<i));
+}
+#endif
 
 void kernel_memory_object_discard_new_page(
     struct kernel_memory_object *object, uint64_t page_index,

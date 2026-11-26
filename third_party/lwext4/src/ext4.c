@@ -1616,7 +1616,9 @@ Finish:
 static uint64_t ext4_group_age_deadline(const struct jbd_trans *running)
 {
 	const uint64_t idle_ns = 100000000;
-	if (running->ordered_count || running->revoke_count || !LIST_EMPTY(&running->quarantine))
+	/* Revokes and quarantine hold reusable space until checkpoint. File
+	 * data records can keep joining while commit/reclaim targets are idle. */
+	if (running->revoke_count || !LIST_EMPTY(&running->quarantine))
 		return running->first_dirty_ns + idle_ns;
 	/* Keep repeated background snapshots joinable. An explicit sync target,
 	 * resource pressure or an ordinary metadata operation can seal earlier. */
@@ -6079,7 +6081,14 @@ Retry:
                     (UINT32_C(524288) / block_size) :
                     (UINT32_C(131072) - (direct ? direct->bytes : 0)) / block_size;
                 if (needed < maximum) maximum = needed;
-                r = ext4_fs_get_inode_dblk_range(&ref, logical_block, maximum, true, &range);
+                uint32_t overwritten = 0;
+                if (journal && !offset) {
+                    uint64_t complete = (mapping_end - file->fpos) / block_size;
+                    overwritten = complete < maximum ? complete : maximum;
+                }
+                r = overwritten ?
+                    ext4_fs_get_inode_dblk_write_range(&ref, logical_block, maximum, overwritten, &range) :
+                    ext4_fs_get_inode_dblk_range(&ref, logical_block, maximum, true, &range);
                 if (r) break;
                 if (batch && batch->completion && !ext4_collect_physical(batch->completion,&range))
                     batch->completion=NULL;

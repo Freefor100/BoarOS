@@ -66,6 +66,14 @@ enum kernel_memory_object_status kernel_memory_object_prepare_page(
     struct kernel_memory_object *, uint64_t index, uint64_t *address, int *created);
 void kernel_memory_object_finish_page(struct kernel_memory_object *,
     uint64_t index, uint64_t address, int accepted);
+#if defined(__riscv) && BOAROS_MAX_CPUS == 1
+/* Prepare a contiguous prefix. Each reference is consumed by the matching
+ * finish, which transfers the installed pages to their translations. */
+unsigned kernel_memory_object_prepare_page_run(struct kernel_memory_object *,
+    uint64_t first, uint64_t *physical, unsigned count);
+void kernel_memory_object_finish_page_run(struct kernel_memory_object *,
+    uint64_t first, const uint64_t *physical, unsigned count, unsigned installed);
+#endif
 /* Caller already released its failed publication reference. Discard only the
  * matching page with no PTE/other pin owners; an adopted page is preserved. */
 void kernel_memory_object_discard_new_page(

@@ -63,13 +63,24 @@ void *__wrap_ext4_user_calloc(size_t count,size_t size)
     return __real_ext4_user_calloc(count,size);
 }
 int __real_ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *,ext4_lblk_t,uint32_t,bool,struct ext4_inode_block_range *);
+int __real_ext4_fs_get_inode_dblk_write_range(struct ext4_inode_ref *,ext4_lblk_t,uint32_t,uint32_t,
+    struct ext4_inode_block_range *);
+static int delayed_mapping_result(int result)
+{
+    if (result || !fail_delayed_allocation) return result;
+    result = fail_delayed_allocation;
+    fail_delayed_allocation = 0;
+    return result;
+}
 int __wrap_ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *ref,ext4_lblk_t first,uint32_t count,bool create,struct ext4_inode_block_range *range)
 {
     int r=__real_ext4_fs_get_inode_dblk_range(ref,first,count,create,range);
-    if (!r && create && fail_delayed_allocation) {
-        int error=fail_delayed_allocation;fail_delayed_allocation=0;return error;
-    }
-    return r;
+    return create ? delayed_mapping_result(r) : r;
+}
+int __wrap_ext4_fs_get_inode_dblk_write_range(struct ext4_inode_ref *ref,ext4_lblk_t first,
+    uint32_t count,uint32_t overwritten,struct ext4_inode_block_range *range)
+{
+    return delayed_mapping_result(__real_ext4_fs_get_inode_dblk_write_range(ref,first,count,overwritten,range));
 }
 static unsigned fail_reserve, fail_remove, failed_direct_calls, fail_complete;
 static unsigned metadata_probe,metadata_open_calls;

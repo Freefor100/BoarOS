@@ -36,6 +36,14 @@ int __wrap_ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *ref,ext4_lblk_t l
     range_queries++;
     return __real_ext4_fs_get_inode_dblk_range(ref,logical,count,create,range);
 }
+int __real_ext4_fs_get_inode_dblk_write_range(struct ext4_inode_ref *,ext4_lblk_t,uint32_t,uint32_t,
+    struct ext4_inode_block_range *);
+int __wrap_ext4_fs_get_inode_dblk_write_range(struct ext4_inode_ref *ref,ext4_lblk_t logical,
+    uint32_t count,uint32_t overwritten,struct ext4_inode_block_range *range)
+{
+    range_queries++;
+    return __real_ext4_fs_get_inode_dblk_write_range(ref,logical,count,overwritten,range);
+}
 uint32_t __real_ext4_crc32c(uint32_t crc, const void *data, uint32_t bytes);
 uint32_t __wrap_ext4_crc32c(uint32_t crc, const void *data, uint32_t bytes)
 {

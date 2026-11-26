@@ -64,14 +64,13 @@ enum kernel_scheduler_status kernel_wait_prepare_monotonic(struct kernel_wait_qu
     uint64_t target,int interruptible,struct kernel_wait_token *token)
 { return kernel_wait_prepare(q,target,interruptible,token); }
 int kernel_socket_poll_prepare(struct kernel_socket *socket,uint32_t mask,uint64_t deadline,
-    struct kernel_wait_node *node,struct kernel_wait_token *token)
+    struct kernel_wait_token *token)
 {
     unsigned ready=kernel_socket_poll(socket,NULL)&mask;
     if (ready) return (int)ready;
-    CHECK(!kernel_wait_prepare_monotonic(NULL,deadline,1,token));
-    kernel_wait_node_init(node,token->task);
-    node->readiness_mask=mask;
-    CHECK(!kernel_wait_node_bind(&queue,node,token));
+    CHECK(!kernel_wait_prepare_monotonic(&queue,deadline,1,token));
+    binds++;
+    if (at_bind) readable=1;
     return 0;
 }
 enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,enum kernel_wait_wake_reason *r)

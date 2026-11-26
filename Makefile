@@ -2025,7 +2025,7 @@ test-memory-object-concurrency-host:
 		tests/host/memory_object_concurrency.c tests/host/mm/context.c \
 		kernel/cpu.c kernel/raw_lock.c tests/host/sync/notifications.c kernel/sched/sync.c kernel/sched/park.c \
 		kernel/physical_page.c mm/heap.c mm/memory_object.c \
-		-Wl,--gc-sections,--wrap=physical_page_acquire,--wrap=physical_page_allocate,--wrap=physical_page_resolve,--wrap=kernel_heap_allocate_zeroed \
+		-Wl,--gc-sections,--wrap=physical_page_allocate_two_references,--wrap=physical_page_allocate,--wrap=physical_page_resolve,--wrap=kernel_heap_allocate_zeroed \
 		-o build/host/mm/object-$$shift; \
 		timeout 30s build/host/mm/object-$$shift; \
 	done
