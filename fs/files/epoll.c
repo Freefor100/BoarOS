@@ -51,12 +51,8 @@ static int epoll_item_put_locked(struct kernel_epoll_item *item)
     return !--item->references;
 }
 
-static void epoll_item_put_or_recycle(struct kernel_epoll_item *item, struct kernel_epoll *reuse)
+static void epoll_item_free(struct kernel_epoll_item *item, struct kernel_epoll *reuse)
 {
-    EPOLL_STATE(irq);
-    int release = epoll_item_put_locked(item);
-    epoll_state_release(&irq);
-    if (!release) return;
     if (reuse) {
         struct kernel_epoll_item *empty = NULL;
         if (__atomic_compare_exchange_n(&reuse->socket_spare,&empty,item,0,
@@ -66,7 +62,12 @@ static void epoll_item_put_or_recycle(struct kernel_epoll_item *item, struct ker
 }
 
 static void epoll_item_put(struct kernel_epoll_item *item)
-{ epoll_item_put_or_recycle(item, NULL); }
+{
+    EPOLL_STATE(irq);
+    int release = epoll_item_put_locked(item);
+    epoll_state_release(&irq);
+    if (release) epoll_item_free(item, NULL);
+}
 
 static void epoll_notify(struct kernel_epoll *epoll)
 {
@@ -107,6 +108,7 @@ static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t r
     if (!node || !node->context) return;
     EPOLL_STATE(irq);
     struct kernel_epoll_item *item = node->context;
+    if (!item->linked) return;
     if(item->target_file->kind==KERNEL_OPEN_FILE_KIND_SIGNALFD)COST_ADD(SIGNAL_FD_CALLBACKS,1);
     if (reason==KERNEL_WAIT_POLL_FREE) {
         /* The callback owns a cursor borrow. Detach without waiting for
@@ -195,17 +197,18 @@ static int epoll_index_compare(int fd, struct kernel_open_file_description *file
     if (fd != item->target_fd) return fd < item->target_fd ? -1 : 1;
     return (uintptr_t)file < (uintptr_t)item->target_file ? -1 : (file != item->target_file);
 }
-static void epoll_index_insert(struct kernel_epoll *epoll, struct kernel_epoll_item *item)
+static int epoll_index_insert(struct kernel_epoll *epoll, struct kernel_epoll_item *item)
 {
     struct kernel_epoll_item **link = &epoll->items_root, *parent = 0;
     while (*link) {
         parent = *link;
         int order = epoll_index_compare(item->target_fd, item->target_file, parent);
-        if (!order) __builtin_trap();
+        if (!order) return -KERNEL_EEXIST;
         link = order < 0 ? &parent->index_left : &parent->index_right;
     }
     *link = item; item->index_parent = parent; item->index_height = 1;
     epoll_index_balance(epoll, parent);
+    return 0;
 }
 static void epoll_index_remove(struct kernel_epoll *epoll, struct kernel_epoll_item *item)
 {
@@ -262,50 +265,47 @@ int kernel_epoll_create(
     return 0;
 }
 
-static enum kernel_files_status epoll_item_unlink_and_destroy(
-    struct kernel_epoll_item *item)
+static void epoll_item_unlink_and_destroy(struct epoll_state_guard *irq,
+    struct kernel_epoll_item *item, int target_pinned, struct kernel_epoll *reuse)
 {
-    if (!item) return KERNEL_FILES_STATUS_OK;
-    EPOLL_STATE(irq);
-    if (!item->linked) { epoll_state_release(&irq); return KERNEL_FILES_STATUS_OK; }
+    kernel_wait_queue_remove(&item->wait_node);
+    if (!target_pinned && kernel_wait_node_references(&item->wait_node)) {
+        /* 关闭路径仍通过反向关联阻止目标释放等待队列。两个关闭者
+         * 可以同时等旧游标，各自的临时引用覆盖锁外等待。 */
+        item->references++;
+        epoll_state_release(irq);
+        if (kernel_wait_node_remove_sync(&item->wait_node) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        epoll_state_acquire(irq);
+        int release = epoll_item_put_locked(item);
+        if (!item->linked) {
+            epoll_state_release(irq);
+            if (release) epoll_item_free(item, NULL);
+            return;
+        }
+    }
     struct kernel_epoll *epoll = item->epoll;
     struct kernel_open_file_description *target_file = item->target_file;
 
-    /* 与POLLFREE自摘共用状态保护；登记撤销后不再访问可能已释放的source。 */
     item->linked = 0;
-    kernel_wait_queue_remove(&item->wait_node);
-    if (kernel_wait_node_references(&item->wait_node)) {
-        epoll_state_release(&irq);
-        if (kernel_wait_node_remove_sync(&item->wait_node) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-        epoll_state_acquire(&irq);
-    }
-
-    if (epoll != 0) {
-        epoll_remove_from_ready_list(epoll, item);
-        epoll_remove_from_pending_list(epoll, item);
-        epoll_index_remove(epoll, item);
-    }
-
-    if (target_file != 0) {
-        if (item->target_prev != 0) {
-            item->target_prev->target_next = item->target_next;
-        } else if (target_file->ep_items == item) {
-            target_file->ep_items = item->target_next;
-        }
-        if (item->target_next != 0) {
-            item->target_next->target_prev = item->target_prev;
-        }
-        item->target_prev = 0;
-        item->target_next = 0;
-        item->target_file = 0;
-    }
-
-    item->linked = 0;
+    epoll_remove_from_ready_list(epoll, item);
+    epoll_remove_from_pending_list(epoll, item);
+    epoll_index_remove(epoll, item);
+    if (item->target_prev) item->target_prev->target_next = item->target_next;
+    else target_file->ep_items = item->target_next;
+    if (item->target_next) item->target_next->target_prev = item->target_prev;
+    item->target_prev = item->target_next = 0;
+    item->target_file = 0;
     item->epoll = 0;
+
+    /* DEL持有目标文件，先发布撤销，再等待旧回调归还。 */
+    if (target_pinned && kernel_wait_node_references(&item->wait_node)) {
+        epoll_state_release(irq);
+        if (kernel_wait_node_remove_sync(&item->wait_node) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        epoll_state_acquire(irq);
+    }
     int release = epoll_item_put_locked(item);
-    epoll_state_release(&irq);
-    if (release) kernel_heap_release(item->heap, item);
-    return KERNEL_FILES_STATUS_OK;
+    epoll_state_release(irq);
+    if (release) epoll_item_free(item, reuse);
 }
 
 enum kernel_files_status kernel_epoll_destroy(struct kernel_epoll *epoll)
@@ -314,13 +314,12 @@ enum kernel_files_status kernel_epoll_destroy(struct kernel_epoll *epoll)
         return KERNEL_FILES_STATUS_OK;
     }
     if (epoll->scan_owner) __builtin_trap();
-    while (epoll->items_root != 0) {
+    for (;;) {
+        EPOLL_STATE(irq);
         struct kernel_epoll_item *item = epoll->items_root;
-        (void)epoll_item_unlink_and_destroy(item);
+        if (!item) break;
+        epoll_item_unlink_and_destroy(&irq, item, 0, NULL);
     }
-    epoll->items_root = 0;
-    epoll->ready_head = 0;
-    epoll->ready_tail = 0;
     enum kernel_scheduler_status status = kernel_wait_queue_close(&epoll->wait_queue);
     if (status != KERNEL_SCHEDULER_STATUS_OK && status != KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED)
         __builtin_trap();
@@ -337,10 +336,14 @@ void kernel_epoll_notify_file_release(
     if (file == 0) {
         return;
     }
-    while (file->ep_items != 0) {
-        (void)epoll_item_unlink_and_destroy(file->ep_items);
+    for (;;) {
+        EPOLL_STATE(irq);
+        struct kernel_epoll_item *item = file->ep_items;
+        if (!item) break;
+        int more = item->target_next != 0;
+        epoll_item_unlink_and_destroy(&irq, item, 0, NULL);
+        if (!more) break;
     }
-    file->ep_items = 0;
 }
 
 
@@ -570,6 +573,7 @@ enum kernel_files_status kernel_files_epoll_ctl(
         }
         /* 分配允许换任务；候选尚未发布，图与重复key必须在它之后检查。 */
         int socket_target = target_file->kind == KERNEL_OPEN_FILE_KIND_SOCKET;
+        int nested = target_file->kind == KERNEL_OPEN_FILE_KIND_EPOLL;
         item = NULL;
         if (socket_target && __atomic_load_n(&epoll->socket_spare,__ATOMIC_RELAXED))
             item = __atomic_exchange_n(&epoll->socket_spare,NULL,__ATOMIC_ACQUIRE);
@@ -592,46 +596,51 @@ enum kernel_files_status kernel_files_epoll_ctl(
         item->wait_node.event_mask=kernel_signal_fd_mask(target_file);
         if (socket_target)
             item->wait_node.readiness_mask = events | KERNEL_POLLERR | KERNEL_POLLHUP;
-        kernel_preempt_disable();
         int error = 0;
-        if (kernel_open_file_kind(target_file) == KERNEL_OPEN_FILE_KIND_EPOLL)
+        if (nested) {
+            kernel_preempt_disable();
             error = epoll_check_nesting(epoll, target_file->epoll);
-        if (!error && epoll_find_item(epoll, (int)fd, target_file)) error = -KERNEL_EEXIST;
+        }
+        EPOLL_STATE(irq);
+        if (!error) error = epoll_index_insert(epoll, item);
         if (error) {
-            kernel_preempt_enable();
-            epoll_item_put(item);
+            epoll_state_release(&irq);
+            if (nested) kernel_preempt_enable();
+            epoll_item_free(item, NULL);
             *linux_result = error;
             break;
         }
-        EPOLL_STATE(irq);
         item->linked = 1;
-        epoll_index_insert(epoll, item);
         item->target_next = target_file->ep_items;
         if (item->target_next) item->target_next->target_prev = item;
         target_file->ep_items = item;
-        item->references++; /* query可睡眠，DEL只撤销登记引用。 */
         /* The pinned socket owns a fixed wait queue. Subscribe before the
          * first readiness query instead of polling to discover the source. */
         if (socket_target) {
             target_queue = kernel_socket_wait_queue(target_file->socket);
+            kernel_wait_queue_add(target_queue, &item->wait_node);
+            if (epoll_stream_snapshot(target_file, events, &current_revents)) {
+                if (current_revents) epoll_publish_ready_locked(item);
+                *linux_result = 0;
+                break;
+            }
+            item->references++;
         } else {
+            /* 跨目标查询保留登记存储，DEL可以先摘除。 */
+            item->references++;
             epoll_state_release(&irq);
-            kernel_preempt_enable();
+            if (nested) kernel_preempt_enable();
             target_queue = 0;
             (void)kernel_open_file_poll(target_file, events, &target_queue);
-            if (kernel_open_file_kind(target_file) == KERNEL_OPEN_FILE_KIND_EPOLL)
-                target_queue = &target_file->epoll->wait_queue;
+            if (nested) target_queue = &target_file->epoll->wait_queue;
             epoll_state_acquire(&irq);
+            if (item->linked && target_queue) kernel_wait_queue_add(target_queue, &item->wait_node);
         }
-        if (item->linked && target_queue) kernel_wait_queue_add(target_queue, &item->wait_node);
         uint64_t control = item->control_generation;
         uint32_t interest = item->events;
         int linked = item->linked;
-        int sampled = linked && epoll_stream_snapshot(target_file, interest, &current_revents);
-        if (sampled && current_revents) epoll_publish_ready_locked(item);
         epoll_state_release(&irq);
-        if (socket_target) kernel_preempt_enable();
-        if (linked && !sampled) {
+        if (linked) {
             current_revents = kernel_open_file_poll(target_file, interest, 0);
             epoll_state_acquire(&irq);
             if (item->linked && control == item->control_generation &&
@@ -651,7 +660,6 @@ enum kernel_files_status kernel_files_epoll_ctl(
             *linux_result = -KERNEL_ENOENT;
             break;
         }
-        item->references++;
         uint64_t control = ++item->control_generation;
         item->events = events;
         if (target_file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
@@ -659,9 +667,12 @@ enum kernel_files_status kernel_files_epoll_ctl(
                 events | KERNEL_POLLERR | KERNEL_POLLHUP, __ATOMIC_RELAXED);
         item->data = data;
         item->oneshot_disarmed = 0;
-        if (item->linked && epoll_stream_snapshot(target_file, events, &current_revents)) {
+        if (epoll_stream_snapshot(target_file, events, &current_revents)) {
             if (current_revents) epoll_publish_ready_locked(item);
+            *linux_result = 0;
+            break;
         } else {
+            item->references++;
             epoll_state_release(&irq);
             current_revents = kernel_open_file_poll(target_file, events, 0);
             epoll_state_acquire(&irq);
@@ -677,13 +688,9 @@ enum kernel_files_status kernel_files_epoll_ctl(
     case KERNEL_EPOLL_CTL_DEL: {
         EPOLL_STATE(irq);
         item = epoll_find_item(epoll, (int)fd, target_file);
-        if (item) item->references++;
-        epoll_state_release(&irq);
-        if (item) {
-            epoll_item_unlink_and_destroy(item);
-            epoll_item_put_or_recycle(item,target_file->kind == KERNEL_OPEN_FILE_KIND_SOCKET ? epoll : NULL);
-        }
         *linux_result = item ? 0 : -KERNEL_ENOENT;
+        if (item) epoll_item_unlink_and_destroy(&irq, item, 1,
+            target_file->kind == KERNEL_OPEN_FILE_KIND_SOCKET ? epoll : NULL);
         break;
     }
     default:

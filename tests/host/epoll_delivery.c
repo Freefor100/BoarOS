@@ -309,11 +309,10 @@ static void delete_at_irq_boundary(void) { control(KERNEL_EPOLL_CTL_DEL,0,0); }
 static void competing_delete(void)
 {
     setup(KERNEL_EPOLLET);
-    struct kernel_epoll_item *item=epoll_find_item(epfile.epoll,1,&targets[0]);
-    CHECK(item);item->references++; /* A的实际DEL查找借用，B在开始解绑前取得CPU。 */
+    int64_t result;
     irq_interleave=delete_at_irq_boundary;
-    CHECK(!epoll_item_unlink_and_destroy(item));
-    epoll_item_put(item);
+    CHECK(!kernel_files_epoll_ctl(&files,0,KERNEL_EPOLL_CTL_DEL,1,0,0,&result));
+    CHECK(result==-KERNEL_ENOENT);
     CHECK(!epfile.epoll->items_root && allocations==1);
     teardown();
     puts("PASS epoll competing DEL: registration owner consumed once across IRQ boundary");
@@ -563,6 +562,66 @@ static void pollfree_during_delete(void)
     puts("PASS epoll DEL detaches before a POLLFREE cursor releases its source");
 }
 
+static void replace_during_callback_drain(struct kernel_wait_node *node)
+{
+    int64_t result;
+    CHECK(!node->queue && node->references==1);
+    CHECK(!kernel_files_epoll_ctl(&files,0,KERNEL_EPOLL_CTL_DEL,1,0,0,&result) && result==-KERNEL_ENOENT);
+    control(KERNEL_EPOLL_CTL_ADD,KERNEL_EPOLLET,87);
+    readable[0]=0;
+    node->callback(node,KERNEL_WAIT_WOKEN,KERNEL_EPOLLIN);
+    node->references--;
+    target_wait[0].borrows--;
+}
+
+static void delete_publication(void)
+{
+    setup(KERNEL_EPOLLET);
+    struct kernel_wait_node *node=target_wait[0].head;
+    CHECK(node);
+    node->references=1;
+    target_wait[0].borrows=1;
+    remove_sync_interleave=replace_during_callback_drain;
+    control(KERNEL_EPOLL_CTL_DEL,0,0);
+    CHECK(!remove_sync_interleave && target_wait[0].registrations==1);
+    struct linux_epoll_event event;
+    CHECK(wait_events(&event,1)==0);
+    readable[0]=1;
+    CHECK(!kernel_wait_queue_wake_all(&target_wait[0]));
+    CHECK(wait_events(&event,1)==1 && event.data==87);
+    unsigned before=epoll_state_acquires;
+    control(KERNEL_EPOLL_CTL_DEL,0,0);
+    CHECK(epoll_state_acquires==before+1);
+    teardown();
+    puts("PASS epoll DEL publishes removal and uses one lock when no callback is borrowed");
+}
+
+static void return_callback_during_close(struct kernel_wait_node *node)
+{
+    CHECK(!node->queue && node->references==1);
+    CHECK(targets[0].ep_items==node->context);
+    node->references--;
+    target_wait[0].borrows--;
+}
+
+static void close_with_borrowed_callback(void)
+{
+    for (unsigned fd=0; fd<2; fd++) {
+        setup(KERNEL_EPOLLET);
+        struct kernel_wait_node *node=target_wait[0].head;
+        CHECK(node);
+        node->references=1;
+        target_wait[0].borrows=1;
+        remove_sync_interleave=return_callback_during_close;
+        struct kernel_open_file_description *file=fds[fd];
+        fds[fd]=NULL;
+        CHECK(!kernel_open_file_release(&file));
+        CHECK(!remove_sync_interleave && !targets[0].ep_items);
+        teardown();
+    }
+    puts("PASS epoll close retains the target association until the old cursor returns");
+}
+
 static void socket_registration(void)
 {
     setup(KERNEL_EPOLLET);
@@ -607,6 +666,8 @@ int main(int argc, char **argv)
     candidate_retirement();
     socket_registration();
     pollfree_during_delete();
+    delete_publication();
+    close_with_borrowed_callback();
     retiring_target();
     setup(0);struct linux_epoll_event local_event;unsigned services=service_entries;
     CHECK(wait_events(&local_event,1)==1 && service_entries==services);
