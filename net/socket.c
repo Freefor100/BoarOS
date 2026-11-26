@@ -151,7 +151,10 @@ struct kernel_socket {
     struct socket_packet *packets_head;
     struct socket_packet *packets_tail;
     struct socket_packet *retired_head, *retired_tail;
-    struct socket_packet *udp_spares;
+    union {
+        struct socket_packet *udp_spares;
+        struct socket_packet *tcp_receive_spare;
+    };
     uint32_t receive_credit;
     uint64_t receive_sequence;
     struct socket_pending *pending_head;
@@ -2940,8 +2943,11 @@ static err_t tcp_data_received(void *context, struct tcp_pcb *pcb,
     if (error != ERR_OK) return error;
     /* TCP already charged the advertised receive credit, including bytes
      * promised before SO_RCVBUF was lowered. Only real memory can fail here. */
-    status = kernel_heap_allocate_zeroed(socket->heap, 1U, sizeof(*packet),
-                                         (void **)&packet);
+    if (socket->tcp_receive_spare) {
+        packet=socket->tcp_receive_spare;
+        socket->tcp_receive_spare=NULL;
+        status=KERNEL_HEAP_STATUS_OK;
+    } else status=kernel_heap_allocate(socket->heap,sizeof(*packet),(void **)&packet);
     if (status == KERNEL_HEAP_STATUS_EMPTY) {
         {
             KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);
@@ -2952,14 +2958,14 @@ static err_t tcp_data_received(void *context, struct tcp_pcb *pcb,
 #if BOAROS_USER_SMP
         /* A reader may have returned a packet before seeing this waiter.
          * Recheck the heap after publication, with the work-list lock free. */
-        status = kernel_heap_allocate_zeroed(socket->heap, 1U, sizeof(*packet), (void **)&packet);
+        status=kernel_heap_allocate(socket->heap,sizeof(*packet),(void **)&packet);
         if (status == KERNEL_HEAP_STATUS_EMPTY) return ERR_MEM;
 #else
         return ERR_MEM;
 #endif
     }
     if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
-    packet->payload = payload;
+    *packet=(struct socket_packet){.payload=payload};
     if (socket->receive_retry) {
         KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);
         socket->receive_retry=0;
@@ -3294,6 +3300,16 @@ static void udp_recycle_locked(struct kernel_socket *socket, struct socket_packe
 static void release_inet_packets(struct kernel_socket *socket, struct socket_packet *packets)
 {
     if (!packets) return;
+    /* The serial protocol owner recycles one descriptor, never its payload.
+     * Under receive pressure the descriptor returns to the shared heap. */
+    if (socket->tcp_loopback && !boaros_lwip_parallel_enabled() && !socket->destroying &&
+        !receive_wait.head && !socket->tcp_receive_spare) {
+        socket->tcp_receive_spare=packets;
+        packets=packets->next;
+        pbuf_free(socket->tcp_receive_spare->payload);
+        socket->tcp_receive_spare->payload=NULL;
+        if (!packets) return;
+    }
     struct socket_packet *spares=NULL;
     unsigned remaining=socket->udp && !socket->destroying?KERNEL_NETWORK_RECEIVE_BATCH:0;
     do {
@@ -3724,7 +3740,8 @@ void kernel_socket_destroy(struct kernel_socket *socket)
         }
         udp_pending_discard(socket);
         udp_remove(socket->udp);
-    }
+    } else if (socket->tcp_receive_spare)
+        kernel_heap_release(socket->heap,socket->tcp_receive_spare);
     if (socket->raw != 0) {raw_recv(socket->raw,NULL,NULL);raw_remove(socket->raw);socket->raw=NULL;}
     if (socket->tcp != 0) {
         if (!socket->listening) {
@@ -4722,7 +4739,12 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
     *request->pin_owner = request->pin;
     request->pin = 0;
     request->socket = 0;
-    if (!unix_stream || socket_receive_empty(socket,0)!=-KERNEL_EAGAIN) wake_socket(socket);
+    if (kernel_socket_is_tcp(socket) && !network_is_stopping()) {
+        /* Releasing a read reservation only makes input visible again. */
+        if (socket->packets_head || socket_receive_empty(socket,0)!=-KERNEL_EAGAIN)
+            socket_state_notify_event(scope.owner,&socket->wait,
+                KERNEL_POLLIN | KERNEL_POLLRDNORM | KERNEL_POLLERR | KERNEL_POLLHUP);
+    } else if (!unix_stream || socket_receive_empty(socket,0)!=-KERNEL_EAGAIN) wake_socket(socket);
     else if (socket->packets_head) unix_stream_ready(socket,KERNEL_POLLIN|KERNEL_POLLRDNORM);
     uint32_t delivered = user_fault && request->datagram ? 0 : bytes;
     if (request->waitall && delivered) {

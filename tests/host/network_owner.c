@@ -3276,6 +3276,16 @@ static void serial_loopback_receive_credit(void)
     CHECK(kernel_socket_finish_read(&request,0)==4 && !memcmp(out,bytes,4));
     CHECK(retired_payloads==1 && !socket->receive_credit && !socket->retired_head &&
           pcb->rcv_wnd==window && !ready_work.head);
+    unsigned allocations_before=heap_allocations;
+    kernel_socket_protocol_enter(&scope);
+    pcb->rcv_nxt+=4;
+    pcb->rcv_wnd-=4;
+    payload=pbuf_alloced_custom(PBUF_RAW,4,PBUF_REF,&storage,bytes,4);
+    CHECK(payload && tcp_data_received(socket,pcb,payload,ERR_OK)==ERR_OK);
+    CHECK(heap_allocations==allocations_before);
+    kernel_socket_protocol_leave(&scope);
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,4,0,NULL)==4);
+    CHECK(kernel_socket_finish_read(&request,0)==4 && retired_payloads==2);
     kernel_socket_destroy(socket);
     CHECK(!heap_live);
     puts("PASS serial TCP loopback returns read credit and buffers without queuing work");
@@ -3439,8 +3449,8 @@ static void tcp_readiness_direction(void)
     writer.readiness_mask=KERNEL_POLLOUT;
     kernel_wait_queue_add(&server->wait,&reader);
     kernel_wait_queue_add(&server->wait,&writer);
-    CHECK(write_buffer(client,"a",1,0)==1);
-    CHECK(server->rx_bytes==1 && reads==1 && !writes);
+    CHECK(write_buffer(client,"ab",2,0)==2);
+    CHECK(server->rx_bytes==2 && reads==1 && !writes);
 
     struct kernel_socket_protocol_scope scope;
     kernel_socket_protocol_enter(&scope);
@@ -3448,6 +3458,13 @@ static void tcp_readiness_direction(void)
     CHECK(tcp_data_sent(server,server->tcp,1)==ERR_OK);
     kernel_socket_protocol_leave(&scope);
     CHECK(reads==1 && writes==1);
+    struct kernel_open_file_description *pin=(void *)server;
+    struct kernel_socket_read_request read={0};
+    for (unsigned i=0;i<2;i++) {
+        CHECK(kernel_socket_reserve_read(server,NULL,&read,&pin,1,0,NULL)==1);
+        CHECK(kernel_socket_finish_read(&read,0)==1);
+        CHECK(server->rx_bytes==1-i && reads==2 && writes==1);
+    }
     CHECK(!kernel_wait_node_remove_sync(&reader) && !kernel_wait_node_remove_sync(&writer));
     kernel_socket_protocol_enter(&scope);
     if (client->tcp) tcp_abort(client->tcp);
