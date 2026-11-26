@@ -79,12 +79,34 @@ static void epoll_notify(struct kernel_epoll *epoll)
     epoll_state_notify(&epoll->wait_queue);
 }
 
+static void epoll_publish_ready_locked(struct kernel_epoll_item *item)
+{
+    struct kernel_epoll *epoll = item->epoll;
+    if (!item->linked || item->oneshot_disarmed) return;
+    item->notification_generation++;
+    if (epoll->scan_owner && !item->on_ready_list) epoll_pending_add(epoll, item);
+    else epoll_ready_add(epoll, item);
+    epoll_notify(epoll);
+}
+
+static int epoll_stream_snapshot(struct kernel_open_file_description *file,
+    uint32_t interest, uint32_t *ready)
+{
+#if BOAROS_MAX_CPUS == 1
+    if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
+        return kernel_socket_stream_ready_snapshot(file->socket,
+            interest | KERNEL_POLLERR | KERNEL_POLLHUP, ready);
+#else
+    (void)file; (void)interest; (void)ready;
+#endif
+    return 0;
+}
+
 static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t reason,uint64_t event)
 {
     if (!node || !node->context) return;
     EPOLL_STATE(irq);
     struct kernel_epoll_item *item = node->context;
-    struct kernel_epoll *epoll = item->epoll;
     if(item->target_file->kind==KERNEL_OPEN_FILE_KIND_SIGNALFD)COST_ADD(SIGNAL_FD_CALLBACKS,1);
     if (reason==KERNEL_WAIT_POLL_FREE) {
         /* The callback owns a cursor borrow. Detach without waiting for
@@ -96,13 +118,7 @@ static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t r
      * replaced its interest. Recheck under the same lock as the modification. */
     if (event && item->target_file->kind == KERNEL_OPEN_FILE_KIND_SOCKET &&
         !(event & (item->events | KERNEL_POLLERR | KERNEL_POLLHUP))) return;
-    if (epoll && item->linked && !item->oneshot_disarmed) {
-        item->notification_generation++;
-        /* poll和用户复制都可能重入；通知链不借用扫描者的ready_next。 */
-        if (epoll->scan_owner && !item->on_ready_list) epoll_pending_add(epoll, item);
-        else epoll_ready_add(epoll, item);
-        epoll_notify(epoll);
-    }
+    epoll_publish_ready_locked(item);
     epoll_state_release(&irq);
 }
 
@@ -611,15 +627,18 @@ enum kernel_files_status kernel_files_epoll_ctl(
         uint64_t control = item->control_generation;
         uint32_t interest = item->events;
         int linked = item->linked;
+        int sampled = linked && epoll_stream_snapshot(target_file, interest, &current_revents);
+        if (sampled && current_revents) epoll_publish_ready_locked(item);
         epoll_state_release(&irq);
         if (socket_target) kernel_preempt_enable();
-        /* 订阅前的通知可能已经结束；绑定后重新查询实际状态。 */
-        current_revents = linked ? kernel_open_file_poll(target_file, interest, 0) : 0;
-        epoll_state_acquire(&irq);
-        if (item->linked && control == item->control_generation &&
-            (current_revents & (item->events | KERNEL_POLLERR | KERNEL_POLLHUP)))
-            kernel_epoll_wait_callback(&item->wait_node, 0, 0);
-        epoll_state_release(&irq);
+        if (linked && !sampled) {
+            current_revents = kernel_open_file_poll(target_file, interest, 0);
+            epoll_state_acquire(&irq);
+            if (item->linked && control == item->control_generation &&
+                (current_revents & (item->events | KERNEL_POLLERR | KERNEL_POLLHUP)))
+                epoll_publish_ready_locked(item);
+            epoll_state_release(&irq);
+        }
         epoll_item_put(item);
         *linux_result = 0;
         break;
@@ -640,12 +659,16 @@ enum kernel_files_status kernel_files_epoll_ctl(
                 events | KERNEL_POLLERR | KERNEL_POLLHUP, __ATOMIC_RELAXED);
         item->data = data;
         item->oneshot_disarmed = 0;
-        epoll_state_release(&irq);
-        current_revents = kernel_open_file_poll(target_file, events, 0);
-        epoll_state_acquire(&irq);
-        if (item->linked && control == item->control_generation &&
-            (current_revents & (events | KERNEL_POLLERR | KERNEL_POLLHUP)))
-            kernel_epoll_wait_callback(&item->wait_node, 0, 0);
+        if (item->linked && epoll_stream_snapshot(target_file, events, &current_revents)) {
+            if (current_revents) epoll_publish_ready_locked(item);
+        } else {
+            epoll_state_release(&irq);
+            current_revents = kernel_open_file_poll(target_file, events, 0);
+            epoll_state_acquire(&irq);
+            if (item->linked && control == item->control_generation &&
+                (current_revents & (events | KERNEL_POLLERR | KERNEL_POLLHUP)))
+                epoll_publish_ready_locked(item);
+        }
         epoll_state_release(&irq);
         epoll_item_put(item);
         *linux_result = 0;
@@ -800,15 +823,22 @@ static int epoll_candidate_refresh(struct kernel_epoll_wait_request *request, st
         .event.data = item->data};
     if (item->linked && !item->oneshot_disarmed && item->target_file) {
         struct kernel_open_file_description *target=item->target_file;
+#if BOAROS_MAX_CPUS == 1
+        /* The epoll lock protects the weak target pointer. With IRQs
+         * disabled, a live stream can be polled before a closer can run. */
+        if (__atomic_load_n(&target->references,__ATOMIC_RELAXED) &&
+            epoll_stream_snapshot(target,candidate->interest,&candidate->event.events))
+            return 1;
+#endif
         if (kernel_open_file_acquire(target)==KERNEL_OPEN_FILE_STATUS_OK) request->target=target;
         else if (__atomic_load_n(&target->references,__ATOMIC_RELAXED)) __builtin_trap();
         /* 末引用可已归零；关闭者须取得此锁拆关联后才能释放存储。
          * 该窗口只跳过已退休目标，不复活OFD，也不查询其关闭中的后端。 */
     }
     epoll_state_release(&irq);
-    if (request->target)
-        candidate->event.events = kernel_open_file_poll(request->target, candidate->interest, 0) &
-            (candidate->interest | KERNEL_POLLERR | KERNEL_POLLHUP);
+    if (!request->target) return 1;
+    candidate->event.events = kernel_open_file_poll(request->target, candidate->interest, 0) &
+        (candidate->interest | KERNEL_POLLERR | KERNEL_POLLHUP);
     epoll_state_acquire(&irq);
     if (!item->linked || item->oneshot_disarmed || candidate->control != item->control_generation)
         candidate->event.events = 0;

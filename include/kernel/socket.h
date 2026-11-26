@@ -327,6 +327,11 @@ void kernel_socket_set_receive_timeout(struct kernel_socket *socket,
 uint64_t kernel_socket_receive_timeout(struct kernel_socket *socket);
 uint32_t kernel_socket_poll(struct kernel_socket *socket,
                             struct kernel_wait_queue **queue);
+#if BOAROS_MAX_CPUS == 1
+/* Interrupts disabled and the caller protects the socket lifetime.
+ * Stream readiness is a bounded snapshot of endpoint state. */
+int kernel_socket_stream_ready_snapshot(struct kernel_socket *, uint32_t mask, uint32_t *ready);
+#endif
 /* Return masked readiness, or register the task's default node while holding
  * the same endpoint lock. The caller finishes any token created. */
 int kernel_socket_poll_prepare(struct kernel_socket *, uint32_t mask,

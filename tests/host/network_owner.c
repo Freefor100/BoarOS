@@ -2964,6 +2964,12 @@ static void loopback_work(void)
         struct kernel_socket_service_result service = kernel_socket_service_pending(
             (struct kernel_socket_service_budget){0, 8, 0});
         CHECK(!service.runnable && !work_pending_snapshot());
+        struct kernel_socket_protocol_scope empty_scope;
+        kernel_socket_protocol_enter(&empty_scope);
+        unsigned empty_locks = state_acquires;
+        service = socket_service_owned(&empty_scope, (struct kernel_socket_service_budget){8, 0, 0}, 0);
+        CHECK(!service.sockets && state_acquires == empty_locks + 1);
+        kernel_socket_protocol_leave(&empty_scope);
 
         /* 不运行 timer 或 inline service；真实入队必须发布可运行工作并请求唤醒。 */
         struct kernel_socket_protocol_scope irq; kernel_socket_protocol_enter(&irq);

@@ -59,7 +59,13 @@ static void socket_event_interest(void)
     char byte;
     CHECK(!epoll_ctl(ep, EPOLL_CTL_ADD, pair[0], &watch));
     CHECK(send(pair[1], "a", 1, 0) == 1);
+    long page = sysconf(_SC_PAGESIZE);
+    CHECK(page > 0);
+    void *fault = mmap(NULL, (size_t)page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(fault != MAP_FAILED);
+    CHECK(epoll_wait(ep, fault, 1, 0) == -1 && errno == EFAULT);
     CHECK(epoll_wait(ep, &event, 1, 0) == 1 && event.events == EPOLLIN);
+    CHECK(!munmap(fault, (size_t)page));
 
     /* Leave the first input unread. Returning the sender's output space
      * cannot deliver a second input edge. */
