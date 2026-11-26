@@ -1774,7 +1774,10 @@ static void pathname_storage_case(struct kernel_heap *heap,struct kernel_vfs_mou
     for (unsigned i=0;i<16;i++) {
         assert(!kernel_files_statx(&local,&directory,&mm,-100,0x100000,0,0x7ff,0x200000,&result) && !result);
         assert(!kernel_files_openat(&local,&directory,&mm,-100,0x100000,0,0,&result) && result>=0);
-        assert(!kernel_files_close(&local,result,&result) && !result);
+        int64_t fd=result;
+        assert(!kernel_files_lseek(&local,fd,0,1,&result) && !result);
+        assert(!kernel_files_lseek(&local,fd,7,0,&result) && result==7);
+        assert(!kernel_files_close(&local,fd,&result) && !result);
         assert(!kernel_task_current()->io_buffer);
     }
     assert(!kernel_files_statx(&local,&directory,&mm,-100,0x300000,0,0x7ff,0x200000,&result) && result==-KERNEL_EFAULT);
@@ -1792,8 +1795,17 @@ static void pathname_storage_case(struct kernel_heap *heap,struct kernel_vfs_mou
     assert(!kernel_copy_to_user(&mm,0x100000,nested,sizeof(nested),&copied) && copied==sizeof(nested));
     assert(!kernel_files_openat(&local,&directory,&mm,-100,0x100000,0,0,&result) && result==-KERNEL_ENOENT);
     assert(!kernel_vfs_create(mount,nested,0600,&file) && !kernel_vfs_close(&file));
+    /* Hold the only reusable path storage in an unrelated open. The
+     * nested ext4 leaf still has a name entry, but needs a new path. */
+    struct kernel_vfs_instance *instance=mount->private_data;
+    struct kernel_vfs_file spare_owner={0};
+    if (instance->ops->search_cached && !instance->namespace_parallel) {
+        assert(!kernel_vfs_open(mount,"/pathname-storage",&spare_owner));
+        assert(!instance->idle_path);
+    }
     assert(!kernel_files_openat(&local,&directory,&mm,-100,0x100000,0,0,&result) && result>=0);
     assert(!kernel_files_close(&local,result,&result) && !result);
+    if (spare_owner.private_data) assert(!kernel_vfs_close(&spare_owner));
     assert(!kernel_vfs_unlink(mount,nested));
     assert(!kernel_files_openat(&local,&directory,&mm,-100,0x100000,0,0,&result) && result==-KERNEL_ENOENT);
     assert(!kernel_vfs_rmdir(mount,"/prefix-observation/sub"));

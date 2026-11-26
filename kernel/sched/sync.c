@@ -25,9 +25,14 @@ struct kernel_io_context *kernel_io_context_current(void)
 
 void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key)
 {
-    *lock = (struct kernel_rwlock){ .rank = rank, .key = key };
-    kernel_wait_queue_init(&lock->waiters);
-    kernel_raw_lock_init(&lock->metadata, KERNEL_RAW_RANK_OBJECT);
+    *lock = (struct kernel_rwlock){
+        .metadata = {
+            .rank = KERNEL_RAW_RANK_OBJECT, .initialized = KERNEL_RAW_INITIALIZED,
+        },
+        .waiters = KERNEL_WAIT_QUEUE_STATIC_INITIALIZER,
+        .rank = rank,
+        .key = key,
+    };
 }
 /* 在对象raw内一次发布登记与FIFO资格owner；本函数不睡眠。 */
 static __attribute__((noinline)) void register_waiter(struct kernel_rwlock *lock,

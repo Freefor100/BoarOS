@@ -3069,7 +3069,26 @@ static bool lookup_walk_child(struct vfs_path_walk *walk,struct kernel_vfs_mount
 struct path_component_span {
     size_t begin, end, next;
     uint32_t missing;
+    struct kernel_vfs_dentry *cached_leaf;
 };
+
+/* The caller owns entry only when it has no path yet. Allocate outside
+ * VFS state, then test for a concurrently published location and mount. */
+static int finish_cached_child(struct kernel_vfs_mount *mount,
+    struct kernel_vfs_dentry *entry, struct kernel_vfs_path **owner,
+    bool covered, bool cross_mount, unsigned resolve)
+{
+    struct kernel_vfs_instance *instance=mount->private_data;
+    int result=instance->ops->error ? instance->ops->error(instance) : 0;
+    if (!*owner) {
+        if (!result) result=path_wrap_new(mount,&entry,owner,false,&covered);
+        dentry_release(&entry);
+    }
+    if (!result && covered && cross_mount)
+        result=enter_mounts(owner,resolve);
+    if (result && *owner && kernel_vfs_path_release(owner)) __builtin_trap();
+    return result;
+}
 
 /* The namespace guard keeps names and permissions valid. The state lock
  * protects the weak dentries until the final directory reference is taken. */
@@ -3154,8 +3173,14 @@ Found:
                 child!=mount->root_dentry && child!=walk->root->dentry &&
                 !__atomic_load_n(&child->mountpoint_seen,__ATOMIC_ACQUIRE)) {
                 struct kernel_vfs_path *location=find_location(mount,child);
-                if (!location) location=reuse_path_locked(mount,child);
-                else if (kernel_vfs_path_acquire(location)) location=NULL;
+                if (!location) {
+                    location=reuse_path_locked(mount,child);
+                    if (!location && !dentry_acquire(child)) {
+                        __atomic_store_n(&child->recently_used,1,__ATOMIC_RELAXED);
+                        part->cached_leaf=child;
+                        return NULL;
+                    }
+                } else if (kernel_vfs_path_acquire(location)) location=NULL;
                 if (location) {
                     __atomic_store_n(&child->recently_used,1,__ATOMIC_RELAXED);
                     *leaf=location;
@@ -3227,21 +3252,8 @@ static int lookup_named_child(struct kernel_vfs_mount *mount,struct kernel_vfs_d
                 }
             } else miss=parent->names_published;
         }
-        if (entry) {
-            result=instance->ops->error ? instance->ops->error(instance) : 0;
-            if (*owner) {
-                if (!result && covered && cross_mount)
-                    result=enter_mounts(owner,walk ? walk->resolve : 0);
-                if (result && kernel_vfs_path_release(owner)) __builtin_trap();
-                return result;
-            }
-            if (result) {dentry_release(&entry);return result;}
-            /* Publish from the reference already taken at the name hit.
-             * Check for a mount edge while acquiring or inserting the location. */
-            result=path_wrap_new(mount,&entry,owner,false,&covered);
-            cross_mount &= covered;
-            goto Enter;
-        }
+        if (entry) return finish_cached_child(mount,entry,owner,covered,cross_mount,
+            walk ? walk->resolve : 0);
     }
     uint64_t inode;uint32_t mode=0;
     struct kernel_vfs_node *stat_node=NULL;
@@ -3312,7 +3324,6 @@ static int lookup_named_child(struct kernel_vfs_mount *mount,struct kernel_vfs_d
         result=register_path(&entry,name_length,miss);if (result) return result;
     }
     result=path_walk_wrap(mount,entry,owner,walk);
-Enter:
     dentry_release(&entry);
     if (!result && cross_mount) {result=enter_mounts(owner,walk ? walk->resolve : 0);if (result) (void)kernel_vfs_path_release(owner);}
     return result;
@@ -3500,16 +3511,15 @@ static int resolve_object(struct kernel_vfs_path *start,
             goto Finish;
         }
         if (borrowed && pending==path && walk->cached_prefix && suffix && !trailing_only) {
-            struct path_component_span part={begin,end,cursor,UINT32_MAX};
+            struct path_component_span part={.begin=begin,.end=end,.next=cursor,
+                .missing=UINT32_MAX};
             bool existing_directory=false;
             struct kernel_vfs_dentry *prefix=cached_path_prefix(walk,current,pending,length,&part,
                 &existing_directory,&next);
-            if (next) {
-                struct kernel_vfs_mount *mount=next->file.mount;
-                struct kernel_vfs_instance *instance=mount->private_data;
-                result=instance->ops->error ? instance->ops->error(instance) : 0;
-                if (result) (void)kernel_vfs_path_release(&next);
-                else {
+            if (next || part.cached_leaf) {
+                struct kernel_vfs_mount *mount=current->file.mount;
+                result=finish_cached_child(mount,part.cached_leaf,&next,false,true,walk->resolve);
+                if (!result) {
                     clear_mount_expiry(mount);
                     *owner=next;
                 }

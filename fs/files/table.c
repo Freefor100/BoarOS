@@ -657,9 +657,8 @@ void kernel_files_queue_description(
     files->record->cleanup_files = description;
 }
 
-void kernel_files_cancel_reservation(struct kernel_files_fd_reservation *reservation)
+void kernel_files_cancel_reserved_fd(struct kernel_files_fd_reservation *reservation)
 {
-    if (!reservation->files) return;
     KERNEL_FILES_SCOPE(guard, reservation->files);
     struct kernel_files_record *record = reservation->files->record;
     if (record->slots[reservation->fd].description ||
