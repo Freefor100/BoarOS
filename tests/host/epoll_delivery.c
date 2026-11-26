@@ -52,6 +52,7 @@ void kernel_service_scope_end(struct kernel_service_scope *scope)
 { scope->entered=0; }
 
 static unsigned prepares, parks, finishes, task_wakes, poll_action;
+static unsigned direct_wakes;
 static void control(int operation,uint32_t mode,uint64_t data);
 static void cancel_at_protocol_entry(void);
 void kernel_preempt_disable(void) { preempt_depth++; }
@@ -157,6 +158,31 @@ void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor,int all)
     (void)all;struct kernel_wait_queue *q=cursor->queue;
     CHECK(q && q->borrows && !kernel_cpu_current()->raw_locks);
     kernel_wait_queue_wake_all(q);q->borrows--;*cursor=(struct kernel_wait_cursor){0};
+}
+int kernel_wait_notification_prepare(struct kernel_wait_queue *queue,
+    struct kernel_wait_notification *notification, uint64_t event)
+{
+    CHECK(!event);
+    struct kernel_wait_node *node=queue->head;
+    if (node && node==queue->tail && node->task && node->generation && !node->callback) {
+        notification->token=(struct kernel_wait_token){node->task,node->generation};
+        notification->direct=1;
+    } else {
+        if (!kernel_wait_cursor_prepare(queue,&notification->cursor)) return 0;
+        notification->direct=0;
+    }
+    notification->queue=queue;
+    return 1;
+}
+void kernel_wait_notification_wake(struct kernel_wait_notification *notification)
+{
+    CHECK(notification->queue && !kernel_cpu_current()->raw_locks);
+    if (notification->direct) {
+        CHECK(notification->token.task && notification->token.generation);
+        direct_wakes++;
+        task_wakes++;
+    } else kernel_wait_cursor_wake(&notification->cursor,1);
+    notification->queue=NULL;
 }
 enum kernel_scheduler_status kernel_wait_queue_close(struct kernel_wait_queue *q)
 { CHECK(q->initialized);q->closed=1;return kernel_wait_queue_wake_all(q); }
@@ -622,6 +648,25 @@ static void close_with_borrowed_callback(void)
     puts("PASS epoll close retains the target association until the old cursor returns");
 }
 
+static void epoll_single_waiter(void)
+{
+    setup(KERNEL_EPOLLET);
+    struct kernel_wait_node first={.task=host_task,.generation=1};
+    struct kernel_wait_node second={.task=(void *)&actors[1],.generation=2};
+    struct kernel_wait_queue *queue=&epfile.epoll->wait_queue;
+    kernel_wait_queue_add(queue,&first);
+    unsigned direct=direct_wakes,wakes=task_wakes;
+    CHECK(!kernel_wait_queue_wake_all(&target_wait[0]));
+    CHECK(direct_wakes==direct+1 && task_wakes==wakes+1 && !queue->borrows);
+    kernel_wait_queue_add(queue,&second);
+    CHECK(!kernel_wait_queue_wake_all(&target_wait[0]));
+    CHECK(direct_wakes==direct+1 && task_wakes==wakes+3 && !queue->borrows);
+    kernel_wait_queue_remove(&second);
+    kernel_wait_queue_remove(&first);
+    teardown();
+    puts("PASS epoll single waiter uses its wait token, multiple waiters use the cursor");
+}
+
 static void socket_registration(void)
 {
     setup(KERNEL_EPOLLET);
@@ -668,6 +713,7 @@ int main(int argc, char **argv)
     pollfree_during_delete();
     delete_publication();
     close_with_borrowed_callback();
+    epoll_single_waiter();
     retiring_target();
     setup(0);struct linux_epoll_event local_event;unsigned services=service_entries;
     CHECK(wait_events(&local_event,1)==1 && service_entries==services);
