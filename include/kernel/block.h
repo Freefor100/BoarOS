@@ -95,6 +95,7 @@ struct kernel_block_device {
     uint32_t logical_block_size;
     kernel_block_flush_fn flush;
     enum kernel_block_cache_mode cache_mode;
+    unsigned flush_allows_reads; /* Backend fences its own aligned writes. */
     /* Registration owns the object lifetime; references cover OFDs, mounts and
      * in-flight requests. Callbacks never run with registry protection held. */
     int (*open)(struct kernel_block_device *, uint32_t flags);

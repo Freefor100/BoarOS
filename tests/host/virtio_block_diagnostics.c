@@ -1246,6 +1246,46 @@ static void notification_conditions_case(unsigned version)
     assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
     printf("PASS block notification conditions transport=%u: descriptor, request and flush progress separated\n",version);
 }
+
+static void read_during_flush_case(unsigned version)
+{
+    struct riscv_virtio_mmio_block device={0};
+    struct physical_page_allocator allocator={0};
+    memset(registers,0,sizeof(registers));
+    registers[0]=0x74726976; registers[1]=version; registers[2]=2;
+    registers[0x10/4]=1U | (1U<<9); registers[0x34/4]=32;
+    registers[0x100/4]=sizeof(sg_disk)/512;
+    fault=MANUAL_COMPLETION; batch_popped=batch_pushed=clock_value=0;
+    notifications=0; sg_fail_sector=UINT32_MAX;
+    assert(initialize_model(&device,registers,sizeof(registers),&allocator,
+        dma_address,1000)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    assert(begin_call(&device,BLOCK_CALL_FLUSH));
+    assert(!admission_available(&device,BLOCK_CALL_READ));
+    struct block_request *flush=reserve_request(&device);
+    assert(flush && !publish_for_test(&device,flush,VIRTIO_BLOCK_REQUEST_FLUSH,0,0,0,0));
+    assert(admission_available(&device,BLOCK_CALL_READ));
+    assert(!admission_available(&device,BLOCK_CALL_WRITE));
+
+    /* Give the read command the next completion while the first entry
+     * in the device's available ring still owns its flush descriptors. */
+    phase_hold=3;
+    memset(sg_disk+512,0x7b,512);
+    fault=SG_BATCH;
+    assert(kernel_block_read_at(&device.block,512,batch_output[0],512)==KERNEL_BLOCK_STATUS_OK);
+    assert(batch_output[0][511]==0x7b && flush->state==2 && phase_held_status);
+    *phase_held_status=0;
+    unsigned slot=device.queue.used->index % device.queue.size;
+    device.queue.used->ring[slot]=(struct virtio_used_element){phase_held_head,1};
+    device.queue.used->index++;
+    assert(!wait_request(&device,flush));
+    release_request(&device,flush);
+    end_call(&device,BLOCK_CALL_FLUSH);
+    phase_hold=0; phase_held_status=NULL;
+    assert(!device.active && !device.queue.claimed);
+    assert(admission_available(&device,BLOCK_CALL_WRITE));
+    assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
+    printf("PASS independent read while the flush retains its descriptors transport=%u\n",version);
+}
 static void bad_segment_limits_case(unsigned version)
 {
     for (unsigned kind = 0; kind < 2; kind++) {
@@ -1582,6 +1622,10 @@ int main(int argc, char **argv)
                 slow_completion_case(version, 4, 95000, kind);
         return 0;
     }
+    if (argc == 2 && !strcmp(argv[1], "flush-read")) {
+        for (unsigned version=1; version<=2; version++) read_during_flush_case(version);
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "slow")) {
         for (unsigned version = 1; version <= 2; version++) {
             slow_completion_case(version, 0, 2500, NORMAL);
@@ -1634,6 +1678,7 @@ int main(int argc, char **argv)
         slow_completion_case(version, 4, 2500, NORMAL);
         for (enum fault_kind kind = NORMAL; kind <= DEVICE_UNSUPPORTED; kind++)
             slow_completion_case(version, 4, 95000, kind);
+        read_during_flush_case(version);
         queue_reuse_case(version);
         completed_before_park_case(version, 0);
         completed_before_park_case(version, 1);

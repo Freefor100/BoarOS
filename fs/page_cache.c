@@ -2720,7 +2720,7 @@ static void commit_read_batch(void *argument)
     {
         CACHE_SCOPE(publish,cache);
         uint64_t size=kernel_vfs_node_size(node);
-        struct kernel_page_cache_entry *next=index_at_or_after(node,first);
+        struct kernel_page_cache_entry *next=count==1?index_find(node,first):index_at_or_after(node,first);
         for (size_t i=0;i<count;i++) {
             if (pages[i].status!=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND || entries[i]) continue;
             struct kernel_page_cache_entry *candidate=loads[i];
@@ -2858,7 +2858,8 @@ static void __attribute__((noinline)) read_batch_local(struct kernel_page_cache 
     }
     if (next<owned) physical_page_release_batch(cache->allocator,allocated+next,owned-next);
     candidates=prepared;
-    if (candidates) {
+    if (candidates || (count==1 && !entries[0] &&
+        pages[0].status==KERNEL_PAGE_CACHE_STATUS_NOT_FOUND)) {
         struct read_batch_load request={cache,file,first,pages,count,entries,loads,outputs,spans,
             workspace?&workspace->backend:NULL,allocation,no_reuse,required};
         enum kernel_page_cache_status submitted=KERNEL_PAGE_CACHE_STATUS_OK;
@@ -2936,8 +2937,8 @@ static int read_cached_batch(struct cache_read_batch_request *request, bool take
             if (!entry) {
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
                 page->cache_miss=1;
-                if (request->count == 1) request->demand_missing = true;
 #endif
+                if (request->count == 1) request->demand_missing = true;
                 pending=1;
                 if (remote<0) remote=remote_cache_client();
                 if (!remote) break;
@@ -3067,7 +3068,12 @@ scalar:;
     struct kernel_page_cache_entry *single_entry;
     struct kernel_page_cache_entry **entries=lease?lease->read.entries:&single_entry;
     int pending=0;
-    for (;;) {
+    if (request->count==1 && request->demand_missing) {
+        /* The optimistic scan saw no entry. Recheck under the inode's I/O
+         * guard when publishing, including when allocation failed. */
+        entries[0]=NULL;
+        pending=1;
+    } else for (;;) {
         CACHE_SCOPE(lookup, cache);
         if (!read_cache_open(node)) {
             kernel_lock_release(&lookup);

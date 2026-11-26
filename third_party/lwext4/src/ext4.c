@@ -5453,16 +5453,29 @@ static int ext4_complete_file_data(ext4_file *file, uint64_t offset, uint64_t en
     return ext4_result(result, ext4_fs_put_inode_ref(&ref));
 }
 
+/* On a serialized mount the read scope also excludes extent mutation.
+ * Ordered I/O owns the accepted versions while their home writes complete. */
+static bool ext4_data_completion_lock(struct ext4_mountpoint *mp)
+{
+    const struct ext4_lock *locks = mp->os_locks;
+    if (mp->fs.jbd_journal && mp->fs.jbd_journal->grouped && locks &&
+        locks->read_lock && locks->serial_writer && !locks->resource_acquire) {
+        locks->read_lock(locks->context);
+        return true;
+    }
+    EXT4_MP_LOCK(mp);
+    return ext4_fs_serial_writer(&mp->fs);
+}
+
 int ext4_fdata_complete(ext4_file *file, uint64_t offset, size_t size)
 {
     if (!file || !file->mp || offset > UINT64_MAX - size) return EINVAL;
     struct ext4_fs *fs = &file->mp->fs;
     if (!size || !fs->jbd_journal) return EOK;
-    EXT4_MP_LOCK(file->mp);
+    bool stable_mapping = ext4_data_completion_lock(file->mp);
     int result;
     if (ext4_operation_depth(fs)) { result = EBUSY; goto Exit; }
-    if (ext4_fs_serial_writer(fs)) {
-        /* The mount writer protects accepted mappings through home I/O. */
+    if (stable_mapping) {
         result = fs->super_replay_required ? EUCLEAN : fs->read_only ? EROFS :
             jbd_journal_error(fs->jbd_journal);
         if (!result) result = ext4_complete_file_data(file, offset, offset + size, NULL);
@@ -5488,8 +5501,8 @@ int ext4_fdata_complete_batch(const struct ext4_file_data_range *files, unsigned
     struct ext4_fs *fs = &mp->fs;
     struct jbd_journal *journal = fs->jbd_journal;
     int result = ENOTSUP;
-    EXT4_MP_LOCK(mp);
-    if (!journal || !journal->grouped || !ext4_fs_serial_writer(fs) ||
+    bool stable_mapping = ext4_data_completion_lock(mp);
+    if (!journal || !journal->grouped || !stable_mapping ||
         ext4_current_operation(fs) || !fs->bdev->bdif->bwrite_phase ||
         fs->read_only || fs->super_replay_required) goto Unlock;
     for (unsigned i = 0; i < count; i++)

@@ -1975,7 +1975,7 @@ static int jbd_complete_ranges(struct jbd_journal *journal,
         unsigned used=0;
         bool more=false;
         {
-            JBD_STATE_SCOPE(journal);
+            JBD_STATE_READ_SCOPE(journal);
             if (jbd_journal_error(journal)) return jbd_journal_error(journal);
             jbd_collect_range_data(journal->committing,ranges,count,data,capacity,&used,&more);
             struct jbd_trans *trans;
