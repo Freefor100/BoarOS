@@ -890,6 +890,76 @@ static void singleton_default_wake(void)
     puts("wait: single default wake preserves commit, later registration and close with no cursor locks");
 }
 
+static void singleton_notification(void)
+{
+    for (unsigned committed = 0; committed < 2; committed++) {
+        struct kernel_wait_queue queue;
+        struct kernel_wait_node node;
+        struct kernel_wait_token token;
+        struct kernel_wait_notification notification = {0};
+        kernel_wait_queue_init(&queue);
+        kernel_wait_node_init(&node, &task);
+        node.readiness_mask = 1;
+        assert(!kernel_wait_prepare(NULL, 0, 1, &token));
+        assert(!kernel_wait_node_bind(&queue, &node, &token));
+        assert(!kernel_wait_notification_prepare(&queue, &notification, 2));
+        assert(!queue.borrows && !kernel_wait_record_borrows(&task.wait));
+        if (committed) {
+            kernel_wait_backend_commit(&task, 0, 1);
+            kernel_wait_record_transition(&task.wait, token.generation,
+                KERNEL_WAIT_COMMITTED, KERNEL_WAIT_WOKEN);
+            task.wait.on_cpu = 0;
+        }
+        measured_wake_queue = &queue;
+        wake_queue_acquisitions = 0;
+        assert(kernel_wait_notification_prepare(&queue, &notification, 1));
+        assert(wake_queue_acquisitions == 1 && notification.direct &&
+            !queue.borrows && !node.references && kernel_wait_record_borrows(&task.wait) == 1);
+        kernel_wait_queue_remove(&node);
+        assert(!kernel_wait_queue_close(&queue) && !kernel_wait_queue_destroy(&queue));
+        unsigned acquired = wake_queue_acquisitions;
+        kernel_wait_notification_wake(&notification);
+        assert(wake_queue_acquisitions == acquired && !kernel_wait_record_borrows(&task.wait));
+        measured_wake_queue = NULL;
+        assert(kernel_wait_record_phase(&task.wait) == KERNEL_WAIT_NOTIFIED);
+        if (committed) {
+            assert(task.completions == 1 && task.ready_node.queued);
+            kernel_sched_dequeue(&runnable, &task.ready_node);
+            task.wait.on_cpu = 1;
+            task.completions = 0;
+        }
+        assert(!kernel_wait_finish(&token));
+    }
+    struct kernel_wait_queue queue;
+    struct kernel_wait_node node, callback;
+    struct kernel_wait_token token;
+    struct kernel_wait_notification notification = {0};
+    uint64_t dynamic_mask = 1;
+    unsigned calls = 0;
+    kernel_wait_queue_init(&queue);
+    kernel_wait_node_init(&node, &task);
+    node.event_mask = &dynamic_mask;
+    assert(!kernel_wait_prepare(NULL, 0, 1, &token));
+    assert(!kernel_wait_node_bind(&queue, &node, &token));
+    assert(kernel_wait_notification_prepare(&queue, &notification, 1) && !notification.direct);
+    dynamic_mask = 2;
+    kernel_wait_notification_wake(&notification);
+    assert(kernel_wait_record_phase(&task.wait) == KERNEL_WAIT_PREPARED);
+    kernel_wait_node_init_callback(&callback, event_callback, &calls);
+    kernel_wait_queue_add(&queue, &callback);
+    assert(kernel_wait_notification_prepare(&queue, &notification, 2) && !notification.direct);
+    kernel_wait_notification_wake(&notification);
+    assert(calls == 1 && observed_event == 2);
+    assert(kernel_wait_record_phase(&task.wait) == KERNEL_WAIT_NOTIFIED);
+    assert(!kernel_wait_finish(&token));
+    assert(kernel_wait_notification_prepare(&queue, &notification, 4) && !notification.direct);
+    kernel_wait_notification_wake(&notification);
+    assert(calls == 2 && observed_event == 4);
+    assert(!kernel_wait_node_remove_sync(&callback));
+    assert(!kernel_wait_queue_close(&queue) && !kernel_wait_queue_destroy(&queue));
+    puts("wait: singleton masked notifications borrow only the task, preserving callbacks, dynamic masks and multiple waiters");
+}
+
 static void independent_wait_registration(void)
 {
     struct kernel_wait_queue queue;
@@ -1105,6 +1175,7 @@ int main(void)
     initialize(0);
     kernel_wait_domain_init();
     singleton_default_wake();
+    singleton_notification();
     independent_wait_registration();
     independent_registration();
     stale_signal_generation();

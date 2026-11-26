@@ -74,6 +74,9 @@
 #define RAW_MAX_PAYLOAD 65515U
 #define SOCKET_WRITE_BATCH 4U
 #define SOCKET_WRITE_RETRY_MS 250U
+#define UNIX_STREAM_SPARE_MIN 128U
+#define UNIX_STREAM_SPARE_MAX 256U
+#define UNIX_STREAM_SPARE_LIMIT 64U
 
 struct socket_packet {
     struct socket_packet *next;
@@ -173,6 +176,7 @@ struct kernel_socket {
     uint32_t tx_budget;
     uint32_t unix_packets;
     uint64_t unix_memory;
+    struct socket_packet *unix_stream_spares[2];
     int pending_error;
     uint8_t reuseaddr;
     uint8_t keepalive;
@@ -1781,6 +1785,38 @@ static void unix_publish_owner(struct kernel_socket *sender,struct socket_packet
 static int unix_writable(const struct kernel_socket *sender)
 { return sender->unix_memory+sender->tx_reserved<=sender->tx_limit/4U; }
 
+/* Keep one clean retired buffer per sender and size class. Both classes match
+ * the heap's rounded slot sizes. Bound the total retained slots across sockets. */
+static unsigned unix_stream_spare_count;
+
+static unsigned unix_stream_spare_index(size_t allocation)
+{ return allocation > UNIX_STREAM_SPARE_MIN; }
+
+static struct socket_packet *unix_stream_take_spare(struct kernel_socket *sender,
+    uint32_t allocation)
+{
+    unsigned index = unix_stream_spare_index(allocation);
+    struct socket_packet *packet = sender->unix_stream_spares[index];
+    if (packet) {
+        sender->unix_stream_spares[index] = NULL;
+        unix_stream_spare_count--;
+    }
+    return packet;
+}
+
+static int unix_stream_keep_spare(struct kernel_socket *sender, struct socket_packet *packet)
+{
+    if (sender->destroying || packet->control || packet->send_charge > UNIX_STREAM_SPARE_MAX ||
+        unix_stream_spare_count == UNIX_STREAM_SPARE_LIMIT)
+        return 0;
+    unsigned index = unix_stream_spare_index(packet->send_charge);
+    if (sender->unix_stream_spares[index]) return 0;
+    packet->unix_sender = NULL;
+    sender->unix_stream_spares[index] = packet;
+    unix_stream_spare_count++;
+    return 1;
+}
+
 
 static void retire_timewait(struct kernel_socket *socket)
 {
@@ -3304,6 +3340,8 @@ static __attribute__((noinline)) void unix_destroy(struct kernel_socket *socket)
     KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);
     if(socket->read_request || socket->tx_reserved || socket->active_writes || socket->destroying)__builtin_trap();
     socket->destroying=1;
+    struct socket_packet *small_spare = unix_stream_take_spare(socket, UNIX_STREAM_SPARE_MIN);
+    struct socket_packet *large_spare = unix_stream_take_spare(socket, UNIX_STREAM_SPARE_MAX);
     struct kernel_socket **gc_link=&unix_sockets;
     while(*gc_link!=socket) {if(!*gc_link)__builtin_trap();gc_link=&(*gc_link)->gc_next;}
     *gc_link=socket->gc_next;socket->gc_next=NULL;socket->gc_file=NULL;
@@ -3347,6 +3385,9 @@ static __attribute__((noinline)) void unix_destroy(struct kernel_socket *socket)
     }
     kernel_lock_release(&gc);
     kernel_lock_release(&control);
+    if (small_spare) kernel_heap_release(socket->heap, small_spare);
+    if (large_spare) kernel_heap_release(socket->heap, large_spare);
+    if (small_spare || large_spare) receive_capacity();
     unix_name_put(peer_name);
     while(socket->packets_head) {
         struct socket_packet *packet=socket->packets_head;socket->packets_head=packet->next;
@@ -4581,6 +4622,8 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
         if (stream_packets==1 || !kernel_wait_queue_registrations(&sender->async_events)) {
             released_sender=unix_uncharge_amount_locked(sender,stream_packets,stream_charge);
             stream_credited=1;
+            if (stream_packets == 1 && unix_stream_keep_spare(sender, retired))
+                retired = NULL;
         }
     }
     if (socket->domain == KERNEL_SOCKET_DOMAIN_INET) {
@@ -5114,6 +5157,7 @@ int kernel_socket_packet_prepare(struct kernel_socket_write_request *request,
         else if (count<PACKET_ETH_HEADER) return -KERNEL_EINVAL;
     }
     struct kernel_socket_control **control=message?&message->control:&request->automatic_control;
+    int unix_stream = socket->domain == KERNEL_SOCKET_DOMAIN_UNIX && socket->type == SOCKET_STREAM;
     int result=0,credentials=0;
     int hold_unix_peer=socket->domain==KERNEL_SOCKET_DOMAIN_UNIX &&
         !(destination && socket->type==SOCKET_DGRAM);
@@ -5169,6 +5213,8 @@ int kernel_socket_packet_prepare(struct kernel_socket_write_request *request,
             request->payload_size=count;request->flags=flags;
             result=request->unix_destination?
                 unix_reserve_packet(request,&preflight,(uint32_t)count,flags,&credentials):unix_peer_failure(socket);
+            if (!result && unix_stream && request->reserved <= UNIX_STREAM_SPARE_MAX)
+                request->packet = unix_stream_take_spare(socket, request->reserved);
         }
     }
     if(result)goto out;
@@ -5206,18 +5252,25 @@ int kernel_socket_packet_prepare(struct kernel_socket_write_request *request,
             goto out;
         }
     } else {
-        KERNEL_NO_RECLAIM_IO;
         size_t size=sizeof(*packet)+(size_t)count+link_header;
-        int stream=socket->domain==KERNEL_SOCKET_DOMAIN_UNIX && socket->type==SOCKET_STREAM;
-        enum kernel_heap_status status=stream?
-            kernel_heap_allocate(socket->heap,size,(void **)&packet):
-            kernel_heap_allocate_zeroed(socket->heap,1,size,(void **)&packet);
-        if (status != KERNEL_HEAP_STATUS_OK) {
-            if (status != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
-            goto out;
+        packet = request->packet;
+        if (!packet) {
+            KERNEL_NO_RECLAIM_IO;
+            enum kernel_heap_status status;
+            if (unix_stream) {
+                if (size <= UNIX_STREAM_SPARE_MAX)
+                    size = unix_stream_spare_index(size) ? UNIX_STREAM_SPARE_MAX : UNIX_STREAM_SPARE_MIN;
+                status = kernel_heap_allocate(socket->heap, size, (void **)&packet);
+            } else {
+                status = kernel_heap_allocate_zeroed(socket->heap, 1, size, (void **)&packet);
+            }
+            if (status != KERNEL_HEAP_STATUS_OK) {
+                if (status != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
+                goto out;
+            }
         }
         /* A stream publishes only the bytes overwritten by the payload copy. */
-        if(stream)__builtin_memset(packet,0,sizeof(*packet));
+        if (unix_stream) __builtin_memset(packet, 0, sizeof(*packet));
         request->packet = packet;
         packet->length = (uint32_t)count;
     }
@@ -7018,18 +7071,14 @@ uint64_t kernel_socket_receive_timeout(struct kernel_socket *socket)
     return timeout;
 }
 
-uint32_t kernel_socket_poll(struct kernel_socket *socket,
-                            struct kernel_wait_queue **queue)
+static uint32_t socket_poll_locked(struct kernel_socket *socket)
 {
     uint32_t events = 0;
-    SOCKET_ENDPOINT(snapshot_irq,socket);
     COST_ADD(NETWORK_POLL_CALLS, 1);
 #if BOAROS_COST_DIAGNOSTICS
     unsigned *polling=socket_poll_depth();
     (*polling)++;
 #endif
-    if (queue != 0) *queue = &socket->wait;
-
     if (socket->domain == KERNEL_SOCKET_DOMAIN_UNIX) {
         if(socket->pending_error)events|=KERNEL_POLLERR;
         if(socket_connection_oriented(socket)) {
@@ -7055,7 +7104,6 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket,
 #if BOAROS_COST_DIAGNOSTICS
         (*polling)--;
 #endif
-        socket_state_release(&snapshot_irq);
         return events;
     }
 
@@ -7086,8 +7134,31 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket,
 #if BOAROS_COST_DIAGNOSTICS
     (*polling)--;
 #endif
-    socket_state_release(&snapshot_irq);
     return events;
+}
+
+uint32_t kernel_socket_poll(struct kernel_socket *socket, struct kernel_wait_queue **queue)
+{
+    SOCKET_ENDPOINT(state,socket);
+    if (queue) *queue = &socket->wait;
+    return socket_poll_locked(socket);
+}
+
+int kernel_socket_poll_prepare(struct kernel_socket *socket, uint32_t mask,
+    uint64_t deadline, struct kernel_wait_node *node, struct kernel_wait_token *token)
+{
+    SOCKET_ENDPOINT(state,socket);
+    uint32_t ready = socket_poll_locked(socket) & mask;
+    if (ready) return (int)ready;
+
+    enum kernel_scheduler_status status = deadline ?
+        kernel_wait_prepare_monotonic(NULL, deadline, 1, token) :
+        kernel_wait_prepare(NULL, 0, 1, token);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) return -KERNEL_EIO;
+    kernel_wait_node_init(node, token->task);
+    node->readiness_mask = mask;
+    status = kernel_wait_node_bind(&socket->wait, node, token);
+    return status == KERNEL_SCHEDULER_STATUS_OK ? 0 : -KERNEL_EIO;
 }
 
 struct kernel_wait_queue *kernel_socket_wait_queue(struct kernel_socket *socket)

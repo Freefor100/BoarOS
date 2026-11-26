@@ -516,6 +516,41 @@ int kernel_wait_cursor_prepare_event(struct kernel_wait_queue *queue,
 }
 int kernel_wait_cursor_prepare(struct kernel_wait_queue *queue,struct kernel_wait_cursor *cursor)
 { return kernel_wait_cursor_prepare_event(queue,cursor,0,0); }
+int kernel_wait_notification_prepare(struct kernel_wait_queue *queue,
+    struct kernel_wait_notification *notification, uint64_t event)
+{
+    if (!queue || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED) __builtin_trap();
+    if (!kernel_wait_queue_registrations(queue)) return 0;
+    KERNEL_IRQ_LOCK_SCOPE(guard, &queue->lock);
+    struct kernel_wait_node *node = queue->head;
+    if (node && node == queue->tail && node->task && node->generation &&
+        !node->callback && !node->event_mask && event_accepts(node, event, NULL)) {
+        queue_shape(queue);
+        if (node->borrow_owner != queue) __builtin_trap();
+        notification->token = (struct kernel_wait_token){node->task, node->generation};
+        kernel_wait_task_pin(node->task);
+        notification->direct = 1;
+    } else {
+        if (!cursor_prepare_queue_locked(queue, &notification->cursor, 0, event, NULL))
+            return 0;
+        notification->direct = 0;
+    }
+    notification->queue = queue;
+    return 1;
+}
+
+void kernel_wait_notification_wake(struct kernel_wait_notification *notification)
+{
+    if (notification->direct) {
+        /* The token owns the task record. Later registrations and source
+         * teardown do not change this captured notification. */
+        (void)notify_token(&notification->token, KERNEL_WAIT_WOKEN);
+        kernel_wait_task_unpin(notification->token.task);
+    } else {
+        kernel_wait_cursor_wake(&notification->cursor, 1);
+    }
+    notification->queue = NULL;
+}
 void kernel_wait_cursor_begin(struct kernel_wait_queue *queue,struct kernel_wait_cursor *cursor)
 {
     KERNEL_IRQ_LOCK_SCOPE(guard,&queue->lock);
