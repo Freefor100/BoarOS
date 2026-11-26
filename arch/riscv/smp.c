@@ -22,6 +22,7 @@ static struct kernel_cpu *cpus[BOAROS_MAX_CPUS];
 static unsigned cpu_count;
 static uint32_t timebase;
 static uint32_t hart_features[BOAROS_MAX_CPUS], common_features;
+static struct physical_page_allocator *hwprobe_allocator;
 
 static uint32_t fatal_claim;
 static uint64_t fatal_hart;
@@ -236,6 +237,7 @@ void riscv_smp_secondary_high(void)
     kernel_cpu_secondary_attach(cpu, (uintptr_t)state->stack,
                                (uintptr_t)state->stack + sizeof(state->stack));
     riscv_hwprobe_initialize(cpu->logical_id, hart_features[cpu->logical_id], common_features, timebase);
+    riscv_hwprobe_measure_scalar(cpu->logical_id, hwprobe_allocator, timebase);
     if (!riscv_vector_check_hart()) riscv_smp_fail("incompatible-vector-VLEN", -1);
     uintptr_t mask = 0x6000U, clean = 0x4000U;
     asm volatile("csrc sstatus, %0; csrs sstatus, %1; csrsi sie, 2"
@@ -265,7 +267,7 @@ void riscv_smp_secondary_high(void)
 }
 
 void riscv_smp_start(const struct dtb_cpu_info *info, uint64_t transition,
-                     uint64_t final, uint32_t frequency)
+                     uint64_t final, uint32_t frequency, struct physical_page_allocator *allocator)
 {
     if (!info || !info->count || info->count > BOAROS_MAX_CPUS ||
         info->count != kernel_cpu_get_boot_count() || cpu_count ||
@@ -280,6 +282,7 @@ void riscv_smp_start(const struct dtb_cpu_info *info, uint64_t transition,
     cpus[0]->state = KERNEL_CPU_ONLINE;
     asm volatile("csrsi sie, 2" ::: "memory");
     if (cpu_count == 1) return;
+    hwprobe_allocator = allocator;
     const unsigned long required[] = { SBI_EXT_HSM, SBI_EXT_IPI, SBI_EXT_RFENCE };
     for (unsigned i = 0; i < 3; i++)
         if (sbi_probe_extension(required[i]) <= 0) riscv_smp_fail("SBI-extension", required[i]);
@@ -315,6 +318,7 @@ void riscv_smp_start(const struct dtb_cpu_info *info, uint64_t transition,
         virt_uart_putc('0' + i); virt_uart_puts(" hart=");
         virt_uart_put_hex(cpus[i]->hardware_id); virt_uart_putc('\n');
     }
+    hwprobe_allocator = NULL;
 }
 
 void riscv_smp_report_user_execution(void)

@@ -1,5 +1,6 @@
 #include <arch/riscv/vector.h>
 #include <arch/riscv/uaccess.h>
+#include <arch/riscv/hwprobe.h>
 #include <kernel/accounting.h>
 #include <kernel/cost.h>
 #include <arch/context.h>
@@ -218,7 +219,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         return;
     }
 
-    if (!from_user && riscv_uaccess_fault(frame)) return;
+    if (!from_user && (riscv_uaccess_fault(frame) || riscv_hwprobe_fault(frame))) return;
 
     if (from_user &&
         (frame->scause & RISCV_SCAUSE_INTERRUPT) == 0U) {
