@@ -283,11 +283,16 @@ struct ext4_block_payload *ext4_bcache_borrow_owned(const struct ext4_block *own
 void ext4_block_rebind(struct ext4_block *, struct ext4_block_payload *);
 /* A nonzero tree key certifies the exact, complete replacement bytes. */
 void ext4_bcache_publish(struct ext4_buf *, struct ext4_block_payload *, uint64_t tree_key);
+/* A merge returns the duplicate pin and descriptor. The running record
+ * keeps its own descriptor and journal home pin. */
+void ext4_bcache_publish_journal(struct ext4_block *, struct ext4_block_payload *,
+    uint64_t tree_key, bool merged);
 void ext4_bcache_begin_fresh(struct ext4_buf *);
 void ext4_bcache_cancel_fresh(struct ext4_buf *);
 struct ext4_block_patch { uint32_t offset, length; };
-bool ext4_bcache_patch_current(struct ext4_buf *, struct ext4_block_payload *,
-    unsigned owners, const uint8_t *bytes, const struct ext4_block_patch *patches,
+/* A successful patch consumes the duplicate journal loan. */
+bool ext4_bcache_patch_current(struct ext4_block *redundant, unsigned owners,
+    const uint8_t *bytes, const struct ext4_block_patch *patches,
     unsigned count, uint64_t tree_key);
 void ext4_bcache_insert_dirty_node(struct ext4_bcache *, struct ext4_buf *);
 void ext4_bcache_remove_dirty_node(struct ext4_bcache *, struct ext4_buf *);

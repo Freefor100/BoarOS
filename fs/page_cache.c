@@ -177,7 +177,7 @@ struct kernel_page_cache_record {
     struct cache_request *reads_head, **reads_tail;
     struct range_writeback *range_head, **range_tail;
     uint64_t range_collect_until;
-    struct kernel_wait_queue range_progress;
+    struct kernel_wait_queue range_progress, range_slots;
     uint64_t range_sequence;
     unsigned range_count;
     struct kernel_io_context *executor_io;
@@ -1540,6 +1540,7 @@ static enum kernel_page_cache_status cache_init(
     }
     kernel_wait_queue_init(&record->work);
     kernel_wait_queue_init(&record->range_progress);
+    kernel_wait_queue_init(&record->range_slots);
     record->reads_tail=&record->reads_head;
     record->range_tail=&record->range_head;
     kernel_mutex_init(&record->metadata, 45, (uintptr_t)record);
@@ -4970,7 +4971,7 @@ int kernel_page_cache_submit_range(struct kernel_page_cache *cache,
                 if (starts_queue || !record->range_collect_until) cache_wake(&record->work);
                 return 0;
             }
-            if (kernel_wait_prepare(&record->range_progress, 0, 0, &token))
+            if (kernel_wait_prepare(&record->range_slots, 0, 0, &token))
                 __builtin_trap();
         }
         wait_range_progress(&token);
@@ -5049,6 +5050,8 @@ static void retire_range_requests(struct kernel_page_cache *cache,
         last->next = NULL;
         record->range_count -= count;
         cache_wake(&record->range_progress);
+        if (__atomic_load_n(&record->range_slots.registrations, __ATOMIC_ACQUIRE))
+            cache_wake(&record->range_slots);
     }
     while (first) {
         struct range_writeback *next = first->next;
@@ -6094,7 +6097,12 @@ void kernel_page_cache_stop_worker(struct kernel_page_cache *cache)
 {
     if (!cache_live(cache) || !cache->record->started) return;
     struct kernel_page_cache_record *r = cache->record;
-    { CACHE_SCOPE(stop, cache); r->stopping = 1; r->dirty_cursor=NULL; r->dirty_remaining=0; }
+    {
+        CACHE_SCOPE(stop, cache);
+        r->stopping = 1; r->dirty_cursor=NULL; r->dirty_remaining=0;
+        if (__atomic_load_n(&r->range_slots.registrations, __ATOMIC_ACQUIRE))
+            cache_wake(&r->range_slots);
+    }
     cache_wake(&r->group->progress);
     version_pool_stop(r->versions);
     {

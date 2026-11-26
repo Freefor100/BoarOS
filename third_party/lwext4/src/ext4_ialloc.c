@@ -113,11 +113,10 @@ static uint32_t ext4_ialloc_bitmap_csum(struct ext4_sblock *sb,	void *bitmap)
 #define ext4_ialloc_bitmap_csum(...) 0
 #endif
 
-void ext4_ialloc_set_bitmap_csum(struct ext4_sblock *sb, struct ext4_bgroup *bg,
-				 void *bitmap __unused)
+static void set_inode_bitmap_checksum(struct ext4_sblock *sb,
+    struct ext4_bgroup *bg, uint32_t csum)
 {
 	int desc_size = ext4_sb_get_desc_size(sb);
-	uint32_t csum = ext4_ialloc_bitmap_csum(sb, bitmap);
 	uint16_t lo_csum = to_le16(csum & 0xFFFF),
 		 hi_csum = to_le16(csum >> 16);
 
@@ -129,6 +128,12 @@ void ext4_ialloc_set_bitmap_csum(struct ext4_sblock *sb, struct ext4_bgroup *bg,
 	if (desc_size == EXT4_MAX_BLOCK_GROUP_DESCRIPTOR_SIZE)
 		bg->inode_bitmap_csum_hi = hi_csum;
 
+}
+
+void ext4_ialloc_set_bitmap_csum(struct ext4_sblock *sb, struct ext4_bgroup *bg,
+				 void *bitmap __unused)
+{
+    set_inode_bitmap_checksum(sb, bg, ext4_ialloc_bitmap_csum(sb, bitmap));
 }
 
 bool
@@ -193,10 +198,18 @@ static bool inode_bitmap_checked(struct ext4_block_group_ref *group, struct ext4
 }
 
 static int inode_bitmap_dirty(struct ext4_block_group_ref *group, struct ext4_block *block,
-    uint32_t bit)
+    uint32_t bit, const uint8_t *baseline, uint32_t length)
 {
-    ext4_ialloc_set_bitmap_csum(ext4_fs_super(group->fs), group->block_group, block->data);
+    struct ext4_sblock *sb = ext4_fs_super(group->fs);
     uint32_t offset = (bit / 8) & ~31U;
+    if (baseline) {
+        uint32_t checksum = ext4_crc32c(ext4_sb_get_csum_seed(sb), baseline, offset);
+        uint32_t changed = length - offset < 32 ? length - offset : 32;
+        checksum = ext4_crc32c(checksum, block->data + offset, changed);
+        uint32_t end = offset + changed;
+        checksum = ext4_crc32c(checksum, baseline + end, length - end);
+        set_inode_bitmap_checksum(sb, group->block_group, checksum);
+    } else ext4_ialloc_set_bitmap_csum(sb, group->block_group, block->data);
     return ext4_trans_set_tree_dirty_range(block, offset, 32, inode_bitmap_key(group));
 }
 
@@ -282,7 +295,7 @@ int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 	/* Free i-node in the bitmap */
 	ext4_bmap_bit_clr(b.data, index_in_group);
 	/* Put back the block with bitmap */
-	rc = inode_bitmap_dirty(&bg_ref, &b, index_in_group);
+	rc = inode_bitmap_dirty(&bg_ref, &b, index_in_group, NULL, 0);
 	int release = ext4_block_set(fs->bdev, &b);
 	if (!rc) rc = release;
 	if (rc != EOK) {
@@ -369,6 +382,14 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir,
         name_len, &first_group);
     if (selected) return selected;
     uint32_t bg_count = ext4_block_group_cnt(sb);
+    uint32_t bitmap_bytes = inode_bitmap_bytes(sb);
+    struct jbd_trans *trans = NULL;
+#if CONFIG_JOURNALING_ENABLE && CONFIG_META_CSUM_ENABLE
+    if (bitmap_bytes>32 && fs->jbd_journal && fs->jbd_journal->grouped &&
+        ext4_fs_serial_writer(fs) &&
+        ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM))
+        trans = ext4_current_trans(fs);
+#endif
     for (uint32_t step = 0; step < bg_count; step++) {
         uint32_t bgid = (first_group + step) % bg_count;
 		/* Load block group to check */
@@ -389,7 +410,9 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir,
 			ext4_fsblk_t bmp_blk_add = ext4_bg_get_inode_bitmap(bg, sb);
 
 			struct ext4_block b;
-			rc = ext4_trans_block_get_range(fs->bdev, &b, bmp_blk_add, 0, inode_bitmap_bytes(sb));
+			rc = trans ? ext4_block_get_range(fs->bdev, &b, bmp_blk_add, 0,
+				bitmap_bytes, EXT4_BLOCK_READ) :
+				ext4_trans_block_get_range(fs->bdev, &b, bmp_blk_add, 0, bitmap_bytes);
 			if (rc != EOK) {
 				ext4_fs_put_block_group_ref(&bg_ref);
 				return rc;
@@ -430,6 +453,19 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir,
 			}
 
             rc = ext4_fs_reserve_inodes(fs, 1);
+#if CONFIG_JOURNALING_ENABLE
+            const uint8_t *baseline = NULL;
+            if (!rc && trans) {
+                const uint8_t *accepted = b.data;
+                uint32_t offset = (idx_in_bg / 8) & ~31U;
+                rc = jbd_trans_prepare_checked_patch(trans, &b, offset, 32, UINT32_MAX);
+                if (!rc) baseline = accepted;
+                else if (rc == ENOTSUP)
+                    rc = jbd_trans_get_write_access_range(trans, &b, 0, bitmap_bytes);
+            }
+#else
+            const uint8_t *baseline = NULL;
+#endif
             if (rc) {
                 ext4_block_set(fs->bdev, &b);
                 ext4_fs_put_block_group_ref(&bg_ref);
@@ -438,7 +474,7 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir,
 			ext4_bmap_bit_set(b.data, idx_in_bg);
 
 			/* Free i-node found, save the bitmap */
-			rc = inode_bitmap_dirty(&bg_ref, &b, idx_in_bg);
+			rc = inode_bitmap_dirty(&bg_ref, &b, idx_in_bg, baseline, bitmap_bytes);
 			int release = ext4_block_set(fs->bdev, &b);
 			if (!rc) rc = release;
 			if (rc != EOK) {
