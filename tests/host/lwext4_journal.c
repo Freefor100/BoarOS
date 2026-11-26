@@ -431,11 +431,18 @@ static void direct_ordered_data(struct ext4_blockdev *dev,struct jbd_journal *jo
 }
 
 static unsigned range_phases, range_requests;
-static void range_serial_lock(void *context) { (void)context; }
-static bool range_serial_writer(void *context) { (void)context; return true; }
+static unsigned range_mount_readers;
+static bool range_expect_shared;
+static void range_serial_lock(void *context) { (void)context; CHECK(!range_mount_readers); }
+static void range_read_lock(void *context) { (void)context; range_mount_readers++; }
+static void range_unlock(void *context)
+{ (void)context; if (range_mount_readers) range_mount_readers--; }
+static bool range_serial_writer(void *context)
+{ (void)context; return !range_mount_readers; }
 
 static int range_data_phase(struct ext4_blockdev *dev, const struct ext4_block_write *first)
 {
+    if (range_expect_shared) CHECK(range_mount_readers == 1);
     range_phases++;
     for (const struct ext4_block_write *entry = first; entry; entry = entry->next)
         range_requests++;
@@ -499,8 +506,8 @@ static void complete_ordered_range_batch(struct ext4_blockdev *dev, struct jbd_j
         CHECK(ext4_fs_get_inode_dblk_idx(&ref, 0, &homes[i], false) == EOK && homes[i]);
         CHECK(ext4_fs_put_inode_ref(&ref) == EOK);
     }
-    const struct ext4_lock locks = {.lock=range_serial_lock, .unlock=range_serial_lock,
-        .serial_writer=range_serial_writer};
+    const struct ext4_lock locks = {.lock=range_serial_lock, .unlock=range_unlock,
+        .read_lock=range_read_lock, .serial_writer=range_serial_writer};
     CHECK(ext4_mount_setup_locks("/", &locks) == EOK);
     dev->fs->jbd_journal = journal;
     CHECK(jbd_journal_group_init(journal, 4 * 1024 * 1024) == EOK);
@@ -520,7 +527,10 @@ static void complete_ordered_range_batch(struct ext4_blockdev *dev, struct jbd_j
     dev->bdif->bwrite_phase = range_data_phase;
     uint64_t flushes = disk.flushes;
     if (fault) disk.fail_write = disk.writes + fault;
+    range_expect_shared = true;
     int result = ext4_fdata_complete_batch(ranges, 2);
+    range_expect_shared = false;
+    CHECK(!range_mount_readers);
     CHECK(disk.flushes == flushes && !journal->durable_sequence);
     if (fault) {
         CHECK(result == EIO && jbd_journal_error(journal) == EIO);

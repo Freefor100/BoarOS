@@ -21,11 +21,13 @@ flowchart LR
     Check -- "普通读 / 扇区对齐写 /<br/>对齐批量写" --> SharedT["共享 transfer_lock<br/>（多核并行提交到驱动）"]
     Check -- "日志长阶段写<br/>(write_phase)" --> SharedP["共享 phase_barrier<br/>+ 共享 transfer_lock"]
     Check -- "非扇区对齐写<br/>(触发 RMW)" --> ExclT["独占 transfer_lock<br/>（读扇区→改字节→写回原子化）"]
-    Check -- "FLUSH / 容量或只读变更 /<br/>loop 配置修改" --> ExclAll["独占 phase_barrier（秩 50）<br/>→ 独占 transfer_lock（秩 51）"]
+    Check -- "VirtIO FLUSH" --> Flush["独占 phase_barrier<br/>+ 共享 transfer_lock<br/>由驱动维持写入屏障"]
+    Check -- "其他设备 FLUSH / 容量或只读变更 /<br/>loop 配置修改" --> ExclAll["独占 phase_barrier（秩 50）<br/>→ 独占 transfer_lock（秩 51）"]
 
     SharedT --> DrvLock["VirtIO 驱动短锁 metadata<br/>（仅保护队列、位图与完成状态；锁外拷贝/分配/休眠）"]
     SharedP --> DrvLock
     ExclT --> DrvLock
+    Flush --> DrvLock
     ExclAll --> DrvLock
 ```
 
@@ -65,7 +67,7 @@ flowchart LR
 - **轮询与中断协作**：启动早期采用显式轮询；启用外部中断控制器（RISC-V PLIC / LoongArch PCH-PIC）后，任务在等待前会先轻量检查 `used->index`（无进展时不访问中断寄存器），登记等待后再次检查，若 DMA 已就绪则不进入睡眠。真实中断总是**先确认设备中断再收割完成环**，确保确认期间新到达的完成项不会丢失通知。
 - **细粒度等待队列**：驱动内部划分 6 条独立等待队列（`admission` 入场、`idle` 刷新排空、`slots` 普通槽、`slots_low` 低优先级槽、`descriptors` 描述符、`workspaces` 批量工作区），加上每槽独立的完成队列 `done`。DMA 完成立即归还描述符并唤醒对应完成队列；请求槽则保留到原调用者消费完结果（如完成中转区拷贝）后才归还并唤醒槽位等待者。
 - **持久化屏障（`FLUSH`）与超时策略**：
-  - `FLUSH` 先置 `barrier_waiters` 阻断新逻辑调用，待所有已入场调用排空（`active == 0`）后发送类型 4 请求（仅头 + 状态共 2 个描述符；已入场的批量调用仍允许补发余下分片，避免互锁）。直写设备同样经过软件排空屏障但不下发硬件 `FLUSH`。
+  - `FLUSH` 登记后暂停接纳新请求，等待已经入场的调用完成。已入场的批量调用继续提交自己的剩余分片。驱动取得请求槽和两个描述符，发布类型 4 的刷新请求后重新接纳读。后续写入和下一次刷新等到当前刷新报告完成。块层在物理父盘上持有共享传输资格，因此跨分区的读也能继续，而扇区读改写和设备配置修改仍须取得独占资格。直写设备只执行软件排空屏障。
   - **普通读写 30 秒超时**：从发布时刻起以平台时钟频率计算 30 秒期限；到期重查仍无进展时输出故障现场并执行同步复位，确认 DMA 停止后向所有在途请求交付 `TIMEOUT`，设备进入失败态。
   - **`FLUSH` 持久等待**：后端同步无固定时间上界，因此 `FLUSH` 每 30 秒检查一次；若仍未完成，打印等待提示并顺延 30 秒期限，**不重发、不复位，也不虚报持久化成功**。
 

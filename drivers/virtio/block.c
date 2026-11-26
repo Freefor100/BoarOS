@@ -641,9 +641,14 @@ int virtio_block_enable_irq(struct virtio_block_device *device, uint32_t source)
     device->irq_source = source;
     return 1;
 }
-static int admission_available(const struct virtio_block_device *device, int barrier)
+enum block_call { BLOCK_CALL_READ, BLOCK_CALL_FLUSH, BLOCK_CALL_WRITE };
+enum block_barrier { BLOCK_BARRIER_PREPARING = 1, BLOCK_BARRIER_SUBMITTED };
+
+static int admission_available(const struct virtio_block_device *device, enum block_call call)
 {
-    return !device->barrier && (barrier ? !device->active : !device->barrier_waiters);
+    if (call == BLOCK_CALL_FLUSH) return !device->barrier && !device->active;
+    return !device->barrier_waiters && (!device->barrier ||
+        (call == BLOCK_CALL_READ && device->barrier == BLOCK_BARRIER_SUBMITTED));
 }
 static void start_call_locked(struct virtio_block_device *device)
 {
@@ -654,16 +659,17 @@ static void check_io_context(const struct virtio_block_device *device)
 {
     if (device->irq_source && (!kernel_scheduler_can_sleep() || arch_external_interrupt_active())) __builtin_trap();
 }
-static int begin_call(struct virtio_block_device *device, int barrier)
+static int begin_call(struct virtio_block_device *device, enum block_call call)
 {
+    int barrier = call == BLOCK_CALL_FLUSH;
     check_io_context(device);
     KERNEL_IRQ_LOCK_SCOPE(guard,&device->metadata);
     if (barrier) device->barrier_waiters++;
     for (;;) {
         if (!device_live(device)) break;
-        if (admission_available(device, barrier)) {
+        if (admission_available(device, call)) {
             start_call_locked(device);
-            if (barrier) { device->barrier_waiters--; device->barrier = 1; }
+            if (barrier) { device->barrier_waiters--; device->barrier = BLOCK_BARRIER_PREPARING; }
             return 1;
         }
         if (!device->irq_source) __builtin_trap();
@@ -672,18 +678,19 @@ static int begin_call(struct virtio_block_device *device, int barrier)
     if (barrier) device->barrier_waiters--;
     return 0;
 }
-static void end_call_locked(struct virtio_block_device *device, int barrier)
+static void end_call_locked(struct virtio_block_device *device, enum block_call call)
 {
+    int barrier = call == BLOCK_CALL_FLUSH;
     if (!device->active || (barrier && !device->barrier)) __builtin_trap();
     device->active--;
     if (barrier) device->barrier = 0;
     if (!device->active) wake(&device->idle);
     if (barrier && !device->barrier_waiters) wake(&device->admission);
 }
-static void end_call(struct virtio_block_device *device, int barrier)
+static void end_call(struct virtio_block_device *device, enum block_call call)
 {
     KERNEL_IRQ_LOCK_SCOPE(guard,&device->metadata);
-    end_call_locked(device, barrier);
+    end_call_locked(device, call);
 }
 static unsigned batch_descriptor_minimum(const struct virtio_block_device *device,
     enum kernel_block_priority priority)
@@ -865,8 +872,15 @@ static enum kernel_block_status publish_request_locked(struct virtio_block_devic
 {
     enum kernel_block_status status = publish_segments(device, r, type, sector,
         &data_address,&data_length, type == VIRTIO_BLOCK_REQUEST_FLUSH ? 0 : 1, bounce);
-    if (status == KERNEL_BLOCK_STATUS_OK &&
-        virtio_split_notify(&device->queue, &device->transport, 0) != VIRTIO_OK) __builtin_trap();
+    if (status == KERNEL_BLOCK_STATUS_OK) {
+        if (virtio_split_notify(&device->queue, &device->transport, 0) != VIRTIO_OK) __builtin_trap();
+        if (type == VIRTIO_BLOCK_REQUEST_FLUSH) {
+            /* FLUSH owns its queue slot and descriptors before readers can
+             * join. New writes wait for the durable completion. */
+            device->barrier = BLOCK_BARRIER_SUBMITTED;
+            wake(&device->admission);
+        }
+    }
     return status;
 }
 static enum kernel_block_status finish_request(struct virtio_block_device *device,
@@ -944,12 +958,12 @@ static enum kernel_block_status virtio_block_flush(void *context)
 {
     struct virtio_block_device *device = context;
     if (!device_live(device)) return KERNEL_BLOCK_STATUS_IO;
-    if (!begin_call(device, 1)) return KERNEL_BLOCK_STATUS_IO;
+    if (!begin_call(device, BLOCK_CALL_FLUSH)) return KERNEL_BLOCK_STATUS_IO;
     struct block_request *r = reserve_request(device);
-    if (!r) { end_call(device, 1); return KERNEL_BLOCK_STATUS_IO; }
+    if (!r) { end_call(device, BLOCK_CALL_FLUSH); return KERNEL_BLOCK_STATUS_IO; }
     enum kernel_block_status result = device->block.cache_mode == KERNEL_BLOCK_CACHE_WRITETHROUGH
         ? KERNEL_BLOCK_STATUS_OK : submit_request(device, r, VIRTIO_BLOCK_REQUEST_FLUSH, 0, 0, 0, 0);
-    release_request(device, r); end_call(device, 1); return result;
+    release_request(device, r); end_call(device, BLOCK_CALL_FLUSH); return result;
 }
 
 static enum kernel_block_status transfer_read(struct virtio_block_device *device, struct block_request *r,
@@ -1124,20 +1138,20 @@ static enum kernel_block_status transfer_write(struct virtio_block_device *devic
 static enum kernel_block_status virtio_block_read(void *context, uint64_t offset, void *buffer, size_t size)
 {
     struct virtio_block_device *device = context;
-    if (!begin_call(device, 0)) return KERNEL_BLOCK_STATUS_IO;
+    if (!begin_call(device, BLOCK_CALL_READ)) return KERNEL_BLOCK_STATUS_IO;
     struct block_request *r = reserve_request_prio(device, KERNEL_BLOCK_PRIO_HIGH);
-    if (!r) { end_call(device, 0); return KERNEL_BLOCK_STATUS_IO; }
+    if (!r) { end_call(device, BLOCK_CALL_READ); return KERNEL_BLOCK_STATUS_IO; }
     enum kernel_block_status result = transfer_read(device, r, offset, buffer, size);
-    release_request(device, r); end_call(device, 0); return result;
+    release_request(device, r); end_call(device, BLOCK_CALL_READ); return result;
 }
 static enum kernel_block_status virtio_block_write(void *context, uint64_t offset, const void *buffer, size_t size)
 {
     struct virtio_block_device *device = context;
-    if (!begin_call(device, 0)) return KERNEL_BLOCK_STATUS_IO;
+    if (!begin_call(device, BLOCK_CALL_WRITE)) return KERNEL_BLOCK_STATUS_IO;
     struct block_request *r = reserve_request_prio(device, KERNEL_BLOCK_PRIO_NORMAL);
-    if (!r) { end_call(device, 0); return KERNEL_BLOCK_STATUS_IO; }
+    if (!r) { end_call(device, BLOCK_CALL_WRITE); return KERNEL_BLOCK_STATUS_IO; }
     enum kernel_block_status result = transfer_write(device, r, offset, buffer, size);
-    release_request(device, r); end_call(device, 0); return result;
+    release_request(device, r); end_call(device, BLOCK_CALL_WRITE); return result;
 }
 
 
@@ -1241,8 +1255,9 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
     struct batch_transfer *parts=workspace->parts;
     kernel_wait_queue_init(&workspace->done);
     int writing = writes || next;
+    enum block_call call = writing ? BLOCK_CALL_WRITE : BLOCK_CALL_READ;
     COST_SCOPE(device_cost, OPERATION_TICKS);
-    if (!begin_call(device, 0)) {
+    if (!begin_call(device, call)) {
         if (reads) for (size_t i = 0; i < count; i++) if (reads[i].size) reads[i].status = KERNEL_BLOCK_STATUS_IO;
         return KERNEL_BLOCK_STATUS_IO;
     }
@@ -1464,7 +1479,7 @@ static enum kernel_block_status transfer_batch_parts(struct virtio_block_device 
         if (parts[i].request) __builtin_trap();
         if (reads && result == KERNEL_BLOCK_STATUS_OK && reads[i].status != KERNEL_BLOCK_STATUS_OK) result = reads[i].status;
     }
-    end_call(device, 0);
+    end_call(device, call);
     return result;
 }
 
@@ -1601,7 +1616,7 @@ static enum kernel_block_status transfer_phase_indirect(struct virtio_block_devi
     const void *context, const void *first, int unordered)
 {
     COST_SCOPE(device_cost, OPERATION_TICKS);
-    if (!begin_call(device, 0)) return KERNEL_BLOCK_STATUS_IO;
+    if (!begin_call(device, BLOCK_CALL_WRITE)) return KERNEL_BLOCK_STATUS_IO;
     kernel_wait_queue_init(&workspace->done);
     struct phase_source source = {.next = next, .context = context, .cursor = first,
         .ordered = unordered ? workspace->ordered_phase : NULL};
@@ -1684,7 +1699,7 @@ static enum kernel_block_status transfer_phase_indirect(struct virtio_block_devi
             }
         }
     }
-    end_call(device, 0);
+    end_call(device, BLOCK_CALL_WRITE);
     return result;
 }
 
@@ -1746,7 +1761,7 @@ static enum kernel_block_status read_direct_span(struct virtio_block_device *dev
         uint64_t free = free_descriptor_mask(device);
         free &= free - 1;
         free &= free - 1;
-        if (free && admission_available(device, 0)) {
+        if (free && admission_available(device, BLOCK_CALL_READ)) {
             struct block_request *request = try_reserve_request(device, KERNEL_BLOCK_PRIO_HIGH);
             if (request) {
                 COST_SCOPE(device_cost, OPERATION_TICKS);
@@ -1755,12 +1770,12 @@ static enum kernel_block_status read_direct_span(struct virtio_block_device *dev
                     VIRTIO_BLOCK_REQUEST_IN, sector, physical, (uint32_t)span->size, 0);
                 if (result == KERNEL_BLOCK_STATUS_OK) result = wait_request_locked(device, request, &guard);
                 release_request_locked(device, request);
-                end_call_locked(device, 0);
+                end_call_locked(device, BLOCK_CALL_READ);
                 return result;
             }
         }
     }
-    if (!begin_call(device, 0)) return KERNEL_BLOCK_STATUS_IO;
+    if (!begin_call(device, BLOCK_CALL_READ)) return KERNEL_BLOCK_STATUS_IO;
     struct block_request *request = reserve_request_prio(device, KERNEL_BLOCK_PRIO_HIGH);
     enum kernel_block_status result = KERNEL_BLOCK_STATUS_IO;
     if (request) {
@@ -1768,7 +1783,7 @@ static enum kernel_block_status read_direct_span(struct virtio_block_device *dev
             sector, physical, (uint32_t)span->size, 0);
         release_request(device, request);
     }
-    end_call(device, 0);
+    end_call(device, BLOCK_CALL_READ);
     return result;
 }
 
@@ -1911,6 +1926,7 @@ enum virtio_block_status virtio_block_init(
     result.block.write_batch_prio = result.read_only != 0U ? 0 : virtio_block_write_batch_prio;
     result.block.write_phase = result.read_only != 0U ? 0 : virtio_block_write_phase;
     result.block.flush = virtio_block_flush;
+    result.block.flush_allows_reads = 1;
     result.block.capacity_bytes =
         capacity_sectors * VIRTIO_BLOCK_SECTOR_SIZE;
     result.block.logical_block_size = VIRTIO_BLOCK_SECTOR_SIZE;

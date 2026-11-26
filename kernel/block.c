@@ -233,7 +233,12 @@ enum kernel_block_status kernel_block_flush_through(struct kernel_block_device *
     BLOCK_REQUEST(device);
     struct kernel_block_device *disk = physical(device);
     KERNEL_LOCK_SCOPE(io); kernel_rwlock_write(&disk->phase_barrier, &io);
-    KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_write(&disk->transfer_lock, &transfer);
+    KERNEL_LOCK_SCOPE(transfer);
+    /* A device fence that owns aligned-write admission can share a
+     * transfer guard. Sector read-modify-write and reconfiguration still
+     * require exclusive access to the full transfer. */
+    if (disk->flush_allows_reads) kernel_rwlock_read(&disk->transfer_lock, &transfer);
+    else kernel_rwlock_write(&disk->transfer_lock, &transfer);
     if (target && __atomic_load_n(&disk->flushed_writeback_epoch, __ATOMIC_RELAXED) >= target)
         return KERNEL_BLOCK_STATUS_OK;
     uint64_t completed = kernel_block_writeback_epoch(disk);

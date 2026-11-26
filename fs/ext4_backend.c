@@ -3531,14 +3531,28 @@ static bool ext4_backend_writeback_growth(struct kernel_vfs_node *node, uint64_t
     return start >= stored;
 }
 
+static int complete_data_result(struct lwext4_mount_adapter *adapter, int result)
+{
+    if (result && jbd_journal_error(adapter->device.fs->jbd_journal)) {
+        const struct ext4_lock *locks = &adapter->locks;
+        /* Failed home I/O may have used a read scope. Publish the sticky
+         * error to durability waiters through the mount writer's exit. */
+        locks->lock(locks->context);
+        locks->unlock(locks->context);
+    }
+    return lwext4_error(result);
+}
+
 static int ext4_backend_complete_data_range(struct kernel_vfs_node *node, uint64_t start, uint64_t end)
 {
-    struct jbd_journal *journal = lwext4_instance(node->instance)->device.fs->jbd_journal;
+    struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
+    struct jbd_journal *journal = adapter->device.fs->jbd_journal;
     if (!journal || jbd_journal_error(journal))
         return 0;
     if (!__atomic_load_n(&journal->ordered_trees, __ATOMIC_ACQUIRE))
         return 0;
-    return lwext4_error(ext4_fdata_complete(lwext4_node_file(node), start, end - start));
+    return complete_data_result(adapter,
+        ext4_fdata_complete(lwext4_node_file(node), start, end - start));
 }
 
 static int ext4_backend_complete_data_batch(const struct kernel_vfs_data_range *ranges, unsigned count)
@@ -3552,7 +3566,7 @@ static int ext4_backend_complete_data_batch(const struct kernel_vfs_data_range *
     for (unsigned i = 0; i < count; i++)
         files[i] = (struct ext4_file_data_range){
             lwext4_node_file(ranges[i].node), ranges[i].start, ranges[i].end};
-    return lwext4_error(ext4_fdata_complete_batch(files, count));
+    return complete_data_result(adapter, ext4_fdata_complete_batch(files, count));
 }
 
 static size_t ext4_backend_direct_alignment(struct kernel_vfs_node *node)
