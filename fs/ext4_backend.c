@@ -3696,13 +3696,30 @@ static int ext4_backend_readlink(struct kernel_vfs_node *node, char *buffer, siz
 }
 static int ext4_backend_truncate(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed)
 {
-    uint64_t before = ext4_fsize(lwext4_node_file(node));
-    int result = ext4_ftruncate(lwext4_node_file(node), size, kernel_vfs_write_mode(node->mode,node->gid));
-    *actual = ext4_fsize(lwext4_node_file(node));
+    ext4_file *file = lwext4_node_file(node);
+    uint64_t before = ext4_fsize(file);
+    uint32_t mode = kernel_vfs_write_mode(node->mode,node->gid);
+    bool prune_tail = before < size && size <= node->size &&
+        lwext4_instance(node->instance)->device.fs->jbd_journal;
+    int result = prune_tail ? ext4_ftruncate_prune_tail(file, size, mode) :
+        ext4_ftruncate(file, size, mode);
+    *actual = ext4_fsize(file);
     *changed = result == EOK || before != *actual;
-    if (*changed) ext4_file_release_reservations(lwext4_node_file(node),*actual);
-    if (*changed) {node->mode=kernel_vfs_write_mode(node->mode,node->gid);((struct lwext4_node *)node)->capability_absent=1;}
+    if (*changed) {
+        ext4_file_release_reservations(file, *actual);
+        node->mode = mode;
+        ((struct lwext4_node *)node)->capability_absent = 1;
+    }
     return lwext4_error(result);
+}
+static bool ext4_backend_truncate_preserves_dirty_prefix(struct kernel_vfs_node *node, uint64_t size)
+{
+    struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
+    uint64_t stored = ext4_fsize(lwext4_node_file(node));
+    /* Extending the backing inode across its own partial EOF block still
+     * reconciles buffered data before the backend zeroes that block's tail. */
+    return adapter->device.fs->jbd_journal &&
+        (size <= stored || !(stored & (node->instance->writeback_block_size - 1U)));
 }
 static bool ext4_backend_fallocate_preserves_dirty_prefix(struct kernel_vfs_node *node)
 {
@@ -3951,6 +3968,7 @@ static void initialize_backend(void)
     ops->readlink = ext4_backend_readlink;
     ops->check_domain = ext4_check_domain;
     ops->truncate = ext4_backend_truncate;
+    ops->truncate_preserves_dirty_prefix = ext4_backend_truncate_preserves_dirty_prefix;
     ops->fallocate_zero_range = true;
     ops->fallocate_preserves_dirty_prefix = ext4_backend_fallocate_preserves_dirty_prefix;
     ops->fallocate = ext4_backend_fallocate;

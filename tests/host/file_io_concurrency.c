@@ -1612,6 +1612,52 @@ static void sparse_writeback_case(struct kernel_heap *heap,struct kernel_vfs_mou
 #endif
 }
 
+static void truncate_dirty_prefix_case(struct kernel_heap *heap, struct kernel_vfs_mount *mount)
+{
+    const size_t page = BOAROS_PAGE_SIZE;
+    struct kernel_open_file_description *file = NULL;
+    int error;
+    size_t done;
+    assert(!kernel_open_file_create_mode(heap, mount, "/truncate-dirty", 0600, &file, &error) && !error);
+    file->open_flags = 2;
+    assert(!kernel_vfs_file_acquire_write(&file->file));
+    assert(!kernel_vfs_ftruncate(&file->file, page));
+    assert(!kernel_vfs_fallocate(&file->file, KERNEL_VFS_FALLOC_KEEP_SIZE, 4*page, page));
+    unsigned char *bytes = malloc(4*page), *actual = malloc(4*page);
+    assert(bytes && actual);
+    memset(bytes, 0x39, 4*page);
+    assert(!kernel_vfs_pwrite(&file->file, 0, bytes, 4*page, &done) && done == 4*page);
+    struct kernel_vfs_stat stat;
+    assert(!kernel_vfs_fstat(&file->file, &stat) && stat.size == 4*page && stat.blocks == 5*page/512);
+
+    /* The first shrink stays beyond backing EOF. The retained pages need no
+     * foreground writeback, and keep-size preallocation still must go away. */
+    watch_sparse_node = kernel_open_file_node(file);
+    sparse_spans = sparse_source_bytes = 0;
+    assert(!kernel_vfs_ftruncate(&file->file, 2*page));
+    assert(!sparse_spans && "aligned journaled shrink must leave the dirty prefix buffered");
+    assert(!kernel_vfs_fstat(&file->file, &stat) && stat.size == 2*page && stat.blocks == 2*page/512);
+    assert(!kernel_open_file_pread(file, 0, actual, 4*page, &done) && done == 2*page &&
+        !memcmp(actual, bytes, done));
+
+    /* A partial EOF still reconciles the surviving part of its boundary page. */
+    size_t partial = page + 519;
+    assert(!kernel_vfs_ftruncate(&file->file, partial));
+    assert(sparse_source_bytes && sparse_source_bytes <= page);
+    watch_sparse_node = NULL;
+    assert(!kernel_vfs_ftruncate(&file->file, 4*page));
+    uint64_t observed = 0;
+    assert(!kernel_vfs_sync(&file->file, 0, &observed));
+    assert(!kernel_page_cache_invalidate_node(kernel_open_file_page_cache(file), kernel_open_file_node(file)));
+    memset(bytes + partial, 0, 4*page - partial);
+    assert(!kernel_open_file_pread(file, 0, actual, 4*page, &done) && done == 4*page &&
+        !memcmp(actual, bytes, done));
+    assert(!kernel_open_file_release(&file) && !kernel_vfs_unlink(mount, "/truncate-dirty"));
+    free(actual);
+    free(bytes);
+    puts("PASS journaled shrink preserves the buffered prefix, writes only the partial EOF page and releases tail allocation");
+}
+
 static void directory_eof(struct kernel_heap *heap,struct kernel_vfs_mount *mount)
 {
     assert(!kernel_vfs_mkdir(mount,"/empty-directory",0700));
@@ -1989,10 +2035,11 @@ int main(int argc,char **argv)
     int transfers_only=getenv("FILE_IO_TRANSFERS_ONLY")!=NULL;
     int direct_only=getenv("FILE_IO_DIRECT_ONLY")!=NULL;
     int range_only=getenv("FILE_IO_RANGE_ONLY")!=NULL;
+    int truncate_only=getenv("FILE_IO_TRUNCATE_ONLY")!=NULL;
     int paths_only=getenv("FILE_IO_PATHS_ONLY")!=NULL;
     int directories_only=getenv("FILE_IO_DIRECTORIES_ONLY")!=NULL;
     int focused=direct_only || range_only || block_only || directories_only || advice_only ||
-        transfers_only || paths_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
+        transfers_only || paths_only || truncate_only || getenv("FILE_IO_VECTORS_ONLY")!=NULL;
     if (!focused) {
     borrowed_page_case(&pages);
     namespace_retiring_mount_case(&heap);
@@ -2069,6 +2116,7 @@ int main(int argc,char **argv)
         mapped_range_batch_case(&heap,&mount);
     }
     else if (transfers_only) transfer_cases(&heap,&mount);
+    else if (truncate_only) truncate_dirty_prefix_case(&heap,&mount);
     else if (advice_only) file_advice_case(&heap,&mount,&cache);
     else if (focused) synchronous_write_ranges(&heap,&mount);
     else {
@@ -2088,6 +2136,7 @@ int main(int argc,char **argv)
     file_case(&heap,&mount,&cache);
     write_page_fragments(&heap,&mount);
     sparse_writeback_case(&heap,&mount);
+    truncate_dirty_prefix_case(&heap,&mount);
     madvise_file_case(&heap,&mount,&cache);
     memlock_file_case(&heap,&mount,&cache);
     crossing_case(&heap,&mount,&cache);

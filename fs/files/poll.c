@@ -200,6 +200,41 @@ static int poll_snapshot(struct kernel_pollfd *pfds,
     return ready;
 }
 
+static int poll_run_socket(struct kernel_socket *socket, struct kernel_task *task,
+    struct kernel_pollfd *pfd, struct kernel_wait_node *node, uint64_t deadline, int immediate)
+{
+    uint32_t mask = (uint16_t)pfd->events | KERNEL_POLLERR | KERNEL_POLLHUP | KERNEL_POLLNVAL;
+    int events;
+    if (immediate) {
+        events = (int)(kernel_socket_poll(socket, NULL) & mask);
+    } else {
+        if (deadline) deadline = kernel_time_select_deadline(task, deadline);
+        for (;;) {
+            uintptr_t saved_intr = arch_interrupt_save();
+            struct kernel_wait_token token = {0};
+            enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
+            /* Readiness and registration observe the same endpoint state. A
+             * producer can notify this prepared token as soon as that lock drops. */
+            events = kernel_socket_poll_prepare(socket, mask, deadline, node, &token);
+            if (!events && kernel_wait_park(&token, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+                events = -KERNEL_EIO;
+            if (token.task && kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK)
+                __builtin_trap();
+            arch_interrupt_restore(saved_intr);
+
+            if (events > 0) break;
+            if (events < 0) return events;
+            if (reason == KERNEL_WAIT_SIGNALLED) return -KERNEL_EINTR;
+            if (reason == KERNEL_WAIT_TIMEOUT) {
+                events = (int)(kernel_socket_poll(socket, NULL) & mask);
+                break;
+            }
+        }
+    }
+    pfd->revents = (int16_t)events;
+    return events != 0;
+}
+
 static int core_poll_run(
     struct kernel_files *files,
     struct kernel_task *task,
@@ -246,6 +281,13 @@ static int core_poll_run(
             pinned[i] = 0;
             continue;
         }
+    }
+    if (nfds == 1 && pinned[0] && kernel_open_file_kind(pinned[0]) == KERNEL_OPEN_FILE_KIND_SOCKET) {
+        int result = poll_run_socket(kernel_open_file_socket(pinned[0]), task,
+            pfds, nodes, target_monotonic_ns, immediate);
+        if (result < 0) error = result;
+        else ready_count = result;
+        goto finish;
     }
 #if BOAROS_USER_SMP
     /* 先持有真实FD快照，再选择设备执行位置；prepared token期间不迁移。 */
@@ -307,8 +349,8 @@ static int core_poll_run(
         if (reason == KERNEL_WAIT_TIMEOUT) break;
     }
 
-    int interrupted = (error == -KERNEL_EINTR);
-    poll_restore_sigmask(task, saved_mask, mask_modified, interrupted);
+finish:
+    poll_restore_sigmask(task, saved_mask, mask_modified, error == -KERNEL_EINTR);
 
     /* Release all pinned OFDs */
     for (uint32_t i = 0; i < nfds; i++) {

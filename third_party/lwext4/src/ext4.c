@@ -4419,7 +4419,8 @@ static int ext4_zero_allocated_eof_tail(struct ext4_inode_ref *ref,
     uint64_t old_size,uint64_t visible_end)
 { return ext4_zero_allocated_eof_tail_mode(ref,old_size,visible_end,false); }
 
-static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size, uint32_t privilege_mode)
+static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size, uint32_t privilege_mode,
+                                 bool prune_tail)
 {
 	struct ext4_inode_ref ref;
 	struct ext4_sblock *sb = ext4_fs_super(&file->mp->fs);
@@ -4437,11 +4438,12 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size, uint32_t privi
 
 	old_size = ext4_inode_get_size(sb, ref.inode);
 	file->fsize = old_size;
-	if (file->delalloc && size <= old_size)
+	prune_tail |= size <= old_size;
+	if (file->delalloc && prune_tail)
 		file->delalloc->mapped_end = 0;
 	/* 外部 capability 的修改会取得组资格；缩短意图先选定 orphan 记录，
 	 * 仍与 capability、EOF 修改共享同一个失败回滚边界。 */
-	if (old_size >= size && file->mp->fs.jbd_journal) {
+	if (prune_tail && file->mp->fs.jbd_journal) {
 		r = ext4_orphan_add(&ref);
         if (r == EOK) r = ext4_orphan_mark_truncate(&ref,true);
 		if (r != EOK) goto Finish;
@@ -4464,9 +4466,9 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size, uint32_t privi
 			ext4_inode_set_size(ref.inode, size);
 			ref.dirty = true;
 		} else r = ext4_trunc_inode(file->mp, ref.index, size);
-		if (r == EOK && file->fpos > size)
-			file->fpos = size;
 	}
+	if (r == EOK && prune_tail && file->fpos > size)
+		file->fpos = size;
 
 Finish:
 	if (r == EOK || ext4_inode_get_size(sb, ref.inode) != old_size) {
@@ -4479,7 +4481,8 @@ Finish:
 	return r;
 }
 
-int ext4_ftruncate(ext4_file *f, uint64_t size, uint32_t privilege_mode)
+static int ext4_ftruncate_mode(ext4_file *f, uint64_t size, uint32_t privilege_mode,
+                               bool prune_tail)
 {
 	int r;
 	uint64_t saved_size, saved_pos;
@@ -4505,7 +4508,7 @@ Retry:
 	}
 	saved_size = f->fsize;
 	saved_pos = f->fpos;
-	r = ext4_ftruncate_no_lock(f, size, privilege_mode);
+	r = ext4_ftruncate_no_lock(f, size, privilege_mode, prune_tail);
 	r = ext4_file_data_finish(f, r);
 	if (ext4_file_rolled_back(f, r)) {
 		f->fsize = saved_size;
@@ -4520,6 +4523,12 @@ Retry:
 	EXT4_MP_UNLOCK(f->mp);
 	return r;
 }
+
+int ext4_ftruncate(ext4_file *file, uint64_t size, uint32_t privilege_mode)
+{ return ext4_ftruncate_mode(file, size, privilege_mode, false); }
+
+int ext4_ftruncate_prune_tail(ext4_file *file, uint64_t size, uint32_t privilege_mode)
+{ return ext4_ftruncate_mode(file, size, privilege_mode, true); }
 
 /* Holes and unwritten mappings already read as zero and must not acquire
  * storage or become initialized just to erase a partial boundary. */
@@ -6878,7 +6887,7 @@ static int ext4_fsymlink_set(ext4_file *f, const void *buf, uint32_t size)
     int r = ext4_fs_get_inode_ref(&f->mp->fs, f->inode, &ref);
     if (r != EOK) return r;
     if (size > ext4_sb_get_block_size(ext4_fs_super(&f->mp->fs))) r = EINVAL;
-    else r = ext4_ftruncate_no_lock(f, 0, UINT32_MAX);
+    else r = ext4_ftruncate_no_lock(f, 0, UINT32_MAX, false);
     if (!r) r = ext4_symlink_inode_set(&ref, buf, size, false);
 
     if (!r) {

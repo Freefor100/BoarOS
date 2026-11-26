@@ -153,6 +153,19 @@ struct kernel_wait_cursor {
     uint64_t event;
     struct kernel_task *recipient;
 };
+struct kernel_wait_notification {
+    struct kernel_wait_queue *queue;
+    union {
+        struct kernel_wait_cursor cursor;
+        struct kernel_wait_token token;
+    };
+    int direct;
+};
+/* For queues whose task nodes stay registered until their owner finishes.
+ * Capture under the producer's condition lock, deliver after unlocking. */
+int kernel_wait_notification_prepare(struct kernel_wait_queue *, struct kernel_wait_notification *,
+    uint64_t event);
+void kernel_wait_notification_wake(struct kernel_wait_notification *);
 int kernel_wait_cursor_prepare_event(struct kernel_wait_queue *,struct kernel_wait_cursor *,uint64_t,struct kernel_task *);
 void kernel_wait_cursor_wake(struct kernel_wait_cursor *, int);
 /* Caller keeps the queue alive and holds the condition lock. Waiters register

@@ -234,6 +234,20 @@ int kernel_wait_cursor_prepare_event(struct kernel_wait_queue *queue,struct kern
     if(prepared)cursor->event=event;
     return prepared;
 }
+int kernel_wait_notification_prepare(struct kernel_wait_queue *queue,
+    struct kernel_wait_notification *notification, uint64_t event)
+{
+    if (!kernel_wait_cursor_prepare_event(queue, &notification->cursor, event, NULL)) return 0;
+    notification->queue = queue;
+    notification->direct = 0;
+    return 1;
+}
+void kernel_wait_notification_wake(struct kernel_wait_notification *notification)
+{
+    CHECK(!notification->direct);
+    kernel_wait_cursor_wake(&notification->cursor, 1);
+    notification->queue = NULL;
+}
 void kernel_wait_cursor_wake(struct kernel_wait_cursor *cursor,int all)
 {
     CHECK(all && cursor->queue->borrows && !kernel_cpu_current()->raw_locks);
@@ -4476,6 +4490,18 @@ static void unix_write_completion_notifications(void)
         kernel_socket_address_release(&source);
         CHECK(notifications && !sender->unix_memory && !sender->unix_packets);
         if (type==SOCKET_STREAM) {
+            unsigned allocations=heap_allocations;
+            CHECK(write_buffer(sender,"fresh",5,0)==5 && heap_allocations==allocations);
+            struct kernel_open_file_description *peek_pin=(void *)receiver;
+            struct kernel_socket_message message={.flags=KERNEL_SOCKET_MSG_PEEK};
+            struct kernel_socket_read_request peek={0};
+            char prefix[5];
+            CHECK(kernel_socket_reserve_read(receiver,NULL,&peek,&peek_pin,5,1,&message)==5);
+            kernel_socket_copy_read(&peek,0,prefix,5);
+            CHECK(!memcmp(prefix,"fresh",5) && kernel_socket_finish_read(&peek,0)==5);
+            CHECK(sender->unix_packets==1);
+            source=read_named_packet(receiver,"fresh");
+            kernel_socket_address_release(&source);
             CHECK(!readable);
             CHECK(write_buffer(receiver,"reply",5,0)==5 && readable==1);
             source=read_named_packet(sender,"reply");
@@ -4507,6 +4533,19 @@ static void unix_write_completion_notifications(void)
             CHECK(!memcmp(bytes,"ghij",4) && kernel_socket_finish_read(&request,0)==4);
             CHECK(!sender->unix_packets && !sender->unix_memory && async_writes==2);
             CHECK(kernel_wait_node_remove_sync(&subscriber)==KERNEL_SCHEDULER_STATUS_OK);
+
+            char medium[128];
+            memset(medium,'m',sizeof(medium));
+            CHECK(write_buffer(sender,medium,80,0)==80);
+            char medium_read[128];
+            CHECK(kernel_socket_reserve_read(receiver,NULL,&request,&pin,80,1,NULL)==80);
+            kernel_socket_copy_read(&request,0,medium_read,80);
+            CHECK(!memcmp(medium_read,medium,80) && kernel_socket_finish_read(&request,0)==80);
+            allocations=heap_allocations;
+            CHECK(write_buffer(sender,medium,128,0)==128 && heap_allocations==allocations);
+            CHECK(kernel_socket_reserve_read(receiver,NULL,&request,&pin,128,1,NULL)==128);
+            kernel_socket_copy_read(&request,0,medium_read,128);
+            CHECK(!memcmp(medium_read,medium,128) && kernel_socket_finish_read(&request,0)==128);
         }
         CHECK(!kernel_socket_set_option(sender,KERNEL_SOCKET_SNDBUF,4096));
         char bytes[3000]={0};const unsigned sizes[]={sizeof(bytes),5};

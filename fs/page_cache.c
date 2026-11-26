@@ -230,7 +230,7 @@ struct kernel_page_cache_record {
     uint32_t mounts;
 #if BOAROS_PAGE_CACHE_DIRTY_AGE
     uint64_t dirty_deadline;
-    unsigned expired_writeback;
+    uint64_t expire_through;
 #endif
 };
 
@@ -1097,17 +1097,18 @@ static inline bool dirty_mark_entry(struct kernel_page_cache_entry *entry,
     struct kernel_page_cache_record *r=entry->cache->record;
     int first_dirty=!entry->dirty_end;
     if (first_dirty) {
-#if BOAROS_PAGE_CACHE_DIRTY_AGE
-        if (!r->dirty_pages) {
-            r->dirty_deadline=dirty_deadline();
-            if (r->started && !r->stopping) cache_wake(&r->work);
-        }
-#endif
         if (account) dirty_charge(r, entry->node, 1);
         struct kernel_page_cache_dirty *dirty=kernel_vfs_node_dirty_pages(entry->node);
         if (entry->dirty_indexed) __builtin_trap();
         if (!dirty->count) {
             if (!RB_EMPTY(&dirty->tree) || dirty->queue_next || dirty->queue_previous) __builtin_trap();
+#if BOAROS_PAGE_CACHE_DIRTY_AGE
+            dirty->expiry=dirty_deadline();
+            if (!r->dirty_head) {
+                r->dirty_deadline=dirty->expiry;
+                if (r->started && !r->stopping) cache_wake(&r->work);
+            }
+#endif
             dirty->queue_previous=r->dirty_tail;
             if (r->dirty_tail) r->dirty_tail->queue_next=dirty; else r->dirty_head=dirty;
             r->dirty_tail=dirty;
@@ -1192,7 +1193,8 @@ static void dirty_batch_return(struct kernel_page_cache_record *r,struct kernel_
     }
 }
 #endif
-static size_t dirty_batch(struct kernel_page_cache_record *r,struct kernel_page_cache_entry **batch,int all)
+static size_t dirty_batch(struct kernel_page_cache_record *r,struct kernel_page_cache_entry **batch,
+    int all,uint64_t expire_through)
 {
     size_t count=0;unsigned scanned=0;
     size_t capacity=r->writeback_capacity<BOAROS_PAGE_CACHE_WRITEBACK_PAGES?r->writeback_capacity:BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
@@ -1203,7 +1205,8 @@ static size_t dirty_batch(struct kernel_page_cache_record *r,struct kernel_page_
         struct kernel_page_cache_entry *entry=RB_NFIND(kernel_page_cache_dirty_tree,&dirty->tree,&key);
         if (!entry) {r->dirty_cursor=dirty->queue_next;r->dirty_scan_index=0;continue;}
         if (count && entry->node!=batch[0]->node) break;
-        int skip=!all && !node_pressure(entry->node,r,1);
+        int skip=!all && !(expire_through && dirty->expiry<=expire_through) &&
+            !node_pressure(entry->node,r,1);
 #if BOAROS_MAX_CPUS > 1
         if (!skip && dirty->batch_state) {
             dirty->batch_state|=DIRTY_BATCH_REVISIT;
@@ -4751,14 +4754,14 @@ int kernel_page_cache_writeback(struct kernel_page_cache *cache, struct kernel_v
 enum { SMALL_FILE_WRITEBACK_MAX=8 };
 
 static size_t writeback_small_files(struct kernel_page_cache *cache,
-    struct kernel_vfs_node **nodes,size_t limit,struct writeback_storage *storage,
+    struct kernel_vfs_node **nodes,size_t limit,struct writeback_workspace *work,
     size_t *attempted)
 {
     if (limit>SMALL_FILE_WRITEBACK_MAX) limit=SMALL_FILE_WRITEBACK_MAX;
     if (limit>BOAROS_PAGE_CACHE_WRITEBACK_PAGES) limit=BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
     size_t count=0,prepared_count=0,locked=0,accepted=0;
-    struct kernel_page_cache_entry **entries=storage->selected;
-    struct prepared_writeback *prepared=storage->prepared;
+    struct kernel_page_cache_entry **entries=work->selected;
+    struct prepared_writeback *prepared=work->prepared;
     struct kernel_lock_guard guards[SMALL_FILE_WRITEBACK_MAX]={0};
     unsigned order[SMALL_FILE_WRITEBACK_MAX];
     {
@@ -4795,7 +4798,7 @@ static size_t writeback_small_files(struct kernel_page_cache *cache,
     for (;locked<count;locked++)
         if (!kernel_vfs_node_try_read(nodes[order[locked]],&guards[locked])) goto Release;
     capture_writeback(cache,entries,prepared,count,UINT64_MAX);
-    struct file_write_span *spans=storage->spans;
+    struct file_write_span *spans=work->spans;
     for (size_t i=0;i<count;i++) {
         size_t cursor=prepared[i].begin,begin,end;
         if (!next_writeback_span(entries[i],&prepared[i],&cursor,&spans[i]) ||
@@ -4841,6 +4844,7 @@ int kernel_page_cache_writeback_mount(struct kernel_page_cache *cache,
 {
     int result=0;
     union foreground_workspace *lease=NULL;
+    struct writeback_workspace work;
     bool batch=count>1 && nodes[0]->instance->ops->writeback_small_files &&
         !nodes[0]->instance->namespace_parallel && !kernel_page_cache_needs_cpu0(cache);
     for (size_t i=0;i<count;) {
@@ -4848,8 +4852,10 @@ int kernel_page_cache_writeback_mount(struct kernel_page_cache *cache,
         if (batch && !lease && count-i>1) {
             lease=foreground_workspace_take(cache);
             if (!lease) batch=false;
+            else work=(struct writeback_workspace){.prepared=lease->writeback.prepared,
+                .spans=lease->writeback.spans,.selected=lease->writeback.selected};
         }
-        size_t accepted=lease?writeback_small_files(cache,nodes+i,count-i,&lease->writeback,&attempted):0;
+        size_t accepted=lease?writeback_small_files(cache,nodes+i,count-i,&work,&attempted):0;
         if (accepted) i+=accepted;
         else {
             if (lease) {
@@ -5084,6 +5090,43 @@ static struct range_writeback *run_mapped_range_batch(struct kernel_page_cache *
     return last;
 }
 
+static bool run_small_range_batch(struct kernel_page_cache *cache, struct range_writeback *first)
+{
+    struct kernel_vfs_instance *instance=first->window.node->instance;
+    if (!instance->ops->writeback_small_files || instance->namespace_parallel ||
+        first->window.cursor || first->window.last || first->window.end<BOAROS_PAGE_SIZE)
+        return false;
+
+    struct kernel_vfs_node *nodes[SMALL_FILE_WRITEBACK_MAX];
+    struct range_writeback *items[SMALL_FILE_WRITEBACK_MAX];
+    size_t count=0;
+    {
+        CACHE_SCOPE(select,cache);
+        for (struct range_writeback *item=first;item && count<SMALL_FILE_WRITEBACK_MAX;item=item->next) {
+            struct kernel_vfs_node *node=item->window.node;
+            if (node->instance!=instance || item->window.cursor || item->window.last ||
+                item->window.end<BOAROS_PAGE_SIZE ||
+                !instance->ops->writeback_small_candidate(node)) break;
+            size_t i=0;
+            while (i<count && nodes[i]!=node) i++;
+            if (i<count) break;
+            nodes[count]=node;
+            items[count++]=item;
+        }
+    }
+    if (count<2) return false;
+    size_t attempted=0;
+    size_t completed=writeback_small_files(cache,nodes,count,cache->record->writeback_workspace,&attempted);
+    if (!completed) return false;
+
+    /* Acceptance may retain ordered data. Finish it before notifying
+     * waiters and returning all of this batch's queue slots together. */
+    for (size_t i=0;i<completed;i++)
+        (void)kernel_vfs_node_complete_data_range(nodes[i],0,BOAROS_PAGE_SIZE);
+    retire_range_requests(cache,first,items[completed-1],completed);
+    return true;
+}
+
 static void run_range_writeback(struct kernel_page_cache *cache,
     struct range_writeback *request, int stopping, bool batch)
 {
@@ -5100,6 +5143,10 @@ static void run_range_writeback(struct kernel_page_cache *cache,
                 retire_range_requests(cache, request, last, completed);
                 return;
             }
+        }
+        if (run_small_range_batch(cache,request)) {
+            io->background_reclaim = previous;
+            return;
         }
         uint64_t first = request->window.cursor;
         writeback_window(&request->window);
@@ -5613,9 +5660,10 @@ static void cache_background(struct kernel_page_cache *cache)
 {
     struct kernel_page_cache_record *r=cache->record;
     unsigned force;
+    uint64_t expire_through=0;
     { CACHE_SCOPE(guard,cache); force=r->force_writeback;
 #if BOAROS_PAGE_CACHE_DIRTY_AGE
-      force|=r->expired_writeback;
+      expire_through=r->expire_through;
 #endif
     }
     struct kernel_io_context *io=kernel_io_context_current();
@@ -5630,7 +5678,8 @@ static void cache_background(struct kernel_page_cache *cache)
         {
             CACHE_SCOPE(guard,cache);
             if (r->stopping) break;
-            count = dirty_batch(r,batch,force || physical_page_available(cache->allocator)<=r->low);
+            count = dirty_batch(r,batch,force || physical_page_available(cache->allocator)<=r->low,
+                expire_through);
 #if BOAROS_MAX_CPUS > 1
             if (count) kernel_vfs_node_dirty_pages(batch[0]->node)->batch_state=DIRTY_BATCH_OWNED;
 #endif
@@ -5664,8 +5713,13 @@ static void cache_background(struct kernel_page_cache *cache)
         if (!interrupted) {
             r->dirty_cursor=NULL;r->dirty_remaining=0;
 #if BOAROS_PAGE_CACHE_DIRTY_AGE
-            if (r->expired_writeback) {
-                r->expired_writeback=0;r->dirty_deadline=r->dirty_pages?dirty_deadline():0;
+            if (expire_through) {
+                /* Retry an unchanged expired inode after one interval. The
+                 * ordinary case arms the next inode's original deadline. */
+                r->expire_through=0;
+                r->dirty_deadline=!r->dirty_head?0:r->dirty_head->expiry;
+                if (r->dirty_deadline && r->dirty_deadline<=expire_through)
+                    r->dirty_deadline=dirty_deadline();
             }
 #endif
         }
@@ -5709,8 +5763,11 @@ static void page_cache_worker(void *argument)
             }
 #endif
 #if BOAROS_PAGE_CACHE_DIRTY_AGE
-            if (!stopping && r->dirty_deadline && kernel_time_monotonic_ns()>=r->dirty_deadline) {
-                r->dirty_deadline=0;r->expired_writeback=1;r->requested=1;
+            if (!stopping && r->dirty_deadline) {
+                uint64_t now=kernel_time_monotonic_ns();
+                if (now>=r->dirty_deadline) {
+                    r->dirty_deadline=0;r->expire_through=now;r->requested=1;
+                }
             }
 #endif
             if (r->range_collect_until && !stopping && !r->requested &&
@@ -5737,7 +5794,8 @@ static void page_cache_worker(void *argument)
                     uint64_t dirtied;
                     enum kernel_time_status status=kernel_time_deadline_from_monotonic(r->dirty_deadline,&dirtied);
                     if (status==KERNEL_TIME_STATUS_DEADLINE_PASSED) {
-                        r->dirty_deadline=0;r->expired_writeback=1;r->requested=1;continue;
+                        r->expire_through=r->dirty_deadline;
+                        r->dirty_deadline=0;r->requested=1;continue;
                     }
                     if (status!=KERNEL_TIME_STATUS_OK) __builtin_trap();
                     if (!deadline || dirtied < deadline) deadline = dirtied;
@@ -5851,7 +5909,10 @@ int kernel_page_cache_start_executor(struct kernel_page_cache *cache)
     r->dirty_high = total / 8 > r->dirty_low ? total / 8 : r->dirty_low + 1;
     r->stopping = 0;
 #if BOAROS_PAGE_CACHE_DIRTY_AGE
-    if (r->expired_writeback) {r->expired_writeback=0;r->dirty_deadline=r->dirty_pages?dirty_deadline():0;}
+    if (r->expire_through) {
+        r->expire_through=0;
+        r->dirty_deadline=r->dirty_head?r->dirty_head->expiry:0;
+    }
 #endif
     enum kernel_scheduler_status result = kernel_thread_create_joinable(page_cache_worker, cache, &r->worker);
     if (result != KERNEL_SCHEDULER_STATUS_OK) {

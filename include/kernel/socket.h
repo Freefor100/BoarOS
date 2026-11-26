@@ -18,6 +18,7 @@ struct kernel_mm;
 struct kernel_socket;
 struct kernel_wait_queue *kernel_socket_async_source(struct kernel_socket *);
 struct kernel_bpf_program;
+struct kernel_wait_node;
 struct kernel_bpf_program *kernel_socket_filter_get(struct kernel_socket *);
 int kernel_socket_filter_locked(struct kernel_socket *);
 int kernel_socket_filter_lock(struct kernel_socket *,int);
@@ -326,6 +327,10 @@ void kernel_socket_set_receive_timeout(struct kernel_socket *socket,
 uint64_t kernel_socket_receive_timeout(struct kernel_socket *socket);
 uint32_t kernel_socket_poll(struct kernel_socket *socket,
                             struct kernel_wait_queue **queue);
+/* Return masked readiness, or register the caller's node while holding the
+ * same endpoint lock. The caller finishes any token created, including on error. */
+int kernel_socket_poll_prepare(struct kernel_socket *, uint32_t mask,
+    uint64_t deadline, struct kernel_wait_node *, struct kernel_wait_token *);
 struct kernel_wait_queue *kernel_socket_wait_queue(struct kernel_socket *socket);
 void kernel_socket_expire_timers(void);
 int kernel_socket_loopback_flags(const char name[16], uint16_t *flags);

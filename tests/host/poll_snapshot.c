@@ -18,7 +18,7 @@ static struct kernel_open_file_description target;
 static struct kernel_wait_queue queue;
 static unsigned polls, binds, parks, finishes, refs, live, initialized, allocs;
 static size_t allocated_bytes;
-static int readable, at_bind, at_park, signalled, stale_hint;
+static int readable, at_bind, at_park, signalled, stale_hint, spurious;
 static unsigned hints;
 static unsigned service_entries, service_exits;
 static int target_cpu0;
@@ -50,19 +50,42 @@ uint32_t kernel_open_file_poll(struct kernel_open_file_description *f,uint32_t r
   if (target_kind==KERNEL_OPEN_FILE_KIND_REGULAR)
       return KERNEL_POLLIN|KERNEL_POLLRDNORM|KERNEL_POLLOUT|KERNEL_POLLWRNORM;
   return readable?(requested&(KERNEL_POLLIN|KERNEL_POLLRDNORM)):0; }
+uint32_t kernel_socket_poll(struct kernel_socket *socket,struct kernel_wait_queue **out)
+{ CHECK(socket==(void *)&target);return kernel_open_file_poll(&target,UINT16_MAX,out); }
 int kernel_epoll_wait_pending(struct kernel_open_file_description *f,struct kernel_wait_queue **out)
 { CHECK(f==&target && target_kind==KERNEL_OPEN_FILE_KIND_EPOLL && live);if(out)*out=&queue;hints++;if(!out && stale_hint){stale_hint--;return 1;}return readable; }
 void kernel_wait_node_init(struct kernel_wait_node *n,struct kernel_task *t)
 { initialized++;*n=(struct kernel_wait_node){.task=t}; }
 enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *q,uint64_t d,int i,struct kernel_wait_token *t)
-{ (void)q;(void)i;CHECK(!live);wait_deadline=d;*t=(struct kernel_wait_token){0};live++;return KERNEL_SCHEDULER_STATUS_OK; }
+{ (void)q;(void)i;CHECK(!live);wait_deadline=d;*t=(struct kernel_wait_token){.task=(void *)&target};live++;return KERNEL_SCHEDULER_STATUS_OK; }
 enum kernel_scheduler_status kernel_wait_node_bind(struct kernel_wait_queue *q,struct kernel_wait_node *n,const struct kernel_wait_token *t)
 { (void)n;(void)t;CHECK(q==&queue && live==1);binds++;if(at_bind)readable=1;return KERNEL_SCHEDULER_STATUS_OK; }
 enum kernel_scheduler_status kernel_wait_prepare_monotonic(struct kernel_wait_queue *q,
     uint64_t target,int interruptible,struct kernel_wait_token *token)
 { return kernel_wait_prepare(q,target,interruptible,token); }
+int kernel_socket_poll_prepare(struct kernel_socket *socket,uint32_t mask,uint64_t deadline,
+    struct kernel_wait_node *node,struct kernel_wait_token *token)
+{
+    unsigned ready=kernel_socket_poll(socket,NULL)&mask;
+    if (ready) return (int)ready;
+    CHECK(!kernel_wait_prepare_monotonic(NULL,deadline,1,token));
+    kernel_wait_node_init(node,token->task);
+    node->readiness_mask=mask;
+    CHECK(!kernel_wait_node_bind(&queue,node,token));
+    return 0;
+}
 enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,enum kernel_wait_wake_reason *r)
-{ (void)t;CHECK(live==1);parks++;if(at_park)readable=1;*r=signalled?KERNEL_WAIT_SIGNALLED:(at_park?KERNEL_WAIT_WOKEN:KERNEL_WAIT_TIMEOUT);if(*r==KERNEL_WAIT_TIMEOUT && wait_deadline>now_ns)now_ns=wait_deadline;return KERNEL_SCHEDULER_STATUS_OK; }
+{
+    (void)t;
+    CHECK(live==1);
+    parks++;
+    if (at_park) readable=1;
+    int notified=at_park || (at_bind && target_kind==KERNEL_OPEN_FILE_KIND_SOCKET) || spurious;
+    *r=signalled?KERNEL_WAIT_SIGNALLED:(notified?KERNEL_WAIT_WOKEN:KERNEL_WAIT_TIMEOUT);
+    if (spurious) spurious--;
+    if (*r==KERNEL_WAIT_TIMEOUT && wait_deadline>now_ns) now_ns=wait_deadline;
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
 enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *t)
 { (void)t;CHECK(live==1);live--;finishes++;return KERNEL_SCHEDULER_STATUS_OK; }
 void kernel_signal_restore_temporary_mask(struct kernel_task *t,uint64_t m,int i)
@@ -106,7 +129,7 @@ void kernel_heap_release(struct kernel_heap *h,void *p)
 static int run(struct kernel_pollfd *p,unsigned n,int immediate)
 { struct kernel_files f={0};int ret=core_poll_run(&f,NULL,p,n,123,immediate,0,0,NULL);CHECK(!refs&&!live&&!allocs);return ret; }
 static void reset(void)
-{ polls=binds=parks=finishes=initialized=0;allocated_bytes=0;readable=at_bind=at_park=signalled=stale_hint=0;hints=0;service_entries=service_exits=0;target_cpu0=0;target_kind=KERNEL_OPEN_FILE_KIND_PIPE;fd_closed=close_after_scan=0;now_ns=1000; }
+{ polls=binds=parks=finishes=initialized=0;allocated_bytes=0;readable=at_bind=at_park=signalled=stale_hint=spurious=0;hints=0;service_entries=service_exits=0;target_cpu0=0;target_kind=KERNEL_OPEN_FILE_KIND_PIPE;fd_closed=close_after_scan=0;now_ns=1000; }
 static void empty_waits(void)
 {
     struct kernel_files files={0};struct kernel_mm mm={0};struct kernel_task task={0};
@@ -178,13 +201,20 @@ int main(void)
         reset();target_kind=i?KERNEL_OPEN_FILE_KIND_EPOLL:KERNEL_OPEN_FILE_KIND_SOCKET;
         p[0]=(struct kernel_pollfd){7,KERNEL_POLLIN,0};at_park=1;
         CHECK(run(p,1,0)==1 && finishes==1);
-        if (!i) CHECK(polls==3);
+        if (!i) CHECK(polls==2);
         reset();target_kind=i?KERNEL_OPEN_FILE_KIND_EPOLL:KERNEL_OPEN_FILE_KIND_SOCKET;
         p[0]=(struct kernel_pollfd){7,KERNEL_POLLIN,0};at_bind=1;
-        CHECK(run(p,1,0)==1 && finishes==1 && !parks);
-        if (!i) CHECK(polls==2);
+        CHECK(run(p,1,0)==1 && finishes==1 && parks==!i);
+        if (!i) CHECK(polls==2 && binds==1);
     }
     CHECK(hints==2 && polls==2);
+    reset();target_kind=KERNEL_OPEN_FILE_KIND_SOCKET;spurious=1;
+    p[0]=(struct kernel_pollfd){7,KERNEL_POLLIN,0};
+    CHECK(run(p,1,0)==0 && !p[0].revents);
+    CHECK(polls==3 && binds==2 && parks==2 && finishes==2);
+    reset();target_kind=KERNEL_OPEN_FILE_KIND_SOCKET;signalled=1;
+    p[0]=(struct kernel_pollfd){7,KERNEL_POLLIN,0};
+    CHECK(run(p,1,0)==-KERNEL_EINTR && polls==1 && finishes==1);
     reset();target_kind=KERNEL_OPEN_FILE_KIND_EPOLL;stale_hint=1;
     p[0]=(struct kernel_pollfd){7,KERNEL_POLLIN,0};
     CHECK(run(p,1,0)==0 && !p[0].revents && parks==1 && finishes==2 && polls==3);

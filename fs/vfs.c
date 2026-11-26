@@ -5569,11 +5569,19 @@ static int ftruncate_borrowing(struct kernel_vfs_file *file,
             kernel_assert_service_context();
         struct kernel_page_cache *cache = node->instance->page_cache;
         uint64_t old_size = node->size;
+        uint64_t writeback_start = 0;
+        if (size <= old_size && node->instance->ops->truncate_preserves_dirty_prefix &&
+            node->instance->ops->truncate_preserves_dirty_prefix(node, size) &&
+            !kernel_vfs_error_sequence(file)) {
+            /* Retained whole pages keep their ordinary writeback owner.
+             * Reconcile the retained part of a partial EOF page before trim. */
+            writeback_start = size & ~BOAROS_PAGE_MASK;
+        }
         result = kernel_file_mapping_prepare(node);
         if (result) return result;
         /* 写操作门保留，inode保护必须在MM回调、pin排空和磁盘等待前释放。 */
         kernel_lock_release(&node_guard);
-        result = size ? kernel_page_cache_writeback_range_borrowing(cache,node,0,size,
+        result = writeback_start < size ? kernel_page_cache_writeback_range_borrowing(cache,node,writeback_start,size,
             borrowed ? borrowed : &operation_guard, false) : 0;
         if (result) return result;
         kernel_vfs_node_lock(node, &node_guard, 1);

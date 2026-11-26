@@ -9,7 +9,7 @@ static struct kernel_raw_lock socket_state_lock = {
 struct socket_state_guard {
     kernel_irq_lock_guard raw;
     struct socket_state_guard *owner;
-    struct kernel_wait_cursor notifications[2];
+    struct kernel_wait_notification notifications[2];
     unsigned count;
     /* Real producers retain each event, independently of poll-wake dedup. */
     struct kernel_wait_cursor async_notifications[4];
@@ -67,8 +67,9 @@ static void socket_state_release(struct socket_state_guard *guard)
     if(!guard->count && !guard->async_count && !guard->work.queue) {socket_state_unlock(guard);return;}
     uintptr_t interrupts=guard->raw.interrupts;guard->raw.interrupts=0;
     socket_state_unlock(guard);
-    /* Queue cursors retain their actual storage; callbacks run without state locks. */
-    for(unsigned i=0;i<guard->count;i++)kernel_wait_cursor_wake(&guard->notifications[i],1);
+    /* Captured task tokens or cursors keep their owners alive; callbacks run
+     * without state locks. */
+    for(unsigned i=0;i<guard->count;i++)kernel_wait_notification_wake(&guard->notifications[i]);
     for(unsigned i=0;i<guard->async_count;i++)kernel_wait_cursor_wake(&guard->async_notifications[i],1);
     if(guard->work.queue)kernel_wait_cursor_wake(&guard->work,1);
     arch_interrupt_restore(interrupts);
@@ -100,13 +101,16 @@ static void socket_state_notify_event(struct socket_state_guard *guard,
     struct kernel_wait_queue *queue, uint32_t events)
 {
     for (unsigned i=0;i<guard->count;i++) {
-        struct kernel_wait_cursor *pending=&guard->notifications[i];
+        struct kernel_wait_notification *pending=&guard->notifications[i];
         if (pending->queue!=queue) continue;
-        pending->event=pending->event && events ? pending->event | events : 0;
+        if (!pending->direct) {
+            uint64_t previous = pending->cursor.event;
+            pending->cursor.event = previous && events ? previous | events : 0;
+        }
         return;
     }
     if(guard->count==2)__builtin_trap();
-    if(kernel_wait_cursor_prepare_event(queue,&guard->notifications[guard->count],events,NULL))guard->count++;
+    if(kernel_wait_notification_prepare(queue,&guard->notifications[guard->count],events))guard->count++;
 }
 static void socket_state_notify(struct socket_state_guard *guard,struct kernel_wait_queue *queue)
 { socket_state_notify_event(guard,queue,0); }
