@@ -573,22 +573,59 @@ static size_t home_charge(struct jbd_memory *memory)
     size_t header=16;while (header<sizeof(struct ext4_buf)) header*=2;
     return memory->block_size+header;
 }
+static bool charge_home_locked(struct jbd_memory *memory)
+{
+    KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
+    size_t charge=home_charge(memory);
+    if (memory->closing || !room_locked(memory,charge)) return false;
+    charge_locked(memory,charge);
+    return true;
+}
+
+static inline __attribute__((always_inline)) bool
+try_pin_home_locked(struct jbd_memory *memory,struct ext4_buf *buf)
+{
+    if (buf->journal_pending==UINT32_MAX) __builtin_trap();
+    if (!buf->journal_pending && !charge_home_locked(memory)) return false;
+    buf->journal_pending++;
+    return true;
+}
+
 bool jbd_memory_pin_home(struct jbd_journal *journal,struct ext4_buf *buf)
 {
     struct jbd_memory *memory=journal->memory;
     for (unsigned attempt=0;attempt<2;attempt++) {
         {
             KERNEL_TASK_LOCK_SCOPE(cache_guard,&buf->bc->metadata);
-            if (buf->journal_pending==UINT32_MAX) __builtin_trap();
-            if (buf->journal_pending) {buf->journal_pending++;return true;}
-            KERNEL_TASK_LOCK_SCOPE(memory_guard,&memory->metadata);
-            if (!memory->closing && room_locked(memory,home_charge(memory))) {
-                charge_locked(memory,home_charge(memory));buf->journal_pending++;return true;
-            }
+            if (try_pin_home_locked(memory,buf)) return true;
         }
         if (!attempt) trim_owner(memory,0);
     }
     budget_failure(journal);return false;
+}
+
+bool jbd_memory_bind_private(struct jbd_journal *journal, struct ext4_block *client,
+    struct ext4_block *accepted, struct ext4_block_payload *private_payload)
+{
+    struct ext4_buf *buf=client->buf;
+    struct jbd_memory *memory=journal->memory;
+    ext4_block_payload_write(private_payload);
+    for (unsigned attempt=0;attempt<2;attempt++) {
+        struct ext4_block_payload *old=NULL;
+        bool bound;
+        {
+            KERNEL_TASK_LOCK_SCOPE(cache_guard,&buf->bc->metadata);
+            bound=!journal->grouped || try_pin_home_locked(memory,buf);
+            if (bound) old=ext4_bcache_bind_private_locked(client,accepted,private_payload);
+        }
+        if (bound) {
+            if (old) ext4_block_payload_put(old);
+            return true;
+        }
+        if (!attempt) trim_owner(memory,0);
+    }
+    budget_failure(journal);
+    return false;
 }
 void jbd_memory_unpin_home(struct jbd_journal *journal,struct ext4_buf *buf)
 {

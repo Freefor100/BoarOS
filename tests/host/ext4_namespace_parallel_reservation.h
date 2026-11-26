@@ -189,11 +189,8 @@ static void serial_log_incremental(struct lwext4_mount_adapter *adapter)
     adapter->locks.unlock(adapter->locks.context);
     printf("PASS serial log delta: real qualification/target loss, same-sequence shape change, duplicate LBA/revoke, descriptor boundary, exact quota, reclaimable group overflow and %u actual OOM prefixes return owners\n",heap_prefixes);
 }
-int __real_jbd_trans_get_write_access_range(struct jbd_trans *,struct ext4_block *,uint32_t,uint32_t);
-int __wrap_jbd_trans_get_write_access_range(struct jbd_trans *trans,struct ext4_block *block,
-    uint32_t offset,uint32_t length)
+static int check_private_grant(struct jbd_trans *trans, struct ext4_block *block, int result)
 {
-    int result=__real_jbd_trans_get_write_access_range(trans,block,offset,length);
     if(result || !serial_reservation_watch)return result;
     struct jbd_buf *record;
     TAILQ_FOREACH(record,&trans->buf_queue,buf_node)if(record->block.lb_id==block->lb_id)break;
@@ -202,6 +199,20 @@ int __wrap_jbd_trans_get_write_access_range(struct jbd_trans *trans,struct ext4_
         block->payload==&record->after->payload && block->data==record->after->data);
     assert(!record->block_rec && !record->reserved_rec);
     return result;
+}
+int __real_jbd_trans_get_write_access_range(struct jbd_trans *,struct ext4_block *,uint32_t,uint32_t);
+int __wrap_jbd_trans_get_write_access_range(struct jbd_trans *trans,struct ext4_block *block,
+    uint32_t offset,uint32_t length)
+{
+    return check_private_grant(trans,block,
+        __real_jbd_trans_get_write_access_range(trans,block,offset,length));
+}
+int __real_jbd_trans_prepare_unowned_range(struct jbd_trans *,struct ext4_block *,uint32_t,uint32_t);
+int __wrap_jbd_trans_prepare_unowned_range(struct jbd_trans *trans,struct ext4_block *block,
+    uint32_t offset,uint32_t length)
+{
+    return check_private_grant(trans,block,
+        __real_jbd_trans_prepare_unowned_range(trans,block,offset,length));
 }
 static void *serial_commit(void *argument)
 {

@@ -271,6 +271,9 @@ static inline void ext4_bcache_clear_dirty(struct ext4_buf *buf) {
  * accepted version; its old payload is returned outside cache metadata. */
 void ext4_bcache_prepare_private(struct ext4_block *client, struct ext4_block *accepted,
     struct ext4_block_payload *private_payload);
+/* Caller holds cache metadata and returns the old loan after unlocking. */
+struct ext4_block_payload *ext4_bcache_bind_private_locked(struct ext4_block *client,
+    struct ext4_block *accepted, struct ext4_block_payload *private_payload);
 /* The owner already keeps this home buffer and baseline alive. Borrow view
  * directly; a requested newer accepted version gets its own snapshot loan. */
 struct ext4_block_payload *ext4_bcache_borrow_owned(const struct ext4_block *owner,
