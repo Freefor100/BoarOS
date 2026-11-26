@@ -163,8 +163,7 @@ int ext4_inode_truncate_orphan_step(struct ext4_inode_ref *ref, bool *done,
 #if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
     if (ext4_inode_has_flag(ref->inode, EXT4_INODE_FLAG_EXTENTS)) {
         if (!ext4_sb_feature_incom(sb, EXT4_FINCOM_EXTENTS)) return EUCLEAN;
-        if (!fs->jbd_journal || type != EXT4_INODE_MODE_FILE || target ||
-            ext4_inode_get_links_cnt(ref->inode)) expanded = NULL;
+        if (!fs->jbd_journal || type != EXT4_INODE_MODE_FILE) expanded = NULL;
         return ext4_extent_remove_tail(ref, keep, TRUNCATE_BATCH, expanded, done);
     }
 #endif
