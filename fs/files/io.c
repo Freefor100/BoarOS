@@ -41,6 +41,7 @@
 #include <arch/context.h>
 #include <arch/mmu.h>
 #include <arch/platform_io.h>
+#include <arch/uaccess.h>
 
 #define KERNEL_FILES_WRITE_STAGING 64U
 
@@ -1726,7 +1727,7 @@ static enum kernel_files_status unix_write_request(struct kernel_files *files, s
 }
 
 /* The existing task scratch holds page references, not another payload copy. */
-enum { TCP_USER_PINS_INLINE=4,
+enum { TCP_USER_PINS_INLINE=4, TCP_USER_SHORT_WRITE=256,
 #if BOAROS_USER_SMP && BOAROS_PAGE_SHIFT == 12
        TCP_USER_PINS_MAX=9 /* Unaligned 32 KiB send window. */
 #else
@@ -1858,6 +1859,13 @@ static __attribute__((noinline)) enum kernel_files_status tcp_write_request(
     uint64_t total=0,target=0,timeout=(flags&KERNEL_SOCKET_MSG_DONTWAIT)?0:kernel_socket_send_timeout(socket);
     int fault=0;
     size_t staged=0,consumed=0;
+    int stage_scalar=0;
+#if ARCH_UACCESS_NATIVE && BOAROS_MAX_CPUS == 1
+    /* The native user copy avoids loaning a physical page for a short
+     * scalar buffer. Longer sends still copy once into final TCP segments. */
+    stage_scalar=count && count<=TCP_USER_SHORT_WRITE && iov_count==1 &&
+        count<=BOAROS_PAGE_SIZE-(iov[0].base&BOAROS_PAGE_MASK);
+#endif
     unsigned pins=TCP_USER_PINS_INLINE;
 #if BOAROS_USER_SMP && BOAROS_PAGE_SHIFT == 12
     if (kernel_socket_stream_has_shard(socket)) pins=TCP_USER_PINS_MAX;
@@ -1868,7 +1876,7 @@ static __attribute__((noinline)) enum kernel_files_status tcp_write_request(
     }
     kernel_socket_stream_begin(&request,&description);
     do {
-        int compact=staged>consumed || tcp_fragmented_prefix(cursor,count-total,pins);
+        int compact=stage_scalar || staged>consumed || tcp_fragmented_prefix(cursor,count-total,pins);
         size_t chunk=staged-consumed;
         if (!chunk && count) {
             uint64_t address;
@@ -1901,6 +1909,8 @@ static __attribute__((noinline)) enum kernel_files_status tcp_write_request(
                     if (!buffer.allocator && kernel_task_io_buffer_acquire(&buffer,mm->allocator)!=KERNEL_TASK_STATUS_OK) {
                         *linux_result=total?(int64_t)total:-KERNEL_ENOMEM;break;
                     }
+                    /* A native copy may also read a secret mapping. */
+                    if (stage_scalar) buffer.wipe_bytes=(uint32_t)count;
                     size_t copied=0;
                     enum kernel_uaccess_status access=kernel_copy_from_user_iov(mm,&cursor,buffer.data,chunk,&copied);
                     if ((access!=KERNEL_UACCESS_STATUS_OK && access!=KERNEL_UACCESS_STATUS_FAULT) ||
