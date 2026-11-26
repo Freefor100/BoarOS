@@ -378,9 +378,10 @@ struct kernel_vfs_backend {
     void (*memory_written)(struct kernel_vfs_node *node, uint64_t end);
     int (*writeback)(struct kernel_vfs_node *node,
         struct file_write_span *spans, size_t count);
-    /* An atomic mount batch of one stable span per inode. Failure leaves
-     * each span dirty so the caller can retry the files independently. */
-    int (*writeback_small_files)(struct kernel_vfs_node *const *, struct file_write_span *, size_t);
+    /* One transaction for independent inodes. A failure leaves all their
+     * bytes dirty so the caller can retry them individually. */
+    int (*writeback_files)(struct kernel_vfs_node *const *, const struct file_write_set *,
+        unsigned, int *data_result);
     /* Lock-free eligibility hint while the cache owns the entry. */
     bool (*writeback_small_candidate)(const struct kernel_vfs_node *);
     /* Under the inode read lock, choose a larger allocation transaction. */

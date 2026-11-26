@@ -248,7 +248,10 @@ int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned 
 /* Bounded mount writeback for distinct new files under their inode locks.
  * An error leaves all spans unaccepted for ordinary per-file retry. */
 #define EXT4_SMALL_WRITEBACK_MAX 8U
-int ext4_fpwrite_small_files(ext4_file *const *files, struct file_write_span *spans, unsigned count);
+/* Optional data_result reports home completion separately from acceptance.
+ * ENOTSUP asks the caller to complete the logical ranges as usual. */
+int ext4_fpwrite_files(ext4_file *const *files, const struct file_write_set *sets,
+    unsigned count, int *data_result);
 /* Called with the adapter's inode I/O qualification. ENOTSUP leaves the
  * entire batch to transactional writeback. */
 int ext4_fpwrite_mapped_batch(ext4_file *file, struct file_write_span *spans, unsigned count);

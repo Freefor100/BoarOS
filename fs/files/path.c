@@ -189,7 +189,7 @@ int kernel_files_borrow_lookup_start(struct kernel_files *files,
 
 static enum kernel_fs_context_status copy_path(
     struct kernel_mm *mm, uint64_t user_path, char *buffer, size_t capacity,
-    int *result)
+    int *result, size_t *path_length)
 {
     size_t length;
     enum kernel_uaccess_status status = kernel_copy_string_from_user(mm,
@@ -197,7 +197,10 @@ static enum kernel_fs_context_status copy_path(
     if (status == KERNEL_UACCESS_STATUS_FAULT) *result = -KERNEL_EFAULT;
     else if (status == KERNEL_UACCESS_STATUS_TOO_LONG) *result = -KERNEL_ENAMETOOLONG;
     else if (status != KERNEL_UACCESS_STATUS_OK) return KERNEL_FS_CONTEXT_STATUS_STATE;
-    else *result=0;
+    else {
+        if (path_length) *path_length = length;
+        *result = 0;
+    }
     return KERNEL_FS_CONTEXT_STATUS_OK;
 }
 
@@ -211,7 +214,7 @@ enum kernel_files_status kernel_files_copy_user_path(struct kernel_mm *mm,
         return KERNEL_FILES_STATUS_OK;
     }
     if (allocation != KERNEL_TASK_STATUS_OK) return KERNEL_FILES_STATUS_STATE;
-    return copy_path(mm, user_path, buffer->data, KERNEL_FS_PATH_MAX, result) ==
+    return copy_path(mm, user_path, buffer->data, KERNEL_FS_PATH_MAX, result, NULL) ==
         KERNEL_FS_CONTEXT_STATUS_OK ? KERNEL_FILES_STATUS_OK : KERNEL_FILES_STATUS_STATE;
 }
 
@@ -221,7 +224,7 @@ static enum kernel_fs_context_status copy_path_start(
     char *buffer, size_t capacity, struct kernel_vfs_path **start,
     struct kernel_vfs_mount **mount, int *result)
 {
-    enum kernel_fs_context_status status=copy_path(mm,user_path,buffer,capacity,result);
+    enum kernel_fs_context_status status=copy_path(mm,user_path,buffer,capacity,result,NULL);
     if (status==KERNEL_FS_CONTEXT_STATUS_OK && !*result) {
         *result = kernel_files_path_start(files, snapshot, dirfd, buffer, start);
         if (!*result) *mount = kernel_vfs_path_mount(*start);
@@ -468,7 +471,8 @@ static enum kernel_files_status files_open(
         return KERNEL_FILES_STATUS_STATE;
     }
     path=path_buffer.data;
-    fs_status = copy_path(mm,user_path,path,KERNEL_FS_PATH_MAX,&result);
+    size_t path_length = 0;
+    fs_status = copy_path(mm,user_path,path,KERNEL_FS_PATH_MAX,&result,&path_length);
     if (fs_status==KERNEL_FS_CONTEXT_STATUS_OK && !result) {
         if (path[0]=='/' && (resolve & KERNEL_VFS_RESOLVE_BENEATH)) result=-KERNEL_EXDEV;
         else {
@@ -492,7 +496,8 @@ static enum kernel_files_status files_open(
     }
     struct kernel_vfs_path *root=(resolve & KERNEL_VFS_RESOLVE_SCOPED) ? start : fs_paths.root;
     struct kernel_vfs_open_request request={.flags=KERNEL_VFS_OPEN_FOLLOW,
-        .mode=(uint32_t)mode,.umask=fs_paths.umask,.resolve=(unsigned)resolve};
+        .mode=(uint32_t)mode,.umask=fs_paths.umask,.resolve=(unsigned)resolve,
+        .path_length=path_length};
     if (flags & LINUX_OPENAT2_REGULAR) {
         request.flags |= KERNEL_VFS_OPEN_REGULAR;
         flags &= ~LINUX_OPENAT2_REGULAR;
@@ -574,7 +579,7 @@ int kernel_files_name_to_handle(struct kernel_files *files, const struct kernel_
     char *path = path_buffer.data;
     int result = 0;
     if (!user_path && (flags & KERNEL_FILES_AT_EMPTY_PATH)) path[0] = 0;
-    else if (copy_path(mm, user_path, path, KERNEL_FS_PATH_MAX, &result)) return -KERNEL_EFAULT;
+    else if (copy_path(mm, user_path, path, KERNEL_FS_PATH_MAX, &result, NULL)) return -KERNEL_EFAULT;
     if (result) return result;
 
     struct kernel_fs_paths paths __attribute__((cleanup(kernel_fs_paths_release))) =

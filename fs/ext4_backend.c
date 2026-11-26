@@ -3455,16 +3455,19 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node,
     return lwext4_error(result);
 }
 
-static int ext4_backend_writeback_small_files(struct kernel_vfs_node *const *nodes,
-    struct file_write_span *spans,size_t count)
+static int ext4_backend_writeback_files(struct kernel_vfs_node *const *nodes,
+    const struct file_write_set *sets,unsigned count,int *data_result)
 {
     ext4_file *files[EXT4_SMALL_WRITEBACK_MAX];
-    if (count>EXT4_SMALL_WRITEBACK_MAX) __builtin_trap();
+    if (count<2 || count>EXT4_SMALL_WRITEBACK_MAX) __builtin_trap();
     for (size_t i=0;i<count;i++) files[i]=lwext4_node_file(nodes[i]);
-    int result=ext4_fpwrite_small_files(files,spans,(unsigned)count);
-    if (!result) for (size_t i=0;i<count;i++) {
-        COST_ADD(BACKEND_REQUESTED,spans[i].size);
-        COST_ADD(BACKEND_ACCEPTED,spans[i].written);
+    int result=ext4_fpwrite_files(files,sets,count,data_result);
+    if (data_result) *data_result=lwext4_error(*data_result);
+    if (!result) for (unsigned i=0;i<count;i++) {
+        for (unsigned j=0;j<sets[i].count;j++) {
+            COST_ADD(BACKEND_REQUESTED,sets[i].spans[j].size);
+            COST_ADD(BACKEND_ACCEPTED,sets[i].spans[j].written);
+        }
     }
     return lwext4_error(result);
 }
@@ -4042,7 +4045,7 @@ static void initialize_backend(void)
     ops->read_directory = ext4_backend_read_directory;
     ops->pread = ext4_backend_pread;
     ops->writeback = ext4_backend_writeback;
-    ops->writeback_small_files = ext4_backend_writeback_small_files;
+    ops->writeback_files = ext4_backend_writeback_files;
     ops->writeback_small_candidate = ext4_backend_writeback_small_candidate;
     ops->writeback_mapped = ext4_backend_writeback_mapped;
     ops->writeback_growth = ext4_backend_writeback_growth;

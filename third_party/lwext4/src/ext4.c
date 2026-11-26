@@ -256,7 +256,8 @@ struct ext4_small_writeback_result {
 
 struct ext4_small_writeback {
     ext4_file *const *files;
-    struct file_write_span *spans;
+    const struct file_write_set *sets;
+    struct ext4_data_completion *completion;
     unsigned prepared;
     struct ext4_block_allocation allocation;
     struct ext4_small_writeback_result results[EXT4_SMALL_WRITEBACK_MAX];
@@ -272,7 +273,8 @@ static uint64_t delalloc_publish(struct ext4_operation *operation)
     if (operation->small_writeback) {
         const struct ext4_small_writeback *batch=operation->small_writeback;
         for (unsigned i=0;i<batch->prepared;i++)
-            count+=delalloc_spans(batch->files[i]->delalloc,&batch->spans[i],1,block,true);
+            count+=delalloc_spans(batch->files[i]->delalloc,batch->sets[i].spans,
+                batch->sets[i].count,block,true);
         operation->small_writeback=NULL;
     } else if (operation->delalloc)
         count=delalloc_spans(operation->delalloc,operation->delalloc_spans,
@@ -5332,6 +5334,20 @@ struct ext4_data_completion {
     unsigned count;
 };
 
+static bool ext4_collect_physical(struct ext4_data_completion *batch,
+    const struct ext4_inode_block_range *range)
+{
+    if (batch->count == JBD_COMPLETE_RANGES_MAX || range->block > UINT64_MAX - range->count)
+        return false;
+    unsigned i = batch->count++;
+    while (i && batch->ranges[i - 1].first > range->block) {
+        batch->ranges[i] = batch->ranges[i - 1];
+        i--;
+    }
+    batch->ranges[i] = (struct jbd_data_range){range->block, range->count};
+    return true;
+}
+
 static int ext4_complete_physical(struct jbd_journal *journal, struct ext4_data_completion *batch)
 {
     /* The input is sorted by physical block. Even a repeated mapping must
@@ -5385,12 +5401,7 @@ static int ext4_complete_file_data(ext4_file *file, uint64_t offset, uint64_t en
             result = ext4_complete_physical(fs->jbd_journal, batch);
             if (result) break;
         }
-        unsigned i = batch->count++;
-        while (i && batch->ranges[i - 1].first > range.block) {
-            batch->ranges[i] = batch->ranges[i - 1];
-            i--;
-        }
-        batch->ranges[i] = (struct jbd_data_range){range.block, range.count};
+        if (!ext4_collect_physical(batch, &range)) __builtin_trap();
     }
     return ext4_result(result, ext4_fs_put_inode_ref(&ref));
 }
@@ -5941,6 +5952,7 @@ Retry:
 	r = ext4_fs_get_inode_ref(fs, file->inode, &ref);
 	if (r) { r = ext4_file_data_finish(file, r); goto Completed; }
 	saved_size = ext4_inode_get_size(ext4_fs_super(fs), ref.inode);
+    if (batch && batch->completion && write_end < saved_size) batch->completion=NULL;
     if (file->delalloc && journal) {
         EXT4_STATE_SCOPE(state,fs);
         /* 在同一次预留遍历中清除即将修改的映射知识；abort 后重新查询。 */
@@ -6023,6 +6035,8 @@ Retry:
                 if (needed < maximum) maximum = needed;
                 r = ext4_fs_get_inode_dblk_range(&ref, logical_block, maximum, true, &range);
                 if (r) break;
+                if (batch && batch->completion && !ext4_collect_physical(batch->completion,&range))
+                    batch->completion=NULL;
                 range_next = logical_block;
             }
             physical = range.block;
@@ -6173,40 +6187,74 @@ static int ext4_fpwrite_batch_mode(ext4_file *file, struct file_write_span *span
 int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count)
 { return ext4_fpwrite_batch_mode(file, spans, count, false); }
 
-int ext4_fpwrite_small_files(ext4_file *const *files, struct file_write_span *spans, unsigned count)
+int ext4_fpwrite_files(ext4_file *const *files, const struct file_write_set *sets,
+    unsigned count, int *data_result)
 {
     if (count<2 || count>EXT4_SMALL_WRITEBACK_MAX) return EINVAL;
+    if (data_result) *data_result=ENOTSUP;
     struct ext4_mountpoint *mp=files[0]->mp;
     struct ext4_fs *fs=&mp->fs;
     EXT4_MP_LOCK(mp);
     int result=ENOTSUP;
     if (!fs->jbd_journal || !fs->jbd_journal->grouped ||
         !ext4_fs_serial_writer(fs) || ext4_current_operation(fs)) goto Unlock;
+    /* Only complete from the new mappings when the prepared spans cover
+     * every logical block through EOF. The serial mount qualification keeps
+     * those mappings stable from transaction acceptance through home I/O. */
+    bool collect=data_result && fs->bdev->bdif->bwrite_phase;
     for (unsigned i=0;i<count;i++) {
         ext4_file *file=files[i];
         bool pending;
-        if (file->mp!=mp || file->fsize || !file->delalloc ||
-            !__atomic_load_n(&file->delalloc->fresh_extent,__ATOMIC_RELAXED) ||
-            spans[i].offset || !spans[i].size || !spans[i].source.retain) goto Unlock;
+        if (file->mp!=mp || !file->delalloc || !sets[i].count ||
+            sets[i].count>EXT4_BLOCK_BATCH_MAX) goto Unlock;
+        bool journaled=false;
+        unsigned block=fs->bdev->lg_bsize;
+        for (unsigned j=0;j<sets[i].count;j++) {
+            const struct file_write_span *span=&sets[i].spans[j];
+            if (span->offset>file->fsize || span->size>file->fsize-span->offset ||
+                span->offset%block || span->size%block) {
+                journaled=true;
+                break;
+            }
+        }
+        if (!journaled) {
+            /* Leave alignable stable mappings to the direct path. */
+            struct ext4_inode_goal probe={.inode=file->inode};
+            struct ext4_inode_goal *goal=RB_FIND(ext4_inode_goal_tree,&fs->inode_goals,&probe);
+            if (!goal || goal->data_sequence<=fs->jbd_journal->durable_sequence) goto Unlock;
+        }
+        if (collect) {
+            uint64_t next=0;
+            for (unsigned j=0;j<sets[i].count;j++) {
+                const struct file_write_span *span=&sets[i].spans[j];
+                if (!span->size || span->offset!=next || span->size>UINT64_MAX-next) {
+                    collect=false;
+                    break;
+                }
+                next+=span->size;
+            }
+            if (next<file->fsize) collect=false;
+        }
         result=ext4_orphan_truncate_pending(fs,file->inode,&pending);
         if (result) goto Unlock;
         result=ENOTSUP;
         if (pending) goto Unlock;
     }
+    struct ext4_data_completion completion={0};
     struct ext4_small_writeback *batch=ext4_malloc(sizeof(*batch));
     if (!batch) {result=ENOMEM;goto Unlock;}
     result=ext4_trans_start_mode(mp,false);
     if (!result) {
         batch->files=files;
-        batch->spans=spans;
+        batch->sets=sets;
+        batch->completion=collect?&completion:NULL;
         batch->prepared=0;
         batch->allocation.allocated=0;
         ext4_current_operation(fs)->small_writeback=batch;
         while (batch->prepared<count) {
             unsigned i=batch->prepared;
             ext4_file local=*files[i];
-            const struct file_data_source *source;
-            result=ext4_write_spans(&local,files[i],&spans[i],1,false,&source);
+            result=ext4_write_spans_small(&local,files[i],sets[i].spans,sets[i].count,false);
             if (result) break;
             batch->prepared++;
         }
@@ -6223,11 +6271,16 @@ int ext4_fpwrite_small_files(ext4_file *const *files, struct file_write_span *sp
                 mp->inode_observer.written(files[i]->time_owner,saved->fields,saved->times,EOK);
             }
         }
+        if (!result && batch->completion) {
+            *data_result=ext4_complete_physical(fs->jbd_journal,&completion);
+            if (*data_result==ENOTSUP) *data_result=EIO;
+        }
     }
     ext4_free(batch);
 Unlock:
     EXT4_MP_UNLOCK(mp);
-    if (result) for (unsigned i=0;i<count;i++) spans[i].written=0;
+    if (result) for (unsigned i=0;i<count;i++)
+        for (unsigned j=0;j<sets[i].count;j++) sets[i].spans[j].written=0;
     return result;
 }
 

@@ -273,7 +273,13 @@ enum kernel_vfs_resolve_flags {
     KERNEL_VFS_RESOLVE_CACHED = 1U << 5,
 };
 #define KERNEL_VFS_RESOLVE_SCOPED (KERNEL_VFS_RESOLVE_BENEATH | KERNEL_VFS_RESOLVE_IN_ROOT)
-struct kernel_vfs_open_request { unsigned flags; uint32_t mode, umask; unsigned access, resolve; };
+struct kernel_vfs_open_request {
+    unsigned flags;
+    uint32_t mode, umask;
+    unsigned access, resolve;
+    /* Length of the imported, null-terminated path. Kernel paths may leave it zero. */
+    size_t path_length;
+};
 /* A failed final magic-link follow can return its owned link identity for
  * an OFD-level reopen. The caller releases pathless_link even on failure. */
 struct kernel_vfs_open_result { int created; struct kernel_vfs_path *pathless_link; };

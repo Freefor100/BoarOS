@@ -69,4 +69,9 @@ struct file_write_span {
     size_t source_size;
 };
 
+struct file_write_set {
+    struct file_write_span *spans;
+    unsigned count;
+};
+
 #endif

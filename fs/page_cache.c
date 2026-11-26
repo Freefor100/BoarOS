@@ -4759,15 +4759,16 @@ int kernel_page_cache_writeback(struct kernel_page_cache *cache, struct kernel_v
 
 enum { SMALL_FILE_WRITEBACK_MAX=8 };
 
-static size_t writeback_small_files(struct kernel_page_cache *cache,
-    struct kernel_vfs_node **nodes,size_t limit,struct writeback_workspace *work,
-    size_t *attempted)
+static size_t writeback_files(struct kernel_page_cache *cache,
+    struct kernel_vfs_node **nodes, struct range_writeback *const *ranges,
+    size_t limit, struct writeback_workspace *work, size_t capacity, size_t *attempted,
+    int *data_result)
 {
     if (limit>SMALL_FILE_WRITEBACK_MAX) limit=SMALL_FILE_WRITEBACK_MAX;
-    if (limit>BOAROS_PAGE_CACHE_WRITEBACK_PAGES) limit=BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
-    size_t count=0,prepared_count=0,locked=0,accepted=0;
+    size_t count=0,pages=0,prepared_count=0,locked=0,accepted=0;
     struct kernel_page_cache_entry **entries=work->selected;
     struct prepared_writeback *prepared=work->prepared;
+    struct file_write_set sets[SMALL_FILE_WRITEBACK_MAX];
     struct kernel_lock_guard guards[SMALL_FILE_WRITEBACK_MAX]={0};
     unsigned order[SMALL_FILE_WRITEBACK_MAX];
     {
@@ -4775,25 +4776,41 @@ static size_t writeback_small_files(struct kernel_page_cache *cache,
         for (;count<limit;count++) {
             struct kernel_vfs_node *node=nodes[count];
             struct kernel_page_cache_dirty *dirty=kernel_vfs_node_dirty_pages(node);
-            if (dirty->count!=1 || kernel_vfs_node_size(node)>BOAROS_PAGE_SIZE ||
+            uint64_t first=0, last=0;
+            if (ranges) {
+                first=ranges[count]->window.cursor;
+                last=ranges[count]->window.last;
+                /* The capture shares one limit across all files. A finite
+                 * range with a partial last page keeps the scalar path. */
+                if (ranges[count]->window.end <= (last << BOAROS_PAGE_SHIFT) ||
+                    ranges[count]->window.end-(last << BOAROS_PAGE_SHIFT)<BOAROS_PAGE_SIZE) break;
+            } else if (dirty->count!=1 || kernel_vfs_node_size(node)>BOAROS_PAGE_SIZE ||
                 !node->instance->ops->writeback_small_candidate(node)) break;
-            struct kernel_page_cache_entry *entry=RB_MIN(kernel_page_cache_dirty_tree,&dirty->tree);
-            if (entry->page_index || entry->dirty_begin || entry->aliases || entry->writeback ||
-                __atomic_load_n(&entry->writes,__ATOMIC_RELAXED)) break;
-            entries[count]=entry;
-            entry_borrow_indexed(entry);
+            struct kernel_page_cache_entry *entry=dirty_at_or_after(node,first);
+            size_t end=pages;
+            for (;entry && entry->page_index<=last;
+                 entry=RB_NEXT(kernel_page_cache_dirty_tree,&dirty->tree,entry)) {
+                if (end==capacity || entry->aliases || entry->writeback ||
+                    (!ranges && entry->dirty_begin) ||
+                    __atomic_load_n(&entry->writes,__ATOMIC_RELAXED)) break;
+                entries[end++]=entry;
+            }
+            if (end==pages || (entry && entry->page_index<=last)) break;
+            sets[count]=(struct file_write_set){work->spans+pages,(unsigned)(end-pages)};
+            for (;pages<end;pages++) entry_borrow_indexed(entries[pages]);
         }
-        entry_borrows_add(cache->record,count);
+        entry_borrows_add(cache->record,pages);
     }
     if (count<2) goto Release;
-    *attempted=count;
-    COST_ADD(WRITEBACK_VISITS,count);
+    if (attempted) *attempted=count;
+    COST_ADD(WRITEBACK_VISITS,pages);
     reclaim_window_memory(cache);
-    memset(prepared,0,count*sizeof(*prepared));
-    if (prepare_writeback_prefix(cache,entries,count,UINT64_MAX,0,prepared,&prepared_count) ||
-        prepared_count!=count) goto Release;
-    for (unsigned i=0;i<count;i++) {
+    memset(prepared,0,pages*sizeof(*prepared));
+    if (prepare_writeback_prefix(cache,entries,pages,UINT64_MAX,0,prepared,&prepared_count) ||
+        prepared_count!=pages) goto Release;
+    for (size_t i=0;i<pages;i++)
         if (!prepared[i].version) goto Release;
+    for (unsigned i=0;i<count;i++) {
         unsigned j=i;
         while (j && nodes[order[j-1]]->io_lock.key>nodes[i]->io_lock.key) {
             order[j]=order[j-1];
@@ -4803,16 +4820,16 @@ static size_t writeback_small_files(struct kernel_page_cache *cache,
     }
     for (;locked<count;locked++)
         if (!kernel_vfs_node_try_read(nodes[order[locked]],&guards[locked])) goto Release;
-    capture_writeback(cache,entries,prepared,count,UINT64_MAX);
+    capture_writeback(cache,entries,prepared,pages,UINT64_MAX);
     struct file_write_span *spans=work->spans;
-    for (size_t i=0;i<count;i++) {
+    for (size_t i=0;i<pages;i++) {
         size_t cursor=prepared[i].begin,begin,end;
         if (!next_writeback_span(entries[i],&prepared[i],&cursor,&spans[i]) ||
             next_writeback_range(entries[i],&prepared[i],&cursor,&begin,&end)) goto Release;
     }
-    if (nodes[0]->instance->ops->writeback_small_files(nodes,spans,count)) goto Release;
+    if (nodes[0]->instance->ops->writeback_files(nodes,sets,(unsigned)count,data_result)) goto Release;
     accepted=count;
-    for (size_t i=0;i<count;i++) {
+    for (size_t i=0;i<pages;i++) {
         if (spans[i].written!=spans[i].size) __builtin_trap();
         prepared[i].written=spans[i].written;
     }
@@ -4824,12 +4841,12 @@ Release:
     }
     {
         CACHE_SCOPE(complete,cache);
-        for (size_t i=0;i<count;i++) {
+        for (size_t i=0;i<pages;i++) {
             if (accepted) (void)complete_writeback(cache,entries[i],&prepared[i],0);
             entry_return(entries[i]);
         }
     }
-    if (accepted) return_prepared_versions(cache,prepared,accepted,0);
+    if (accepted) return_prepared_versions(cache,prepared,pages,0);
     return accepted;
 }
 
@@ -4851,7 +4868,7 @@ int kernel_page_cache_writeback_mount(struct kernel_page_cache *cache,
     int result=0;
     union foreground_workspace *lease=NULL;
     struct writeback_workspace work;
-    bool batch=count>1 && nodes[0]->instance->ops->writeback_small_files &&
+    bool batch=count>1 && nodes[0]->instance->ops->writeback_files &&
         !nodes[0]->instance->namespace_parallel && !kernel_page_cache_needs_cpu0(cache);
     for (size_t i=0;i<count;) {
         size_t attempted=1;
@@ -4861,7 +4878,8 @@ int kernel_page_cache_writeback_mount(struct kernel_page_cache *cache,
             else work=(struct writeback_workspace){.prepared=lease->writeback.prepared,
                 .spans=lease->writeback.spans,.selected=lease->writeback.selected};
         }
-        size_t accepted=lease?writeback_small_files(cache,nodes+i,count-i,&work,&attempted):0;
+        size_t accepted=lease?writeback_files(cache,nodes+i,NULL,count-i,&work,
+            BOAROS_PAGE_CACHE_WRITEBACK_PAGES,&attempted,NULL):0;
         if (accepted) i+=accepted;
         else {
             if (lease) {
@@ -5145,6 +5163,7 @@ static bool run_queued_range_batch(struct kernel_page_cache *cache, struct range
     if (!first->collect || !instance->ops->complete_data_batch || instance->namespace_parallel)
         return false;
     struct range_writeback *items[SMALL_FILE_WRITEBACK_MAX];
+    struct kernel_vfs_node *nodes[SMALL_FILE_WRITEBACK_MAX];
     struct kernel_vfs_data_range ranges[SMALL_FILE_WRITEBACK_MAX];
     struct range_writeback *owners[SMALL_FILE_WRITEBACK_MAX];
     unsigned count = 0;
@@ -5157,8 +5176,9 @@ static bool run_queued_range_batch(struct kernel_page_cache *cache, struct range
             uint64_t windows = item->window.last - item->window.cursor + 1;
             if (windows > cache->record->writeback_capacity - pages) break;
             unsigned i = 0;
-            while (i < count && items[i]->window.node != item->window.node) i++;
+            while (i < count && nodes[i] != item->window.node) i++;
             if (i < count) break;
+            nodes[count] = item->window.node;
             items[count++] = item;
             pages += windows;
         }
@@ -5168,6 +5188,29 @@ static bool run_queued_range_batch(struct kernel_page_cache *cache, struct range
     /* Cache acceptance and home data completion are distinct. Leave every
      * accepted request visible to matching range waiters until device I/O. */
     unsigned processed = 0, ready = 0;
+    int data_result = -KERNEL_EOPNOTSUPP;
+    if (instance->ops->writeback_files)
+        processed = (unsigned)writeback_files(cache, nodes, items, count,
+            cache->record->writeback_workspace, cache->record->writeback_capacity, NULL,
+            &data_result);
+    if (processed && data_result != -KERNEL_EOPNOTSUPP) {
+        if (data_result)
+            for (unsigned i = 0; i < processed; i++)
+                kernel_vfs_record_writeback_error(nodes[i], data_result);
+        retire_range_requests(cache, first, items[processed - 1], processed);
+        return true;
+    }
+    while (ready < processed) {
+        struct range_writeback *item = items[ready];
+        struct foreground_writeback *window = &item->window;
+        ranges[ready] = (struct kernel_vfs_data_range){window->node,
+            window->cursor << BOAROS_PAGE_SHIFT, (window->last + 1) << BOAROS_PAGE_SHIFT};
+        owners[ready++] = item;
+        window->done = 1;
+    }
+    /* An accepted transaction can leave the next file on the ordinary
+     * path. Finish the accepted prefix first and return its queue slots. */
+    if (processed) count = processed;
     while (processed < count) {
         struct range_writeback *item = items[processed++];
         if (writeback_range_window(item, &ranges[ready])) owners[ready++] = item;
@@ -5188,50 +5231,13 @@ static bool run_queued_range_batch(struct kernel_page_cache *cache, struct range
             }
         }
     }
-    if (!items[processed - 1]->window.done) {
-        struct range_writeback *partial = items[--processed];
+    struct range_writeback *last = items[processed - 1];
+    if (!last->window.done) {
         CACHE_SCOPE(progress, cache);
-        partial->first = partial->window.cursor;
-        if (!processed) cache_wake(&cache->record->range_progress);
+        last->first = last->window.cursor;
+        if (!--processed) cache_wake(&cache->record->range_progress);
     }
     if (processed) retire_range_requests(cache, first, items[processed - 1], processed);
-    return true;
-}
-
-static bool run_small_range_batch(struct kernel_page_cache *cache, struct range_writeback *first)
-{
-    struct kernel_vfs_instance *instance=first->window.node->instance;
-    if (!instance->ops->writeback_small_files || instance->namespace_parallel ||
-        first->window.cursor || first->window.last || first->window.end<BOAROS_PAGE_SIZE)
-        return false;
-
-    struct kernel_vfs_node *nodes[SMALL_FILE_WRITEBACK_MAX];
-    struct range_writeback *items[SMALL_FILE_WRITEBACK_MAX];
-    size_t count=0;
-    {
-        CACHE_SCOPE(select,cache);
-        for (struct range_writeback *item=first;item && count<SMALL_FILE_WRITEBACK_MAX;item=item->next) {
-            struct kernel_vfs_node *node=item->window.node;
-            if (node->instance!=instance || item->window.cursor || item->window.last ||
-                item->window.end<BOAROS_PAGE_SIZE ||
-                !instance->ops->writeback_small_candidate(node)) break;
-            size_t i=0;
-            while (i<count && nodes[i]!=node) i++;
-            if (i<count) break;
-            nodes[count]=node;
-            items[count++]=item;
-        }
-    }
-    if (count<2) return false;
-    size_t attempted=0;
-    size_t completed=writeback_small_files(cache,nodes,count,cache->record->writeback_workspace,&attempted);
-    if (!completed) return false;
-
-    /* Acceptance may retain ordered data. Finish it before notifying
-     * waiters and returning all of this batch's queue slots together. */
-    for (size_t i=0;i<completed;i++)
-        (void)kernel_vfs_node_complete_data_range(nodes[i],0,BOAROS_PAGE_SIZE);
-    retire_range_requests(cache,first,items[completed-1],completed);
     return true;
 }
 
@@ -5251,10 +5257,6 @@ static void run_range_writeback(struct kernel_page_cache *cache,
                 retire_range_requests(cache, request, last, completed);
                 return;
             }
-        }
-        if (run_small_range_batch(cache,request)) {
-            io->background_reclaim = previous;
-            return;
         }
         if (run_queued_range_batch(cache, request)) {
             io->background_reclaim = previous;

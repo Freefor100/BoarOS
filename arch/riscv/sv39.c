@@ -2775,10 +2775,11 @@ static enum riscv_sv39_status init_forked_user_space(
 
 /* Same encoding for a private fork leaf at either page size. Shared
  * mappings already have their final permissions, including PROT_NONE. */
-static enum riscv_sv39_status fork_leaf_entry(uint64_t old, int action, uint64_t *entry)
+static inline __attribute__((always_inline)) enum riscv_sv39_status fork_leaf_entry(
+    uint64_t old, int action, uint64_t *entry)
 {
     if (action == RISCV_SV39_FORK_SHARED) {
-        if (present_cow_entry(old) || protected_cow_entry(old))
+        if (old & RISCV_SV39_PTE_COW)
             return RISCV_SV39_STATUS_STATE;
         *entry = old;
     } else if (action == RISCV_SV39_FORK_PRIVATE) {
@@ -2818,50 +2819,48 @@ static __attribute__((noinline)) enum riscv_sv39_status share_leaf_table(
     struct riscv_sv39_user_space *child, const uint64_t *parent_entries,
     uint64_t base, int (*policy)(void *, uint64_t), void *context)
 {
-    _Static_assert((RISCV_SV39_INDEX_MASK + 1) % PHYSICAL_PAGE_REFERENCE_BATCH_MAX == 0,
-                   "whole number of reference batches per leaf table");
-    _Static_assert((PHYSICAL_PAGE_REFERENCE_BATCH_MAX & (PHYSICAL_PAGE_REFERENCE_BATCH_MAX - 1U)) == 0,
-                   "reference batches must be a power of two");
     const unsigned batch = PHYSICAL_PAGE_REFERENCE_BATCH_MAX;
     const unsigned limit = RISCV_SV39_INDEX_MASK + 1U;
     uint64_t *child_entries = NULL;
-    for (unsigned start = 0; start < limit;) {
-        unsigned first_present = next_table_entry(parent_entries, start, limit);
-        if (first_present == limit) break;
-        unsigned first = first_present & ~(batch - 1U);
-        start = first + batch;
+    for (unsigned index = 0; index < limit;) {
         uint64_t refs[PHYSICAL_PAGE_REFERENCE_BATCH_MAX];
-        uint64_t entries[PHYSICAL_PAGE_REFERENCE_BATCH_MAX] = {0};
+        uint64_t entries[PHYSICAL_PAGE_REFERENCE_BATCH_MAX];
+        uint16_t slots[PHYSICAL_PAGE_REFERENCE_BATCH_MAX];
         unsigned count = 0, protected = 0, cow = 0;
-        for (unsigned i = first_present - first; i < batch; i++) {
-            unsigned index = first + i;
-            uint64_t old = parent_entries[index];
-            if (!old) continue;
-            if (!valid_user_leaf_entry(old) && !valid_protected_entry(old))
+        while (index < limit && count < batch) {
+            unsigned slot = index++;
+            uint64_t old = parent_entries[slot];
+            if (!old) {
+                index = next_table_entry(parent_entries, index, limit);
+                continue;
+            }
+            int present = valid_user_leaf_entry(old);
+            if (!present && !valid_protected_entry(old))
                 return RISCV_SV39_STATUS_STATE;
-            uint64_t address = base | ((uint64_t)index << BOAROS_PAGE_SHIFT);
+            uint64_t address = base | ((uint64_t)slot << BOAROS_PAGE_SHIFT);
             int action = policy ? policy(context, address) : RISCV_SV39_FORK_PRIVATE;
             if (action == RISCV_SV39_FORK_SKIP) continue;
-            enum riscv_sv39_status status = fork_leaf_entry(old, action, &entries[i]);
+            enum riscv_sv39_status status = fork_leaf_entry(old, action, &entries[count]);
             if (status) return status;
-            if (!child_entries) {
-                uint64_t *slot;
-                status = resolve_user_order_slot(child, address, &slot, 0);
-                if (status) return status;
-                child_entries = slot - index;
-            }
-            refs[count++] = entry_address(old);
-            protected += valid_protected_entry(old) != 0;
+            refs[count] = entry_address(old);
+            slots[count++] = slot;
+            protected += !present;
             cow += action == RISCV_SV39_FORK_PRIVATE;
         }
-        if (!count) continue;
+        if (!count) break;
         if (child->cow_pages > UINT32_MAX-cow) return RISCV_SV39_STATUS_STATE;
-        /* The new table is private and empty. All fallible preparation for
-         * this window precedes its references and PTEs, so teardown owns
-         * exactly the windows already published on any later failure. */
+        if (!child_entries) {
+            uint64_t *slot;
+            uint64_t address = base | ((uint64_t)slots[0] << BOAROS_PAGE_SHIFT);
+            enum riscv_sv39_status status = resolve_user_order_slot(child, address, &slot, 0);
+            if (status) return status;
+            child_entries = slot - slots[0];
+        }
+        /* Complete fallible work before taking references. Pack up to 16
+         * inherited leaves across holes within this private child table. */
         physical_page_acquire_batch(child->allocator, refs, count);
-        for (unsigned i = 0; i < batch; i++)
-            child_entries[first+i] = entries[i];
+        for (unsigned i = 0; i < count; i++)
+            child_entries[slots[i]] = entries[i];
         child->protected_pages += protected;
         child->leaf_pages += count-protected;
         child->cow_pages += cow;

@@ -2436,6 +2436,28 @@ int jbd_trans_prepare_unowned_range(struct jbd_trans *trans, struct ext4_block *
     return error ? error : jbd_prepare_private(trans, block, offset, length, JBD_COPY);
 }
 
+int jbd_trans_prepare_checked_patch(struct jbd_trans *trans, struct ext4_block *block,
+    uint32_t offset, uint32_t length, uint32_t checksum_offset)
+{
+    COST_SCOPE(prepare_cost, JOURNAL_RECORD_PREPARE_TICKS);
+    if ((offset | length | checksum_offset) & 31U) return EINVAL;
+    int result = write_range_status(trans, offset, length);
+    if (!result) result = write_range_status(trans, checksum_offset, 32);
+    if (result) return result;
+    if (jbd_trans_find_buf(trans, block->lb_id)) return ENOTSUP;
+    /* Binding transfers the current payload loan to the accepted block.
+     * Its new owner holds the original bytes if the identities match. */
+    uintptr_t baseline = (uintptr_t)block->payload;
+    result = jbd_prepare_private(trans, block, offset, length, JBD_COPY);
+    if (!result) {
+        struct jbd_buf *record = TAILQ_FIRST(&trans->buf_queue);
+        if ((uintptr_t)record->block.payload != baseline) result = EAGAIN;
+        else if (checksum_offset < offset || checksum_offset >= offset + length)
+            result = jbd_initialize_range(record, record->block.payload, checksum_offset, 32, true);
+    }
+    return result;
+}
+
 int jbd_trans_get_write_access_range(struct jbd_trans *trans,
     struct ext4_block *block, uint32_t offset, uint32_t length)
 {
@@ -2542,16 +2564,22 @@ static bool jbd_patch_running(const struct jbd_buf *jb, const struct jbd_buf *ru
     if (current != &running->after->payload || current != running->block.payload ||
         __atomic_load_n(&jb->after->payload.references, __ATOMIC_ACQUIRE) != 1)
         return false;
-    uint32_t size = jb->trans->journal->block_size;
-    uint32_t end = size / 32, first = jbd_range_next(jb->dirty_ranges, 0, end, true);
-    uint32_t last = jbd_range_next(jb->dirty_ranges, first, end, false);
-    uint32_t length = (last - first) * 32U;
-    if (!length || length > 1024 || length > size / 4 ||
-        jbd_range_next(jb->dirty_ranges, last, end, true) != end)
-        return false;
-    uint32_t offset = first * 32U;
-    return ext4_bcache_patch_current(jb->block.buf, current, 4, offset,
-        (const uint8_t *)jb->after->data + offset, length, jb->checked_tree);
+    uint32_t size = jb->trans->journal->block_size, end = size / 32;
+    struct ext4_block_patch patches[2];
+    uint32_t bytes = 0;
+    unsigned count = 0;
+    for (uint32_t first = jbd_range_next(jb->dirty_ranges, 0, end, true);
+         first < end;) {
+        if (count == sizeof(patches) / sizeof(patches[0])) return false;
+        uint32_t last = jbd_range_next(jb->dirty_ranges, first, end, false);
+        uint32_t length = (last - first) * 32U;
+        bytes += length;
+        if (bytes > 1024 || bytes > size / 4) return false;
+        patches[count++] = (struct ext4_block_patch){first * 32U, length};
+        first = jbd_range_next(jb->dirty_ranges, last, end, true);
+    }
+    return count && ext4_bcache_patch_current(jb->block.buf, current, 4,
+        jb->after->data, patches, count, jb->checked_tree);
 }
 
 /* All records and credits were reserved before publication. Validate the full
