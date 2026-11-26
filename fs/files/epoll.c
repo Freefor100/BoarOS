@@ -65,7 +65,7 @@ static void epoll_notify(struct kernel_epoll *epoll)
 }
 
 static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t reason,uint64_t event)
-{ (void)event;
+{
     if (!node || !node->context) return;
     EPOLL_STATE(irq);
     struct kernel_epoll_item *item = node->context;
@@ -77,6 +77,10 @@ static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t r
         kernel_wait_queue_remove(node);
         return;
     }
+    /* A socket event may have passed the queue filter before EPOLL_CTL_MOD
+     * replaced its interest. Recheck under the same lock as the modification. */
+    if (event && item->target_file->kind == KERNEL_OPEN_FILE_KIND_SOCKET &&
+        !(event & (item->events | KERNEL_POLLERR | KERNEL_POLLHUP))) return;
     if (epoll && item->linked && !item->oneshot_disarmed) {
         item->notification_generation++;
         /* poll和用户复制都可能重入；通知链不借用扫描者的ready_next。 */
@@ -568,6 +572,8 @@ enum kernel_files_status kernel_files_epoll_ctl(
         item->data = data;
         kernel_wait_node_init_callback(&item->wait_node, kernel_epoll_wait_callback, item);
         item->wait_node.event_mask=kernel_signal_fd_mask(target_file);
+        if (target_file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
+            item->wait_node.readiness_mask = events | KERNEL_POLLERR | KERNEL_POLLHUP;
         kernel_preempt_disable();
         int error = 0;
         if (kernel_open_file_kind(target_file) == KERNEL_OPEN_FILE_KIND_EPOLL)
@@ -619,6 +625,9 @@ enum kernel_files_status kernel_files_epoll_ctl(
         item->references++;
         uint64_t control = ++item->control_generation;
         item->events = events;
+        if (target_file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
+            __atomic_store_n(&item->wait_node.readiness_mask,
+                events | KERNEL_POLLERR | KERNEL_POLLHUP, __ATOMIC_RELAXED);
         item->data = data;
         item->oneshot_disarmed = 0;
         epoll_state_release(&irq);

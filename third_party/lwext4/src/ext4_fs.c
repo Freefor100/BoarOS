@@ -1942,8 +1942,8 @@ out:
     return r;
 }
 
-int ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *ref,
-    ext4_lblk_t iblock, uint32_t max_blocks, bool create,
+static int inode_dblk_range(struct ext4_inode_ref *ref,
+    ext4_lblk_t iblock, uint32_t max_blocks, bool create, uint32_t overwritten_blocks __unused,
     struct ext4_inode_block_range *range)
 {
     COST_PHASE_SCOPE(read_source, 6);
@@ -1952,10 +1952,27 @@ int ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *ref,
     struct ext4_fs *fs = ref->fs;
 #if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
     if (ext4_sb_feature_incom(ext4_fs_super(fs), EXT4_FINCOM_EXTENTS) &&
-        ext4_inode_has_flag(ref->inode, EXT4_INODE_FLAG_EXTENTS))
+        ext4_inode_has_flag(ref->inode, EXT4_INODE_FLAG_EXTENTS)) {
+        if (overwritten_blocks)
+            return ext4_extent_write_range(ref, iblock, max_blocks, overwritten_blocks, range);
         return ext4_extent_get_range(ref, iblock, max_blocks, create, range);
+    }
 #endif
     return ext4_fs_indirect_range(ref, iblock, max_blocks, create, range);
+}
+
+int ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *ref,
+    ext4_lblk_t iblock, uint32_t max_blocks, bool create,
+    struct ext4_inode_block_range *range)
+{
+    return inode_dblk_range(ref, iblock, max_blocks, create, 0, range);
+}
+
+int ext4_fs_get_inode_dblk_write_range(struct ext4_inode_ref *ref,
+    ext4_lblk_t iblock, uint32_t max_blocks, uint32_t overwritten_blocks,
+    struct ext4_inode_block_range *range)
+{
+    return inode_dblk_range(ref, iblock, max_blocks, true, overwritten_blocks, range);
 }
 
 int ext4_fs_release_inode_dblk_idx(struct ext4_inode_ref *inode_ref,

@@ -1753,7 +1753,8 @@ static struct kernel_socket *unix_uncharge_amount_locked(struct kernel_socket *s
         if (sender->type==SOCKET_STREAM)
             unix_stream_ready(sender,KERNEL_POLLOUT|KERNEL_POLLWRNORM|KERNEL_POLLWRBAND);
         else wake_socket(sender);
-        if (unix_writable(sender)) socket_async(sender,KERNEL_ASYNC_POLL_OUT);
+        if (kernel_wait_queue_registrations(&sender->async_events) && unix_writable(sender))
+            socket_async(sender,KERNEL_ASYNC_POLL_OUT);
     }
     return release?sender:NULL;
 }
@@ -4294,10 +4295,8 @@ static int socket_receive_empty(const struct kernel_socket *socket, int nonblock
 int kernel_socket_receive_ready(struct kernel_socket *socket)
 {
     SOCKET_ENDPOINT(saved,socket);
-    int ready = socket->read_request == 0 &&
+    return socket->read_request == 0 &&
         (socket->listening || socket->packets_head != 0 || socket_receive_empty(socket, 0) != -KERNEL_EAGAIN);
-    socket_state_release(&saved);
-    return ready;
 }
 
 static uint32_t packet_available(const struct socket_packet *packet)
@@ -4346,7 +4345,8 @@ int kernel_socket_reserve_read(struct kernel_socket *socket,
     uint32_t length = 0;
     /* acquire只检查lock并随后填满guard；无UNIX图边不清零未使用的锁记录。 */
     struct kernel_lock_guard gc __attribute__((cleanup(kernel_lock_scope_release)));gc.lock=0;
-    struct socket_state_guard old_status __attribute__((cleanup(socket_state_release)))={0};
+    struct socket_state_guard old_status __attribute__((cleanup(socket_state_release)));
+    old_status.owner=0;
     if (request == 0 || request->socket != 0 ||
         pin_owner == 0 || *pin_owner == 0 ||
         kernel_open_file_socket(*pin_owner) != socket)
@@ -4355,13 +4355,11 @@ retry:
     socket_state_acquire_lock(&old_status,socket_endpoint_lock(socket));
     if(socket->domain==KERNEL_SOCKET_DOMAIN_INET && network_is_stopping())return -KERNEL_EIO;
     if (socket->listening) {
-        socket_state_release(&old_status);
         return socket->domain==KERNEL_SOCKET_DOMAIN_UNIX && socket->type==SOCKET_STREAM?-KERNEL_EINVAL:-KERNEL_ENOTCONN;
     }
     if (socket->read_request != 0) {
         if(message && socket->domain==KERNEL_SOCKET_DOMAIN_UNIX && socket->type==SOCKET_STREAM && socket->connected)
             message->receive_state=KERNEL_SOCKET_RECEIVE_STREAM_EMPTY;
-        socket_state_release(&old_status);
         return -KERNEL_EAGAIN;
     }
     int continuing_peek = request->waitall && message &&
@@ -4376,12 +4374,10 @@ retry:
         int result = socket_receive_empty(socket, nonblocking);
         if(message && !result && socket->type==SOCKET_SEQPACKET)message->receive_state=KERNEL_SOCKET_RECEIVE_EOF;
         if (socket->pending_error && !request->progressed) socket->pending_error = 0;
-        socket_state_release(&old_status);
         return result;
     }
     /* UNIX recv(0)仍检查队首控制消息；INET保留原来的空范围处理。 */
     if (capacity == 0U && socket->type == SOCKET_STREAM && socket->domain!=KERNEL_SOCKET_DOMAIN_UNIX) {
-        socket_state_release(&old_status);
         return 0;
     }
     if (capacity > (uint32_t)__INT_MAX__) capacity = __INT_MAX__;
@@ -4426,8 +4422,8 @@ retry:
         kernel_task_socket_read_register(task, request) != KERNEL_TASK_STATUS_OK)
         __builtin_trap();
     socket->read_request = request;
-    socket_state_release(&old_status);
     if(source) {
+        socket_state_release(&old_status);
         struct kernel_socket_control *copy=NULL;
         int peek=message && (message->flags&KERNEL_SOCKET_MSG_PEEK);
         int preserve=!request->datagram && source->count && source->has_credentials &&
@@ -4438,7 +4434,7 @@ retry:
         if(error) {
             socket_state_acquire_lock(&old_status,socket_endpoint_lock(socket));socket->read_request=NULL;wake_socket(socket);
             if(task && kernel_task_socket_read_clear(task,request)!=KERNEL_TASK_STATUS_OK)__builtin_trap();
-            *pin_owner=request->pin;request->pin=NULL;request->socket=NULL;socket_state_release(&old_status);return error;
+            *pin_owner=request->pin;request->pin=NULL;request->socket=NULL;return error;
         }
         request->peek_control=copy;
     }
@@ -4591,7 +4587,10 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
         packet = packet->next;
     }
     if(peek)charge=0;
-    SOCKET_ENDPOINT(scope,socket);
+    /* Release this state before disposing of detached controls and packets. */
+    struct socket_state_guard scope;
+    scope.owner = NULL;
+    socket_state_acquire_lock(&scope, socket_endpoint_lock(socket));
     if (tail) {
         retired = socket->packets_head;
         socket->packets_head = tail->next;
@@ -7071,7 +7070,7 @@ uint64_t kernel_socket_receive_timeout(struct kernel_socket *socket)
     return timeout;
 }
 
-static uint32_t socket_poll_locked(struct kernel_socket *socket)
+static uint32_t socket_poll_locked(struct kernel_socket *socket, uint32_t mask)
 {
     uint32_t events = 0;
     COST_ADD(NETWORK_POLL_CALLS, 1);
@@ -7087,7 +7086,9 @@ static uint32_t socket_poll_locked(struct kernel_socket *socket)
             if(socket->read_closed)events|=KERNEL_POLLRDHUP;
             if((socket->read_closed && socket->write_closed) || (!socket->connected && !socket->listening))
                 events|=KERNEL_POLLHUP;
-            if(!socket->listening && unix_writable(socket))events|=KERNEL_POLLOUT|KERNEL_POLLWRNORM|KERNEL_POLLWRBAND;
+            uint32_t write_events = KERNEL_POLLOUT | KERNEL_POLLWRNORM | KERNEL_POLLWRBAND;
+            if ((mask & write_events) && !socket->listening && unix_writable(socket))
+                events |= write_events;
         } else {
             if ((socket->packets_head != 0 || socket->read_closed) && socket->read_request == 0)
                 events |= KERNEL_POLLIN | KERNEL_POLLRDNORM;
@@ -7141,23 +7142,23 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket, struct kernel_wait_que
 {
     SOCKET_ENDPOINT(state,socket);
     if (queue) *queue = &socket->wait;
-    return socket_poll_locked(socket);
+    return socket_poll_locked(socket, UINT32_MAX);
 }
 
 int kernel_socket_poll_prepare(struct kernel_socket *socket, uint32_t mask,
-    uint64_t deadline, struct kernel_wait_node *node, struct kernel_wait_token *token)
+    uint64_t deadline, struct kernel_wait_token *token)
 {
+#if BOAROS_COST_DIAGNOSTICS
     SOCKET_ENDPOINT(state,socket);
-    uint32_t ready = socket_poll_locked(socket) & mask;
+#else
+    /* Sampling and registration never stage endpoint notifications. */
+    KERNEL_IRQ_LOCK_SCOPE(state, socket_endpoint_lock(socket));
+#endif
+    uint32_t ready = socket_poll_locked(socket, mask) & mask;
     if (ready) return (int)ready;
 
-    enum kernel_scheduler_status status = deadline ?
-        kernel_wait_prepare_monotonic(NULL, deadline, 1, token) :
-        kernel_wait_prepare(NULL, 0, 1, token);
-    if (status != KERNEL_SCHEDULER_STATUS_OK) return -KERNEL_EIO;
-    kernel_wait_node_init(node, token->task);
-    node->readiness_mask = mask;
-    status = kernel_wait_node_bind(&socket->wait, node, token);
+    enum kernel_scheduler_status status = kernel_wait_prepare_poll(&socket->wait,
+        deadline, mask, token);
     return status == KERNEL_SCHEDULER_STATUS_OK ? 0 : -KERNEL_EIO;
 }
 

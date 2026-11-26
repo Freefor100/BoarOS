@@ -1339,13 +1339,20 @@ static void capture_allocation_hooks(struct physical_page_allocator *a,
 
 static enum physical_page_status
 physical_page_allocate_order_once(struct physical_page_allocator *a, uint32_t order,
-    uint64_t *address, struct physical_page_reclaim_hooks *hooks, uint64_t *available)
+    uint64_t *address, struct physical_page_reclaim_hooks *hooks, uint64_t *available,
+    int two_references)
 {
     PAGE_METADATA_SCOPE(work,a);
     if (!allocator_initialized(a) || !address || order>PHYSICAL_PAGE_MAX_ORDER)
         return PHYSICAL_PAGE_STATUS_INVALID;
     if (!physical_page_allocator_is_finalized(a)) return PHYSICAL_PAGE_STATUS_STATE;
-    enum physical_page_status status = allocate_order_locked(a, order, address, NULL, &work, 1);
+    struct buddy_owner owner;
+    enum physical_page_status status = allocate_order_locked(a, order, address,
+        two_references ? &owner : NULL, &work, 1);
+    if (!status && two_references) {
+        a->metadata[owner.first].reference_count = 2;
+        page_written(&work);
+    }
     if (hooks) {
         *available = a->available_pages;
         capture_allocation_hooks(a, hooks, status == PHYSICAL_PAGE_STATUS_EMPTY);
@@ -1553,28 +1560,28 @@ enum physical_page_status physical_page_allocate_order_nosleep(
     struct physical_page_allocator *allocator, uint32_t order, uint64_t *address)
 {
     COST_ADD(PAGE_CALLS,1);
-    enum physical_page_status status=physical_page_allocate_order_once(allocator,order,address,NULL,NULL);
+    enum physical_page_status status=physical_page_allocate_order_once(allocator,order,address,NULL,NULL,0);
     if (status==PHYSICAL_PAGE_STATUS_OK) {
         COST_ADD(PAGE_ACCEPTED,order_page_count(order));COST_IO_ADD(7,order_page_count(order));
     } else COST_ADD(PAGE_FAILURES,1);
     return status;
 }
 
-enum physical_page_status physical_page_allocate_order(
+static enum physical_page_status allocate_order_reclaim(
     struct physical_page_allocator *allocator,
     uint32_t order,
-    uint64_t *address)
+    uint64_t *address, int two_references)
 {
     kernel_assert_can_block();
     COST_ADD(PAGE_CALLS, 1);
     struct physical_page_reclaim_hooks hooks = {0};
     uint64_t available = 0;
     enum physical_page_status status =
-        physical_page_allocate_order_once(allocator, order, address, &hooks, &available);
+        physical_page_allocate_order_once(allocator, order, address, &hooks, &available,two_references);
     if (hooks.notify) hooks.notify(hooks.context, available);
     if (status == PHYSICAL_PAGE_STATUS_EMPTY && kernel_stack_cache_reclaim &&
         kernel_stack_cache_reclaim(allocator))
-        status = physical_page_allocate_order_once(allocator, order, address, NULL, NULL);
+        status = physical_page_allocate_order_once(allocator, order, address, NULL, NULL,two_references);
     if (status == PHYSICAL_PAGE_STATUS_EMPTY) {
         uint64_t (*lazy_reclaim)(struct physical_page_allocator *,uint64_t,uint64_t *)=
             __atomic_load_n(&allocator->lazy_reclaim,__ATOMIC_ACQUIRE);
@@ -1594,7 +1601,7 @@ enum physical_page_status physical_page_allocate_order(
                 released=lazy_reclaim ? lazy_reclaim(allocator,order_page_count(order),&detached) : 0;
                 if (released<order_page_count(order) && hooks.reclaim)
                     released+=hooks.reclaim(hooks.context,order_page_count(order)-released);
-                status=physical_page_allocate_order_once(allocator,order,address,NULL,NULL);
+                status=physical_page_allocate_order_once(allocator,order,address,NULL,NULL,two_references);
                 /* LRU归还的页不保证物理相邻；有实际进展就继续尝试所需
                  * order，不能用空闲页总数代替连续块是否已经形成。 */
             } while (status==PHYSICAL_PAGE_STATUS_EMPTY && (released || detached));
@@ -1603,7 +1610,7 @@ enum physical_page_status physical_page_allocate_order(
             if (status==PHYSICAL_PAGE_STATUS_EMPTY &&
                 physical_page_available(allocator)<order_page_count(order) && hooks.wait) {
                 hooks.wait(hooks.context);
-                status=physical_page_allocate_order_once(allocator,order,address,NULL,NULL);
+                status=physical_page_allocate_order_once(allocator,order,address,NULL,NULL,two_references);
             }
         }
     }
@@ -1615,6 +1622,14 @@ reclaim_done:
     } else COST_ADD(PAGE_FAILURES, 1);
     return status;
 }
+
+enum physical_page_status physical_page_allocate_order(
+    struct physical_page_allocator *allocator, uint32_t order, uint64_t *address)
+{ return allocate_order_reclaim(allocator,order,address,0); }
+
+enum physical_page_status physical_page_allocate_two_references(
+    struct physical_page_allocator *allocator, uint64_t *address)
+{ return allocate_order_reclaim(allocator,0,address,1); }
 
 enum physical_page_status physical_page_allocation_order(
     const struct physical_page_allocator *a, uint64_t address, uint32_t *order)

@@ -5,14 +5,37 @@ work=$(mktemp -d)
 trap 'result=$?; if [ "$result" -eq 0 ]; then rm -rf "$work"; else echo "test artifacts retained: $work" >&2; fi' EXIT
 trap 'exit 1' HUP INT TERM
 cc=${HOST_CC:-cc}
+case " ${JOURNAL_TEST_CFLAGS:-} " in
+    *" -DBOAROS_PAGE_SHIFT="*) ;;
+    *) JOURNAL_TEST_CFLAGS="${JOURNAL_TEST_CFLAGS:-} -DBOAROS_PAGE_SHIFT=12" ;;
+esac
 "$cc" -std=gnu11 -O1 -g -Wall -Wextra -Werror -Wno-unused-but-set-variable \
     -Wno-stringop-truncation -DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 ${JOURNAL_TEST_CFLAGS:-} \
     -DTEST_JBD_RECORD_COPY -DTEST_JBD_CREDIT_PARALLEL -fno-builtin-memcpy \
     -Wl,--wrap=memcpy -Wl,--wrap=calloc -Wl,--wrap=malloc -Wl,--wrap=free -Wl,--wrap=ext4_crc32c \
     -Wl,--wrap=kernel_raw_lock_acquire,--wrap=ext4_bcache_find_get,--wrap=ext4_bcache_publish_journal,--wrap=ext4_block_rebind \
+    -DTEST_WRITEBACK_REGRESSIONS -Wl,--wrap=ext4_trans_write_data \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_journal.c" \
     "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
+case "${JOURNAL_TEST_CASE:-}" in
+write-unwritten|ordered-idle|'')
+    cases=${JOURNAL_TEST_CASE:-"write-unwritten ordered-idle"}
+    printf 'Old data' > "$work/data"
+    for block in 1024 4096; do
+        truncate -s 32M "$work/writeback-base.img"
+        mkfs.ext4 -q -F -b "$block" "$work/writeback-base.img"
+        debugfs -w -R "write $work/data /probe" "$work/writeback-base.img" >/dev/null 2>&1
+        for scenario in $cases; do
+            cp "$work/writeback-base.img" "$work/writeback.img"
+            timeout 30 "$work/probe" "$work/writeback.img" "$scenario"
+            e2fsck -fn "$work/writeback.img" > "$work/writeback-fsck.log" 2>&1 ||
+                { cat "$work/writeback-fsck.log"; exit 1; }
+        done
+    done
+    if [ -n "${JOURNAL_TEST_CASE:-}" ]; then exit 0; fi
+    ;;
+esac
 if [ "${JOURNAL_TEST_CASE:-}" = ext3-recovery ]; then
     printf 'Old data' > "$work/data"
     for block in 1024 4096; do

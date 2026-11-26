@@ -11,7 +11,7 @@ ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -Wno-unused-but-set-variable -Wno-stringop-truncation \
     -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT="${LWEXT4_HOST_PAGE_SHIFT:-12}" \
     -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 -DCONFIG_DEBUG_ASSERT=0 \
-    -DTEST_RANGE_WORK_COUNTERS=1 -DTEST_DIRECT_REUSE_GOAL=1 -Wl,--wrap=ext4_balloc_alloc_blocks -Wl,--wrap=ext4_crc32c -Wl,--wrap=ext4_fs_get_inode_dblk_range -Wl,--wrap=ext4_trans_block_get \
+    -DTEST_RANGE_WORK_COUNTERS=1 -DTEST_DIRECT_REUSE_GOAL=1 -Wl,--wrap=ext4_balloc_alloc_blocks -Wl,--wrap=ext4_crc32c -Wl,--wrap=ext4_fs_get_inode_dblk_range,--wrap=ext4_fs_get_inode_dblk_write_range -Wl,--wrap=ext4_trans_block_get \
     -include "$root/tests/host/lwext4_memory.h" \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_metadata.c" \

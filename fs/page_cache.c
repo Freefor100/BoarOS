@@ -2720,6 +2720,7 @@ static void commit_read_batch(void *argument)
     {
         CACHE_SCOPE(publish,cache);
         uint64_t size=kernel_vfs_node_size(node);
+        struct kernel_page_cache_entry *next=index_at_or_after(node,first);
         for (size_t i=0;i<count;i++) {
             if (pages[i].status!=KERNEL_PAGE_CACHE_STATUS_NOT_FOUND || entries[i]) continue;
             struct kernel_page_cache_entry *candidate=loads[i];
@@ -2728,7 +2729,9 @@ static void commit_read_batch(void *argument)
                 pages[i].status=KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE;
                 continue;
             }
-            struct kernel_page_cache_entry *entry=index_find(node,first+i);
+            while (next && next->page_index<first+i)
+                next=RB_NEXT(kernel_page_cache_tree,&node->cache_pages,next);
+            struct kernel_page_cache_entry *entry=next && next->page_index==first+i?next:NULL;
             if (entry) {
                 if (request->required>=0 && i!=(size_t)request->required) {
                     pages[i].status=KERNEL_PAGE_CACHE_STATUS_BUSY;
@@ -3072,7 +3075,7 @@ scalar:;
             continue;
         }
         uint64_t size=kernel_vfs_node_size(node);
-        struct kernel_page_cache_entry *next=required>=0?index_at_or_after(node,request->first):NULL;
+        struct kernel_page_cache_entry *next=index_at_or_after(node,request->first);
         for (size_t i = 0; i < request->count; i++) {
             struct kernel_page_cache_read_page *page = &request->pages[i];
             entries[i] = NULL;
@@ -3083,13 +3086,9 @@ scalar:;
                 continue;
             }
             uint64_t index=request->first+i;
-            struct kernel_page_cache_entry *entry;
-            if (required<0) entry=index_find(node,index);
-            else {
-                while (next && next->page_index<index)
-                    next=RB_NEXT(kernel_page_cache_tree,&node->cache_pages,next);
-                entry=next && next->page_index==index?next:NULL;
-            }
+            while (next && next->page_index<index)
+                next=RB_NEXT(kernel_page_cache_tree,&node->cache_pages,next);
+            struct kernel_page_cache_entry *entry=next && next->page_index==index?next:NULL;
             if (entry) {
                 if (required>=0 && i!=(size_t)required) {
                     page->status=KERNEL_PAGE_CACHE_STATUS_BUSY;
@@ -3322,7 +3321,7 @@ struct cached_write_workspace {
     struct kernel_mm_user_pin pins[KERNEL_MM_USER_READ_BATCH];
     union {
         struct kernel_page_cache_write_borrow writers[KERNEL_MM_USER_READ_BATCH];
-        struct kernel_page_cache_entry *append[KERNEL_MM_USER_READ_BATCH];
+        void *append[KERNEL_MM_USER_READ_BATCH];
     };
 };
 _Static_assert(sizeof(struct cached_write_workspace) <= BOAROS_PAGE_SIZE,
@@ -3355,32 +3354,46 @@ static __attribute__((noinline)) size_t copy_cached_append_batch(
     unsigned count = cached_user_batch(source, offset, limit, &address);
     if (count < 2) return 0;
     struct kernel_task_io_buffer scratch = {0};
-    if (kernel_task_io_buffer_acquire(&scratch, cache->allocator)) return 0;
-    struct cached_write_workspace *work = scratch.data;
+    struct kernel_mm_user_pin pair_pins[2];
+    void *pair_entries[2];
+    struct kernel_mm_user_pin *pins = pair_pins;
+    void **entries = pair_entries;
+    if (count > 2) {
+        if (kernel_task_io_buffer_acquire(&scratch, cache->allocator)) return 0;
+        struct cached_write_workspace *work = scratch.data;
+        pins = work->pins;
+        entries = work->append;
+    }
     uint64_t pages[KERNEL_MM_USER_READ_BATCH];
     uint64_t first = offset >> BOAROS_PAGE_SHIFT;
     unsigned owned = physical_page_allocate_batch(cache->allocator, pages, count);
+    unsigned headers = owned ? kernel_heap_allocate_zeroed_batch_nosleep(
+        cache->heap, owned, sizeof(struct kernel_page_cache_entry), entries) : 0;
     unsigned built = 0;
-    for (; built < owned; built++) {
-        struct kernel_page_cache_entry *entry;
-        if (allocate_entry_header(cache, node, first + built, &entry)) break;
+    for (; built < headers; built++) {
+        struct kernel_page_cache_entry *entry = entries[built];
+        if (kernel_vfs_node_acquire(node)) break;
+        entry->cache = cache;
+        entry->node = node;
+        entry->page_index = first + built;
         entry->physical_address = pages[built];
         entry->page_references_owned = 1;
         if (physical_page_map_owned(cache->allocator, pages[built], (void **)&entry->data))
             __builtin_trap();
-        work->append[built] = entry;
     }
+    kernel_heap_release_small_batch(cache->heap, entries + built, headers - built);
     physical_page_release_batch(cache->allocator, pages + built, owned - built);
-    memset(work->pins, 0, built * sizeof(work->pins[0]));
+    memset(pins, 0, built * sizeof(*pins));
     unsigned pinned = built ?
-        kernel_mm_try_pin_user_read_batch(source->mm, address, built, work->pins) : 0;
+        kernel_mm_try_pin_user_read_batch(source->mm, address, built, pins) : 0;
     struct kernel_vfs_write_source copy = *source;
     for (unsigned i = 0; i < pinned; i++) {
-        copy.data = work->pins[i].page;
-        kernel_vfs_write_source_copy(&copy, work->append[i]->data, BOAROS_PAGE_SIZE);
+        struct kernel_page_cache_entry *entry = entries[i];
+        copy.data = pins[i].page;
+        kernel_vfs_write_source_copy(&copy, entry->data, BOAROS_PAGE_SIZE);
         kernel_vfs_write_source_advance(&copy, BOAROS_PAGE_SIZE);
     }
-    kernel_mm_unpin_user_read_batch(work->pins, pinned);
+    kernel_mm_unpin_user_read_batch(pins, pinned);
     unsigned published = 0;
     if (pinned) {
         KERNEL_LOCK_SCOPE(io);
@@ -3397,7 +3410,7 @@ static __attribute__((noinline)) size_t copy_cached_append_batch(
                         struct kernel_page_cache_entry *next = index_at_or_after(node, first);
                         for (; published < pinned; published++) {
                             if (next && next->page_index == first + published) break;
-                            struct kernel_page_cache_entry *entry = work->append[published];
+                            struct kernel_page_cache_entry *entry = entries[published];
                             prepare_entry_publication(entry, KERNEL_PAGE_CACHE_STATUS_OK);
                             if (RB_INSERT(kernel_page_cache_tree, &node->cache_pages, entry))
                                 __builtin_trap();
@@ -3405,8 +3418,9 @@ static __attribute__((noinline)) size_t copy_cached_append_batch(
                     }
                 }
                 for (unsigned i = 0; i < published; i++) {
-                    account_entry_publication(cache, work->append[i]);
-                    dirty_mark_entry(work->append[i], 0, BOAROS_PAGE_SIZE, false);
+                    struct kernel_page_cache_entry *entry = entries[i];
+                    account_entry_publication(cache, entry);
+                    dirty_mark_entry(entry, 0, BOAROS_PAGE_SIZE, false);
                 }
                 if (published) {
                     dirty_charge(cache->record, node, published);
@@ -3422,8 +3436,8 @@ static __attribute__((noinline)) size_t copy_cached_append_batch(
         }
     }
     for (unsigned i = published; i < built; i++)
-        (void)abandon_entry(cache, work->append[i], KERNEL_PAGE_CACHE_STATUS_OK);
-    kernel_task_io_buffer_release(&scratch);
+        (void)abandon_entry(cache, entries[i], KERNEL_PAGE_CACHE_STATUS_OK);
+    if (scratch.allocator) kernel_task_io_buffer_release(&scratch);
     size_t bytes = (size_t)published * BOAROS_PAGE_SIZE;
     if (published) source->data = NULL;
     source->user.offset += bytes;

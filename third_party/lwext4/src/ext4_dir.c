@@ -889,8 +889,13 @@ Finish:;
 static inline __attribute__((always_inline)) int find_directory_record(uint8_t *data,
 		size_t remaining, uint32_t name_mask, size_t name_len, const char *name,
 		struct ext4_dir_search_result *result, bool aligned, bool checked,
-		struct ext4_block_payload *learn, uint32_t layout, uint32_t observed)
+		struct ext4_block_payload *learn, uint32_t layout, uint32_t observed,
+		bool word_name)
 {
+	uint32_t name_word = 0;
+	if (word_name)
+		name_word = to_le32((uint32_t)(uint8_t)name[0] | (uint32_t)(uint8_t)name[1] << 8 |
+			(uint32_t)(uint8_t)name[2] << 16 | (uint32_t)(uint8_t)name[3] << 24);
 	struct ext4_dir_en *previous = NULL;
 	bool found = false;
 	const uint8_t *begin = data;
@@ -911,7 +916,8 @@ static inline __attribute__((always_inline)) int find_directory_record(uint8_t *
 			if (!tail && length - split >= 8) first_possible = data - begin;
 		}
 		if (!found && bytes == name_len && used &&
-			    !memcmp(name, de->name, name_len)) {
+		    (word_name ? *(const directory_word *)(const void *)(data+8) == name_word :
+		        !memcmp(name, de->name, name_len))) {
 			result->dentry = de;
 			result->previous = previous;
 			if (!learn) return EOK;
@@ -938,20 +944,24 @@ int ext4_dir_find_in_block(struct ext4_block *block, struct ext4_sblock *sb,
 	size_t size = ext4_sb_get_block_size(sb);
 	/* Every accepted record advances by a multiple of four bytes. */
 	if ((uintptr_t)block->data & 3U)
-		return find_directory_record(block->data,size,name_mask,name_len,name,result,false,false,NULL,0,0);
+		return find_directory_record(block->data,size,name_mask,name_len,name,result,false,false,NULL,0,0,false);
 	if (block->payload && size<=4096U) {
 		uint32_t layout=size | (name_mask==UINT8_MAX);
 		uint32_t observed=__atomic_load_n(&block->payload->directory_layout,__ATOMIC_ACQUIRE);
 		bool matched = (observed & DIRECTORY_LAYOUT_MASK) == layout;
-		if (matched && (observed & DIRECTORY_LAYOUT_CHECKED))
-			return find_directory_record(block->data,size,name_mask,name_len,name,result,true,true,NULL,0,0);
+		if (matched && (observed & DIRECTORY_LAYOUT_CHECKED)) {
+			/* The layout proof covers this aligned four-byte name field. */
+			if (name_len==sizeof(directory_word))
+				return find_directory_record(block->data,size,name_mask,name_len,name,result,true,true,NULL,0,0,true);
+			return find_directory_record(block->data,size,name_mask,name_len,name,result,true,true,NULL,0,0,false);
+		}
 		/* A lookup can succeed before a malformed later record. Keep that
 		 * result, and publish a reusable layout only after checking every record. */
 		if (!observed || matched)
 			return find_directory_record(block->data,size,name_mask,name_len,name,result,
-				true,false,block->payload,layout,observed);
+				true,false,block->payload,layout,observed,false);
 	}
-	return find_directory_record(block->data,size,name_mask,name_len,name,result,true,false,NULL,0,0);
+	return find_directory_record(block->data,size,name_mask,name_len,name,result,true,false,NULL,0,0,false);
 }
 
 int ext4_dir_destroy_result(struct ext4_inode_ref *parent,

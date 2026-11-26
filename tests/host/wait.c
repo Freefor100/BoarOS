@@ -796,6 +796,8 @@ static void pollfree_lifetime(void)
 }
 enum kernel_time_status kernel_time_deadline_from_realtime(uint64_t ns,uint64_t *deadline)
 { *deadline=ns;return KERNEL_TIME_STATUS_OK; }
+enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns,uint64_t *deadline)
+{ *deadline=ns;return KERNEL_TIME_STATUS_OK; }
 static unsigned event_calls[2];
 static uint64_t observed_event;
 static void event_callback(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
@@ -894,14 +896,12 @@ static void singleton_notification(void)
 {
     for (unsigned committed = 0; committed < 2; committed++) {
         struct kernel_wait_queue queue;
-        struct kernel_wait_node node;
         struct kernel_wait_token token;
         struct kernel_wait_notification notification = {0};
         kernel_wait_queue_init(&queue);
-        kernel_wait_node_init(&node, &task);
-        node.readiness_mask = 1;
-        assert(!kernel_wait_prepare(NULL, 0, 1, &token));
-        assert(!kernel_wait_node_bind(&queue, &node, &token));
+        uint64_t deadline = committed ? 0 : 123;
+        assert(!kernel_wait_prepare_poll(&queue, deadline, 1, &token));
+        assert(task.wait.deadline == deadline && task.node.queue == &queue);
         assert(!kernel_wait_notification_prepare(&queue, &notification, 2));
         assert(!queue.borrows && !kernel_wait_record_borrows(&task.wait));
         if (committed) {
@@ -914,8 +914,8 @@ static void singleton_notification(void)
         wake_queue_acquisitions = 0;
         assert(kernel_wait_notification_prepare(&queue, &notification, 1));
         assert(wake_queue_acquisitions == 1 && notification.direct &&
-            !queue.borrows && !node.references && kernel_wait_record_borrows(&task.wait) == 1);
-        kernel_wait_queue_remove(&node);
+            !queue.borrows && !task.node.references && kernel_wait_record_borrows(&task.wait) == 1);
+        kernel_wait_queue_remove(&task.node);
         assert(!kernel_wait_queue_close(&queue) && !kernel_wait_queue_destroy(&queue));
         unsigned acquired = wake_queue_acquisitions;
         kernel_wait_notification_wake(&notification);
@@ -929,6 +929,7 @@ static void singleton_notification(void)
             task.completions = 0;
         }
         assert(!kernel_wait_finish(&token));
+        assert(!task.node.readiness_mask && !task.wait.deadline);
     }
     struct kernel_wait_queue queue;
     struct kernel_wait_node node, callback;

@@ -201,7 +201,7 @@ static int poll_snapshot(struct kernel_pollfd *pfds,
 }
 
 static int poll_run_socket(struct kernel_socket *socket, struct kernel_task *task,
-    struct kernel_pollfd *pfd, struct kernel_wait_node *node, uint64_t deadline, int immediate)
+    struct kernel_pollfd *pfd, uint64_t deadline, int immediate)
 {
     uint32_t mask = (uint16_t)pfd->events | KERNEL_POLLERR | KERNEL_POLLHUP | KERNEL_POLLNVAL;
     int events;
@@ -215,7 +215,7 @@ static int poll_run_socket(struct kernel_socket *socket, struct kernel_task *tas
             enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
             /* Readiness and registration observe the same endpoint state. A
              * producer can notify this prepared token as soon as that lock drops. */
-            events = kernel_socket_poll_prepare(socket, mask, deadline, node, &token);
+            events = kernel_socket_poll_prepare(socket, mask, deadline, &token);
             if (!events && kernel_wait_park(&token, &reason) != KERNEL_SCHEDULER_STATUS_OK)
                 events = -KERNEL_EIO;
             if (token.task && kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK)
@@ -284,7 +284,7 @@ static int core_poll_run(
     }
     if (nfds == 1 && pinned[0] && kernel_open_file_kind(pinned[0]) == KERNEL_OPEN_FILE_KIND_SOCKET) {
         int result = poll_run_socket(kernel_open_file_socket(pinned[0]), task,
-            pfds, nodes, target_monotonic_ns, immediate);
+            pfds, target_monotonic_ns, immediate);
         if (result < 0) error = result;
         else ready_count = result;
         goto finish;

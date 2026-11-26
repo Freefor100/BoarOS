@@ -8559,6 +8559,92 @@ memory_tables_changed:
     if (cookie && status != KERNEL_MM_STATUS_OK) physical_page_release(allocator, old);
     return status;
 }
+
+#if defined(__riscv) && BOAROS_MAX_CPUS == 1
+unsigned kernel_mm_copy_to_missing_anon_pages(struct kernel_mm *mm, uint64_t first,
+    const void *const *source, unsigned count)
+{
+    struct mm_operation operation __attribute__((cleanup(mm_operation_end))) = {0};
+    if (count<2 || count>KERNEL_MM_COPY_READY_PAGES || (first&BOAROS_PAGE_MASK) ||
+        mm_operation_begin(mm,&operation)) return 0;
+    struct kernel_mm_record *record=operation.record;
+    struct fault_vma view={0};
+    if (read_fault_vma(&operation,first,&view,0,0)) return 0;
+    const struct kernel_vma *vma=&view.vma;
+    if (vma->kind!=KERNEL_VMA_KIND_ANON_SHARED ||
+        !(vma->permissions&KERNEL_MM_WRITE) || (vma->permissions&KERNEL_MM_EXECUTE) ||
+        (vma->flags&(KERNEL_VMA_LOCK_MASK | KERNEL_VMA_USERFAULT_MISSING)) ||
+        fault_needs_anon_history(vma,KERNEL_MM_WRITE,0)) return 0;
+    uint64_t remaining=(vma->end-first)/BOAROS_PAGE_SIZE;
+    if (count>remaining) count=(unsigned)remaining;
+    const uint64_t leaf_bytes=UINT64_C(1)<<21;
+    unsigned leaf_remaining=(leaf_bytes-(first&(leaf_bytes-1)))/BOAROS_PAGE_SIZE;
+    if (count>leaf_remaining) count=leaf_remaining;
+    if (count<2) return 0;
+    {
+        KERNEL_RAW_READ_SCOPE(raw,&record->metadata);
+        uint64_t *leaf;
+        unsigned empty;
+        if (pin_admission_closed(record) ||
+            riscv_sv39_user_empty_window_slot(&record->space,first,count,&empty,&leaf) ||
+            !leaf || (empty&3U)!=3U) return 0;
+        unsigned prefix=2;
+        while (prefix<count && (empty&(1U<<prefix))) prefix++;
+        count=prefix;
+    }
+
+    struct kernel_memory_object *object=vma->backing;
+    uint64_t offset=vma->backing_offset+first-vma->start, epoch;
+    if (!kernel_memory_object_contains_offset(object,offset+(count-1)*BOAROS_PAGE_SIZE) ||
+        kernel_memory_object_epoch(object,&epoch) || kernel_memory_object_acquire(object))
+        return 0;
+    /* Backing preparation can allocate. The captured object stays alive
+     * while the MM gate is open. Recheck both lifetimes before publication. */
+    mm_operation_release(&operation);
+    uint64_t pages[KERNEL_MM_COPY_READY_PAGES];
+    unsigned prepared=kernel_memory_object_prepare_page_run(object,
+        offset>>BOAROS_PAGE_SHIFT,pages,count);
+    unsigned installed=0;
+    struct kernel_mm_retirement batch;
+    batch.count=batch.nonleaf=batch.compound=0;
+    uint32_t targets=0;
+    if (prepared && !mm_operation_lock(&operation)) {
+        uint64_t current;
+        KERNEL_RAW_WRITE_SCOPE(raw,&record->metadata);
+        if (!pin_admission_closed(record) &&
+            !memory_fault_view_changed(record,first,&view) &&
+            !kernel_memory_object_epoch(object,&current) && current==epoch) {
+            installed=arch_mmu_user_map_required_window(&record->space,first,
+                (1U<<prepared)-1,pages,backend_permissions_from_mm(vma->permissions),0,0);
+            if (installed) targets=note_fault_change_locked(record,&batch,0,0);
+        }
+    }
+    if (installed) finish_fault_change(record,&batch,targets,first,
+        (uint64_t)prepared*BOAROS_PAGE_SIZE,0,0);
+    if (prepared) kernel_memory_object_finish_page_run(object,offset>>BOAROS_PAGE_SHIFT,
+        pages,prepared,installed);
+    kernel_memory_object_release(&object);
+    /* The publishing gate keeps the accepted PTEs live through the copy.
+     * Only the contiguous prefix contributes to the I/O result. */
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_tag tag=kernel_cost_capture();
+    uint64_t start=kernel_cost_clock();
+#endif
+    unsigned copied=0;
+    for (;copied<prepared && (installed&(1U<<copied));copied++) {
+        void *destination;
+        if (physical_page_map_owned(mm->allocator,pages[copied],&destination)) __builtin_trap();
+        if (destination!=source[copied]) riscv_copy_page(destination,source[copied]);
+    }
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_add_tag(tag,COST_UACCESS_COPY_TICKS,kernel_cost_clock()-start);
+    kernel_cost_add_tag(tag,COST_UACCESS_COPY_BYTES,copied*BOAROS_PAGE_SIZE);
+#endif
+    COST_ADD(COPY_TO_USER,copied*BOAROS_PAGE_SIZE);
+    return copied;
+}
+#endif
+
 static int userfault_fill_vma(struct kernel_userfault_ctx *ctx,
     uint64_t start, uint64_t end, struct kernel_vma *vma)
 {

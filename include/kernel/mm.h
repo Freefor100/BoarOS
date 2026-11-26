@@ -143,6 +143,9 @@ void kernel_mm_unpin_user_read_batch(struct kernel_mm_user_pin *, unsigned count
 /* Resident writable base pages, excluding shared file-write aliases. */
 unsigned kernel_mm_copy_to_ready_user_pages(struct kernel_mm *, uint64_t first,
     const void *const *source, unsigned count);
+/* Copy complete cache pages to a missing, writable shared-anonymous prefix. */
+unsigned kernel_mm_copy_to_missing_anon_pages(struct kernel_mm *, uint64_t first,
+    const void *const *source, unsigned count);
 #endif
 
 /* Caller retains an independently acquired MM owner through faults and copy.

@@ -61,6 +61,8 @@ bool ext4_extent_small_root(struct ext4_inode_ref *inode, uint32_t limit, uint32
 struct ext4_inode_block_range;
 int ext4_extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
     uint32_t max_blocks, bool create, struct ext4_inode_block_range *range);
+int ext4_extent_write_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
+    uint32_t max_blocks, uint32_t overwritten_blocks, struct ext4_inode_block_range *range);
 
 /* Allocate holes as unwritten extents, preserving the state of existing mappings. */
 int ext4_extent_reserve_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
