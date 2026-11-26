@@ -1058,16 +1058,56 @@ static void ext4_initialize_inode_times(struct ext4_mountpoint *mp,struct ext4_i
     (void)ext4_store_current_times(mp,ref,EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME);
 }
 
+static int ext4_touch_create_parent(struct ext4_mountpoint *mp,
+    struct ext4_inode_ref *parent, bool read_parent)
+{
+    const unsigned fields = EXT4_TIME_MTIME | EXT4_TIME_CTIME;
+    if (!read_parent) {
+        ext4_touch_inode(mp, parent, fields, NULL);
+        return EOK;
+    }
+
+    /* A regular child in an existing linear leaf touches only these times.
+     * Check and checksum one record without taking a private table image. */
+    struct {
+        struct ext4_inode inode;
+        uint8_t rest[256 - sizeof(struct ext4_inode)];
+    } bytes;
+    uint16_t size = ext4_get16(ext4_fs_super(parent->fs), inode_size);
+    if (size > sizeof(bytes)) __builtin_trap();
+    memcpy(&bytes, parent->inode, size);
+    struct ext4_inode_ref updated = *parent;
+    updated.inode = &bytes.inode;
+    unsigned stored = ext4_store_current_times(mp, &updated, fields);
+    if (!updated.dirty) {
+        ext4_publish_times(mp, parent, stored, NULL);
+        return EOK;
+    }
+    if (jbd_trans_stage_parent_times(ext4_current_trans(parent->fs), parent, updated.inode)) {
+        ext4_publish_times(mp, &updated, stored, NULL);
+        return EOK;
+    }
+    int result = ext4_fs_inode_ref_write(parent);
+    if (result) return result;
+    /* Serial qualification covers the parent record until this operation
+     * finishes. A private table image can also contain the new child's slot. */
+    memcpy(parent->inode, &bytes, size);
+    parent->dirty = true;
+    ext4_publish_times(mp, parent, stored, NULL);
+    return EOK;
+}
+
 static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
 		     struct ext4_inode_ref *ch, const char *n,
-		     uint32_t len, bool rename)
+		     uint32_t len, bool rename, bool *read_parent)
 {
 	/* Check maximum name length */
 	if (len > EXT4_DIRECTORY_FILENAME_LEN)
 		return EINVAL;
 
 	/* Add entry to parent directory */
-	int r = ext4_dir_add_entry(parent, n, len, ch);
+	int r = read_parent ? ext4_dir_add_entry_with_read_parent(parent, n, len, ch, read_parent) :
+	    ext4_dir_add_entry(parent, n, len, ch);
 	if (r != EOK)
 		return r;
 
@@ -1152,8 +1192,7 @@ static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
 		ch->dirty = true;
 	}
 
-	ext4_touch_inode(mp, parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME, NULL);
-	return r;
+	return ext4_touch_create_parent(mp, parent, read_parent && *read_parent);
 }
 
 static void ext4_unlink_update_links(struct ext4_mountpoint *mp,
@@ -2998,7 +3037,7 @@ static int ext4_trunc_dir(struct ext4_mountpoint *mp,
 
 static int ext4_alloc_linked_child(struct ext4_mountpoint *mp,
     struct ext4_inode_ref *parent, const char *name, uint32_t length, int type,
-    struct ext4_inode_ref *child)
+    struct ext4_inode_ref *child, bool *read_parent)
 {
     struct ext4_fs *fs = parent->fs;
     struct ext4_sblock *sb = ext4_fs_super(fs);
@@ -3014,7 +3053,7 @@ static int ext4_alloc_linked_child(struct ext4_mountpoint *mp,
             ext4_inode_set_mode(sb, child->inode, ext4_inode_get_mode(sb, child->inode) | 02000U);
     }
     ext4_initialize_inode_times(mp,child);
-    result = ext4_link(mp, parent, child, name, length, false);
+    result = ext4_link(mp, parent, child, name, length, false, read_parent);
     if (result) {
         ext4_fs_free_inode(child);
         child->dirty = false;
@@ -3097,7 +3136,7 @@ static int ext4_open_relative(ext4_file *f, struct ext4_mountpoint *mp,
 
 			struct ext4_inode_ref child_ref;
 			r = ext4_alloc_linked_child(mp, &ref, path, len,
-				is_goal ? ftype : EXT4_DE_DIR, &child_ref);
+				is_goal ? ftype : EXT4_DE_DIR, &child_ref, NULL);
 			if (r != EOK)
 				break;
 
@@ -3338,7 +3377,7 @@ static int ext4_create_hardlink(const char *path,
 				break;
 
 			/*Link with root dir.*/
-			r = ext4_link(mp, &ref, child_ref, path, len, rename);
+			r = ext4_link(mp, &ref, child_ref, path, len, rename, NULL);
 			break;
 		} else if (r == EOK && is_goal) {
 			/*Destroy last result*/
@@ -7384,19 +7423,26 @@ int ext4_create_child_acl(const char *mount, uint32_t parent, const char *name,
 
 int ext4_create_regular_missing(const ext4_file *parent, const char *name,
     uint32_t mode, uint32_t uid, uint32_t gid, ext4_file *output,
-    struct ext4_inode *initial)
+    struct ext4_inode *initial, bool final_parent_update)
 {
     struct ext4_mountpoint *mp = parent->mp;
     struct ext4_fs *fs = &mp->fs;
     struct ext4_inode_ref directory, child;
     size_t length = strlen(name);
     if (!ext4_rename_name_valid(name, length)) return EINVAL;
-    int result = ext4_fs_get_inode_ref(fs, parent->inode, &directory);
+    uint16_t size = ext4_get16(&fs->sb, inode_size);
+    bool read_parent = final_parent_update &&
+        (size == EXT4_GOOD_OLD_INODE_SIZE || size == 256) &&
+        fs->jbd_journal && fs->jbd_journal->grouped && fs->jbd_journal->running &&
+        ext4_fs_serial_writer(fs) && ext4_current_trans(fs);
+    int result = read_parent ? ext4_fs_get_inode_ref_read(fs, parent->inode, &directory) :
+        ext4_fs_get_inode_ref(fs, parent->inode, &directory);
     if (result) return result;
     if (!ext4_inode_is_type(&fs->sb, directory.inode, EXT4_INODE_MODE_DIRECTORY))
         result = ENOTDIR;
     else if (!ext4_inode_get_links_cnt(directory.inode)) result = ENOENT;
-    else result = ext4_alloc_linked_child(mp, &directory, name, length, EXT4_DE_REG_FILE, &child);
+    else result = ext4_alloc_linked_child(mp, &directory, name, length, EXT4_DE_REG_FILE, &child,
+        read_parent ? &read_parent : NULL);
     int release = ext4_fs_put_inode_ref(&directory);
     if (result) return result;
     ext4_inode_set_mode_initial(&child, mode);

@@ -139,6 +139,42 @@ static inline struct ext4_block_payload *publish_locked(struct ext4_buf *buf,
     return old;
 }
 
+bool ext4_bcache_patch_running(const struct ext4_running_patch *targets, unsigned count)
+{
+    if (!count || count > 2) __builtin_trap();
+    struct ext4_bcache *cache = targets[0].block->buf->bc;
+    KERNEL_TASK_LOCK_SCOPE(guard, &cache->metadata);
+    for (unsigned i = 0; i < count; i++) {
+        const struct ext4_block *block = targets[i].block;
+        struct ext4_buf *buf = block->buf;
+        if (buf->bc != cache || !buf->journal_pending) __builtin_trap();
+        /* The cache, running image and running descriptor are the owners. */
+        if (buf->version != targets[i].version || buf->current_payload != block->payload ||
+            __atomic_load_n(&block->payload->references, __ATOMIC_ACQUIRE) != 3)
+            return false;
+    }
+    for (unsigned i = 0; i < count; i++) {
+        const struct ext4_block *block = targets[i].block;
+        const struct ext4_block_patch *patches = targets[i].patches;
+        for (unsigned j = 0; j < targets[i].count; j++)
+            memcpy(block->data + patches[j].offset, patches[j].data, patches[j].length);
+        struct ext4_block_payload *payload = block->payload;
+        unsigned record = targets[i].inode_record;
+        if (targets[i].inode_schema && record < 256 &&
+            __atomic_load_n(&payload->metadata_schema, __ATOMIC_ACQUIRE) == targets[i].inode_schema &&
+            (__atomic_load_n(&payload->verified[record / 64], __ATOMIC_ACQUIRE) &
+             (UINT64_C(1) << (record % 64)))) {
+            /* The checked record's new checksum covers its patched times.
+             * No other record was changed. Whole-block proofs still expire. */
+            __atomic_store_n(&payload->tree_verified, 0, __ATOMIC_RELAXED);
+            __atomic_store_n(&payload->directory_layout, 0, __ATOMIC_RELAXED);
+        } else publish_verification(payload, 0, 0);
+        advance_version(block->buf);
+        journal_publication_locked(block->buf, NULL);
+    }
+    return true;
+}
+
 void ext4_bcache_publish(struct ext4_buf *buf, struct ext4_block_payload *payload, uint64_t tree_key)
 {
     struct ext4_block_payload *old;

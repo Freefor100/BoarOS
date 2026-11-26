@@ -250,6 +250,10 @@ void ext4_dir_write_entry(struct ext4_sblock *sb, struct ext4_dir_en *en,
  */
 int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 		       uint32_t name_len, struct ext4_inode_ref *child);
+/* A linear insertion needs only the parent mapping until it grows or
+ * promotes the directory. Upgrade the caller's ref before either change. */
+int ext4_dir_add_entry_with_read_parent(struct ext4_inode_ref *parent, const char *name,
+    uint32_t name_len, struct ext4_inode_ref *child, bool *read_parent);
 
 /**@brief Find directory entry with passed name.
  * @param result Result structure to be returned if entry found

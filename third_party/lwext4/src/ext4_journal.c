@@ -2536,15 +2536,55 @@ int jbd_trans_reserve_superblock(struct jbd_trans *trans, struct ext4_block *blo
     return result;
 }
 
-static struct jbd_buf *running_superblock(struct jbd_journal *journal, struct jbd_trans *running)
+static struct jbd_buf *running_metadata_block(struct jbd_journal *journal,
+    struct jbd_trans *running, ext4_fsblk_t lba)
 {
     if (!running) return NULL;
-    struct jbd_block_rec *record = jbd_trans_block_rec_lookup(journal,
-        EXT4_SUPERBLOCK_OFFSET / journal->block_size);
+    struct jbd_block_rec *record = jbd_trans_block_rec_lookup(journal, lba);
     struct jbd_buf *buffer = record ? TAILQ_LAST(&record->dirty_buf_queue, jbd_buf_dirty) : NULL;
     if (!buffer || buffer->trans != running || buffer->block.payload != &buffer->after->payload)
         return NULL;
     return buffer;
+}
+
+static struct jbd_buf *running_superblock(struct jbd_journal *journal, struct jbd_trans *running)
+{
+    return running_metadata_block(journal, running, EXT4_SUPERBLOCK_OFFSET / journal->block_size);
+}
+
+bool jbd_trans_stage_parent_times(struct jbd_trans *trans, const struct ext4_inode_ref *parent,
+    struct ext4_inode *updated)
+{
+    struct jbd_journal *journal = trans->journal;
+    ext4_fsblk_t lba = parent->block.lb_id;
+    if (!journal->grouped || !ext4_fs_serial_writer(parent->fs) ||
+        trans->parent_times.sequence || lba == EXT4_SUPERBLOCK_OFFSET / journal->block_size ||
+        jbd_trans_find_buf(trans, lba)) return false;
+    struct jbd_buf *buffer = running_metadata_block(journal, journal->running, lba);
+    /* Include the caller's read reference in addition to the running owners.
+     * The caller returns that reference before the operation can publish. */
+    if (!buffer || buffer->block.payload != parent->block.payload ||
+        __atomic_load_n(&parent->block.payload->references, __ATOMIC_ACQUIRE) != 4)
+        return false;
+    uint32_t offset = (const uint8_t *)parent->inode - parent->block.data;
+    uint16_t size = ext4_get16(&parent->fs->sb, inode_size);
+    if ((size != EXT4_GOOD_OLD_INODE_SIZE && size != 256) ||
+        offset > journal->block_size || size > journal->block_size - offset)
+        return false;
+    ext4_fs_update_inode_times_checksum(parent, updated);
+    trans->parent_times = (struct jbd_parent_times){
+        .sequence = journal->running->sequence, .version = buffer->block.buf->version,
+        .inode_schema = ext4_fs_inode_record_schema(parent),
+        .lba = lba, .offset = offset, .size = size,
+        .base = {updated->change_inode_time, updated->modification_time},
+        .checksum_lo = updated->osd2.linux2.checksum_lo,
+    };
+    if (size > EXT4_GOOD_OLD_INODE_SIZE) {
+        trans->parent_times.extra[0] = updated->ctime_extra;
+        trans->parent_times.extra[1] = updated->mtime_extra;
+        trans->parent_times.checksum_hi = updated->checksum_hi;
+    }
+    return true;
 }
 
 bool jbd_trans_try_reuse_superblock(struct jbd_trans *trans)
@@ -2662,24 +2702,68 @@ static bool jbd_patch_running(struct jbd_buf *jb, const struct jbd_buf *running)
         jb->checked_tree, directory, true);
 }
 
-static int jbd_publish_reused_super(struct jbd_trans *trans, struct jbd_trans *running)
+static int jbd_publish_reused_metadata(struct jbd_trans *trans, struct jbd_trans *running)
 {
+    _Static_assert(offsetof(struct ext4_inode, modification_time) ==
+        offsetof(struct ext4_inode, change_inode_time) + sizeof(uint32_t), "inode time pair layout");
+    _Static_assert(offsetof(struct ext4_inode, mtime_extra) ==
+        offsetof(struct ext4_inode, ctime_extra) + sizeof(uint32_t), "inode extra time pair layout");
+    _Static_assert(offsetof(struct ext4_inode, osd2.linux2.checksum_lo) + sizeof(uint16_t) <=
+        EXT4_GOOD_OLD_INODE_SIZE, "low checksum fits an old inode");
+    _Static_assert(offsetof(struct ext4_inode, mtime_extra) + sizeof(uint32_t) <= 256 &&
+        offsetof(struct ext4_inode, checksum_hi) + sizeof(uint16_t) <= 256,
+        "extra times and high checksum fit a 256-byte inode");
     struct jbd_journal *journal = trans->journal;
     struct ext4_operation *operation = &trans->operation;
-    if (!running || running->sequence != trans->reused_super_sequence ||
-        !ext4_fs_serial_writer(operation->fs)) return EAGAIN;
-    struct jbd_buf *buffer = running_superblock(journal, running);
-    if (!buffer || !buffer->accepted_super) return EAGAIN;
-    unsigned offset = EXT4_SUPERBLOCK_OFFSET % journal->block_size;
-    int result = ext4_operation_prepare_super(operation, NULL);
-    if (result) return result;
-    uint32_t inodes = to_le32(operation->super_publish.inodes);
-    const struct ext4_block_patch patches[] = {
-        {offset + offsetof(struct ext4_sblock, free_inodes_count), sizeof(inodes), &inodes},
-        {offset + offsetof(struct ext4_sblock, checksum), sizeof(operation->super_publish.checksum),
-            &operation->super_publish.checksum},
-    };
-    return ext4_bcache_patch_current(&buffer->block, 3, patches, 2, 0, 0, false) ? EOK : EAGAIN;
+    if (!running || !ext4_fs_serial_writer(operation->fs)) return EAGAIN;
+    struct ext4_running_patch targets[2];
+    unsigned count = 0;
+    uint32_t inodes;
+    struct ext4_block_patch super_patches[2], parent_patches[4];
+    if (trans->reused_super_sequence) {
+        if (running->sequence != trans->reused_super_sequence) return EAGAIN;
+        struct jbd_buf *buffer = running_superblock(journal, running);
+        if (!buffer || !buffer->accepted_super) return EAGAIN;
+        unsigned offset = EXT4_SUPERBLOCK_OFFSET % journal->block_size;
+        int result = ext4_operation_prepare_super(operation, NULL);
+        if (result) return result;
+        inodes = to_le32(operation->super_publish.inodes);
+        super_patches[0] = (struct ext4_block_patch){
+            offset + offsetof(struct ext4_sblock, free_inodes_count), sizeof(inodes), &inodes};
+        super_patches[1] = (struct ext4_block_patch){
+            offset + offsetof(struct ext4_sblock, checksum), sizeof(operation->super_publish.checksum),
+            &operation->super_publish.checksum};
+        targets[count++] = (struct ext4_running_patch){
+            .block = &buffer->block, .version = buffer->block.buf->version,
+            .patches = super_patches, .count = 2};
+    }
+    const struct jbd_parent_times *parent = &trans->parent_times;
+    if (parent->sequence) {
+        if (running->sequence != parent->sequence || jbd_trans_find_buf(trans, parent->lba))
+            return EAGAIN;
+        struct jbd_buf *buffer = running_metadata_block(journal, running, parent->lba);
+        if (!buffer) return EAGAIN;
+        uint32_t offset = parent->offset;
+        parent_patches[0] = (struct ext4_block_patch){
+            offset + offsetof(struct ext4_inode, change_inode_time), sizeof(parent->base), parent->base};
+        parent_patches[1] = (struct ext4_block_patch){
+            offset + offsetof(struct ext4_inode, osd2.linux2.checksum_lo),
+            sizeof(parent->checksum_lo), &parent->checksum_lo};
+        unsigned fields = 2;
+        if (parent->size > EXT4_GOOD_OLD_INODE_SIZE) {
+            parent_patches[2] = (struct ext4_block_patch){
+                offset + offsetof(struct ext4_inode, ctime_extra), sizeof(parent->extra), parent->extra};
+            parent_patches[3] = (struct ext4_block_patch){
+                offset + offsetof(struct ext4_inode, checksum_hi),
+                sizeof(parent->checksum_hi), &parent->checksum_hi};
+            fields = 4;
+        }
+        targets[count++] = (struct ext4_running_patch){
+            .block = &buffer->block, .version = parent->version,
+            .patches = parent_patches, .count = fields, .inode_schema = parent->inode_schema,
+            .inode_record = offset / parent->size};
+    }
+    return ext4_bcache_patch_running(targets, count) ? EOK : EAGAIN;
 }
 
 /* All records and credits were reserved before publication. Validate the full
@@ -2747,8 +2831,8 @@ static int jbd_publish_private(struct jbd_trans *trans, struct jbd_trans *runnin
     }
     /* The private edits have passed validation. The existing running record
      * already carries the superblock's log credit and checkpoint ownership. */
-    if (trans->reused_super_sequence) {
-        int result = jbd_publish_reused_super(trans, running);
+    if (trans->reused_super_sequence || trans->parent_times.sequence) {
+        int result = jbd_publish_reused_metadata(trans, running);
         if (result) return result;
     }
     struct jbd_trans *owner = running ? running : trans;
@@ -3368,7 +3452,8 @@ int jbd_trans_prepare_operation(struct jbd_trans *trans)
         return jbd_journal_error(journal) ? jbd_journal_error(journal) : trans->error;
     if (trans->reserved_logs || trans->reservation_group_sequence || trans->frozen) __builtin_trap();
     jbd_trans_prune(journal, trans);
-    if (!trans->reused_super_sequence && TAILQ_EMPTY(&trans->buf_queue) && TAILQ_EMPTY(&trans->data_queue) &&
+    if (!trans->reused_super_sequence && !trans->parent_times.sequence &&
+        TAILQ_EMPTY(&trans->buf_queue) && TAILQ_EMPTY(&trans->data_queue) &&
         RB_EMPTY(&trans->revoke_root)) return EOK;
     bool serial_writer = ext4_fs_serial_writer(journal->jbd_fs->inode_ref.fs);
     struct jbd_buf *jb;
@@ -3501,7 +3586,8 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 	if (!journal->grouped || jbd_journal_error(journal)) return jbd_journal_error(journal) ? jbd_journal_error(journal) : EINVAL;
 	if (operation->error) return operation->error;
 	struct jbd_data *data, *next_data;
-	if (!operation->reused_super_sequence && TAILQ_EMPTY(&operation->buf_queue) &&
+	if (!operation->reused_super_sequence && !operation->parent_times.sequence &&
+        TAILQ_EMPTY(&operation->buf_queue) &&
 	    TAILQ_EMPTY(&operation->data_queue) && RB_EMPTY(&operation->revoke_root)) {
 		/* An empty operation owns no accepted version. Its candidates must
 		 * not inherit an unrelated inode's current running group. */

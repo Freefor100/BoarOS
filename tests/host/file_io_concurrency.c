@@ -1760,13 +1760,15 @@ static void pathname_storage_case(struct kernel_heap *heap,struct kernel_vfs_mou
     /* Warm the actual inode and the task's existing scratch owner first. */
     assert(!kernel_files_statx(&local,&directory,&mm,-100,0x100000,0,0x7ff,0x200000,&result) && !result);
     assert(!kernel_copy_from_user(&mm,&query,0x200000,sizeof(query),&copied) && copied==sizeof(query));
-    assert(query.stx_mask==STATX_BASIC_STATS && query.stx_mode==expected.mode &&
+    assert((query.stx_mask & STATX_BASIC_STATS)==STATX_BASIC_STATS &&
+        (query.stx_mask & STATX_MNT_ID) && query.stx_mnt_id && query.stx_mode==expected.mode &&
         query.stx_uid==expected.uid && query.stx_gid==expected.gid && query.stx_nlink==expected.nlink &&
         query.stx_ino==expected.ino && query.stx_size==expected.size && query.stx_blocks==expected.blocks &&
         query.stx_blksize==expected.blksize && query.stx_atime.tv_sec==expected.atime.seconds &&
         query.stx_atime.tv_nsec==expected.atime.nanoseconds && query.stx_mtime.tv_sec==expected.mtime.seconds &&
         query.stx_ctime.tv_sec==expected.ctime.seconds && !query.stx_btime.tv_sec && !query.stx_btime.tv_nsec);
-    for(unsigned i=144;i<sizeof(query);i++)assert(!((unsigned char *)&query)[i]);
+    for (size_t i=offsetof(struct statx, stx_mnt_id)+sizeof(query.stx_mnt_id);i<sizeof(query);i++)
+        assert(!((unsigned char *)&query)[i]);
     cached_name_independent_of_mount_state(heap,mount);
     path_snapshot_watch=1;path_snapshot_allocations=0;
     for (unsigned i=0;i<16;i++) {
@@ -1784,10 +1786,22 @@ static void pathname_storage_case(struct kernel_heap *heap,struct kernel_vfs_mou
     path_snapshot_watch=0;
     printf("pathname snapshots: full-size allocations=%u\n",path_snapshot_allocations);
     assert(!path_snapshot_allocations && !kernel_task_current()->io_buffer);
+    assert(!kernel_vfs_mkdir(mount,"/prefix-observation",0700));
+    assert(!kernel_vfs_mkdir(mount,"/prefix-observation/sub",0700));
+    static const char nested[] = "/prefix-observation/sub/leaf";
+    assert(!kernel_copy_to_user(&mm,0x100000,nested,sizeof(nested),&copied) && copied==sizeof(nested));
+    assert(!kernel_files_openat(&local,&directory,&mm,-100,0x100000,0,0,&result) && result==-KERNEL_ENOENT);
+    assert(!kernel_vfs_create(mount,nested,0600,&file) && !kernel_vfs_close(&file));
+    assert(!kernel_files_openat(&local,&directory,&mm,-100,0x100000,0,0,&result) && result>=0);
+    assert(!kernel_files_close(&local,result,&result) && !result);
+    assert(!kernel_vfs_unlink(mount,nested));
+    assert(!kernel_files_openat(&local,&directory,&mm,-100,0x100000,0,0,&result) && result==-KERNEL_ENOENT);
+    assert(!kernel_vfs_rmdir(mount,"/prefix-observation/sub"));
+    assert(!kernel_vfs_rmdir(mount,"/prefix-observation"));
     assert(!kernel_files_release(&local) && !kernel_fs_context_release(&directory));
     assert(!kernel_vfs_unlink(mount,"/pathname-storage"));
     mm_test_finish();mm_test_attach(0);mm_test_activate_task();
-    puts("PASS pathname storage: repeated stat/open, input fault, missing name, long name and final scratch release");
+    puts("PASS pathname storage: repeated stat/open, miss and later publication, input fault, long name and scratch release");
 }
 
 #include "namespace_cases.h"

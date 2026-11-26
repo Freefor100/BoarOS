@@ -295,6 +295,16 @@ struct ext4_block_patch {
     uint32_t offset, length;
     const void *data;
 };
+struct ext4_running_patch {
+    const struct ext4_block *block;
+    uint64_t version;
+    const struct ext4_block_patch *patches;
+    unsigned count;
+    uint64_t inode_schema;
+    unsigned inode_record;
+};
+/* Both running records are checked before either is modified. */
+bool ext4_bcache_patch_running(const struct ext4_running_patch *, unsigned count);
 /* A merge may also return the duplicate loan after publishing the patch. */
 bool ext4_bcache_patch_current(struct ext4_block *block, unsigned owners,
     const struct ext4_block_patch *patches, unsigned count, uint64_t tree_key,

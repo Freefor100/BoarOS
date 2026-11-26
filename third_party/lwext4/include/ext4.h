@@ -913,10 +913,12 @@ int ext4_create_child_acl(const char *mount, uint32_t parent, const char *name,
     struct ext4_inode *initial, uint32_t uid, uint32_t gid,
     const struct ext4_create_acl *acl);
 /* The caller owns a journal operation and holds the parent namespace writer
- * from lookup of this absent basename until transaction completion. */
+ * from lookup of this absent basename until transaction completion.
+ * final_parent_update also requires no subsequent access to the parent or
+ * its table record before the current operation finishes. */
 int ext4_create_regular_missing(const ext4_file *parent, const char *name,
     uint32_t mode, uint32_t uid, uint32_t gid, ext4_file *output,
-    struct ext4_inode *initial);
+    struct ext4_inode *initial, bool final_parent_update);
 int ext4_unlink_child(const char *mount, uint32_t parent, const char *name,
     bool directory, uint32_t *inode, bool *orphan);
 /* Remove only the resolved inode. A callback also certifies that the target

@@ -66,14 +66,15 @@ enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *h
     return __real_kernel_heap_allocate_zeroed(heap,n,size,out);
 }
 int __real_ext4_create_regular_missing(const ext4_file *,const char *,uint32_t,uint32_t,
-    uint32_t,ext4_file *,struct ext4_inode *);
+    uint32_t,ext4_file *,struct ext4_inode *,bool);
 int __wrap_ext4_create_regular_missing(const ext4_file *parent,const char *name,uint32_t mode,
-    uint32_t uid,uint32_t gid,ext4_file *file,struct ext4_inode *initial)
+    uint32_t uid,uint32_t gid,ext4_file *file,struct ext4_inode *initial,bool final_parent_update)
 {
     /* Measure only the resolver, before journal records and the child path
      * can allocate objects of the same size. */
     create_path_watch=0;
-    return __real_ext4_create_regular_missing(parent,name,mode,uid,gid,file,initial);
+    return __real_ext4_create_regular_missing(parent,name,mode,uid,gid,file,initial,
+        final_parent_update);
 }
 void __real_kernel_rwlock_read(struct kernel_rwlock *,struct kernel_lock_guard *);
 void __wrap_kernel_rwlock_read(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
@@ -989,6 +990,7 @@ int main(int argc,char **argv)
         const struct ext4_journal_runtime runtime={.now_ns=parallel_now};
         assert(!ext4_journal_group_enable(adapter->mount_point,&runtime,8*1024*1024));
         serial_reservation_case(adapter,1);
+        serial_parent_timestamp_reuse(adapter,&mount);
         boaros_lwext4_enable_parallel(&adapter->backend_lock,fs);adapter->instance.namespace_parallel=1;
         serial_reservation_case(adapter,0);
     }
