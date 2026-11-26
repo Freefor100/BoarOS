@@ -24,7 +24,7 @@
 #include <ext4_journal.h>
 #include <string.h>
 
-static unsigned char pool[16 * 1024 * 1024] __attribute__((aligned(4096)));
+static unsigned char pool[32 * 1024 * 1024] __attribute__((aligned(4096)));
 static struct physical_page_allocator allocator;
 static struct kernel_heap heap;
 static struct kernel_page_cache cache;
@@ -153,8 +153,14 @@ static void exercise_independent_checkpoint(struct lwext4_mount_adapter *adapter
         journal->durable_sequence>durable && journal->durable_sequence==journal->accepted_sequence,86);
     irq=riscv_interrupt_save();
     checkpoint_release=1;
+    checkpoint_held=0;
     check(kernel_wait_queue_wake_all(&checkpoint_release_wait)==KERNEL_SCHEDULER_STATUS_OK,87);
     riscv_interrupt_restore(irq);
+    /* The new group arrived during home I/O. It gets its own batching window
+     * after the prior prefix, including that prefix's expired timer, retires. */
+    wait_checkpoint_window(journal->durable_sequence);
+    check(journal->checkpoint_count==1 && journal->checkpoint_sequence==durable &&
+        !journal->checkpointing,100);
     check(ext4_journal_group_drain(adapter->mount_point)==0 && !journal->checkpointing &&
         journal->checkpoint_sequence==journal->durable_sequence,88);
     checkpoint_clock_adapter=NULL;
