@@ -28,6 +28,7 @@ static struct kernel_epoll_wait_request *requests[2];
 static unsigned actor, actors[2];
 _Thread_local uintptr_t network_host_irq = RISCV_SSTATUS_SIE;
 static void (*irq_interleave)(void);
+static unsigned epoll_state_acquires;
 static uintptr_t epoll_test_irq_save(void)
 {
     if(network_host_irq && irq_interleave) { void (*run)(void)=irq_interleave;irq_interleave=NULL;run(); }
@@ -36,6 +37,7 @@ static uintptr_t epoll_test_irq_save(void)
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *,struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock,struct kernel_raw_guard *guard)
 {
+    if(lock==&epoll_state_lock) epoll_state_acquires++;
     uintptr_t interrupts=epoll_test_irq_save();arch_interrupt_restore(interrupts);
     __real_kernel_raw_lock_acquire(lock,guard);
 }
@@ -61,7 +63,7 @@ void kernel_socket_protocol_leave(struct kernel_socket_protocol_scope *scope)
 #define registered requests[actor]
 #define host_task ((struct kernel_task *)&actors[actor])
 static struct kernel_mm *mm = (void *)&heap;
-static size_t allocations, copy_remaining = SIZE_MAX;
+static size_t allocations, allocation_calls, copy_remaining = SIZE_MAX;
 static void (*allocation_interleave)(void);
 static void (*poll_interleave)(void);
 static unsigned poll_notification, copy_action, poll_calls, readable[2];
@@ -78,7 +80,7 @@ uint64_t kernel_wait_notification_sequence(void)
 int kernel_files_is_live(const struct kernel_files *f) { return f == &files; }
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t z,void **p)
 { (void)h; CHECK(!preempt_depth); if (allocation_interleave) { void (*run)(void)=allocation_interleave; allocation_interleave=NULL; run(); }
-  *p=calloc(n,z); CHECK(*p); allocations++; return KERNEL_HEAP_STATUS_OK; }
+  *p=calloc(n,z); CHECK(*p); allocations++; allocation_calls++; return KERNEL_HEAP_STATUS_OK; }
 void kernel_heap_release(struct kernel_heap *h,void *p)
 { (void)h; CHECK(p && allocations && !scopes[actor] && network_host_irq); allocations--; free(p); }
 enum kernel_open_file_kind kernel_open_file_kind(const struct kernel_open_file_description *f)
@@ -103,6 +105,20 @@ enum kernel_files_status kernel_files_pin_data(struct kernel_files *f,int64_t fd
 {
     CHECK(f==&files); *p=NULL; *result=-KERNEL_EBADF;
     if(fd>=0 && fd<(int64_t)(sizeof(fds)/sizeof(fds[0])) && fds[fd]) { *p=fds[fd]; kernel_open_file_acquire(*p); *result=0; }
+    return KERNEL_FILES_STATUS_OK;
+}
+enum kernel_files_status kernel_files_pin_epoll_control(struct kernel_files *f,int64_t epfd,int64_t fd,
+    struct kernel_open_file_description **epoll,struct kernel_open_file_description **target,int64_t *result)
+{
+    CHECK(f==&files && result);
+    if (epfd<0 || epfd>=(int64_t)(sizeof(fds)/sizeof(fds[0])) || !fds[epfd]) *result=-KERNEL_EBADF;
+    else if (fds[epfd]->kind!=KERNEL_OPEN_FILE_KIND_EPOLL || fd==epfd) *result=-KERNEL_EINVAL;
+    else if (fd<0 || fd>=(int64_t)(sizeof(fds)/sizeof(fds[0])) || !fds[fd]) *result=-KERNEL_EBADF;
+    else if (fds[fd]==fds[epfd]) *result=-KERNEL_EINVAL;
+    else {
+        CHECK(!kernel_open_file_acquire(fds[epfd]) && !kernel_open_file_acquire(fds[fd]));
+        *epoll=fds[epfd]; *target=fds[fd]; *result=0;
+    }
     return KERNEL_FILES_STATUS_OK;
 }
 void kernel_wait_queue_init(struct kernel_wait_queue *q) { *q=(struct kernel_wait_queue){.initialized=1}; }
@@ -560,12 +576,35 @@ static void socket_registration(void)
     struct linux_epoll_event event;
     CHECK(wait_events(&event,1)==1 && event.data==81);
     CHECK(!wait_events(&event,1));
+
+    control(KERNEL_EPOLL_CTL_DEL,0,0);
+    CHECK(!target_wait[0].head && allocations==2);
+    size_t before_allocations=allocation_calls;
+    control(KERNEL_EPOLL_CTL_ADD,KERNEL_EPOLLET,82);
+    CHECK(allocation_calls==before_allocations && wait_events(&event,1)==1 && event.data==82);
+    control(KERNEL_EPOLL_CTL_DEL,0,0);
     teardown();
     puts("PASS epoll socket ADD registers before a single readiness query");
 }
 
+static void candidate_retirement(void)
+{
+    setup(KERNEL_EPOLLET);
+    struct kernel_epoll_wait_request request={.epoll=epfile.epoll};
+    struct epoll_candidate candidate;
+    CHECK(epoll_scan_begin(&request));
+    CHECK(epoll_candidate_refresh(&request,&candidate) && candidate.event.events);
+    unsigned before=epoll_state_acquires;
+    CHECK(!epoll_candidate_finish(&request,&candidate,1,0));
+    CHECK(epoll_state_acquires==before+1);
+    CHECK(!request.current && !request.target && targets[0].references==1);
+    epoll_scan_finish(&request);
+    teardown();
+}
+
 int main(int argc, char **argv)
 {
+    candidate_retirement();
     socket_registration();
     pollfree_during_delete();
     retiring_target();

@@ -756,6 +756,41 @@ enum kernel_files_status kernel_files_pin_data(
     return status;
 }
 
+enum kernel_files_status kernel_files_pin_epoll_control(
+    struct kernel_files *files, int64_t epfd, int64_t fd,
+    struct kernel_open_file_description **epoll, struct kernel_open_file_description **target,
+    int64_t *result)
+{
+    if (!kernel_files_is_live(files) || !result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    KERNEL_FILES_SCOPE(guard, files);
+    struct kernel_open_file_description *first = lookup_locked(files, epfd);
+    if (!first || first->kind == KERNEL_OPEN_FILE_KIND_PATH) {
+        *result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (first->kind != KERNEL_OPEN_FILE_KIND_EPOLL || !first->epoll || epfd == fd) {
+        *result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    struct kernel_open_file_description *second = lookup_locked(files, fd);
+    if (!second || second->kind == KERNEL_OPEN_FILE_KIND_PATH) {
+        *result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (first == second) {
+        *result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_acquire(first) != KERNEL_OPEN_FILE_STATUS_OK)
+        return KERNEL_FILES_STATUS_STATE;
+    *epoll = first;
+    if (kernel_open_file_acquire(second) != KERNEL_OPEN_FILE_STATUS_OK)
+        return KERNEL_FILES_STATUS_STATE;
+    *target = second;
+    *result = 0;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 static enum kernel_files_status pin_file(
     struct kernel_files *files,
     int64_t fd,
