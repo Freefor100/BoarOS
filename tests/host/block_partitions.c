@@ -78,8 +78,9 @@ static int produce(const void *context, const void **cursor, struct kernel_block
     *span=*current; *cursor=current+1; return 1;
 }
 static enum kernel_block_status phase_write(void *c, kernel_block_phase_next_fn next,
-    const void *context, const void *first)
+    const void *context, const void *first, int unordered)
 {
+    (void)unordered;
     phases++;
     /* Drivers may restart traversal: translation must not mutate producer nodes. */
     for(unsigned pass=0;pass<2;pass++) {

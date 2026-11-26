@@ -4488,7 +4488,7 @@ struct foreground_writeback {
     struct kernel_page_cache_entry **selected;
     struct writeback_workspace *workspace;
     size_t capacity;
-    bool mapped_candidate;
+    bool mapped_candidate, wide_phase;
     int result,done;
 };
 
@@ -4625,7 +4625,7 @@ static void writeback_window(void *argument)
     kernel_lock_scope_release(&io);
     if (result == -KERNEL_EOPNOTSUPP) {
         size_t limit = count;
-        if (request->mapped_candidate) {
+        if (request->mapped_candidate && !request->wide_phase) {
             limit = BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
             request->capacity = limit;
         }
@@ -4701,13 +4701,17 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
         return result;
     }
     reclaim_window_memory(cache);
-    const size_t large_capacity=(512U * 1024U) / BOAROS_PAGE_SIZE;
+    size_t large_capacity=(512U * 1024U) / BOAROS_PAGE_SIZE;
     _Static_assert((512U * 1024U) / BOAROS_PAGE_SIZE <= KERNEL_VFS_GROWTH_WRITEBACK_MAX,
         "a growth window must fit the backend span array");
     struct writeback_workspace work={0};
     size_t capacity=multiple?BOAROS_PAGE_CACHE_WRITEBACK_PAGES:1;
     bool growth=false;
     bool large=false;
+    size_t device_pages=node->instance->writeback_window_bytes/BOAROS_PAGE_SIZE;
+    bool wide_phase=!dispatch && multiple && end==UINT64_MAX &&
+        device_pages>BOAROS_PAGE_CACHE_WRITEBACK_PAGES;
+    if (wide_phase && device_pages<large_capacity) large_capacity=device_pages;
 #if BOAROS_MAX_CPUS == 1
     bool mapped=several_dirty_files && multiple && end==UINT64_MAX &&
         node->instance->ops->writeback_mapped;
@@ -4715,14 +4719,14 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
     bool mapped=BOAROS_MAX_CPUS > 1 && multiple && end==UINT64_MAX &&
         node->instance->ops->writeback_mapped && kernel_cpu_get_boot_count()>1;
 #endif
-    if (mapped && large_capacity > capacity && dirty>=large_capacity &&
+    if ((mapped || wide_phase) && large_capacity > capacity && dirty>=large_capacity &&
         last-first>=large_capacity-1 && node->instance->ops->writeback_growth) {
         {
             KERNEL_LOCK_SCOPE(io);
             kernel_vfs_node_lock(node,&io,0);
             growth=node->instance->ops->writeback_growth(node,first<<BOAROS_PAGE_SHIFT);
         }
-        if (growth || node->instance->writeback_block_size==BOAROS_PAGE_SIZE)
+        if (wide_phase || growth || node->instance->writeback_block_size==BOAROS_PAGE_SIZE)
             large=!writeback_workspace_init(cache,&work,large_capacity);
         if (large) capacity=large_capacity;
     }
@@ -4740,7 +4744,7 @@ int kernel_page_cache_writeback_range_borrowing(struct kernel_page_cache *cache,
     struct foreground_writeback request={.cache=cache,.node=node,.cursor=cursor,.last=last,
         .end=end,.selected=multiple?work.selected:&single,.workspace=multiple?&work:NULL,
         .capacity=capacity,
-        .mapped_candidate=mapped && !growth};
+        .mapped_candidate=mapped && !growth,.wide_phase=wide_phase && large};
     /* 前台批次使用调用者的描述符和稳定版本，可与同一 cache 上另一设备的
      * 后台写回并行。只在后端要求 CPU0 时借用执行队列。 */
     if (dispatch) {

@@ -14,6 +14,12 @@ extern __attribute__((weak)) int kernel_nvme_block_name(uint64_t, char name[32])
 static struct kernel_block_device *physical(struct kernel_block_device *device)
 { return device->parent ? device->parent : device; }
 
+uint32_t kernel_block_write_phase_bytes(const struct kernel_block_device *device)
+{
+    if (device->parent) device = device->parent;
+    return device->write_phase ? device->write_phase_bytes : 0;
+}
+
 enum block_operation { BLOCK_IO_READ, BLOCK_IO_WRITE, BLOCK_IO_FLUSH };
 
 static void block_activity(struct kernel_block_usage *usage, uint64_t now, int completing)
@@ -502,8 +508,8 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
     const uint64_t limit = capacity(device);
     const void *cursor = first;
     struct kernel_block_span span;
-    uint64_t submitted = 0;
-    int nonempty = 0;
+    uint64_t submitted = 0, previous_end = 0;
+    int unordered = 0;
     while (next(next_context, &cursor, &span)) {
         if (span.offset > limit || span.size > limit - span.offset)
             return KERNEL_BLOCK_STATUS_OUT_OF_RANGE;
@@ -513,9 +519,10 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
             write_needs_rmw(device,span.offset,span.size))
             return KERNEL_BLOCK_STATUS_INVALID;
         submitted += span.size;
-        nonempty = 1;
+        unordered |= span.offset < previous_end;
+        previous_end = span.offset + span.size;
     }
-    if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
+    if (!submitted) return KERNEL_BLOCK_STATUS_OK;
     if (kernel_block_read_only(device)) return KERNEL_BLOCK_STATUS_READ_ONLY;
     if (disk->write_phase) {
         /* Keep the immutable producer live until every DMA completes. The
@@ -525,8 +532,8 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
         uint64_t started = block_io_begin(device);
         const struct translated_phase phase = { next, next_context, device->start_bytes };
         enum kernel_block_status result = device->start_bytes ?
-            disk->write_phase(disk->context, translated_phase_next, &phase, first) :
-            disk->write_phase(disk->context, next, next_context, first);
+            disk->write_phase(disk->context, translated_phase_next, &phase, first, unordered) :
+            disk->write_phase(disk->context, next, next_context, first, unordered);
         block_io_end(device, BLOCK_IO_WRITE, started, result ? 0 : submitted);
         return result;
     }

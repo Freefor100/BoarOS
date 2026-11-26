@@ -7,7 +7,8 @@
 #include "virtio_mmio_block_native.c"
 
 static uint32_t registers[128];
-static void *queue_allocation, *workspace_allocation[VIRTIO_BLOCK_BATCH_POOL_PAGES];
+#define MODEL_POOL_PAGES (VIRTIO_BLOCK_BATCH_POOL_PAGES + VIRTIO_BLOCK_INDIRECT_POOL_PAGES)
+static void *queue_allocation, *workspace_allocation[MODEL_POOL_PAGES];
 static unsigned release_batch_slot;
 static unsigned fail_workspace;
 static size_t allocation_size;
@@ -39,11 +40,12 @@ static int injected, final_statistics;
 static unsigned batch_mode, batch_popped, batch_pushed;
 static int batch_is_write;
 static struct virtio_block_device *wait_irq_device;
-static unsigned char batch_output[96][8192];
+static unsigned char batch_output[96][8192] __attribute__((aligned(4096)));
 static unsigned char sg_disk[1048576];
 static unsigned notifications, first_notify_heads, sg_max_segments, park_calls;
 static unsigned sg_fail_sector;
 static unsigned sg_max_bytes, ack_calls;
+static unsigned indirect_heads, fragment_dma;
 static uint32_t sg_used_length = UINT32_MAX;
 static unsigned char sg_read_status;
 static uint32_t (*underlying_ack)(void *);
@@ -74,6 +76,9 @@ enum virtio_status __wrap_virtio_split_take(struct virtio_split_queue *queue, st
 }
 static unsigned phase_hold, phase_held_head, phase_later_completed;
 static unsigned char *phase_held_status;
+static struct wire_descriptor *held_table;
+static unsigned held_table_bytes;
+static unsigned char held_descriptors[64 * 16];
 static void (*underlying_write)(void *, enum virtio_register, uint32_t);
 static void sg_device_step(void);
 static uint32_t observed_ack(void *context)
@@ -98,6 +103,20 @@ struct wire_completion { uint32_t id, length; };
 
 static void *physical_pointer(uint64_t address, size_t size)
 {
+    if (address >= UINT64_C(0x84000000)) {
+        uint64_t offset = address - UINT64_C(0x84000000);
+        unsigned within = offset % 8192;
+        assert(fragment_dma && within < 4096 && size <= 4096 - within);
+        offset = offset / 8192 * 4096 + within;
+        assert(offset < sizeof(batch_output) && size <= sizeof(batch_output) - offset);
+        return (unsigned char *)batch_output + offset;
+    }
+    if (address >= UINT64_C(0x83000000)) {
+        uint64_t offset = address - UINT64_C(0x83000000);
+        unsigned i = offset / 4096, within = offset % 4096;
+        assert(i < MODEL_POOL_PAGES && workspace_allocation[i] && size <= 4096 - within);
+        return (unsigned char *)workspace_allocation[i] + within;
+    }
     if (address >= UINT64_C(0x82000000)) {
         uint64_t offset = address - UINT64_C(0x82000000);
         assert(offset <= sizeof(batch_output) && size <= sizeof(batch_output) - offset);
@@ -120,7 +139,7 @@ static void sg_device_step(void)
 {
     unsigned size = registers[0x38 / 4];
     uint64_t base = registers[1] == 1 ? (uint64_t)registers[0x40 / 4] << 12 : register_address(0x80);
-    struct wire_descriptor *d = physical_pointer(base, size * 16);
+    struct wire_descriptor *ring = physical_pointer(base, size * 16);
     uint16_t *available = physical_pointer(registers[1] == 1 ? base + size * 16 : register_address(0x90), 4 + size * 2);
     uint16_t *used = physical_pointer(registers[1] == 1 ? base + 4096 : register_address(0xa0), 4 + size * 8);
     struct wire_completion *done = (void *)(used + 2);
@@ -129,9 +148,22 @@ static void sg_device_step(void)
     if (notifications == 1) first_notify_heads = count;
     batch_popped += count;
     for (unsigned n = count; n; n--) {
-        unsigned head = available[2 + (first + n - 1) % size], at = head, segments = 0;
-        assert(head < size && d[head].flags == 1 && d[head].length == 16);
-        unsigned char *header = physical_pointer(d[head].address, 16);
+        unsigned head = available[2 + (first + n - 1) % size], start = head, segments = 0;
+        assert(head < size);
+        struct wire_descriptor *d = ring;
+        unsigned chain_size = size;
+        if (ring[head].flags == 4) {
+            assert((registers[0x10 / 4] & (1U << 28)) && !ring[head].next);
+            assert(!(ring[head].length % 16) && !(ring[head].address % 16));
+            chain_size = ring[head].length / 16;
+            assert(chain_size >= 3 && chain_size <= size);
+            d = physical_pointer(ring[head].address, ring[head].length);
+            start = 0;
+            indirect_heads++;
+        }
+        unsigned at = start;
+        assert(d[start].flags == 1 && d[start].length == 16);
+        unsigned char *header = physical_pointer(d[start].address, 16);
         uint32_t type; uint64_t sector;
         memcpy(&type, header, 4); memcpy(&sector, header + 8, 8);
         assert(type == 0 || type == 1 || type == 4);
@@ -142,13 +174,13 @@ static void sg_device_step(void)
         uint32_t reported = type == 0 ? sg_used_length : UINT32_MAX;
         unsigned writable = 0;
         if (reported != UINT32_MAX)
-            for (unsigned part = head;; part = d[part].next) {
+            for (unsigned part = start;; part = d[part].next) {
                 if (d[part].flags & 2) writable += d[part].length;
                 if (!(d[part].flags & 1)) break;
             }
         while (d[at].flags & 1) {
             at = d[at].next;
-            assert(at < size);
+            assert(at < chain_size);
             if (!(d[at].flags & 1)) break;
             assert(d[at].flags == (type == 0 ? 3 : 1));
             assert(d[at].length && !(d[at].length % 512));
@@ -161,7 +193,7 @@ static void sg_device_step(void)
                 else memcpy(sg_disk + offset, buffer, d[at].length);
             }
             offset += d[at].length; bytes += d[at].length; segments++;
-            assert(segments <= 32);
+            assert(segments + 2 <= chain_size);
         }
         assert(d[at].flags == 2 && d[at].length == 1);
         if (segments > sg_max_segments) sg_max_segments = segments;
@@ -169,6 +201,11 @@ static void sg_device_step(void)
         if (phase_hold && !sector) {
             phase_held_head=head;
             phase_held_status=physical_pointer(d[at].address,1);
+            if (d != ring) {
+                held_table = d;
+                held_table_bytes = chain_size * sizeof(*d);
+                memcpy(held_descriptors, d, held_table_bytes);
+            }
             continue;
         }
         *(unsigned char *)physical_pointer(d[at].address, 1) =
@@ -178,6 +215,10 @@ static void sg_device_step(void)
         if (reported != UINT32_MAX) sg_used_length = UINT32_MAX;
     }
     if (phase_hold == 1 && phase_later_completed && phase_held_status) {
+        if (held_table) {
+            assert(!memcmp(held_descriptors, held_table, held_table_bytes));
+            held_table = NULL;
+        }
         *phase_held_status=0;
         done[batch_pushed++ % size]=(struct wire_completion){phase_held_head,1};
         phase_held_status=NULL;
@@ -361,8 +402,8 @@ enum physical_page_status physical_page_allocate_order(struct physical_page_allo
     (void)allocator;
     if (!order) {
         unsigned i;
-        for (i = 0; i < VIRTIO_BLOCK_BATCH_POOL_PAGES; i++) if (!workspace_allocation[i]) break;
-        assert(i < VIRTIO_BLOCK_BATCH_POOL_PAGES);
+        for (i = 0; i < MODEL_POOL_PAGES; i++) if (!workspace_allocation[i]) break;
+        assert(i < MODEL_POOL_PAGES);
         if (fail_workspace && i >= fail_workspace - 1) return PHYSICAL_PAGE_STATUS_EMPTY;
         workspace_allocation[i] = calloc(1, 4096);
         assert(workspace_allocation[i]);
@@ -383,7 +424,7 @@ enum physical_page_status physical_page_resolve(const struct physical_page_alloc
     (void)allocator;
     if (physical >= UINT64_C(0x83000000)) {
         unsigned i = (physical - UINT64_C(0x83000000)) / 4096;
-        assert(i < VIRTIO_BLOCK_BATCH_POOL_PAGES && workspace_allocation[i]);
+        assert(i < MODEL_POOL_PAGES && workspace_allocation[i]);
         *pointer = workspace_allocation[i]; return PHYSICAL_PAGE_STATUS_OK;
     }
     assert(physical == UINT64_C(0x81000000));
@@ -396,7 +437,8 @@ enum physical_page_status physical_page_release_order(struct physical_page_alloc
     (void)allocator;
     if (physical >= UINT64_C(0x83000000)) {
         unsigned i = (physical - UINT64_C(0x83000000)) / 4096;
-        assert(!order && i < VIRTIO_BLOCK_BATCH_POOL_PAGES && workspace_allocation[i]);
+        assert(!order && i < MODEL_POOL_PAGES && workspace_allocation[i]);
+        assert(!(registers[0x70 / 4] & 4U));
         free(workspace_allocation[i]); workspace_allocation[i] = NULL; releases++;
         return PHYSICAL_PAGE_STATUS_OK;
     }
@@ -413,6 +455,12 @@ static int dma_address(const void *pointer, uint64_t size, uint64_t *physical)
     if (fault == BATCH_READ || fault == SG_BATCH) {
         uintptr_t offset = (uintptr_t)pointer - (uintptr_t)batch_output;
         assert(offset < sizeof(batch_output) && size <= sizeof(batch_output) - offset);
+        if (fragment_dma) {
+            unsigned within = offset % 4096;
+            if (size > 4096 - within) return 0;
+            *physical = UINT64_C(0x84000000) + offset / 4096 * 8192 + within;
+            return 1;
+        }
         *physical = UINT64_C(0x82000000) + offset; return 1;
     }
     assert(pointer != NULL && size == 512);
@@ -942,12 +990,13 @@ static int phase_next(const void *context, const void **cursor, struct kernel_bl
     if (!entry) return 0;
     *span=entry->span; *cursor=entry->next; return 1;
 }
-static void write_phase_case(unsigned version, int failing)
+static void write_phase_case(unsigned version, int failing, int indirect)
 {
     struct riscv_virtio_mmio_block device={0}; struct physical_page_allocator allocator={0};
     memset(registers,0,sizeof(registers));
     registers[0]=0x74726976; registers[1]=version; registers[2]=2;
-    registers[0x10/4]=1; registers[0x34/4]=32; registers[0x100/4]=sizeof(sg_disk)/512;
+    registers[0x10/4]=1U | (indirect ? 1U << 28 : 0);
+    registers[0x34/4]=32; registers[0x100/4]=sizeof(sg_disk)/512;
     fault=SG_BATCH; batch_popped=batch_pushed=clock_value=0;
     notifications=first_notify_heads=sg_max_segments=park_calls=0;
     sg_fail_sector=failing?64:UINT32_MAX; diagnostic_length=0;
@@ -983,7 +1032,8 @@ static void write_phase_case(unsigned version, int failing)
         assert(!fail_during_phase && !device.active && !device.queue.claimed && !device.batch_claimed);
     }
     phase_hold=0; device.irq_source=0; wait_irq_device=NULL;
-    printf("PASS journal phase transport=%u error=%d: 80 spans, later requests complete while first DMA held, error drains owners\n",version,failing);
+    printf("PASS journal phase transport=%u indirect=%d error=%d: 80 spans, later requests complete while first DMA held, error drains owners\n",
+        version,indirect,failing);
     assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
 }
 static void large_phase_case(unsigned version)
@@ -991,7 +1041,8 @@ static void large_phase_case(unsigned version)
     struct riscv_virtio_mmio_block device={0}; struct physical_page_allocator allocator={0};
     memset(registers,0,sizeof(registers));
     registers[0]=0x74726976; registers[1]=version; registers[2]=2;
-    registers[0x10/4]=1; registers[0x34/4]=32; registers[0x100/4]=sizeof(sg_disk)/512;
+    registers[0x10/4]=1;
+    registers[0x34/4]=32; registers[0x100/4]=sizeof(sg_disk)/512;
     fault=SG_BATCH; batch_popped=batch_pushed=clock_value=0;
     notifications=first_notify_heads=sg_max_segments=sg_max_bytes=park_calls=0;
     sg_fail_sector=UINT32_MAX; diagnostic_length=0;
@@ -1016,6 +1067,103 @@ static void large_phase_case(unsigned version)
     device.irq_source=0; wait_irq_device=NULL;
     printf("PASS large journal phase transport=%u: one 512KiB phase owner, four concurrent128KiB requests; single public span retains its request, quiet poll and IRQ ack\n",version);
     assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
+}
+
+static void indirect_phase_case(unsigned version, unsigned mode)
+{
+    struct riscv_virtio_mmio_block device={0};
+    struct physical_page_allocator allocator={0};
+    memset(registers,0,sizeof(registers));
+    registers[0]=0x74726976; registers[1]=version; registers[2]=2;
+    registers[0x10/4]=1U | (1U << 28);
+    registers[0x34/4]=64;
+    registers[0x100/4]=sizeof(sg_disk)/512;
+    if (mode == 2) {
+        registers[0x10/4] |= 6;
+        registers[0x108/4] = 4096;
+        registers[0x10c/4] = 13;
+    }
+    fault=SG_BATCH; batch_popped=batch_pushed=clock_value=0;
+    notifications=first_notify_heads=sg_max_segments=sg_max_bytes=park_calls=indirect_heads=0;
+    sg_fail_sector=UINT32_MAX; diagnostic_length=0;
+    int unordered = mode >= 3;
+    fragment_dma = mode == 1 || unordered;
+    assert(initialize_model(&device,registers,sizeof(registers),&allocator,dma_address,1000)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    assert(device.transport.features & (UINT64_C(1) << 28));
+    device.irq_source=1; wait_irq_device=&device;
+
+    unsigned char *bytes=(void *)batch_output;
+    unsigned count = mode == 1 ? 1 : mode == 3 ? 32 : mode == 4 ? 67 : 128;
+    unsigned payload = unordered ? count * 4096 : 512 * 1024;
+    for (unsigned i=0;i<payload;i++) bytes[i]=(unsigned char)(i*13+i/512);
+    memset(sg_disk,0,sizeof(sg_disk));
+    struct phase_entry entries[128];
+    unsigned step = payload / count;
+    for (unsigned i = 0; i < count; i++) {
+        unsigned disk_page = i;
+        if (unordered) {
+            unsigned first = i / 32 * 32;
+            unsigned window = count - first < 32 ? count - first : 32;
+            disk_page = first + ((i - first) * 7) % window;
+        }
+        entries[i]=(struct phase_entry){{disk_page * step, bytes + disk_page * step, step},
+            i + 1 == count ? NULL : &entries[i + 1]};
+    }
+    assert(kernel_block_write_phase(&device.block,phase_next,0,entries)==KERNEL_BLOCK_STATUS_OK);
+    unsigned expected_segments = mode == 3 ? count : mode == 2 ? 13 : mode == 0 ? 1 : 62;
+    unsigned expected_bytes = mode == 0 ? 512 * 1024 : expected_segments * 4096;
+    unsigned expected_requests = (payload + expected_bytes - 1) / expected_bytes;
+    if (indirect_heads != expected_requests || sg_max_segments != expected_segments || sg_max_bytes != expected_bytes)
+        fprintf(stderr,"indirect phase transport=%u mode=%u: got %u requests with up to %u bytes/%u segments\n",
+            version,mode,indirect_heads,sg_max_bytes,sg_max_segments);
+    assert(sg_max_segments == expected_segments && sg_max_bytes == expected_bytes);
+    assert(indirect_heads == expected_requests && device.statistics.requests == expected_requests);
+    assert(device.statistics.max_inflight == (expected_requests <= 8 ? expected_requests : 8));
+    assert(!memcmp(bytes,sg_disk,payload));
+    assert(!device.active && !device.queue.inflight && !device.queue.claimed && !device.batch_claimed);
+    fragment_dma=0; device.irq_source=0; wait_irq_device=NULL;
+    printf("PASS indirect journal phase transport=%u mode=%u: %u bytes of payload, %u requests, maximum %u bytes/%u segments\n",
+        version,mode,payload,expected_requests,expected_bytes,expected_segments);
+    assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
+}
+
+static void indirect_phase_reset_case(void)
+{
+    struct riscv_virtio_mmio_block device={0};
+    struct physical_page_allocator allocator={0};
+    memset(registers,0,sizeof(registers));
+    registers[0]=0x74726976; registers[1]=2; registers[2]=2;
+    registers[0x10/4]=1U | (1U << 28);
+    registers[0x34/4]=64;
+    registers[0x100/4]=sizeof(sg_disk)/512;
+    fault=SG_BATCH; batch_popped=batch_pushed=clock_value=0;
+    notifications=indirect_heads=0;
+    sg_fail_sector=UINT32_MAX; diagnostic_length=0;
+    fail_workspace = VIRTIO_BLOCK_BATCH_POOL_PAGES + VIRTIO_BLOCK_INDIRECT_POOL_PAGES;
+    unsigned before = releases;
+    assert(initialize_model(&device,registers,sizeof(registers),&allocator,dma_address,1000)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    assert(device.transport.features & (UINT64_C(1) << 28));
+    assert(!device.block.write_phase_bytes && !device.max_phase_segments && releases==before+1);
+    struct phase_entry fallback = {{0, batch_output, 512 * 1024}, NULL};
+    assert(kernel_block_write_phase(&device.block,phase_next,0,&fallback)==KERNEL_BLOCK_STATUS_OK);
+    assert(!indirect_heads && device.statistics.requests==4);
+    assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
+    device=(struct riscv_virtio_mmio_block){0};
+    fail_workspace = 0;
+    registers[0x44/4] = 0; /* The register-array model does not clear QueueReady on reset. */
+    batch_popped=batch_pushed=0;
+    assert(initialize_model(&device,registers,sizeof(registers),&allocator,dma_address,1000)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    phase_hold = 3;
+    device.timeout_ticks = 10;
+    struct phase_entry entry = {{0, batch_output[0], sizeof(batch_output[0])}, NULL};
+    before = releases;
+    assert(kernel_block_write_phase(&device.block,phase_next,0,&entry)==KERNEL_BLOCK_STATUS_TIMEOUT);
+    assert(indirect_heads==1 && device.statistics.timeouts==1 && !registers[0x70/4] && releases==before);
+    assert(!device.active && !device.queue.inflight && !device.queue.claimed && !device.batch_claimed);
+    assert(held_table && !memcmp(held_descriptors, held_table, held_table_bytes));
+    held_table=NULL; phase_held_status=NULL; phase_hold=0;
+    assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
+    puts("PASS indirect journal phase allocation fallback and pending-DMA timeout: confirmed reset before releasing published tables");
 }
 static void late_harvest_case(unsigned version)
 {
@@ -1371,8 +1519,18 @@ int main(int argc, char **argv)
     if (argc==2 && !strcmp(argv[1],"large-phase")) {
         large_phase_case(1); large_phase_case(2); return 0;
     }
+    if (argc==2 && !strcmp(argv[1],"indirect-phase")) {
+        for (unsigned version=1;version<=2;version++) {
+            for (unsigned mode=0;mode<5;mode++) indirect_phase_case(version,mode);
+            write_phase_case(version,0,1);
+            write_phase_case(version,1,1);
+        }
+        indirect_phase_reset_case();
+        return 0;
+    }
     if (argc==2 && !strcmp(argv[1],"write-phase")) {
-        for (unsigned version=1;version<=2;version++) for (int failing=0;failing<=1;failing++) write_phase_case(version,failing);
+        for (unsigned version=1;version<=2;version++)
+            for (int failing=0;failing<=1;failing++) write_phase_case(version,failing,0);
         return 0;
     }
     if (argc == 2 && !strcmp(argv[1], "sg-128k")) {
@@ -1449,8 +1607,12 @@ int main(int argc, char **argv)
         late_harvest_case(version); notification_conditions_case(version);
         cross_cpu_notification_case(version);
         large_phase_case(version);
-        write_phase_case(version,0);
-        write_phase_case(version,1);
+        for (unsigned mode=0;mode<5;mode++) indirect_phase_case(version,mode);
+        if (version == 2) indirect_phase_reset_case();
+        write_phase_case(version,0,1);
+        write_phase_case(version,1,1);
+        write_phase_case(version,0,0);
+        write_phase_case(version,1,0);
         bad_segment_limits_case(version);
         workspace_pool_case(version);
         for (int writing = 0; writing <= 1; writing++) {

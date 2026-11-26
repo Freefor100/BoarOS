@@ -1935,11 +1935,11 @@ static void jbd_data_free(struct jbd_data *data)
  * replaced running records alive without holding STATE across device I/O. */
 static void jbd_collect_range_data(struct jbd_trans *trans,
     const struct jbd_data_range *ranges, unsigned count, struct jbd_data **data,
-    unsigned *used, bool *more)
+    unsigned capacity, unsigned *used, bool *more)
 {
     if (!trans) return;
     unsigned position = 0;
-    for (unsigned i = 0; i < count && *used < EXT4_BLOCK_BATCH_MAX; i++) {
+    for (unsigned i = 0; i < count && *used < capacity; i++) {
         struct jbd_data key = {.block.lb_id=ranges[i].first};
         struct jbd_data *entry = RB_NFIND(jbd_data_tree, &trans->data_root, &key);
         for (; entry && entry->block.lb_id-ranges[i].first < ranges[i].count;
@@ -1957,7 +1957,7 @@ static void jbd_collect_range_data(struct jbd_trans *trans,
             if (!old || old == UINT32_MAX) __builtin_trap();
             for (unsigned n = *used; n > position; n--) data[n] = data[n - 1];
             data[position++] = entry;
-            if (++*used == EXT4_BLOCK_BATCH_MAX) {
+            if (++*used == capacity) {
                 *more = true;
                 return;
             }
@@ -1965,35 +1965,25 @@ static void jbd_collect_range_data(struct jbd_trans *trans,
     }
 }
 
-int jbd_journal_complete_data_batch(struct jbd_journal *journal,
-    const struct jbd_data_range *ranges, unsigned count)
+static int jbd_complete_ranges(struct jbd_journal *journal,
+    const struct jbd_data_range *ranges, unsigned count, struct jbd_data **data,
+    unsigned capacity)
 {
-    if (!count) return EOK;
-    if (count > JBD_COMPLETE_RANGES_MAX) return EINVAL;
-    uint64_t end = 0;
-    for (unsigned i = 0; i < count; i++) {
-        if (ranges[i].first < end || ranges[i].first > UINT64_MAX - ranges[i].count)
-            return EINVAL;
-        end = ranges[i].first + ranges[i].count;
-    }
     KERNEL_LOCK_SCOPE(io); kernel_mutex_lock(&journal->ordered_io,&io);
     bool serial = ext4_fs_serial_writer(journal->jbd_fs->inode_ref.fs);
     for (;;) {
-        /* Use the filesystem's bounded block batch. The device refills its
-         * existing slots during a phase and may combine adjacent buffers. */
-        struct jbd_data *data[EXT4_BLOCK_BATCH_MAX];
         unsigned used=0;
         bool more=false;
         {
             JBD_STATE_SCOPE(journal);
             if (jbd_journal_error(journal)) return jbd_journal_error(journal);
-            jbd_collect_range_data(journal->committing,ranges,count,data,&used,&more);
+            jbd_collect_range_data(journal->committing,ranges,count,data,capacity,&used,&more);
             struct jbd_trans *trans;
             TAILQ_FOREACH(trans,&journal->sealed_queue,trans_node) {
-                if (used == EXT4_BLOCK_BATCH_MAX) break;
-                jbd_collect_range_data(trans,ranges,count,data,&used,&more);
+                if (used == capacity) break;
+                jbd_collect_range_data(trans,ranges,count,data,capacity,&used,&more);
             }
-            jbd_collect_range_data(journal->running,ranges,count,data,&used,&more);
+            jbd_collect_range_data(journal->running,ranges,count,data,capacity,&used,&more);
         }
         if (!used) return EOK;
         struct jbd_io_phase phase={0};
@@ -2008,6 +1998,33 @@ int jbd_journal_complete_data_batch(struct jbd_journal *journal,
          * this phase owns its snapshot. A serial mount has excluded them. */
         if (error || (serial && !more)) return error;
     }
+}
+
+int jbd_journal_complete_data_batch(struct jbd_journal *journal,
+    const struct jbd_data_range *ranges, unsigned count)
+{
+    if (!count) return EOK;
+    if (count > JBD_COMPLETE_RANGES_MAX) return EINVAL;
+    uint64_t end = 0, blocks = 0;
+    for (unsigned i = 0; i < count; i++) {
+        if (ranges[i].first < end || ranges[i].first > UINT64_MAX - ranges[i].count)
+            return EINVAL;
+        end = ranges[i].first + ranges[i].count;
+        blocks += ranges[i].count;
+    }
+    unsigned capacity = journal->jbd_fs->bdev->bdif->write_phase_bytes / journal->block_size;
+    if (capacity > EXT4_WRITE_PHASE_SPANS) capacity = EXT4_WRITE_PHASE_SPANS;
+    if (capacity > blocks) capacity = (unsigned)blocks;
+    if (capacity > EXT4_BLOCK_BATCH_MAX) {
+        struct jbd_data **wide = ext4_malloc(capacity * sizeof(*wide));
+        if (wide) {
+            int error = jbd_complete_ranges(journal,ranges,count,wide,capacity);
+            ext4_free(wide);
+            return error;
+        }
+    }
+    struct jbd_data *data[EXT4_BLOCK_BATCH_MAX];
+    return jbd_complete_ranges(journal,ranges,count,data,EXT4_BLOCK_BATCH_MAX);
 }
 
 int jbd_journal_complete_data(struct jbd_journal *journal,ext4_fsblk_t first,uint32_t count)

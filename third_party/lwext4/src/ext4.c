@@ -5865,16 +5865,18 @@ int ext4_fpread_batch(const ext4_file *file, struct file_read_span *spans, unsig
 
 /* Direct writes borrow the input until device completion. A private journaled
  * allocation remains unreachable until its metadata is committed. */
+struct ext4_direct_write_logical {
+    struct file_write_span *span;
+    uint64_t offset;
+    size_t length;
+    bool allocated;
+};
+
 struct ext4_direct_write_batch {
-    struct kernel_block_span blocks[EXT4_BLOCK_BATCH_MAX];
-    struct {
-        struct file_write_span *span;
-        uint64_t offset;
-        size_t length;
-        bool allocated;
-    } logical[EXT4_BLOCK_BATCH_MAX];
-    unsigned count;
-    size_t bytes;
+    struct ext4_direct_write_logical *logical;
+    unsigned count, capacity;
+    size_t bytes, byte_limit;
+    struct kernel_block_span blocks[];
 };
 /* Drop the highest mapped blocks before any queued prefix. Releasing a middle
  * block can split an extent and require metadata allocation during error repair. */
@@ -6025,7 +6027,21 @@ Retry:
 #endif
         spans[0].offset >= saved_size && fs->bdev->bdif->bwrite_batch;
     if ((!journal || fresh_ordered) && blocks > 1 && (source_count || synchronous)) {
-        direct = ext4_calloc(1, sizeof(*direct));
+        size_t byte_limit = EXT4_WRITE_BATCH_BYTES;
+        unsigned capacity = EXT4_BLOCK_BATCH_MAX;
+        if (fresh_ordered && fs->bdev->bdif->write_phase_bytes > byte_limit &&
+            blocks > byte_limit / block_size) {
+            byte_limit = fs->bdev->bdif->write_phase_bytes;
+            capacity = EXT4_WRITE_PHASE_SPANS;
+        }
+        if (blocks < capacity) capacity = (unsigned)blocks;
+        direct = ext4_calloc(1, sizeof(*direct) +
+            capacity * (sizeof(*direct->blocks) + sizeof(*direct->logical)));
+        if (direct) {
+            direct->capacity = capacity;
+            direct->byte_limit = byte_limit;
+            direct->logical = (void *)(direct->blocks + capacity);
+        }
         if (!direct && !journal) r = ENOMEM;
     }
     struct ext4_inode_block_range range = {0};
@@ -6054,7 +6070,7 @@ Retry:
         }
         size_t consumed = 0;
 		while (consumed < span->size && !r) {
-            if (direct && (direct->bytes == 131072 || direct->count == EXT4_BLOCK_BATCH_MAX)) {
+            if (direct && (direct->bytes >= direct->byte_limit || direct->count == direct->capacity)) {
                 r = ext4_direct_write_flush(&ref, file, direct, &range, range_next);
                 if (r) break;
             }
@@ -6079,7 +6095,7 @@ Retry:
                 uint64_t needed = (mapping_end - 1) / block_size - logical_block + 1;
                 uint32_t maximum = fresh_ordered ?
                     (UINT32_C(524288) / block_size) :
-                    (UINT32_C(131072) - (direct ? direct->bytes : 0)) / block_size;
+                    (EXT4_WRITE_BATCH_BYTES - (direct ? direct->bytes : 0)) / block_size;
                 if (needed < maximum) maximum = needed;
                 uint32_t overwritten = 0;
                 if (journal && !offset) {
@@ -6119,7 +6135,7 @@ Retry:
                     (const uint8_t *)direct->blocks[n-1].buffer + direct->blocks[n-1].size == input;
                 bool overlap = n && physical * block_size >= direct->blocks[n-1].offset &&
                     physical * block_size - direct->blocks[n-1].offset < direct->blocks[n-1].size;
-                if ((!merge && n == EXT4_BLOCK_BATCH_MAX) || overlap || direct->bytes + block_size > 131072) {
+                if ((!merge && n == direct->capacity) || overlap || direct->bytes + block_size > direct->byte_limit) {
                     r = ext4_direct_write_flush(&ref, file, direct, &range, range_next); n = 0; merge = false;
                 }
                 if (!r && merge) {

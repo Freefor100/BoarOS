@@ -1015,12 +1015,36 @@ static int block_close(struct ext4_blockdev *device)
     return block_open(device);
 }
 
+static int block_write_array_next(const void *end, const void **cursor,
+    struct kernel_block_span *span)
+{
+    const struct kernel_block_span *item = *cursor;
+    if (item == end) return 0;
+    *span = *item;
+    *cursor = item + 1;
+    return 1;
+}
+
 static int block_write_batch(struct ext4_blockdev *device,
                             const struct kernel_block_span *spans, unsigned count)
 {
     struct lwext4_mount_adapter *adapter = device->bdif->p_user;
-    if (count > KERNEL_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
-    enum kernel_block_status status = kernel_block_write_batch(adapter->block, spans, count);
+    if ((count && !spans) || count > (device->bdif->write_phase_bytes ?
+            EXT4_WRITE_PHASE_SPANS : KERNEL_BLOCK_BATCH_MAX)) return EINVAL;
+    bool phase = count > KERNEL_BLOCK_BATCH_MAX;
+    if (device->bdif->write_phase_bytes && !phase) {
+        size_t bytes = 0;
+        for (unsigned i = 0; i < count; i++) {
+            if (spans[i].size > EXT4_WRITE_BATCH_BYTES - bytes) {
+                phase = true;
+                break;
+            }
+            bytes += spans[i].size;
+        }
+    }
+    enum kernel_block_status status = phase ?
+        kernel_block_write_phase(adapter->block, block_write_array_next, spans + count, spans) :
+        kernel_block_write_batch(adapter->block, spans, count);
     switch (status) {
     case KERNEL_BLOCK_STATUS_OK: return EOK;
     case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
@@ -1892,6 +1916,7 @@ static int mount_ext_filesystem(struct kernel_vfs_mount *mount,
     adapter->interface.bwrite = block_write;
     adapter->interface.bwrite_batch = block_write_batch;
     adapter->interface.bwrite_phase = block_write_phase;
+    adapter->interface.write_phase_bytes = kernel_block_write_phase_bytes(block);
     adapter->interface.close = block_close;
     adapter->interface.flush = block_flush;
     adapter->interface.lock = 0;
@@ -1981,6 +2006,7 @@ static int mount_ext_filesystem(struct kernel_vfs_mount *mount,
     adapter->superblock = superblock;
     ext4_name_cache_init(adapter);
     adapter->instance.writeback_block_size = ext4_sb_get_block_size(superblock);
+    adapter->instance.writeback_window_bytes = adapter->interface.write_phase_bytes;
     mount->read_only=adapter->instance.read_only;
     mount->state = VFS_MOUNT_STATE_LIVE;
     adapter->instance.backend_mount.state=VFS_MOUNT_STATE_LIVE;

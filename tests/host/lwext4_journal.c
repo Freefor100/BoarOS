@@ -442,6 +442,49 @@ static int range_data_phase(struct ext4_blockdev *dev, const struct ext4_block_w
     return reverse_data_phase(dev, first);
 }
 
+static void wide_ordered_range(struct ext4_blockdev *dev, struct jbd_journal *journal,
+    ext4_file *file)
+{
+    enum { blocks = 96 };
+    struct resource_source sources[blocks] = {0};
+    struct ext4_inode_ref inode;
+    dev->fs->jbd_journal = journal;
+    CHECK(jbd_journal_group_init(journal,16*1024*1024)==EOK);
+    CHECK(ext4_fs_get_inode_ref_read(dev->fs,file->inode,&inode)==EOK);
+    for (unsigned i=0;i<blocks;i++) {
+        ext4_fsblk_t home;
+        CHECK(ext4_fs_get_inode_dblk_idx(&inode,i,&home,false)==EOK && home);
+        sources[i].data=malloc(journal->block_size);
+        CHECK(sources[i].data);
+        memset(sources[i].data,i+1,journal->block_size);
+        resource_accept_data(journal,home,&sources[i],false);
+    }
+    CHECK(ext4_fs_put_inode_ref(&inode)==EOK);
+    dev->bdif->bwrite_phase = range_data_phase;
+    dev->bdif->write_phase_bytes = 512*1024;
+    uint64_t flushes=disk.flushes;
+    CHECK(ext4_fdata_complete(file,0,blocks*journal->block_size)==EOK);
+    CHECK(range_phases==1 && range_requests==blocks && disk.flushes==flushes);
+    CHECK(jbd_journal_freeze(journal)==EOK);
+    CHECK(jbd_journal_select_stage(journal,JBD_JOURNAL_COMMIT)==JBD_JOURNAL_COMMIT);
+    CHECK(jbd_journal_retire_stage(journal,JBD_JOURNAL_COMMIT,jbd_journal_submit(journal))==EOK);
+    journal->checkpoint_target=journal->durable_sequence;
+    while (jbd_journal_select_stage(journal,JBD_JOURNAL_CHECKPOINT)==JBD_JOURNAL_CHECKPOINT)
+        CHECK(jbd_journal_retire_stage(journal,JBD_JOURNAL_CHECKPOINT,jbd_journal_checkpoint(journal))==EOK);
+    for (unsigned i=0;i<blocks;i++) {
+        char byte=0;
+        size_t done;
+        CHECK(ext4_fpread(file,i*journal->block_size,&byte,1,&done)==EOK &&
+            done==1 && (unsigned char)byte==i+1);
+        CHECK(!sources[i].references);
+        free(sources[i].data);
+    }
+    CHECK(ext4_fclose(file)==EOK);
+    close_normal_journal(dev,journal);
+    CHECK(fault_block_crash(&disk)==0);
+    puts("PASS wide ordered range: 96 separate buffers in one phase, contents and owners verified");
+}
+
 static void complete_ordered_range_batch(struct ext4_blockdev *dev, struct jbd_journal *journal,
     ext4_file *first, ext4_fsblk_t first_home, unsigned fault)
 {
@@ -1957,6 +2000,10 @@ int main(int argc, char **argv)
     if (!strcmp(argv[2], "ordered-range-batch")) {
         complete_ordered_range_batch(&dev, &journal, &file, home,
             argc > 3 ? (unsigned)atoi(argv[3]) : 0);
+        return 0;
+    }
+    if (!strcmp(argv[2], "wide-ordered-range")) {
+        wide_ordered_range(&dev,&journal,&file);
         return 0;
     }
     if (!strcmp(argv[2], "resource-admission")) {

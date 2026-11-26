@@ -31,6 +31,7 @@ struct kernel_vfs_instance {
     struct kernel_heap *heap;
     struct kernel_page_cache *page_cache;
     size_t writeback_block_size; /* Zero means no block alignment requirement. */
+    uint32_t writeback_window_bytes; /* Preferred write phase size from the device. */
     struct kernel_vfs_node *nodes, *node_index;
     size_t node_count;
     uint64_t node_publications;

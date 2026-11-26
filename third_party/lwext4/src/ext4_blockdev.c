@@ -711,10 +711,12 @@ int ext4_blocks_set_direct(struct ext4_blockdev *bdev, const void *buf,
 int ext4_blocks_check_batch(struct ext4_blockdev *bdev,
 	const struct kernel_block_span *spans, unsigned count)
 {
-	if (!bdev || !bdev->bdif || count > EXT4_BLOCK_BATCH_MAX ||
+	if (!bdev || !bdev->bdif || count > (bdev->bdif->write_phase_bytes ?
+	    EXT4_WRITE_PHASE_SPANS : EXT4_BLOCK_BATCH_MAX) ||
 	    (count && !spans) || !bdev->bdif->ph_bsize || !bdev->lg_bsize ||
 	    bdev->lg_bsize % bdev->bdif->ph_bsize ||
 	    bdev->part_offset % bdev->bdif->ph_bsize) return EINVAL;
+	uint64_t first = UINT64_MAX, last = 0;
 	for (unsigned i = 0; i < count; i++) {
 		if (!spans[i].buffer || !spans[i].size ||
 		    spans[i].offset % bdev->lg_bsize || spans[i].size % bdev->lg_bsize ||
@@ -725,9 +727,13 @@ int ext4_blocks_check_batch(struct ext4_blockdev *bdev,
 		    spans[i].offset > UINT64_MAX - bdev->part_offset ||
 		    spans[i].size > UINT64_MAX - bdev->part_offset - spans[i].offset)
 			return EINVAL;
-		for (unsigned j = 0; j < i; j++)
-			if (spans[i].offset < spans[j].offset + spans[j].size &&
-			    spans[j].offset < spans[i].offset + spans[i].size) return EINVAL;
+		uint64_t end = spans[i].offset + spans[i].size;
+		if (spans[i].offset < last && end > first)
+			for (unsigned j = 0; j < i; j++)
+				if (spans[i].offset < spans[j].offset + spans[j].size &&
+				    spans[j].offset < end) return EINVAL;
+		if (spans[i].offset < first) first = spans[i].offset;
+		if (end > last) last = end;
 	}
     return EOK;
 }
@@ -736,6 +742,12 @@ int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
 {
     int checked=ext4_blocks_check_batch(bdev,spans,count);
     if (checked || !count) return checked;
+    return ext4_blocks_submit_batch(bdev,spans,count);
+}
+
+int ext4_blocks_submit_batch(struct ext4_blockdev *bdev,
+    struct kernel_block_span *spans,unsigned count)
+{
 	if (!bdev->bdif->bwrite_batch) {
 		for (unsigned i = 0; i < count; i++) {
 			int r = ext4_bdif_bwrite(bdev, spans[i].buffer,

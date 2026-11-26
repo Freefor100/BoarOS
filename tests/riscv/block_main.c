@@ -177,6 +177,57 @@ static void test_128k_sg(struct riscv_virtio_mmio_block *device)
     virt_uart_puts("BoarOS: block 128KiB discrete SG read/write passed\n");
 }
 
+#define PHASE_PAGES 40U
+#define PHASE_START (512U * 1024U)
+
+static int phase_next(const void *context, const void **cursor, struct kernel_block_span *span)
+{
+    const uint64_t *addresses = context;
+    const uint64_t *current = *cursor;
+    size_t page = current - addresses;
+    if (page == PHASE_PAGES) return 0;
+    *span = (struct kernel_block_span){PHASE_START + page * BOAROS_PAGE_SIZE,
+        identity_access(*current), BOAROS_PAGE_SIZE};
+    *cursor = current + 1;
+    return 1;
+}
+
+static void test_write_phase(struct riscv_virtio_mmio_block *device)
+{
+    struct physical_page_allocator *allocator = device->page_allocator;
+    uint64_t baseline = physical_page_available(allocator);
+    uint64_t addresses[PHASE_PAGES];
+    for (unsigned i = 0; i < PHASE_PAGES; i++) {
+        /* The second page of each allocation separates the SG segments. */
+        if (physical_page_allocate_order(allocator, 1, &addresses[i]) != PHYSICAL_PAGE_STATUS_OK)
+            fail_block(120, 0, i);
+        unsigned char *page = identity_access(addresses[i]);
+        for (unsigned j = 0; j < BOAROS_PAGE_SIZE; j++) page[j] = (unsigned char)(i + j * 17);
+    }
+    uint64_t requests = device->statistics.requests;
+    uint64_t bounce = device->statistics.bounce_requests;
+    int indirect = device->block.write_phase_bytes != 0;
+    unsigned expected_requests = indirect ? 1 : 2;
+    if (kernel_block_write_phase(&device->block, phase_next, addresses, addresses) != KERNEL_BLOCK_STATUS_OK ||
+        device->statistics.requests != requests + expected_requests || device->statistics.bounce_requests != bounce)
+        fail_block(121, requests + expected_requests, device->statistics.requests);
+    if (kernel_block_flush(&device->block) != KERNEL_BLOCK_STATUS_OK) fail_block(122, 0, 1);
+    for (unsigned i = 0; i < PHASE_PAGES; i++) {
+        unsigned char *page = identity_access(addresses[i]);
+        for (unsigned j = 0; j < BOAROS_PAGE_SIZE; j++) page[j] = 0;
+        if (kernel_block_read_at(&device->block, PHASE_START + i * BOAROS_PAGE_SIZE, page,
+            BOAROS_PAGE_SIZE) != KERNEL_BLOCK_STATUS_OK) fail_block(123, 0, i);
+        for (unsigned j = 0; j < BOAROS_PAGE_SIZE; j++)
+            if (page[j] != (unsigned char)(i + j * 17)) fail_block(124, (unsigned char)(i + j * 17), page[j]);
+        if (physical_page_release_order(allocator, addresses[i], 1) != PHYSICAL_PAGE_STATUS_OK)
+            fail_block(125, 0, i);
+    }
+    if (physical_page_available(allocator) != baseline || device->queue.inflight || device->queue.claimed || device->active)
+        fail_block(126, baseline, physical_page_available(allocator));
+    virt_uart_puts(indirect ? "BoarOS: block 160KiB phase passed in one indirect request\n" :
+        "BoarOS: block 160KiB phase passed in two direct requests\n");
+}
+
 static void test_rejects_invalid_or_non_block_mmio(void)
 {
     uint32_t registers[0x200U / sizeof(uint32_t)] = {0U};
@@ -526,6 +577,7 @@ static void test_real_virtio_block(const void *dtb)
     }
     virt_uart_puts(rw_dev->block.cache_mode == KERNEL_BLOCK_CACHE_WRITEBACK
         ? "BoarOS: block cache writeback\n" : "BoarOS: block cache writethrough\n");
+    test_write_phase(rw_dev);
 
     int partition_error = test_primary_partitions(&rw_dev->block);
     if (partition_error) fail_block(90, 0, partition_error);

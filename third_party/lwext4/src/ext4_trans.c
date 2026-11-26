@@ -156,7 +156,7 @@ int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
         int r=ext4_block_flush_lba(bdev,spans[i].offset/bdev->lg_bsize+j);
         if (r) return r;
     }
-    int r = ext4_blocks_set_batch(bdev, spans, count);
+    int r = ext4_blocks_submit_batch(bdev, spans, count);
     if (r) {
         for (unsigned i=0;i<count;i++) ext4_bcache_invalidate_lba(bdev->bc,
             spans[i].offset/bdev->lg_bsize,spans[i].size/bdev->lg_bsize);
