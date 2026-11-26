@@ -7189,6 +7189,18 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket, struct kernel_wait_que
     return socket_poll_locked(socket, UINT32_MAX);
 }
 
+#if BOAROS_MAX_CPUS == 1
+int kernel_socket_stream_ready_snapshot(struct kernel_socket *socket, uint32_t mask, uint32_t *ready)
+{
+    if (socket->type != SOCKET_STREAM ||
+        (socket->domain != KERNEL_SOCKET_DOMAIN_UNIX && socket->domain != KERNEL_SOCKET_DOMAIN_INET))
+        return 0;
+    if (BOAROS_LOCK_DEBUG && arch_interrupt_is_enabled()) __builtin_trap();
+    *ready = socket_poll_locked(socket, mask) & mask;
+    return 1;
+}
+#endif
+
 int kernel_socket_poll_prepare(struct kernel_socket *socket, uint32_t mask,
     uint64_t deadline, struct kernel_wait_token *token)
 {
@@ -7856,9 +7868,18 @@ static struct kernel_socket_service_result socket_service_owned(
     if (!scope->outer || protocol_current_owner() != kernel_io_context_current() || protocol_depth != 1) __builtin_trap();
     if (!socket_initialized) return result;
     COST_ADD(NETWORK_SERVICE_CALLS, 1);
-    service_loopback(&result, budget.packets);
+    if (loopback_pending) service_loopback(&result, budget.packets);
+    unsigned socket_budget = budget.sockets;
+    if (socket_budget) {
+        /* The service queues share one state owner. Avoid acquiring it
+         * separately for an empty ready list, capacity list and retry list. */
+        KERNEL_IRQ_LOCK_SCOPE(state,&socket_state_lock);
+        if (!ready_work.head && !pool_wait.head && !nic_wait.head &&
+            !receive_wait.head && !(orphan_nic_ready & 1U) && !write_retry_head)
+            socket_budget = 0;
+    }
     /* 容量、到期重试和实际socket工作共用额度，沿原游标轮转。 */
-    while (result.sockets < budget.sockets) {
+    while (result.sockets < socket_budget) {
         unsigned advanced = 0;
         for (unsigned i = 0; i < 3; i++) {
             unsigned which = service_cursor;
