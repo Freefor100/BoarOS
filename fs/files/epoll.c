@@ -13,6 +13,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
 #include <kernel/signal_fd.h>
+#include <kernel/socket.h>
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
 #include <kernel/files.h>
@@ -572,7 +573,8 @@ enum kernel_files_status kernel_files_epoll_ctl(
         item->data = data;
         kernel_wait_node_init_callback(&item->wait_node, kernel_epoll_wait_callback, item);
         item->wait_node.event_mask=kernel_signal_fd_mask(target_file);
-        if (target_file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
+        int socket_target = target_file->kind == KERNEL_OPEN_FILE_KIND_SOCKET;
+        if (socket_target)
             item->wait_node.readiness_mask = events | KERNEL_POLLERR | KERNEL_POLLHUP;
         kernel_preempt_disable();
         int error = 0;
@@ -592,19 +594,27 @@ enum kernel_files_status kernel_files_epoll_ctl(
         if (item->target_next) item->target_next->target_prev = item;
         target_file->ep_items = item;
         item->references++; /* query可睡眠，DEL只撤销登记引用。 */
-        epoll_state_release(&irq);
-        kernel_preempt_enable();
-        target_queue = 0;
-        current_revents = kernel_open_file_poll(target_file, events, &target_queue);
-        if (kernel_open_file_kind(target_file) == KERNEL_OPEN_FILE_KIND_EPOLL)
-            target_queue = &target_file->epoll->wait_queue;
-        epoll_state_acquire(&irq);
+        /* The pinned socket owns a fixed wait queue. Subscribe before the
+         * first readiness query instead of polling to discover the source. */
+        if (socket_target) {
+            target_queue = kernel_socket_wait_queue(target_file->socket);
+        } else {
+            epoll_state_release(&irq);
+            kernel_preempt_enable();
+            target_queue = 0;
+            (void)kernel_open_file_poll(target_file, events, &target_queue);
+            if (kernel_open_file_kind(target_file) == KERNEL_OPEN_FILE_KIND_EPOLL)
+                target_queue = &target_file->epoll->wait_queue;
+            epoll_state_acquire(&irq);
+        }
         if (item->linked && target_queue) kernel_wait_queue_add(target_queue, &item->wait_node);
         uint64_t control = item->control_generation;
         uint32_t interest = item->events;
+        int linked = item->linked;
         epoll_state_release(&irq);
+        if (socket_target) kernel_preempt_enable();
         /* 订阅前的通知可能已经结束；绑定后重新查询实际状态。 */
-        if (item->linked) current_revents = kernel_open_file_poll(target_file, interest, 0);
+        current_revents = linked ? kernel_open_file_poll(target_file, interest, 0) : 0;
         epoll_state_acquire(&irq);
         if (item->linked && control == item->control_generation &&
             (current_revents & (item->events | KERNEL_POLLERR | KERNEL_POLLHUP)))

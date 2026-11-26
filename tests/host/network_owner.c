@@ -3015,6 +3015,16 @@ static void loopback_work(void)
         CHECK(observation.error == ERR_OK && work_pending_snapshot());
         service = kernel_socket_service_pending((struct kernel_socket_service_budget){0, 1, 0});
         CHECK(service.packets == 1 && !service.timers && observation.received == 4);
+
+        before_wakes = observation.wakes;
+        loopback_prepare(&observation);
+        kernel_socket_protocol_enter(&irq);
+        loopback_emit(&observation);
+        service = kernel_socket_service_owned(&irq,(struct kernel_socket_service_budget){0, 1, 0});
+        kernel_socket_protocol_leave(&irq);
+        CHECK(service.packets == 1 && observation.received == 5 && !service.runnable);
+        CHECK(observation.wakes == before_wakes);
+
         udp_remove(observation.sender); udp_remove(receiver);
         kernel_socket_network_hooks(NULL, NULL, NULL, NULL, NULL);
         CHECK(clock_ns == frozen && lwip_stats.mem.used == initial_memory);
@@ -3236,6 +3246,41 @@ static unsigned serial_receive_inline(void *context)
     return 1;
 }
 
+static void serial_loopback_receive_credit(void)
+{
+    kernel_socket_network_initialize();
+    kernel_wait_queue_init(&model_work_queue);
+    kernel_socket_network_hooks(NULL,&model_work_queue,NULL,NULL,NULL);
+    struct kernel_socket *socket=NULL;
+    CHECK(!kernel_socket_create(&test_heap,KERNEL_SOCKET_AF_INET,SOCKET_STREAM,0,&socket));
+    socket->connected=1;
+    socket->tcp_loopback=1;
+
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    struct tcp_pcb *pcb=socket->tcp;
+    uint32_t window=pcb->rcv_wnd;
+    pcb->rcv_ann_right_edge=window;
+    pcb->rcv_nxt=4;
+    pcb->rcv_wnd-=4;
+    struct pbuf_custom storage={.custom_free_function=retired_payload_free};
+    unsigned char bytes[]="data",out[4];
+    struct pbuf *payload=pbuf_alloced_custom(PBUF_RAW,4,PBUF_REF,&storage,bytes,4);
+    CHECK(payload && tcp_data_received(socket,pcb,payload,ERR_OK)==ERR_OK);
+    kernel_socket_protocol_leave(&scope);
+
+    struct kernel_open_file_description *pin=(void *)socket;
+    struct kernel_socket_read_request request={0};
+    CHECK(kernel_socket_reserve_read(socket,NULL,&request,&pin,4,0,NULL)==4);
+    kernel_socket_copy_read(&request,0,out,4);
+    CHECK(kernel_socket_finish_read(&request,0)==4 && !memcmp(out,bytes,4));
+    CHECK(retired_payloads==1 && !socket->receive_credit && !socket->retired_head &&
+          pcb->rcv_wnd==window && !ready_work.head);
+    kernel_socket_destroy(socket);
+    CHECK(!heap_live);
+    puts("PASS serial TCP loopback returns read credit and buffers without queuing work");
+}
+
 static void serial_tcp_receive_credit(void)
 {
 #if BOAROS_USER_SMP
@@ -3379,6 +3424,44 @@ static void pool_release_owner(void)
 
 static void tcp_quota_wakeup(struct kernel_wait_node *node,uint32_t reason,uint64_t event)
 { (void)event; CHECK(reason==KERNEL_WAIT_WOKEN);(*(unsigned *)node->context)++; }
+
+static void tcp_readiness_direction(void)
+{
+    struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
+    connected_pair(&listener,&client,&server);
+    for (unsigned i=0;i<8;i++)
+        kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    unsigned reads=0,writes=0;
+    struct kernel_wait_node reader={0},writer={0};
+    kernel_wait_node_init_callback(&reader,tcp_quota_wakeup,&reads);
+    kernel_wait_node_init_callback(&writer,tcp_quota_wakeup,&writes);
+    reader.readiness_mask=KERNEL_POLLIN;
+    writer.readiness_mask=KERNEL_POLLOUT;
+    kernel_wait_queue_add(&server->wait,&reader);
+    kernel_wait_queue_add(&server->wait,&writer);
+    CHECK(write_buffer(client,"a",1,0)==1);
+    CHECK(server->rx_bytes==1 && reads==1 && !writes);
+
+    struct kernel_socket_protocol_scope scope;
+    kernel_socket_protocol_enter(&scope);
+    server->tx_budget=0; /* The previous endpoint snapshot was full. */
+    CHECK(tcp_data_sent(server,server->tcp,1)==ERR_OK);
+    kernel_socket_protocol_leave(&scope);
+    CHECK(reads==1 && writes==1);
+    CHECK(!kernel_wait_node_remove_sync(&reader) && !kernel_wait_node_remove_sync(&writer));
+    kernel_socket_protocol_enter(&scope);
+    if (client->tcp) tcp_abort(client->tcp);
+    if (server->tcp) tcp_abort(server->tcp);
+    kernel_socket_protocol_leave(&scope);
+    kernel_socket_destroy(client);
+    kernel_socket_destroy(server);
+    kernel_socket_destroy(listener);
+    for (unsigned i=0;i<8;i++)
+        kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
+    CHECK(!heap_live);
+    puts("PASS TCP receive publication and returned send credit wake only the matching direction");
+}
+
 static void tcp_quota_notifications(void)
 {
     struct kernel_socket *listener=NULL,*client=NULL,*server=NULL;
@@ -6464,6 +6547,7 @@ int main(int argc, char **argv)
         tcp_passive_capacity_retry(1);
     }
     else if (!strcmp(argv[1], "tcp-loopback-checksum")) tcp_loopback_checksum();
+    else if (!strcmp(argv[1], "serial-loopback-credit")) serial_loopback_receive_credit();
     else if (!strcmp(argv[1], "serial-tcp-credit")) serial_tcp_receive_credit();
     else if (!strcmp(argv[1], "tcp-ack-batch")) tcp_ack_receive_batch();
     else if (!strcmp(argv[1], "tcp-serial-train")) tcp_receive_train_contract(0);
@@ -6540,6 +6624,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "unix-sender")) unix_sender_owner();
     else if (!strcmp(argv[1], "tcp-batch")) copy_capacity(0,1);
     else if (!strcmp(argv[1], "tcp-quota-notify")) tcp_quota_notifications();
+    else if (!strcmp(argv[1], "tcp-readiness-direction")) tcp_readiness_direction();
     else if (!strcmp(argv[1], "pool-release-owner")) pool_release_owner();
     else if (!strcmp(argv[1], "tcp-batch-last")) copy_capacity(0,2);
     else if (!strcmp(argv[1], "tcp-batch-abort")) copy_capacity(0,3);

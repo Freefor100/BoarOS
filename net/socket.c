@@ -609,6 +609,7 @@ static unsigned orphan_nic_wait, orphan_nic_ready;
 static unsigned pool_has_waiters, receive_has_waiters;
 #endif
 static unsigned loopback_pending, nic_blocked, protocol_depth, service_cursor, capacity_cursor;
+static unsigned loopback_notification_deferred;
 #if BOAROS_COST_DIAGNOSTICS
 static unsigned polling_snapshot[BOAROS_MAX_CPUS];
 static inline unsigned *socket_poll_depth(void)
@@ -773,6 +774,12 @@ static inline int protocol_lock(struct kernel_socket_protocol_scope *scope, int 
     return 1;
 }
 
+static void socket_work_ready(void)
+{
+    SOCKET_STATE(state);
+    socket_work_ready_locked(state.owner);
+}
+
 static int protocol_enter(struct kernel_socket_protocol_scope *scope, int try_only, int local_only)
 {
 #if BOAROS_USER_SMP
@@ -836,6 +843,8 @@ void kernel_socket_protocol_leave(struct kernel_socket_protocol_scope *scope)
     struct kernel_io_context *owner=protocol_current_owner();
     if (protocol_depth != 1 || owner != kernel_io_context_current() ||
         !owner->allocation_depth) __builtin_trap();
+    int publish_loopback = loopback_notification_deferred && loopback_pending;
+    loopback_notification_deferred = 0;
     protocol_depth = 0;
     owner->allocation_depth--;
     __atomic_store_n(&protocol_owner, 0, __ATOMIC_RELAXED);
@@ -844,6 +853,7 @@ void kernel_socket_protocol_leave(struct kernel_socket_protocol_scope *scope)
     /* 先归还协议owner，再允许恢复用户CPU资格；不能带mutex等待迁移。 */
     kernel_service_scope_end(&scope->service);
 #endif
+    if (publish_loopback) socket_work_ready();
     arch_interrupt_restore(scope->interrupts);
 }
 void kernel_socket_pbuf_free(struct pbuf *payload)
@@ -1100,7 +1110,14 @@ static void protocol_work_ready(void)
     /* loopback队列只有协议owner生产/消费；已有待处理包时不重复通知。 */
     if(loopback_pending)return;
     loopback_pending=1;
-    SOCKET_STATE(state);socket_work_ready_locked(state.owner);
+    /* The serial owner may consume this packet in its current turn. Only
+     * publish work that survives that turn, including packets sent by timers. */
+    if (!boaros_lwip_parallel_enabled() &&
+        protocol_current_owner()==kernel_io_context_current()) {
+        loopback_notification_deferred=1;
+        return;
+    }
+    socket_work_ready();
 }
 static void protocol_capacity(int pool)
 {
@@ -1119,6 +1136,10 @@ static void protocol_capacity(int pool)
     pool_generation++;
     if (pool_wait.head) { SOCKET_STATE(state);socket_work_ready_locked(state.owner); }
 }
+static struct kernel_socket_service_result socket_service_owned(
+    struct kernel_socket_protocol_scope *scope, struct kernel_socket_service_budget budget,
+    int report_pending);
+
 static void service_inline(struct kernel_socket_protocol_scope *scope)
 {
     /* raw API已返回但outer资格尚未交接；同步回调借用scope时不重入服务。 */
@@ -1127,7 +1148,7 @@ static void service_inline(struct kernel_socket_protocol_scope *scope)
         && !scope->tcp_owner
 #endif
         )
-        (void)kernel_socket_service_owned(scope, (struct kernel_socket_service_budget){8, 8, 1});
+        (void)socket_service_owned(scope, (struct kernel_socket_service_budget){8, 8, 1}, 0);
 }
 
 /* The list itself owns no socket reference.
@@ -2507,15 +2528,16 @@ static void packet_publish_locked(struct kernel_socket *socket, struct socket_pa
     else socket->packets_head = packet;
     socket->packets_tail = packet;
     struct socket_state_guard *state=socket_state_owner(socket_endpoint_lock(socket));
+    int tcp = kernel_socket_is_tcp(socket);
 #if BOAROS_USER_SMP
-    struct socket_tcp_owner *owner = kernel_socket_is_tcp(socket) && !socket->tcp_loopback ?
+    struct socket_tcp_owner *owner = tcp && !socket->tcp_loopback ?
         current_tcp_owner() : NULL;
     struct kernel_socket **pending = owner ? owner->ack_waiter : NULL;
     if (pending && (!*pending || *pending == socket)) {
         if (!*pending && kernel_wait_queue_registrations(&socket->wait)) *pending = socket;
     } else
 #endif
-        socket_state_notify(state,&socket->wait);
+        socket_state_notify_event(state,&socket->wait,tcp ? KERNEL_POLLIN | KERNEL_POLLRDNORM : 0);
     socket_state_async(state,&socket->async_events,KERNEL_ASYNC_POLL_IN);
 }
 
@@ -2972,7 +2994,7 @@ static err_t tcp_data_sent(void *context, struct tcp_pcb *pcb, u16_t length)
             else if (kernel_wait_queue_registrations(&socket->wait)) *pending = socket;
         } else
 #endif
-            socket_state_notify(state.owner,&socket->wait);
+            socket_state_notify_event(state.owner,&socket->wait,KERNEL_POLLOUT | KERNEL_POLLWRNORM);
         socket_async(socket,KERNEL_ASYNC_POLL_OUT);
     }
     return ERR_OK;
@@ -3315,7 +3337,7 @@ static void retire_received(struct kernel_socket *socket)
     }
 }
 
-/* The serial NIC path can return credit and receive buffers before the
+/* The serial TCP path can return credit and receive buffers before the
  * reader gives up its OFD pin. A contended owner keeps the queued path. */
 static __attribute__((noinline)) int try_retire_received(struct kernel_socket *socket, int need_input)
 {
@@ -4655,11 +4677,11 @@ uint32_t kernel_socket_finish_read(struct kernel_socket_read_request *request, i
 #endif
         if (needs_reap && (socket->receive_credit || socket->retired_head)) {
             if (kernel_socket_is_tcp(socket) && !boaros_lwip_parallel_enabled() &&
-                !socket->tcp_loopback && !socket->receive_retry && !network_is_stopping() &&
+                !socket->receive_retry && !network_is_stopping() &&
                 !kernel_io_context_inline()->locks) {
                 /* Splice still holds its pipe write lease here. Leave the
                  * credit and NIC work to the existing protocol owner. */
-                int need_input = !socket->packets_head && !socket->peer_closed &&
+                int need_input = !socket->tcp_loopback && !socket->packets_head && !socket->peer_closed &&
                     !socket->read_closed && !socket->pending_error;
                 socket_state_release(&scope);
                 int done = try_retire_received(socket, need_input);
@@ -7800,8 +7822,9 @@ static unsigned service_packet_ring_timers(unsigned budget)
     return retired;
 }
 
-struct kernel_socket_service_result kernel_socket_service_owned(struct kernel_socket_protocol_scope *scope,
-    struct kernel_socket_service_budget budget)
+static struct kernel_socket_service_result socket_service_owned(
+    struct kernel_socket_protocol_scope *scope, struct kernel_socket_service_budget budget,
+    int report_pending)
 {
     struct kernel_socket_service_result result = {0};
 #if BOAROS_COST_DIAGNOSTICS
@@ -7838,12 +7861,22 @@ struct kernel_socket_service_result kernel_socket_service_owned(struct kernel_so
     result.timers += boaros_lwip_tcp_cork_due(budget.timers-result.timers);
     result.timers += sys_check_timeouts_budget(budget.timers-result.timers);
     socket_timer_running = 0;
-    result.runnable = kernel_socket_work_pending();
-    result.next_deadline = socket_next_timer_deadline();
+    /* An inline caller returns to its syscall. Only the worker needs
+     * a deadline and runnable snapshot before it decides how to wait. */
+    if (report_pending) {
+        result.runnable = kernel_socket_work_pending();
+        result.next_deadline = socket_next_timer_deadline();
+    }
     COST_ADD(NETWORK_SOCKET_VISITS, visits);
     COST_ADD(NETWORK_LOOP_PACKETS, result.packets);
     COST_ADD(NETWORK_TIMER_CALLBACKS, result.timers);
     return result;
+}
+
+struct kernel_socket_service_result kernel_socket_service_owned(
+    struct kernel_socket_protocol_scope *scope, struct kernel_socket_service_budget budget)
+{
+    return socket_service_owned(scope, budget, 1);
 }
 
 struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_socket_service_budget budget)
