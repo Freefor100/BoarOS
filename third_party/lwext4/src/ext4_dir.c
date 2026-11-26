@@ -461,8 +461,16 @@ static int insert_checked_linear_leaf(struct ext4_inode_ref *parent, ext4_fsblk_
 	struct ext4_inode_ref *child, const char *name, uint32_t name_len, struct jbd_trans *trans);
 #endif
 
-int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
-		       uint32_t name_len, struct ext4_inode_ref *child)
+static int directory_parent_write(struct ext4_inode_ref *parent, bool *read_parent)
+{
+	if (!read_parent || !*read_parent) return EOK;
+	int result = ext4_fs_inode_ref_write(parent);
+	if (!result) *read_parent = false;
+	return result;
+}
+
+int ext4_dir_add_entry_with_read_parent(struct ext4_inode_ref *parent, const char *name,
+		       uint32_t name_len, struct ext4_inode_ref *child, bool *read_parent)
 {
 	int r;
 	struct ext4_fs *fs = parent->fs;
@@ -475,6 +483,8 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 	/* Index adding (if allowed) */
 	if ((ext4_sb_feature_com(sb, EXT4_FCOM_DIR_INDEX)) &&
 	    (ext4_inode_has_flag(parent->inode, EXT4_INODE_FLAG_INDEX))) {
+		r = directory_parent_write(parent, read_parent);
+		if (r) return r;
 		r = ext4_dir_dx_add_entry(parent, child, name, name_len);
 
 		return r == EXT4_ERR_BAD_DX_DIR ? EUCLEAN : r;
@@ -518,7 +528,8 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 						name, name_len);
 #if CONFIG_DIR_INDEX_ENABLE
 		if (r == ENOSPC && can_promote) {
-			r = ext4_dir_dx_promote(parent, &block);
+			r = directory_parent_write(parent, read_parent);
+			if (!r) r = ext4_dir_dx_promote(parent, &block);
 			int release = ext4_block_set(fs->bdev, &block);
 			if (r) return r;
 			if (release) return release;
@@ -535,6 +546,8 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 
 	/* No free block found - needed to allocate next data block */
 
+	r = directory_parent_write(parent, read_parent);
+	if (r) return r;
 	iblock = 0;
 	fblock = 0;
 	r = ext4_fs_append_inode_dblk(parent, &fblock, &iblock);
@@ -565,6 +578,12 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 	r = ext4_dir_mark_dirty(parent, &b);
 	int release = ext4_block_set(fs->bdev, &b);
 	return r ? r : release;
+}
+
+int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
+		       uint32_t name_len, struct ext4_inode_ref *child)
+{
+	return ext4_dir_add_entry_with_read_parent(parent, name, name_len, child, NULL);
 }
 
 int ext4_dir_find_entry_from(struct ext4_dir_search_result *result,

@@ -195,7 +195,7 @@ static void create_inode_read_ahead_test(struct ext4_fs *fs, const ext4_file *pa
             }
         }
         CHECK(ext4_transaction_begin("/") == EOK);
-        CHECK(ext4_create_regular_missing(parent, name, 0640, 53, 17, &file, &created) == EOK);
+        CHECK(ext4_create_regular_missing(parent, name, 0640, 53, 17, &file, &created, false) == EOK);
         CHECK(ext4_transaction_end("/") == EOK);
         if (old_slot && file.inode == previous_inode + 1) {
             uint32_t generation = ext4_inode_get_generation(&original) + 1U;
@@ -220,7 +220,7 @@ static uint32_t create_inode_bitmap_file(const ext4_file *parent, const char *na
 {
     ext4_file file;
     CHECK(ext4_transaction_begin("/") == EOK);
-    CHECK(ext4_create_regular_missing(parent, name, 0640, 53, 17, &file, NULL) == EOK);
+    CHECK(ext4_create_regular_missing(parent, name, 0640, 53, 17, &file, NULL, false) == EOK);
     CHECK(ext4_transaction_end("/") == EOK);
     uint32_t inode = file.inode;
     CHECK(ext4_fclose(&file) == EOK);
@@ -286,8 +286,46 @@ static void create_inode_bitmap_test(struct ext4_fs *fs, const ext4_file *parent
     puts("PASS joined inode bitmap patch retains an unborrowed version and preserves a borrowed version");
 }
 
+static void create_parent_time_checksum_test(const struct ext4_fs *fs)
+{
+    struct test_inode_record {
+        struct ext4_inode inode;
+        uint8_t tail[256 - sizeof(struct ext4_inode)];
+    } old, delta, full;
+    struct ext4_fs model = {.sb = fs->sb};
+    ext4_set32(&model.sb, features_read_only,
+        ext4_get32(&model.sb, features_read_only) | EXT4_FRO_COM_METADATA_CSUM);
+    uint32_t state = 0x1bc23ac7;
+    const size_t sizes[] = {EXT4_GOOD_OLD_INODE_SIZE, sizeof(old)};
+    for (unsigned width = 0; width < sizeof(sizes) / sizeof(sizes[0]); width++) {
+        ext4_set16(&model.sb, inode_size, sizes[width]);
+        for (unsigned sample = 0; sample < 512; sample++) {
+            uint8_t *raw = (void *)&old;
+            for (size_t byte = 0; byte < sizeof(old); byte++) {
+                state = state * 1664525U + 1013904223U;
+                raw[byte] = state >> 24;
+            }
+            struct ext4_inode_ref accepted = {.fs = &model, .index = state, .inode = &old.inode};
+            ext4_fs_set_inode_checksum(&accepted);
+            delta = old;
+            if (sample & 1) delta.inode.change_inode_time ^= to_le32(state);
+            if (sample & 2) delta.inode.modification_time ^= to_le32(~state);
+            if (sample & 4) delta.inode.ctime_extra ^= to_le32(state >> 3);
+            if (sample & 8) delta.inode.mtime_extra ^= to_le32(state << 7);
+            full = delta;
+            struct ext4_inode_ref expected = accepted;
+            expected.inode = &full.inode;
+            ext4_fs_set_inode_checksum(&expected);
+            ext4_fs_update_inode_times_checksum(&accepted, &delta.inode);
+            CHECK(!memcmp(&delta, &full, sizes[width]));
+        }
+    }
+    puts("PASS parent timestamp checksum delta matches 1,024 full checksums at both inode widths");
+}
+
 static void create_ref_test(struct ext4_fs *fs)
 {
+    create_parent_time_checksum_test(fs);
     ext4_file parent;
     CHECK(ext4_create_child("/", EXT4_INODE_ROOT_INDEX, "create-ref-parent", 0042770, 0, NULL, &parent, NULL,0,0) == EOK);
     CHECK(ext4_file_set_owner(&parent, UINT32_MAX, 17, UINT32_MAX) == EOK);
@@ -394,7 +432,7 @@ static void create_ref_test(struct ext4_fs *fs)
             &found, NULL, NULL, NULL, NULL) == ENOENT);
         CHECK(ext4_transaction_begin("/") == EOK);
         create_ref_begin(qualified);
-        CHECK(ext4_create_regular_missing(&parent, qualified, 0640, 53, 17, &file, &provisional) == EOK);
+        CHECK(ext4_create_regular_missing(&parent, qualified, 0640, 53, 17, &file, &provisional, false) == EOK);
         create_ref.active = false;
         CHECK(!create_ref.searches && create_ref.count == 1 && !create_ref.gets && create_ref.puts == 1);
         CHECK(ext4_inode_get_uid(&provisional) == 53 && ext4_inode_get_gid(&provisional) == 17);

@@ -137,6 +137,14 @@ struct jbd_quarantine {
 struct ext4_orphan_undo;
 struct jbd_allocation_group;
 
+struct jbd_parent_times {
+    uint64_t sequence, version, inode_schema;
+    ext4_fsblk_t lba;
+    uint32_t offset;
+    uint32_t base[2], extra[2];
+    uint16_t size, checksum_lo, checksum_hi;
+};
+
 struct jbd_trans {
 	struct ext4_operation operation;
 	uint32_t trans_id;
@@ -170,6 +178,7 @@ struct jbd_trans {
 	uint64_t last_dirty_ns;
 	TAILQ_ENTRY(jbd_trans) trans_node;
 	uint64_t reused_super_sequence;
+	struct jbd_parent_times parent_times;
 };
 
 struct jbd_journal {
@@ -266,6 +275,9 @@ int jbd_trans_prepare_checked_patch(struct jbd_trans *, struct ext4_block *,
     uint32_t offset, uint32_t length, uint32_t checksum_offset);
 int jbd_trans_reserve_superblock(struct jbd_trans *, struct ext4_block *);
 bool jbd_trans_try_reuse_superblock(struct jbd_trans *);
+/* The final create has no subsequent parent read inside this operation. */
+bool jbd_trans_stage_parent_times(struct jbd_trans *, const struct ext4_inode_ref *,
+    struct ext4_inode *updated);
 int jbd_trans_get_new_access(struct jbd_trans *, struct ext4_block *);
 int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t block,
 	uint32_t offset, const void *data, uint32_t length, bool initialize,

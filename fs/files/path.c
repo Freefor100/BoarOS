@@ -280,7 +280,7 @@ static enum kernel_files_status finish_open(struct kernel_files *files,
     }
     /* VFS has checked access intent, O_DIRECTORY and directory write errors
      * before publishing this description or opening a device/FIFO. */
-    if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFDIR) {
+    if (object_type == KERNEL_VFS_S_IFDIR) {
         description->kind = KERNEL_OPEN_FILE_KIND_DIRECTORY;
     } else if(kernel_mqueue_fs_is_mount(description->file.mount)) {
         struct kernel_open_file_description *mq=0;
@@ -289,11 +289,10 @@ static enum kernel_files_status finish_open(struct kernel_files *files,
         if(kernel_open_file_release(&description))__builtin_trap();
         if(error){KERNEL_FILES_NOTE(files,open_failures,1);*linux_result=error;return KERNEL_FILES_STATUS_OK;}
         description=mq;
-    } else if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
-               KERNEL_VFS_S_IFREG) {
+    } else if (object_type == KERNEL_VFS_S_IFREG) {
         uint64_t access_mode = flags & LINUX_O_ACCMODE;
 
-        int generated = kernel_vfs_file_generated(&description->file);
+        int generated = description->kind == KERNEL_OPEN_FILE_KIND_GENERATED;
         int write=access_mode==LINUX_O_WRONLY || access_mode==LINUX_O_RDWR;
         int error=0;
         if (!generated && write)
@@ -311,7 +310,7 @@ static enum kernel_files_status finish_open(struct kernel_files *files,
         }
         description->kind = generated
             ? KERNEL_OPEN_FILE_KIND_GENERATED : KERNEL_OPEN_FILE_KIND_REGULAR;
-    } else if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFIFO) {
+    } else if (object_type == KERNEL_VFS_S_IFIFO) {
         int error = kernel_pipe_fifo_open(files->heap, description->file.private_data, (uint32_t)flags,
                 &description->pipe, &description->pipe_endpoint, &description->pipe_observed_writers);
         if (error) {
@@ -322,8 +321,7 @@ static enum kernel_files_status finish_open(struct kernel_files *files,
             return KERNEL_FILES_STATUS_OK;
         }
         description->kind = KERNEL_OPEN_FILE_KIND_PIPE;
-    } else if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
-               KERNEL_VFS_S_IFCHR) {
+    } else if (object_type == KERNEL_VFS_S_IFCHR) {
         struct kernel_vfs_stat stat;
         int stat_result = kernel_vfs_fstat(&description->file, &stat);
 
@@ -342,7 +340,7 @@ static enum kernel_files_status finish_open(struct kernel_files *files,
             *linux_result = stat_result;
             return KERNEL_FILES_STATUS_OK;
         }
-    } else if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFBLK) {
+    } else if (object_type == KERNEL_VFS_S_IFBLK) {
         struct kernel_vfs_stat stat;
         int error = (flags & LINUX_O_DIRECTORY) ? -KERNEL_ENOTDIR :
             kernel_vfs_fstat(&description->file, &stat);

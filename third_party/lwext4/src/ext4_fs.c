@@ -701,6 +701,12 @@ static bool metadata_cached(struct ext4_block_payload *payload,uint32_t index,
     return (__atomic_load_n(&payload->verified[record.position/64],__ATOMIC_ACQUIRE) &
         (UINT64_C(1)<<(record.position%64)))!=0;
 }
+
+uint64_t ext4_fs_inode_record_schema(const struct ext4_inode_ref *ref)
+{
+    uint32_t offset = (const uint8_t *)ref->inode - ref->block.data;
+    return metadata_record(ref->index, offset, ext4_get16(&ref->fs->sb, inode_size), true).schema;
+}
 static void metadata_checked(struct ext4_block_payload *payload,
     const struct metadata_check *check)
 {
@@ -1011,7 +1017,7 @@ static uint32_t ext4_fs_inode_checksum(struct ext4_inode_ref *inode_ref)
 #define ext4_fs_inode_checksum(...) 0
 #endif
 
-static void ext4_fs_set_inode_checksum(struct ext4_inode_ref *inode_ref)
+void ext4_fs_set_inode_checksum(struct ext4_inode_ref *inode_ref)
 {
 	struct ext4_sblock *sb = ext4_fs_super(inode_ref->fs);
 	if (!ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM))
@@ -1019,6 +1025,35 @@ static void ext4_fs_set_inode_checksum(struct ext4_inode_ref *inode_ref)
 
 	uint32_t csum = ext4_fs_inode_checksum(inode_ref);
 	ext4_inode_set_csum(sb, inode_ref->inode, csum);
+}
+
+void ext4_fs_update_inode_times_checksum(const struct ext4_inode_ref *verified,
+    struct ext4_inode *updated)
+{
+#if CONFIG_META_CSUM_ENABLE
+	struct ext4_sblock *sb = ext4_fs_super(verified->fs);
+	if (!ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) return;
+	uint16_t size = ext4_get16(sb, inode_size);
+	if (size != EXT4_GOOD_OLD_INODE_SIZE && size != 256) __builtin_trap();
+
+	enum { base = offsetof(struct ext4_inode, change_inode_time),
+		extra = offsetof(struct ext4_inode, ctime_extra), bytes = 2 * sizeof(uint32_t) };
+	_Static_assert(base + bytes == 20 && extra + bytes == 140, "inode timestamp suffix layout");
+	/* The factors are CRC32C(0x80000000, zero suffix). The base pair
+	 * has 108 or 236 trailing bytes. The extended pair has 116.
+	 * The absent high half of a 128-byte checksum need not be recovered:
+	 * the replacement XORs the delta, and the setter stores the low half. */
+	const uint8_t *old = (const void *)verified->inode, *next = (const void *)updated;
+	uint32_t crc = ext4_inode_get_csum(sb, verified->inode);
+	crc = ext4_crc32c_replace(crc, old + base, next + base, bytes,
+		size == EXT4_GOOD_OLD_INODE_SIZE ? 0xa11bfaf3U : 0x963a1892U);
+	if (size == 256)
+		crc = ext4_crc32c_replace(crc, old + extra, next + extra, bytes, 0x156c8e18U);
+	ext4_inode_set_csum(sb, updated, crc);
+#else
+	(void)verified;
+	(void)updated;
+#endif
 }
 
 #if CONFIG_META_CSUM_ENABLE

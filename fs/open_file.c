@@ -42,6 +42,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 static int open_file_live(
     const struct kernel_open_file_description *file);
@@ -564,18 +565,22 @@ enum kernel_open_file_status kernel_open_file_create_at(
     if (!heap || !start || !root || !request || !owner || *owner || !linux_result)
         return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
     if (opened) *opened=(struct kernel_vfs_open_result){0};
-    enum kernel_heap_status allocation = kernel_heap_allocate_zeroed(heap,
-                                         1U, sizeof(*file), (void **)&file);
+    enum kernel_heap_status allocation = kernel_heap_allocate(heap, sizeof(*file), (void **)&file);
     if (allocation != KERNEL_HEAP_STATUS_OK) {
         if (allocation != KERNEL_HEAP_STATUS_EMPTY) return KERNEL_OPEN_FILE_STATUS_STATE;
         *linux_result = -KERNEL_ENOMEM;
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
+    /* Reserve the description before any create effects. Path resolution
+     * only uses the VFS file prefix; a failed lookup never uses the tail. */
+    file->file = (struct kernel_vfs_file){0};
     int result = path ? kernel_vfs_open_at(start,root,path,request,&file->file,opened) :
         kernel_vfs_open_resolved(start, &file->file, request);
-    if (!result && (request->flags & KERNEL_VFS_OPEN_PATH_ONLY))
-        file->kind=KERNEL_OPEN_FILE_KIND_PATH;
-    if (!result) result = finish_path_open(file, heap);
+    if (!result) {
+        memset((uint8_t *)file + sizeof(file->file), 0, sizeof(*file) - sizeof(file->file));
+        if (request->flags & KERNEL_VFS_OPEN_PATH_ONLY) file->kind=KERNEL_OPEN_FILE_KIND_PATH;
+        result = finish_path_open(file, heap);
+    }
     if (result) {
         kernel_heap_release(heap, file);
     } else {

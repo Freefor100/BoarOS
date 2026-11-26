@@ -5,6 +5,53 @@ static unsigned serial_log_saved;
 static unsigned serial_bitmap_patches;
 static unsigned serial_super_mode;
 static uint64_t serial_reservation_lba;
+static uint64_t parent_time_lba;
+static uint32_t parent_time_offset;
+static unsigned parent_time_prepares;
+static unsigned parent_time_kept;
+static bool parent_time_inject_reader;
+static struct ext4_block parent_time_reader;
+static uint32_t parent_time_before[2];
+
+bool __real_ext4_bcache_patch_running(const struct ext4_running_patch *,unsigned);
+bool __wrap_ext4_bcache_patch_running(const struct ext4_running_patch *targets,unsigned count)
+{
+    if (!parent_time_inject_reader || count!=2) {
+        const struct ext4_running_patch *inode=&targets[count-1];
+        const struct ext4_block_payload *payload=inode->block->payload;
+        unsigned record=inode->inode_record;
+        bool verified=inode->inode_schema && record<256 &&
+            payload->metadata_schema==inode->inode_schema &&
+            (payload->verified[record/64]&(UINT64_C(1)<<(record%64)));
+        bool applied=__real_ext4_bcache_patch_running(targets,count);
+        if (applied && verified) {
+            assert(payload->metadata_schema==inode->inode_schema);
+            assert(payload->verified[record/64]&(UINT64_C(1)<<(record%64)));
+            assert(!payload->tree_verified && !payload->directory_layout);
+            parent_time_kept++;
+        }
+        return applied;
+    }
+    const struct ext4_block *super=targets[0].block,*parent=targets[1].block;
+    assert(!ext4_block_get(parent->buf->bc->bdev,&parent_time_reader,parent->lb_id));
+    assert(parent_time_reader.payload==parent->payload);
+    const struct ext4_inode *old=(void *)(parent_time_reader.data+parent_time_offset);
+    parent_time_before[0]=old->change_inode_time;
+    parent_time_before[1]=old->modification_time;
+    uint32_t before[2];
+    assert(targets[0].count==2);
+    for (unsigned i=0;i<2;i++) {
+        assert(targets[0].patches[i].length==sizeof(before[i]));
+        memcpy(&before[i],super->data+targets[0].patches[i].offset,sizeof(before[i]));
+    }
+    parent_time_inject_reader=false;
+    assert(!__real_ext4_bcache_patch_running(targets,count));
+    for (unsigned i=0;i<2;i++)
+        assert(!memcmp(&before[i],super->data+targets[0].patches[i].offset,sizeof(before[i])));
+    assert(old->change_inode_time==parent_time_before[0] &&
+        old->modification_time==parent_time_before[1]);
+    return false;
+}
 static unsigned serial_heap_failure, serial_heap_calls;
 void *__real_ext4_user_malloc(size_t);
 void *__real_ext4_user_calloc(size_t,size_t);
@@ -220,6 +267,8 @@ int __real_jbd_trans_get_write_access_range(struct jbd_trans *,struct ext4_block
 int __wrap_jbd_trans_get_write_access_range(struct jbd_trans *trans,struct ext4_block *block,
     uint32_t offset,uint32_t length)
 {
+    if (block->lb_id==parent_time_lba && offset==parent_time_offset)
+        parent_time_prepares++;
     return check_private_grant(trans,block,
         __real_jbd_trans_get_write_access_range(trans,block,offset,length));
 }
@@ -227,6 +276,8 @@ int __real_jbd_trans_prepare_unowned_range(struct jbd_trans *,struct ext4_block 
 int __wrap_jbd_trans_prepare_unowned_range(struct jbd_trans *trans,struct ext4_block *block,
     uint32_t offset,uint32_t length)
 {
+    if (block->lb_id==parent_time_lba && offset==parent_time_offset)
+        parent_time_prepares++;
     return check_private_grant(trans,block,
         __real_jbd_trans_prepare_unowned_range(trans,block,offset,length));
 }
@@ -313,6 +364,68 @@ static void serial_leaf_first_fit(struct lwext4_mount_adapter *adapter)
     assert(serial_leaf_offset(adapter, names[3]) == gap);
     for (unsigned i = 1; i < 4; i++) assert(!ext4_fremove(paths[i]));
     puts("PASS sparse directory first-fit: a long insertion leaves the earlier short hole reusable");
+}
+
+static void serial_parent_timestamp_reuse(struct lwext4_mount_adapter *adapter,
+    struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_path *root=NULL;
+    assert(!kernel_vfs_path_root(mount,adapter->instance.heap,&root));
+    struct ext4_fs *fs=adapter->device.fs;
+    struct ext4_inode_ref accepted;
+    adapter->locks.read_lock(adapter->locks.context);
+    assert(!ext4_fs_get_inode_ref_read(fs,EXT4_ROOT_INO,&accepted));
+    uint64_t lba=accepted.block.lb_id;
+    parent_time_offset=(uint8_t *)accepted.inode-accepted.block.data;
+    assert(!ext4_fs_put_inode_ref(&accepted));
+    adapter->locks.unlock(adapter->locks.context);
+
+    struct kernel_vfs_file file={0};
+    char names[8][32];
+    for (unsigned i=0;i<8;i++) {
+        snprintf(names[i],sizeof(names[i]),"parent-time-test-%u",i);
+        if (i==1) {parent_time_lba=lba;parent_time_prepares=0;parent_time_kept=0;}
+        assert(!kernel_vfs_create_at(root,root,names[i],0600,&file,0));
+        assert(!kernel_vfs_close(&file));
+    }
+    parent_time_lba=0;
+    printf("serial create parent inode write preparations: %u/7, verified slot retained: %u/7\n",
+        parent_time_prepares,parent_time_kept);
+    assert(!parent_time_prepares && parent_time_kept==7);
+
+    uint64_t sequence=fs->jbd_journal->running->sequence,target=0;
+    assert(!ext4_file_sync_metadata_prepare(lwext4_node_file(root->file.private_data),false,&target));
+    assert(target==sequence);
+
+    /* Sync can seal the previous group. Seed a new running parent owner. */
+    const char warm[]="parent-time-warm";
+    assert(!kernel_vfs_create_at(root,root,warm,0600,&file,0));
+    assert(!kernel_vfs_close(&file));
+    const char late[]="parent-time-late-reader";
+    parent_time_inject_reader=true;
+    assert(!kernel_vfs_create_at(root,root,late,0600,&file,0));
+    assert(!parent_time_inject_reader && parent_time_reader.payload);
+    const struct ext4_inode *prior=(void *)(parent_time_reader.data+parent_time_offset);
+    assert(prior->change_inode_time==parent_time_before[0] &&
+        prior->modification_time==parent_time_before[1]);
+    adapter->locks.read_lock(adapter->locks.context);
+    assert(!ext4_fs_get_inode_ref_read(fs,EXT4_ROOT_INO,&accepted));
+    assert(accepted.block.payload!=parent_time_reader.payload);
+    assert(accepted.inode->change_inode_time!=prior->change_inode_time ||
+        accepted.inode->ctime_extra!=prior->ctime_extra);
+    assert(!ext4_fs_put_inode_ref(&accepted));
+    assert(!ext4_block_set(fs->bdev,&parent_time_reader));
+    adapter->locks.unlock(adapter->locks.context);
+    sequence=fs->jbd_journal->running->sequence;
+    target=0;
+    assert(!ext4_file_sync_metadata_prepare(lwext4_node_file(root->file.private_data),false,&target));
+    assert(target==sequence);
+    assert(!kernel_vfs_close(&file));
+    assert(!kernel_vfs_unlink_at(root,root,late,0));
+    assert(!kernel_vfs_unlink_at(root,root,warm,0));
+    for (unsigned i=0;i<8;i++) assert(!kernel_vfs_unlink_at(root,root,names[i],0));
+    assert(!kernel_vfs_path_release(&root));
+    puts("PASS parent timestamp reuse: late reader prevents both edits, retry preserves old bytes and directory sync goal");
 }
 
 static void serial_reservation_case(struct lwext4_mount_adapter *adapter,int serial)

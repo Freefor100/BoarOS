@@ -814,16 +814,12 @@ static void namespace_inode_lock(struct kernel_vfs_node *node,
         (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)
         kernel_vfs_node_lock(node, guard, 1);
 }
-static int path_walk_select_mode(struct vfs_path_walk *walk,
-    struct kernel_vfs_path *path, int write, int use_local_directory)
+static __attribute__((noinline)) int path_walk_change_mode(struct vfs_path_walk *walk,
+    struct kernel_vfs_path *path, int write, int use_local_directory, int parallel)
 {
     struct kernel_vfs_mount *mount=path->file.mount;
     struct kernel_vfs_instance *instance=mount->private_data;
     struct kernel_vfs_node *node=path->file.private_data;
-    int parallel=namespace_is_parallel(instance);
-    if (walk->mount==mount && (!write || walk->mutation.lock ||
-        kernel_lock_held(&instance->reconfiguration,0)) && (!parallel ||
-        (walk->directory==node && (!write || walk->guard.write)))) return 0;
     int keep_mount=walk->mount==mount && parallel && !write && !walk->mutation.lock;
     if (keep_mount) {
         kernel_lock_scope_release(&walk->guard);
@@ -857,6 +853,18 @@ static int path_walk_select_mode(struct vfs_path_walk *walk,
     walk->mount=mount;
     walk->directory=node;
     return instance->quiescing ? -KERNEL_EIO : 0;
+}
+static inline int path_walk_select_mode(struct vfs_path_walk *walk,
+    struct kernel_vfs_path *path, int write, int use_local_directory)
+{
+    struct kernel_vfs_mount *mount=path->file.mount;
+    struct kernel_vfs_instance *instance=mount->private_data;
+    int parallel=namespace_is_parallel(instance);
+    if (walk->mount==mount && (!write || walk->mutation.lock ||
+        kernel_lock_held(&instance->reconfiguration,0)) && (!parallel ||
+        (walk->directory==path->file.private_data && (!write || walk->guard.write))))
+        return 0;
+    return path_walk_change_mode(walk,path,write,use_local_directory,parallel);
 }
 static int path_walk_select(struct vfs_path_walk *walk,struct kernel_vfs_path *path)
 { return path_walk_select_mode(walk,path,0,0); }
@@ -3058,7 +3066,10 @@ static bool lookup_walk_child(struct vfs_path_walk *walk,struct kernel_vfs_mount
     return true;
 }
 
-struct path_component_span { size_t begin,end,next; };
+struct path_component_span {
+    size_t begin, end, next;
+    uint32_t missing;
+};
 
 /* The namespace guard keeps names and permissions valid. The state lock
  * protects the weak dentries until the final directory reference is taken. */
@@ -3138,6 +3149,7 @@ Found:
         struct kernel_vfs_node *node=parent->file.private_data;
         if (!node->unlinked && instance->ops->search_cached(node,cred)) {
             struct kernel_vfs_dentry *child=find_child_name(parent,path+begin,end-begin);
+            if (!child) part->missing=parent->names_published;
             if (child && (child->file.mode&KERNEL_VFS_S_IFMT)==KERNEL_VFS_S_IFREG &&
                 child!=mount->root_dentry && child!=walk->root->dentry &&
                 !__atomic_load_n(&child->mountpoint_seen,__ATOMIC_ACQUIRE)) {
@@ -3169,13 +3181,16 @@ Found:
         }
     }
     if (dentry_acquire(parent)) __builtin_trap();
-    *part=(struct path_component_span){begin,end,cursor};
+    part->begin=begin;
+    part->end=end;
+    part->next=cursor;
     return parent;
 }
 
 static int lookup_named_child(struct kernel_vfs_mount *mount,struct kernel_vfs_dentry *parent,
     const char *name,size_t name_length,struct kernel_vfs_path **owner,
-    struct vfs_path_walk *walk,bool parsed,bool cross_mount,const struct vfs_walk_stat *query)
+    struct vfs_path_walk *walk,bool parsed,bool cross_mount,const struct vfs_walk_stat *query,
+    uint32_t miss)
 {
     struct kernel_vfs_node *directory=parent->file.private_data;
     if (directory->unlinked) return -KERNEL_ENOENT;
@@ -3184,8 +3199,7 @@ static int lookup_named_child(struct kernel_vfs_mount *mount,struct kernel_vfs_d
     int result;
     struct kernel_vfs_instance *instance=mount->private_data;
     struct kernel_vfs_dentry *entry=NULL;
-    uint32_t miss=UINT32_MAX;
-    if (instance->ops->owns_dentry_names) {
+    if (instance->ops->owns_dentry_names && miss==UINT32_MAX) {
         /* The held parent qualification spans backend mutation and dentry
          * publication. A retained positive name needs no second disk lookup;
          * pseudo-filesystems with independent name changes still revalidate. */
@@ -3338,7 +3352,8 @@ static int path_lookup_locked_mode(struct kernel_vfs_path *parent,
         }
         result=path_walk_wrap(mount,ancestor,owner,walk);dentry_release(&ancestor);return result;
     }
-    return lookup_named_child(mount,parent->dentry,name,name_length,owner,walk,parsed,cross_mount,query);
+    return lookup_named_child(mount,parent->dentry,name,name_length,owner,walk,parsed,cross_mount,
+        query,UINT32_MAX);
 }
 
 static int path_lookup_locked(struct kernel_vfs_path *parent,const char *name,size_t length,struct kernel_vfs_path **owner)
@@ -3485,7 +3500,7 @@ static int resolve_object(struct kernel_vfs_path *start,
             goto Finish;
         }
         if (borrowed && pending==path && walk->cached_prefix && suffix && !trailing_only) {
-            struct path_component_span part={begin,end,cursor};
+            struct path_component_span part={begin,end,cursor,UINT32_MAX};
             bool existing_directory=false;
             struct kernel_vfs_dentry *prefix=cached_path_prefix(walk,current,pending,length,&part,
                 &existing_directory,&next);
@@ -3510,10 +3525,14 @@ static int resolve_object(struct kernel_vfs_path *start,
                 size_t count=part.end-part.begin;
                 if (!walk->final_write && part.end==length && count<=255U &&
                     !(leaf[0]=='.' && (count==1 || (count==2 && leaf[1]=='.')))) {
-                    result=inode_permission(prefix->file.private_data,KERNEL_VFS_MAY_EXEC,1,false);
+                    /* A prefix walk already checked search permission and
+                     * sampled this exact absent name under the name index. */
+                    result=part.missing==UINT32_MAX ?
+                        inode_permission(prefix->file.private_data,KERNEL_VFS_MAY_EXEC,1,false) : 0;
                     if (!result) {
                         walk->component=walk->terminal;
-                        result=lookup_named_child(mount,prefix,leaf,count,&next,walk,true,true,walk->stat);
+                        result=lookup_named_child(mount,prefix,leaf,count,&next,walk,true,true,
+                            walk->stat,part.missing);
                         walk->component=NULL;
                     }
                     if (result || !next || next->file.mount!=mount || !follow_final ||

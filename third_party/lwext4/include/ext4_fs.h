@@ -327,6 +327,11 @@ int ext4_fs_put_inode_ref(struct ext4_inode_ref *ref);
 
 /* Stage changed inode bytes and their checksum while keeping the reference. */
 int ext4_fs_stage_inode_ref(struct ext4_inode_ref *ref);
+void ext4_fs_set_inode_checksum(struct ext4_inode_ref *ref);
+/* The verified inode and updated inode differ only in ctime and mtime. */
+void ext4_fs_update_inode_times_checksum(const struct ext4_inode_ref *verified,
+    struct ext4_inode *updated);
+uint64_t ext4_fs_inode_record_schema(const struct ext4_inode_ref *ref);
 
 /**@brief Convert filetype to inode mode.
  * @param filetype File type

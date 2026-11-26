@@ -2519,6 +2519,7 @@ struct namespace_create {
     size_t access_size,default_size;
     struct kernel_vfs_handle *handle;
     bool prepare_acl;
+    bool reuse_parent_times;
 };
 static int apply_namespace_create(void *context)
 {
@@ -2536,7 +2537,8 @@ static int apply_namespace_create(void *context)
     if (request->qualified_parent && request->type == KERNEL_VFS_S_IFREG &&
         ext4_current_trans(lwext4_instance(request->qualified_parent->instance)->device.fs))
         result = ext4_create_regular_missing(lwext4_node_file(request->qualified_parent),
-            request->path, request->mode, request->uid, request->gid, file, request->initial);
+            request->path, request->mode, request->uid, request->gid, file, request->initial,
+            request->reuse_parent_times);
     else if (request->path)
         result = ext4_create_child_acl(request->mount, request->parent, request->path,
             request->mode | request->type, request->device, request->target, file,
@@ -2619,7 +2621,15 @@ static int namespace_create_execute(struct lwext4_mount_adapter *adapter,struct 
     if (access) kernel_heap_release(adapter->instance.heap,access);
     request->prepare_acl = adapter->device.fs->ext2_format &&
         (request->access_acl || request->default_acl);
-    if (!result) result=ext4_metadata_execute(adapter->mount_point,apply_namespace_create,request);
+    request->reuse_parent_times = request->qualified_parent && request->type == KERNEL_VFS_S_IFREG &&
+        !request->access_acl && !request->default_acl && !ext4_current_operation(adapter->device.fs);
+    if (!result) {
+        result=ext4_metadata_execute(adapter->mount_point,apply_namespace_create,request);
+        if (result==EAGAIN && request->reuse_parent_times) {
+            request->reuse_parent_times=false;
+            result=ext4_metadata_execute(adapter->mount_point,apply_namespace_create,request);
+        }
+    }
     if (request->access_acl) kernel_heap_release(adapter->instance.heap,request->access_acl);
     if (request->default_acl) kernel_heap_release(adapter->instance.heap,request->default_acl);
     return result;
