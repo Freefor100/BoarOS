@@ -7,6 +7,7 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
 ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -Wno-unused-but-set-variable -Wno-stringop-truncation \
     -DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 \
+    -DBOAROS_PAGE_SHIFT="${LWEXT4_HOST_PAGE_SHIFT:-12}" \
     -include "$root/tests/host/lwext4_memory.h" \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_metadata.c" \
@@ -27,6 +28,20 @@ for block in 1024 4096; do
     "$work/probe" "$work/disk.img" seed
     "$work/probe" "$work/disk.img" operation-context
     cp "$work/disk.img" "$work/base.img"
+    if [ "${GROUP_TEST_CASE:-}" != ordered-release ]; then
+        for cut in 0 1 2 3; do
+            cp "$work/base.img" "$work/reuse.img"
+            "$work/probe" "$work/reuse.img" group-data-reuse "$cut"
+            if [ "$cut" != 0 ]; then
+                "$work/probe" "$work/reuse.img" group-data-reuse-recover "$cut"
+            fi
+            e2fsck -fn "$work/reuse.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+        done
+        cp "$work/base.img" "$work/reuse.img"
+        "$work/probe" "$work/reuse.img" group-data-reuse-cached
+        e2fsck -fn "$work/reuse.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    fi
+    if [ "${GROUP_TEST_CASE:-}" = data-reuse ]; then continue; fi
     ordered_release_cases
     if [ "${GROUP_TEST_CASE:-}" = ordered-release ]; then continue; fi
     for mode in group-checkpoint-background group-ordered-retire-batch group-sync-coalesce group-sync-coalesce-age group-sync-coalesce-force group-checkpoint-batching group-checkpoint-target group-checkpoint-pressure group-mapped-writeback; do

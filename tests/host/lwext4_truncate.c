@@ -62,11 +62,11 @@ int __wrap_ext4_fs_inode_ref_write(struct ext4_inode_ref *ref)
     if (ref->index == reaped_inode) reap_write_qualifications++;
     return __real_ext4_fs_inode_ref_write(ref);
 }
-int __real_ext4_balloc_free_blocks(struct ext4_inode_ref *, ext4_fsblk_t, uint32_t);
+int __real_ext4_balloc_free_blocks(struct ext4_inode_ref *, ext4_fsblk_t, uint32_t, bool);
 int __wrap_ext4_balloc_free_blocks(struct ext4_inode_ref *ref, ext4_fsblk_t first,
-                                 uint32_t count)
+    uint32_t count, bool file_data)
 {
-    int result = __real_ext4_balloc_free_blocks(ref, first, count);
+    int result = __real_ext4_balloc_free_blocks(ref, first, count, file_data);
     if (!reclaim_injected_error || result != EOK) return result;
     /* Fail after allocating quarantine and changing the private bitmap. */
     if (count > 32) {

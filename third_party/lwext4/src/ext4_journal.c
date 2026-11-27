@@ -3139,6 +3139,35 @@ int jbd_trans_try_revoke_range(struct jbd_trans *trans,
     }
 }
 
+static void jbd_remove_quarantine(struct jbd_journal *journal, struct jbd_quarantine *q)
+{
+    LIST_REMOVE(q, node);
+    RB_REMOVE(jbd_quarantine_tree, &journal->quarantine_index[q->inode], q);
+    uint64_t *count = q->inode ? &journal->quarantined_inodes : &journal->quarantined_blocks;
+    if (*count < q->count) __builtin_trap();
+    *count -= q->count;
+    jbd_free(q);
+}
+
+static void jbd_release_committed_file_blocks(struct jbd_journal *journal,
+                                              struct jbd_trans *trans)
+{
+    struct ext4_bcache *cache = journal->jbd_fs->bdev->bc;
+    struct jbd_quarantine *q, *next;
+    LIST_FOREACH_SAFE(q, &trans->quarantine, node, next) {
+        if (!q->file_data) continue;
+        /* Ordered data through this commit has finished. Older journal
+         * versions may still write home, and cached incarnations still
+         * need the existing checkpoint retirement and invalidation. */
+        struct jbd_block_rec key = {.lba = q->first};
+        struct jbd_block_rec *record = RB_NFIND(jbd_block, &journal->block_rec_root, &key);
+        if ((record && record->lba - q->first < q->count) ||
+            ext4_bcache_has_lba(cache, q->first, q->first + q->count))
+            continue;
+        jbd_remove_quarantine(journal, q);
+    }
+}
+
 /**@brief  Free a transaction
  * @param  journal current journal session
  * @param  trans transaction
@@ -3199,12 +3228,7 @@ void jbd_journal_free_trans_state_held(struct jbd_journal *journal,
          * leaves accepted bytes and callbacks usable by the restored inode. */
         if (!abort && !q->inode)
             ext4_bcache_invalidate_lba(fs->bdev->bc, q->first, q->count);
-		LIST_REMOVE(q, node);
-		RB_REMOVE(jbd_quarantine_tree, &journal->quarantine_index[q->inode], q);
-		uint64_t *count = q->inode ? &journal->quarantined_inodes : &journal->quarantined_blocks;
-		if (*count < q->count) __builtin_trap();
-		*count -= q->count;
-		jbd_free(q);
+		jbd_remove_quarantine(journal, q);
 	}
 	ext4_orphan_trans_finish_state_held(trans, abort);
 	ext4_operation_discard_super_state_held(&trans->operation);
@@ -3721,6 +3745,7 @@ static void jbd_quarantine_accept(struct jbd_journal *journal,
         RB_REMOVE(jbd_quarantine_tree, index, q);
         q->owner = group;
         while (before && !before->allocation && before->owner == group &&
+            before->file_data == q->file_data &&
             before->first + before->count == q->first &&
             before->count <= UINT32_MAX - q->count) {
             struct jbd_quarantine *old = before;
@@ -3730,6 +3755,7 @@ static void jbd_quarantine_accept(struct jbd_journal *journal,
             LIST_REMOVE(old, node); jbd_free(old);
         }
         while (after && !after->allocation && after->owner == group &&
+            after->file_data == q->file_data &&
             q->first + q->count == after->first &&
             after->count <= UINT32_MAX - q->count) {
             struct jbd_quarantine *old = after;
@@ -4092,6 +4118,7 @@ int jbd_journal_retire_stage(struct jbd_journal *journal,
         if (jbd_journal_error(journal)) return jbd_journal_error(journal);
         journal->committed_id=trans->trans_id;
         journal->durable_sequence=trans->sequence;
+        jbd_release_committed_file_blocks(journal, trans);
         ext4_fs_retire_inode_goals(journal->jbd_fs->inode_ref.fs,journal->durable_sequence);
         journal->committing=NULL;
         jbd_release_prepared(trans);
@@ -4181,8 +4208,8 @@ unsigned jbd_journal_write_resources(struct jbd_journal *journal, const struct j
     return missing;
 }
 
-int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
-    uint32_t count, bool inode)
+int jbd_trans_quarantine_range(struct ext4_fs *fs, ext4_fsblk_t first,
+                              uint32_t count, enum jbd_quarantine_kind kind)
 {
     struct jbd_journal *journal = fs->jbd_journal;
     if (!journal || !count) return EOK;
@@ -4191,6 +4218,7 @@ int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
      * 在原操作 abort 或旧版本回写之前进入新所有者的 unwritten 映射。 */
     struct jbd_trans *trans = ext4_current_trans(fs);
     if (!trans || count > UINT64_MAX - first) return EINVAL;
+    bool inode = kind == JBD_QUARANTINE_INODE;
     struct jbd_quarantine_tree *index = &journal->quarantine_index[inode];
     struct jbd_quarantine key = {.first = first};
     struct jbd_quarantine *after = RB_NFIND(jbd_quarantine_tree, index, &key);
@@ -4203,6 +4231,7 @@ int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
     struct jbd_quarantine *q = jbd_alloc(journal, sizeof(*q));
     if (!q) return ENOMEM;
     q->first = first; q->count = count; q->inode = inode; q->owner = trans;
+    q->file_data = kind == JBD_QUARANTINE_FILE_DATA;
     if (RB_INSERT(jbd_quarantine_tree, index, q)) __builtin_trap();
     LIST_INSERT_HEAD(&trans->quarantine, q, node);
     uint64_t *total = inode ? &journal->quarantined_inodes : &journal->quarantined_blocks;

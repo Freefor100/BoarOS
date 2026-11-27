@@ -129,6 +129,7 @@ struct jbd_quarantine {
 	uint32_t count;
 	bool inode;
 	bool allocation;
+	bool file_data;
 	RB_ENTRY(jbd_quarantine) index_node;
 	LIST_ENTRY(jbd_quarantine) node;
 	struct jbd_trans *owner;
@@ -203,7 +204,7 @@ struct jbd_journal {
 	unsigned ordered_trees;
 	uint64_t checkpoint_target;
 	bool grouped;
-	/* Transaction lists own each range through abort or checkpoint. These
+	/* Transaction lists own each range until abort or safe reuse. The
 	 * block/inode indexes borrow the same nodes across accept and sealing. */
 	RB_HEAD(jbd_quarantine_tree, jbd_quarantine) quarantine_index[2];
 	uint64_t quarantined_blocks, quarantined_inodes;
@@ -405,8 +406,17 @@ static inline unsigned jbd_journal_operation_resources(struct jbd_journal *journ
  * ownership always require checkpoint. Recheck resources after the wait. */
 bool jbd_journal_reclaim_goal(const struct jbd_journal *, unsigned resources,
     struct jbd_journal_reclaim *);
-int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
-	uint32_t count, bool inode);
+enum jbd_quarantine_kind {
+    JBD_QUARANTINE_BLOCK, JBD_QUARANTINE_INODE, JBD_QUARANTINE_FILE_DATA,
+};
+int jbd_trans_quarantine_range(struct ext4_fs *fs, ext4_fsblk_t first,
+                              uint32_t count, enum jbd_quarantine_kind kind);
+static inline int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
+                                      uint32_t count, bool inode)
+{
+    return jbd_trans_quarantine_range(fs, first, count,
+        inode ? JBD_QUARANTINE_INODE : JBD_QUARANTINE_BLOCK);
+}
 /* The caller pins the bitmap and owns its block-group modification right.
  * Find one clear run while walking the protected quarantine index once. */
 int jbd_journal_find_reusable(struct ext4_fs *fs, const void *bitmap,

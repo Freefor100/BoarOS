@@ -986,6 +986,78 @@ static void group_quarantine(struct ext4_fs *fs, bool failed)
     } else CHECK(ext4_fclose(&file)==EOK);
     printf("quarantine index block=%u error=%d: interval holes, double-free, exact counts, bitmap skip, abort and durable owner lifetime\n",fs->bdev->lg_bsize,failed);
 }
+static ext4_fsblk_t file_tail_block(struct ext4_fs *fs, ext4_file *file)
+{
+    struct ext4_inode_ref ref;
+    ext4_fsblk_t home;
+    CHECK(ext4_fs_get_inode_ref(fs,file->inode,&ref)==EOK);
+    CHECK(ext4_fs_get_inode_dblk_idx(&ref,4096/fs->bdev->lg_bsize,&home,false)==EOK && home);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    return home;
+}
+
+static void group_data_reuse(struct ext4_fs *fs, unsigned cut, bool cached)
+{
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    struct jbd_journal *journal=fs->jbd_journal;
+    ext4_file file;
+    size_t block=fs->bdev->lg_bsize, done;
+    unsigned char bytes[4096];
+    CHECK(ext4_fopen(&file,"/file","r+")==EOK && file.fsize==4096);
+    memset(bytes,0x33,block);
+    CHECK(ext4_fpwrite(&file,4096,bytes,block,&done)==EOK && done==block);
+    CHECK(ext4_journal_group_drain("/")==EOK);
+    ext4_fsblk_t home=file_tail_block(fs,&file);
+    struct ext4_block held=EXT4_BLOCK_ZERO();
+    if (cached) CHECK(ext4_block_get(fs->bdev,&held,home)==EOK);
+    uint64_t checkpoint=journal->checkpoint_sequence;
+    CHECK(ext4_ftruncate(&file,4096,UINT32_MAX)==EOK);
+    CHECK(quarantine_blocks_reuse(fs,home,false));
+    if (cut==1) goto crash;
+
+    CHECK(ext4_journal_group_commit("/",true)==EOK);
+    CHECK(journal->checkpoint_sequence==checkpoint && journal->durable_sequence>checkpoint);
+    if (cached) {
+        CHECK(quarantine_blocks_reuse(fs,home,false));
+        CHECK(ext4_journal_group_drain("/")==EOK && !quarantine_blocks_reuse(fs,home,false));
+        for (size_t i=0;i<block;i++) CHECK(((unsigned char *)held.data)[i]==0x33);
+        CHECK(ext4_block_set(fs->bdev,&held)==EOK && ext4_fclose(&file)==EOK);
+        printf("PASS block=%zu: cached incarnation waits for checkpoint; old borrower retains bytes\n",block);
+        return;
+    }
+    CHECK(!quarantine_blocks_reuse(fs,home,false));
+    if (cut==2) goto crash;
+
+    memset(bytes,0x77,block);
+    CHECK(ext4_fpwrite(&file,4096,bytes,block,&done)==EOK && done==block);
+    CHECK(file_tail_block(fs,&file)==home);
+    CHECK(ext4_journal_group_commit("/",true)==EOK && journal->checkpoint_sequence==checkpoint);
+    if (cut==3) goto crash;
+
+    CHECK(ext4_journal_group_drain("/")==EOK);
+    CHECK(ext4_blocks_get_direct(fs->bdev,bytes,home,1)==EOK);
+    for (size_t i=0;i<block;i++) CHECK(bytes[i]==0x77);
+    CHECK(ext4_fclose(&file)==EOK);
+    printf("PASS block=%zu: durable free reused before checkpoint; checkpoint preserves replacement\n",block);
+    return;
+crash:
+    CHECK(fault_block_crash(&disk)==0);
+}
+
+static void group_data_reuse_recover(struct ext4_fs *fs, unsigned cut)
+{
+    ext4_file file;
+    CHECK(ext4_fopen(&file,"/file","r")==EOK);
+    size_t block=fs->bdev->lg_bsize, done;
+    unsigned char bytes[4096];
+    CHECK(file.fsize==4096+(cut==2 ? 0 : block));
+    CHECK(ext4_fpread(&file,4096,bytes,block,&done)==EOK && done==(cut==2 ? 0 : block));
+    for (size_t i=0;i<done;i++) CHECK(bytes[i]==(cut==1 ? 0x33 : 0x77));
+    CHECK(ext4_fclose(&file)==EOK);
+    printf("PASS block=%zu: replay after data recycle cut=%u\n",block,cut);
+}
+
 static void group_fault(struct ext4_fs *fs, const char *kind, unsigned point)
 {
     struct ext4_journal_runtime runtime={.now_ns=group_clock};
@@ -2181,7 +2253,7 @@ static void group_namespace(struct ext4_fs *fs, bool unlink_files)
     CHECK(namespace_waits==waits && disk.writes==writes && disk.flushes==flushes);
     namespace_hold=false;
     CHECK(ext4_journal_group_drain("/")==EOK);
-    printf("group namespace: %s accepted without forced I/O; reuse quarantined until checkpoint\n",unlink_files?"unlink":"truncate");
+    printf("group namespace: %s accepted without forced I/O\n",unlink_files?"unlink":"truncate");
 }
 static struct ext4_timestamp get_time(const struct ext4_inode *inode,unsigned i,bool extended)
 {
@@ -3155,9 +3227,9 @@ static void fragmented_range(struct ext4_blockdev *dev)
     int result=ext4_balloc_alloc_blocks(&ref,first,8,&block,&count);
     if(result || block!=first || count!=3)fprintf(stderr,"fragment result=%d first=%llu block=%llu count=%u grouped=%d\n",result,(unsigned long long)first,(unsigned long long)block,count,dev->fs->jbd_journal->grouped);
     CHECK(result==EOK && block==first && count==3);
-    CHECK(ext4_balloc_free_blocks(&ref,block,count)==EOK);
+    CHECK(ext4_balloc_free_blocks(&ref,block,count,false)==EOK);
     CHECK(ext4_balloc_alloc_blocks(&ref,first+3,5,&block,&count)==EOK && block==first+4 && count==5);
-    CHECK(ext4_balloc_free_blocks(&ref,block,count)==EOK);
+    CHECK(ext4_balloc_free_blocks(&ref,block,count,false)==EOK);
     CHECK(ext4_sb_get_free_blocks_cnt(&dev->fs->sb)==free_before);
     CHECK(ext4_fs_put_inode_ref(&ref)==EOK && ext4_transaction_end("/")==EOK);
     CHECK(ext4_fclose(&f)==EOK && ext4_fremove("/range-fragments")==EOK);
@@ -3826,6 +3898,11 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[2],"group-checkpoint-target"))group_checkpoint_target(dev.fs);
     else if(!strcmp(argv[2],"group-checkpoint-pressure"))group_checkpoint_pressure(dev.fs);
     else if(!strcmp(argv[2],"group-quarantine") || !strcmp(argv[2],"group-quarantine-error")) {bool failed=!strcmp(argv[2],"group-quarantine-error");group_quarantine(dev.fs,failed);if(failed)return 0;}
+    else if(!strcmp(argv[2],"group-data-reuse") || !strcmp(argv[2],"group-data-reuse-cached")) {
+        unsigned cut=argc>3?strtoul(argv[3],NULL,10):0;
+        group_data_reuse(dev.fs,cut,!strcmp(argv[2],"group-data-reuse-cached"));if(cut)return 0;
+    }
+    else if(!strcmp(argv[2],"group-data-reuse-recover")) {CHECK(argc==4);group_data_reuse_recover(dev.fs,strtoul(argv[3],NULL,10));}
     else if(!strcmp(argv[2],"group-namespace-truncate"))group_namespace(dev.fs,false);
     else if(!strcmp(argv[2],"group-namespace-unlink"))group_namespace(dev.fs,true);
     else if(!strcmp(argv[2],"group-space"))group_space(dev.fs);

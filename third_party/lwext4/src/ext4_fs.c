@@ -1928,7 +1928,7 @@ out:
     }
     if (!published && !ext4_current_trans(fs)) {
         if (data_owned) {
-            int cleanup = ext4_balloc_free_blocks(ref, range->block, range->count);
+            int cleanup = ext4_balloc_free_blocks(ref, range->block, range->count, false);
             if (cleanup) r = cleanup;
             *range = (struct ext4_inode_block_range){0};
         }
