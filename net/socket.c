@@ -2361,7 +2361,7 @@ static int tcp_reclaim_remote_timewait(void)
          * Drop IP before acquiring a shard, in the same order as promotion. */
         if (!ip && !(ip = boaros_lwip_ip_drop_current())) return 0;
         struct kernel_socket_protocol_scope scope;
-        (void)tcp_owner_lock(&scope, owner, 0);
+        if (!tcp_owner_lock(&scope, owner, 1)) continue;
         if (!tcp_owner_stopping(owner)) reclaimed = boaros_lwip_tcp_reclaim_timewait();
         kernel_socket_protocol_leave(&scope);
     }
@@ -3258,6 +3258,7 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type, int pro
                                       IPADDR_TYPE_V4 : IPADDR_TYPE_ANY);
         if (socket->udp != 0) {socket->udp->ttl=64;udp_set_multicast_ttl(socket->udp,1);udp_recv(socket->udp, udp_received, socket);}
     } else {
+        boaros_lwip_tcp_pcb_bind_heap(heap);
         socket->tcp = tcp_new_ip_type(family == KERNEL_SOCKET_AF_INET ?
                                       IPADDR_TYPE_V4 : IPADDR_TYPE_ANY);
         if (socket->tcp != 0) {

@@ -1229,6 +1229,7 @@ tcp_enter_timewait(struct tcp_pcb *pcb)
 {
   tcp_pcb_purge(pcb);
   TCP_RMV_ACTIVE(pcb);
+  pcb->tmr = tcp_ticks;
   tcp_set_state(pcb, TIME_WAIT);
 #if BOAROS_USER_SMP
   boaros_lwip_tcp_pcb_timewait(pcb);
@@ -1482,6 +1483,7 @@ tcp_process(struct tcp_input_state *rx, struct tcp_pcb *pcb)
         }
       } else if ((rx->flags & TCP_ACK) && (rx->ackno == pcb->snd_nxt) &&
                  pcb->unsent == NULL) {
+        pcb->tmr = tcp_ticks;
         tcp_set_state(pcb, FIN_WAIT_2);
       }
       break;

@@ -2729,14 +2729,31 @@ static void timewait_owner(unsigned mode)
     struct tcp_pcb *borrowed = close_to_timewait(client, server);
     unsigned owned_before = heap_live;
     if (mode == 0) {
-        void *held[MEMP_NUM_TCP_PCB]; unsigned count = 0;
-        while (count < MEMP_NUM_TCP_PCB && (held[count] = memp_malloc(MEMP_TCP_PCB))) ++count;
-        CHECK(count && lwip_stats.memp[MEMP_TCP_PCB]->used == MEMP_NUM_TCP_PCB);
-        struct tcp_pcb *next = tcp_new(); CHECK(next);
-        /* Stop at the owner boundary; do not access the released old PCB. */
+        unsigned limit = MEMP_STATS_GET(avail, MEMP_TCP_PCB);
+        CHECK(limit > 32);
+        void **held = calloc(limit, sizeof(*held));
+        CHECK(held);
+        struct tcp_pcb *closing = tcp_new(), *last_ack = tcp_new();
+        CHECK(closing && last_ack);
+        tcp_set_state(closing, CLOSING);
+        tcp_set_state(last_ack, LAST_ACK);
+        TCP_REG_ACTIVE(closing);
+        TCP_REG_ACTIVE(last_ack);
+        unsigned count = 0;
+        while (MEMP_STATS_GET(used, MEMP_TCP_PCB) < limit) {
+            held[count] = memp_malloc(MEMP_TCP_PCB);
+            CHECK(held[count++]);
+        }
+        CHECK(tcp_tw_pcbs == borrowed && !memp_malloc(MEMP_TCP_PCB));
+        struct tcp_pcb *next = tcp_new();
+        CHECK(next && !tcp_tw_pcbs && MEMP_STATS_GET(used, MEMP_TCP_PCB) == limit);
+        CHECK(!tcp_new() && tcp_active_pcbs == last_ack && last_ack->next == closing);
         CHECK(client->tcp == NULL && client->peer_closed && heap_live == owned_before);
+        tcp_abandon(last_ack, 0);
+        tcp_abandon(closing, 0);
         tcp_abort(next);
         for (unsigned i = 0; i < count; ++i) memp_free(MEMP_TCP_PCB, held[i]);
+        free(held);
     } else if (mode == 1) {
         for (unsigned i = 0; i <= 2U * TCP_MSL / TCP_SLOW_INTERVAL + 1; ++i) tcp_slowtmr();
         CHECK(client->tcp == NULL && client->peer_closed && heap_live == owned_before);
@@ -2750,7 +2767,7 @@ static void timewait_owner(unsigned mode)
     kernel_socket_destroy(server); kernel_socket_destroy(listener);
     kernel_socket_protocol_leave(&irq);
     CHECK(!heap_live && !tcp_tw_pcbs);
-    printf("PASS TIME_WAIT owner %s without deferred socket service\n", mode == 0 ? "capacity reclaim" : mode == 1 ? "timer expiry" : "already destroyed");
+    printf("PASS TIME_WAIT owner %s without deferred socket service\n", mode == 0 ? "bounded admission and closing-state preservation" : mode == 1 ? "timer expiry" : "already destroyed");
 }
 
 static void raw_error(void *context, err_t error) { (void)context; (void)error; abort(); }

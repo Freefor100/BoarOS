@@ -833,7 +833,6 @@ mem_trim(void *rmem, mem_size_t new_size)
 #error "TCP data admission requires the heap's charged block counter"
 #endif
 /* Budget 256 bytes per active PCB for ACK/control and receive metadata. */
-#define BOAROS_TCP_PROGRESS_RESERVE (MEMP_NUM_TCP_PCB * 256U)
 _Static_assert(BOAROS_TCP_PROGRESS_RESERVE < MEM_SIZE_ALIGNED, "TCP heap reserve must fit");
 static void *
 mem_malloc_admitted(mem_size_t size_in, mem_size_t reserve)

@@ -110,7 +110,7 @@ PACK_STRUCT_END
 #if (LWIP_UDP && (MEMP_NUM_UDP_PCB<=0))
 #error "If you want to use UDP, you have to define MEMP_NUM_UDP_PCB>=1 in your lwipopts.h"
 #endif
-#if (LWIP_TCP && (MEMP_NUM_TCP_PCB<=0))
+#if (LWIP_TCP && (MEMP_NUM_TCP_PCB<=0) && !defined(BOAROS_LWIP_TCP_PCB_LIMIT))
 #error "If you want to use TCP, you have to define MEMP_NUM_TCP_PCB>=1 in your lwipopts.h"
 #endif
 #if (LWIP_IGMP && (MEMP_NUM_IGMP_GROUP<=1))

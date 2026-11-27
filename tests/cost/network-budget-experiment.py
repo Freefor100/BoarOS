@@ -13,8 +13,8 @@ Examples (run only after coordinating exclusive access to the measurement host):
 References are selected explicitly with --baseline or --linux-kernel.
 Each case is a fresh boot and disk copy; TAP also gets a fresh network namespace.
 A partial case/profile selection is reported exactly, never as the full matrix.
-Mixed cases add one independent RR control connection; near reduces bulk count
-to keep four active PCB slots free. All means 60 cases. TAP delay is one-way
+Mixed cases add one independent RR control connection. The near profile fixes
+14 loopback or 28 TAP connections. All means 60 cases. TAP delay is one-way
 host-to-guest egress netem; 1/10 ms require host kernel support, with no relay or
 module-loading fallback. Smoke output is functional evidence, never performance.
 Formal candidates require a matching build manifest bound into the ELF. Generic
@@ -86,20 +86,21 @@ def profile(name):
     if not match:
         raise ValueError('profile must be w{8,16,32}-p{1,2,4}-m{1,2,4}: ' + name)
     window, pools, memory = map(int, match.groups())
+    options = (ROOT / 'net/lwip_port/include/lwipopts.h').read_text()
+    pcb_limit = int(re.search(r'^#define BOAROS_LWIP_TCP_PCB_LIMIT (\d+)U$', options, re.M)[1])
     return {'name': name, 'window_mss': window, 'pool_scale': pools, 'mem_scale': memory,
             'tcp_mss': 1460, 'tcp_window_bytes': window * 1460,
             'tcp_send_bytes': window * 1460, 'tcp_send_queue_pbufs': window * 4,
             'tcp_segments': 128 * pools, 'pbuf_headers': 64 * pools,
             'pbuf_pool_count': 64 * pools, 'pbuf_pool_payload_bytes': 1536,
             'protocol_heap_bytes': 262144 * memory,
-            'tcp_active_pcbs': 32, 'tcp_listen_pcbs': 16, 'udp_pcbs': 16,
+            'tcp_active_pcbs': pcb_limit, 'tcp_listen_pcbs': 16, 'udp_pcbs': 16,
             'fragment_pbuf_headers': 15, 'ipv4_reassembly_pbuf_limit': 48,
             'ipv4_reassembly_records': 8, 'ipv6_neighbor_queue_headers': 20,
             'udp_control_heap_headroom_bytes': 65536 + 4096,
             'udp_control_pbuf_headroom_count': 16,
             'near_pool_loopback_connections': 14, 'near_pool_tap_connections': 28,
-            'near_pool_unused_active_pcbs': 4,
-            'headroom_scope': 'Existing UDP admission headroom remains fixed; TCP has no hard per-flow segment or heap reservation. Four PCB slots are workload headroom, not a production admission guarantee.'}
+            'headroom_scope': 'The near profile keeps its original connection counts. Packet storage and TCP control block quotas are independent.'}
 
 
 def names(value):
@@ -201,8 +202,8 @@ def parse_case(value, size, rounds):
     limit = 14 if path == 'loopback' else 28
     bulk_connections = limit - (kind == 'mixed') if count == 'near' else int(count)
     connections = bulk_connections + (kind == 'mixed')
-    if not 1 <= connections <= (14 if path == 'loopback' else 28):
-        raise ValueError('case exceeds PCB headroom ' + value)
+    if not 1 <= connections <= limit:
+        raise ValueError('case exceeds workload connection count ' + value)
     if kind == 'rr' and direction != 'rx':
         raise ValueError('RR uses direction rx (request to guest, echo to client)')
     return dict(name=value, path=path, mode=mode, kind=kind, connections=connections,
@@ -694,7 +695,7 @@ def main():
         p.add_argument('--baseline', type=Path, help='explicit baseline for this run; never inserted automatically')
         p.add_argument('--baseline-commit', help='source commit for the explicitly selected baseline, when known')
         p.add_argument('--linux-kernel', type=Path, help='optional fixed Linux Image; same ELF, disk, RAM and devices')
-        p.add_argument('--cases', default='loopback:blocking:bulk:1:rx,tap:nonblocking:mixed:1:tx', help='comma separated path:mode:kind:connections:direction, or all; mixed adds one control connection, near keeps four active PCB slots free')
+        p.add_argument('--cases', default='loopback:blocking:bulk:1:rx,tap:nonblocking:mixed:1:tx', help='comma separated path:mode:kind:connections:direction, or all; mixed adds one control connection; near uses 14 loopback or 28 TAP connections')
         p.add_argument('--bytes', type=int, default=262144 if smoke else 4 * 1024 * 1024)
         p.add_argument('--rounds', type=int, default=64 if smoke else 1024)
         p.add_argument('--repeat', type=int, default=1 if smoke else 3)

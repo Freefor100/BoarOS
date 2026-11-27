@@ -638,6 +638,7 @@ tcp_close_shutdown_fin(struct tcp_pcb *pcb)
       err = tcp_send_fin(pcb);
       if (err == ERR_OK) {
         MIB2_STATS_INC(mib2.tcpestabresets);
+        pcb->tmr = tcp_ticks;
         tcp_set_state(pcb, LAST_ACK);
       }
       break;
@@ -668,6 +669,14 @@ tcp_close_shutdown_fin(struct tcp_pcb *pcb)
     return ERR_OK;
   }
   return err;
+}
+
+static void
+tcp_set_receive_closed(struct tcp_pcb *pcb)
+{
+  if (pcb->state == FIN_WAIT_2 && !(pcb->flags & TF_RXCLOSED))
+    pcb->tmr = tcp_ticks;
+  tcp_set_flags(pcb, TF_RXCLOSED);
 }
 
 /**
@@ -703,7 +712,7 @@ tcp_close(struct tcp_pcb *pcb)
 
   if (pcb->state != LISTEN) {
     /* Set a flag not to receive any more data... */
-    tcp_set_flags(pcb, TF_RXCLOSED);
+    tcp_set_receive_closed(pcb);
   }
   /* ... and close */
   return tcp_close_shutdown(pcb, 1);
@@ -734,7 +743,7 @@ tcp_shutdown(struct tcp_pcb *pcb, int shut_rx, int shut_tx)
   }
   if (shut_rx) {
     /* shut down the receive side: set a flag not to receive any more data... */
-    tcp_set_flags(pcb, TF_RXCLOSED);
+    tcp_set_receive_closed(pcb);
     if (shut_tx) {
       /* shutting down the tx AND rx side is the same as closing for the raw API */
       return tcp_close_shutdown(pcb, 1);
@@ -2020,6 +2029,7 @@ tcp_recv_null(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 }
 #endif /* LWIP_CALLBACK_API */
 
+#ifndef BOAROS_LWIP_TCP_PCB_LIMIT
 /**
  * Kills the oldest active connection that has a lower priority than 'prio'.
  *
@@ -2099,6 +2109,8 @@ tcp_kill_state(enum tcp_state state)
   }
 }
 
+#endif /* !BOAROS_LWIP_TCP_PCB_LIMIT */
+
 /**
  * Kills the oldest connection that is in TIME_WAIT state.
  * Called from tcp_alloc() if no more connections are available.
@@ -2113,6 +2125,13 @@ tcp_kill_timewait(void)
   inactive = NULL;
   /* Go through the list of TIME_WAIT pcbs and get the oldest pcb. */
   for (pcb = tcp_tw_pcbs; pcb != NULL; pcb = pcb->next) {
+#ifdef BOAROS_LWIP_TCP_PCB_LIMIT
+    /* Only an orphaned tuple may donate a slot, and input can still hold
+     * a borrow on a PCB that has just entered TIME_WAIT. */
+    if (pcb == tcp_input_pcb || pcb->callback_arg || pcb->errf) {
+      continue;
+    }
+#endif
     if ((u32_t)(tcp_ticks - pcb->tmr) >= inactivity) {
       inactivity = tcp_ticks - pcb->tmr;
       inactive = pcb;
@@ -2135,6 +2154,7 @@ boaros_lwip_tcp_reclaim_timewait(void)
 }
 #endif
 
+#ifndef BOAROS_LWIP_TCP_PCB_LIMIT
 /* Called when allocating a pcb fails.
  * In this case, we want to handle all pcbs that want to close first: if we can
  * now send the FIN (which failed before), the pcb might be in a state that is
@@ -2157,6 +2177,8 @@ tcp_handle_closepend(void)
   }
 }
 
+#endif /* !BOAROS_LWIP_TCP_PCB_LIMIT */
+
 /**
  * Allocate a new tcp_pcb structure.
  *
@@ -2171,6 +2193,18 @@ tcp_alloc(u8_t prio)
   LWIP_ASSERT_CORE_LOCKED();
 
   pcb = (struct tcp_pcb *)memp_malloc(MEMP_TCP_PCB);
+#ifdef BOAROS_LWIP_TCP_PCB_LIMIT
+  if (pcb == NULL && (tcp_kill_timewait()
+#if BOAROS_USER_SMP
+      || boaros_lwip_tcp_reclaim_remote_timewait()
+#endif
+      )) {
+    pcb = (struct tcp_pcb *)memp_malloc(MEMP_TCP_PCB);
+    if (pcb) {
+      MEMP_STATS_DEC(err, MEMP_TCP_PCB);
+    }
+  }
+#else
   if (pcb == NULL) {
     /* Try to send FIN for all pcbs stuck in TF_CLOSEPEND first */
     tcp_handle_closepend();
@@ -2224,6 +2258,7 @@ tcp_alloc(u8_t prio)
       MEMP_STATS_DEC(err, MEMP_TCP_PCB);
     }
   }
+#endif /* BOAROS_LWIP_TCP_PCB_LIMIT */
   if (pcb != NULL) {
     /* zero out the whole pcb, so there is no need to initialize members to zero */
     memset(pcb, 0, sizeof(struct tcp_pcb));

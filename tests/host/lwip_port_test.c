@@ -136,7 +136,7 @@ static int tcp_vector_prefix(struct tcp_pcb *sender, struct tcp_pcb *receiver, s
     if (!probe) return 48;
     mem_size_t heap_header=STATS_GET(mem.used)-seed_charge-32;
     mem_free(probe);
-    void *held=mem_malloc(MEM_SIZE-MEMP_NUM_TCP_PCB*256U-seed_charge-segment_charge-heap_header);
+    void *held=mem_malloc(MEM_SIZE-BOAROS_TCP_PROGRESS_RESERVE-seed_charge-segment_charge-heap_header);
     if (!held) return 48;
 
     /* One segment is available: scalar must roll back old tail and new queue. */
@@ -207,7 +207,7 @@ static err_t hold_received(void *, struct tcp_pcb *, struct pbuf *, err_t);
 static int tcp_copy_heap_reserve(struct tcp_pcb *sender, struct tcp_pcb *receiver)
 {
     static unsigned char bytes[8192];
-    const mem_size_t baseline=STATS_GET(mem.used),reserve=MEMP_NUM_TCP_PCB*256U;
+    const mem_size_t baseline=STATS_GET(mem.used),reserve=BOAROS_TCP_PROGRESS_RESERVE;
     const u32_t sequence=sender->snd_lbb;
     const tcpwnd_size_t room=sender->snd_buf;
     /* Measure the real allocator charges rather than assuming header layout. */
@@ -386,8 +386,25 @@ static int tcp_fin_window_case(const ip_addr_t *address)
     if (test.bytes != sizeof(data) || test.eof != 1 ||
         test.receiver->rcv_nxt != start + sizeof(data) + 1 ||
         sender->state != FIN_WAIT_2) return 81;
-    tcp_abort(sender);
+
+    /* A write-only shutdown leaves the application able to receive.
+     * Closing its descriptor later starts a fresh FIN-WAIT-2 interval. */
+    for (unsigned tick = 0; tick <= 2 * TCP_MSL / TCP_SLOW_INTERVAL; tick++)
+        tcp_slowtmr();
+    if (tcp_close(sender) != ERR_OK) return 83;
+    tcp_slowtmr();
+    struct tcp_pcb *active = tcp_active_pcbs;
+    while (active && active != sender) active = active->next;
+    if (!active || active->state != FIN_WAIT_2) return 83;
+    if (tcp_close(test.receiver) != ERR_OK) return 84;
+    /* Leave the peer's FIN and its reply in flight across a timer tick. */
+    tcp_slowtmr();
+    active = tcp_active_pcbs;
+    while (active && active != test.receiver) active = active->next;
+    if (!active || active->state != LAST_ACK) return 85;
     netif_poll_all();
+    if (tcp_tw_pcbs != sender || sender->tmr != tcp_ticks) return 84;
+    tcp_abort(sender);
     return tcp_close(listener) == ERR_OK ? 0 : 82;
 }
 
