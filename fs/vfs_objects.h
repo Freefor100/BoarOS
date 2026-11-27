@@ -389,7 +389,7 @@ struct kernel_vfs_backend {
     /* Under the inode read lock, choose a larger allocation transaction. */
     bool (*writeback_growth)(struct kernel_vfs_node *, uint64_t start);
     /* Synchronous data-only submission; EOPNOTSUPP leaves bytes untouched. */
-    int (*writeback_mapped)(struct kernel_vfs_node *, struct file_write_span *, size_t);
+    int (*writeback_mapped)(struct kernel_vfs_node *, struct file_write_span *, size_t, bool try_only);
     /* Caller owns inode io_lock; positive result is the returned byte count. */
     int (*xattr)(struct kernel_vfs_node *, enum kernel_xattr_operation,
         const char *, void *, size_t, uint32_t);

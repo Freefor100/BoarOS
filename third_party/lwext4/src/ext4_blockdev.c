@@ -770,10 +770,11 @@ int ext4_blocks_submit_batch(struct ext4_blockdev *bdev,
 	return r;
 }
 
-int ext4_blocks_set_phase(struct ext4_blockdev *bdev,
-	const struct ext4_block_write *first)
+static int blocks_set_phase(struct ext4_blockdev *bdev,
+	const struct ext4_block_write *first, bool try_only)
 {
 	if (!bdev || !bdev->bdif || !bdev->bdif->ph_bsize) return EINVAL;
+	if (try_only && !bdev->bdif->bwrite_phase_try) return ENOTSUP;
 	uint32_t sector = bdev->bdif->ph_bsize;
 	for (const struct ext4_block_write *io = first; io; io = io->next) {
 		if (!io->data || !io->size || io->offset % sector || io->size % sector ||
@@ -784,7 +785,8 @@ int ext4_blocks_set_phase(struct ext4_blockdev *bdev,
 	if (!first) return EOK;
 	ext4_bdif_lock(bdev);
 	int r = EOK;
-	if (bdev->bdif->bwrite_phase) r = bdev->bdif->bwrite_phase(bdev, first);
+	if (try_only) r = bdev->bdif->bwrite_phase_try(bdev, first);
+	else if (bdev->bdif->bwrite_phase) r = bdev->bdif->bwrite_phase(bdev, first);
 	else for (const struct ext4_block_write *io = first; io; io = io->next) {
 		/* Legacy devices have no in-flight phase producer. */
 		const uint8_t *data = io->data;
@@ -798,10 +800,18 @@ int ext4_blocks_set_phase(struct ext4_blockdev *bdev,
 		}
 		if (r != EOK) break;
 	}
-	for (const struct ext4_block_write *io = first; io; io = io->next) __atomic_fetch_add(&bdev->bdif->bwrite_ctr,1,__ATOMIC_RELAXED);
+	if (!try_only || r != EAGAIN)
+		for (const struct ext4_block_write *io = first; io; io = io->next)
+			__atomic_fetch_add(&bdev->bdif->bwrite_ctr, 1, __ATOMIC_RELAXED);
 	ext4_bdif_unlock(bdev);
 	return r;
 }
+
+int ext4_blocks_set_phase(struct ext4_blockdev *bdev, const struct ext4_block_write *first)
+{ return blocks_set_phase(bdev, first, false); }
+
+int ext4_blocks_try_set_phase(struct ext4_blockdev *bdev, const struct ext4_block_write *first)
+{ return blocks_set_phase(bdev, first, true); }
 
 int ext4_block_writebytes(struct ext4_blockdev *bdev, uint64_t off,
 			  const void *buf, uint32_t len)

@@ -466,6 +466,68 @@ static int reverse_data_phase(struct ext4_blockdev *dev,const struct ext4_block_
     }
     return EOK;
 }
+
+static bool mapped_device_busy;
+
+static int try_mapped_phase(struct ext4_blockdev *dev, const struct ext4_block_write *first)
+{ return mapped_device_busy ? EAGAIN : reverse_data_phase(dev, first); }
+
+static void write_mapped_background(struct ext4_blockdev *dev)
+{
+    CHECK(ext4_journal_start("/") == EOK);
+    const struct ext4_journal_runtime runtime = {.now_ns = resource_now};
+    CHECK(ext4_journal_group_enable("/", &runtime, 4 * 1024 * 1024) == EOK);
+    ext4_file file;
+    CHECK(ext4_fopen(&file, "/mapped", "w+") == EOK);
+    size_t block = dev->lg_bsize, done;
+    unsigned char *input = malloc(2 * block), *output = malloc(2 * block);
+    CHECK(input && output);
+    memset(input, 'a', 2 * block);
+    CHECK(ext4_fpwrite(&file, 0, input, 2 * block, &done) == EOK && done == 2 * block);
+    CHECK(ext4_journal_group_commit("/", true) == EOK);
+    CHECK(ext4_journal_group_checkpoint("/") == EOK);
+
+    dev->bdif->bwrite_phase = reverse_data_phase;
+    dev->bdif->bwrite_phase_try = try_mapped_phase;
+    memset(input, 'b', block);
+    CHECK(ext4_fpwrite(&file, 0, input, block, &done) == EOK && done == block);
+    struct jbd_journal *journal = dev->fs->jbd_journal;
+    CHECK(journal->running && journal->running->ordered_count == 1);
+    struct resource_source owner = {.data = input + block};
+    memset(input + block, 'c', block);
+    struct file_write_span span = {.offset = block, .buffer = input + block, .size = block,
+        .source = {.context = &owner, .bytes = block, .retain = resource_retain, .release = resource_release}};
+    kernel_io_context_current()->background_reclaim = 1;
+    uint64_t writes = disk.writes;
+    mapped_device_busy = true;
+    CHECK(ext4_fpwrite_mapped_try(&file, &span, 1) == EAGAIN &&
+        !span.written && !owner.references && disk.writes == writes);
+    mapped_device_busy = false;
+    CHECK(ext4_fpwrite_mapped_try(&file, &span, 1) == EOK && span.written == block);
+    CHECK(disk.writes > writes && !owner.references && journal->running->ordered_count == 1);
+    CHECK(ext4_fpread(&file, 0, output, 2 * block, &done) == EOK && done == 2 * block);
+    CHECK(!memcmp(output, input, block) && !memcmp(output + block, input + block, block));
+
+    span.offset = 0;
+    writes = disk.writes;
+    CHECK(ext4_fpwrite_mapped_try(&file, &span, 1) == ENOTSUP && !span.written);
+    CHECK(jbd_journal_freeze(journal) == EOK);
+    CHECK(ext4_fpwrite_mapped_try(&file, &span, 1) == ENOTSUP && !span.written);
+    CHECK(jbd_journal_select_stage(journal, JBD_JOURNAL_COMMIT) == JBD_JOURNAL_COMMIT);
+    CHECK(ext4_fpwrite_mapped_try(&file, &span, 1) == ENOTSUP && !span.written);
+    CHECK(ext4_fpwrite_batch(&file, &span, 1) == EOK && span.written == block);
+    CHECK(disk.writes == writes && owner.references == 1 && journal->running->ordered_count == 1);
+    kernel_io_context_current()->background_reclaim = 0;
+    CHECK(jbd_journal_retire_stage(journal, JBD_JOURNAL_COMMIT, jbd_journal_submit(journal)) == EOK);
+    CHECK(ext4_journal_group_commit("/", true) == EOK && !owner.references);
+    CHECK(ext4_fpread(&file, 0, output, 2 * block, &done) == EOK && done == 2 * block);
+    CHECK(!memcmp(output, input + block, block) && !memcmp(output + block, input + block, block));
+    CHECK(ext4_fclose(&file) == EOK && ext4_journal_stop("/") == EOK);
+    CHECK(ext4_umount("/") == EOK && fault_block_crash(&disk) == 0);
+    free(input); free(output);
+    puts("PASS mapped background overwrite: disjoint overwrite bypassed the log; an overlapping older write retained its order");
+}
+
 static void direct_ordered_data(struct ext4_blockdev *dev,struct jbd_journal *journal,
     ext4_file *file,ext4_fsblk_t home,unsigned fault)
 {
@@ -2008,6 +2070,10 @@ int main(int argc, char **argv)
         ext4_mount_ext3("journal-test", "/", read_only) :
         ext4_mount("journal-test", "/", read_only);
     CHECK(mounted == EOK);
+    if (!strcmp(argv[2], "mapped-background")) {
+        write_mapped_background(&dev);
+        return 0;
+    }
 #ifdef TEST_WRITEBACK_REGRESSIONS
     if (!strcmp(argv[2], "deferred-prewrite")) {
         write_deferred_prewrite(&dev);

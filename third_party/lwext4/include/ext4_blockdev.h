@@ -95,6 +95,9 @@ struct ext4_blockdev_iface {
 		const struct kernel_block_span *spans, unsigned count);
 	int (*bwrite_phase)(struct ext4_blockdev *bdev,
 		const struct ext4_block_write *first);
+	/* EAGAIN means no write entered the device phase. */
+	int (*bwrite_phase_try)(struct ext4_blockdev *bdev,
+		const struct ext4_block_write *first);
 	/* Larger disjoint write arrays use the same phase transport. */
 	uint32_t write_phase_bytes;
 
@@ -202,6 +205,8 @@ int ext4_block_init(struct ext4_blockdev *bdev);
 int ext4_blockdev_flush(struct ext4_blockdev *bdev);
 int ext4_blocks_set_phase(struct ext4_blockdev *bdev,
 	const struct ext4_block_write *first);
+int ext4_blocks_try_set_phase(struct ext4_blockdev *bdev,
+    const struct ext4_block_write *first);
 /* Disjoint whole-block byte ranges relative to the
  * filesystem. Borrows caller storage; all offsets are restored before return. */
 int ext4_blocks_check_batch(struct ext4_blockdev *bdev,

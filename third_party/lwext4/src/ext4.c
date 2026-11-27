@@ -6411,16 +6411,21 @@ Unlock:
 }
 
 static int ext4_write_mapped(ext4_file *file, struct file_write_span *spans, unsigned count,
-    struct ext4_block_write *writes)
+    struct ext4_block_write *writes, bool try_only)
 {
     struct ext4_fs *fs = &file->mp->fs;
     struct jbd_journal *journal = fs->jbd_journal;
     size_t block = fs->bdev->lg_bsize;
-    if (!journal || !journal->grouped || !fs->bdev->bdif->bwrite_phase ||
-        !count || fs->read_only)
+    if (!journal || !journal->grouped || !count || fs->read_only ||
+        (try_only ? !fs->bdev->bdif->bwrite_phase_try : !fs->bdev->bdif->bwrite_phase))
         return ENOTSUP;
-    for (unsigned i = 0; i < count; i++)
-        if (spans[i].offset % block || !spans[i].size || spans[i].size % block) return ENOTSUP;
+    for (unsigned i = 0; i < count; i++) {
+        spans[i].written = 0;
+        if (spans[i].offset % block || !spans[i].size || spans[i].size % block ||
+            (i && (spans[i].offset < spans[i-1].offset ||
+                spans[i].offset - spans[i-1].offset < spans[i-1].size)))
+            return ENOTSUP;
+    }
 
     EXT4_MP_LOCK(file->mp);
     int result;
@@ -6428,9 +6433,14 @@ static int ext4_write_mapped(ext4_file *file, struct file_write_span *spans, uns
         EXT4_STATE_READ_SCOPE(state, fs);
         result = jbd_journal_error(journal);
         struct ext4_inode_goal probe = {.inode = file->inode};
-        struct ext4_inode_goal *goal = RB_FIND(ext4_inode_goal_tree, &fs->inode_goals, &probe);
+        struct ext4_inode_goal *goal = try_only ? NULL :
+            RB_FIND(ext4_inode_goal_tree, &fs->inode_goals, &probe);
         if (!result && (ext4_current_operation(fs) ||
             (goal && goal->data_sequence > journal->durable_sequence))) result = ENOTSUP;
+        if (!result && try_only &&
+            (spans[count-1].offset > file->fsize ||
+             spans[count-1].size > file->fsize - spans[count-1].offset))
+            result = ENOTSUP;
     }
     if (result) goto out;
 
@@ -6475,12 +6485,16 @@ static int ext4_write_mapped(ext4_file *file, struct file_write_span *spans, uns
         range.count -= blocks;
     }
     result = ext4_result(result, ext4_fs_put_inode_ref(&ref));
+    /* An unrelated ordered write on this inode need not delay the batch.
+     * The caller owns these cache entries through I/O. The inode reader
+     * prevents remapping or a new overlapping writeback from the direct path. */
+    if (!result && try_only && jbd_journal_overlaps_data(journal, writes))
+        result = ENOTSUP;
 out:
     EXT4_MP_UNLOCK(file->mp);
     if (result) return result;
-    /* The VFS inode reader excludes truncate and hole punching through I/O.
-     * The durable data goal excludes older ordered payloads for these blocks. */
-    result = ext4_blocks_set_phase(fs->bdev, writes);
+    result = try_only ? ext4_blocks_try_set_phase(fs->bdev, writes) :
+        ext4_blocks_set_phase(fs->bdev, writes);
     if (!result) {
         for (unsigned i = 0; i < count; i++) spans[i].written = spans[i].size;
     } else if (result == ENOTSUP) result = EIO;
@@ -6488,23 +6502,30 @@ out:
 }
 
 static __attribute__((noinline)) int ext4_write_mapped_small(ext4_file *file,
-    struct file_write_span *spans, unsigned count)
+    struct file_write_span *spans, unsigned count, bool try_only)
 {
     struct ext4_block_write writes[EXT4_BLOCK_BATCH_MAX];
-    return ext4_write_mapped(file, spans, count, writes);
+    return ext4_write_mapped(file, spans, count, writes, try_only);
 }
 
-int ext4_fpwrite_mapped_batch(ext4_file *file, struct file_write_span *spans, unsigned count)
+static int ext4_write_mapped_mode(ext4_file *file, struct file_write_span *spans,
+    unsigned count, bool try_only)
 {
     if (count <= EXT4_BLOCK_BATCH_MAX)
-        return ext4_write_mapped_small(file, spans, count);
+        return ext4_write_mapped_small(file, spans, count, try_only);
     if (count > EXT4_FILE_WRITEBACK_MAX) return ENOTSUP;
     struct ext4_block_write *writes = ext4_malloc(count * sizeof(*writes));
     if (!writes) return ENOTSUP;
-    int result = ext4_write_mapped(file, spans, count, writes);
+    int result = ext4_write_mapped(file, spans, count, writes, try_only);
     ext4_free(writes);
     return result;
 }
+
+int ext4_fpwrite_mapped_batch(ext4_file *file, struct file_write_span *spans, unsigned count)
+{ return ext4_write_mapped_mode(file, spans, count, false); }
+
+int ext4_fpwrite_mapped_try(ext4_file *file, struct file_write_span *spans, unsigned count)
+{ return ext4_write_mapped_mode(file, spans, count, true); }
 
 /* Nonjournal synchronous storage is borrowed only until device completion.
  * Journal users need the ordered-owner completion protocol instead. */

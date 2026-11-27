@@ -258,6 +258,7 @@ int ext4_fpwrite_files(ext4_file *const *files, const struct file_write_set *set
 /* Called with the adapter's inode I/O qualification. ENOTSUP leaves the
  * entire batch to transactional writeback. */
 int ext4_fpwrite_mapped_batch(ext4_file *file, struct file_write_span *spans, unsigned count);
+int ext4_fpwrite_mapped_try(ext4_file *file, struct file_write_span *spans, unsigned count);
 /* Synchronous no-journal data path; caller storage is never retained. */
 int ext4_fpwrite_direct(ext4_file *file, struct file_write_span *span);
 int ext4_fpwrite(ext4_file *file, uint64_t offset, const void *buffer, size_t size, size_t *written);
