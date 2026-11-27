@@ -12,7 +12,7 @@ cases = ('unix-peer-identity', 'async-events', 'ipv4-address-shutdown', 'ipv4-ro
 cases += ('tcp-quota-notify', 'tcp-readiness-direction', 'remote-quota-notify', 'remote-batch-writers', 'remote-direct', 'queued-completion')
 cases += ('internet-checksum', 'tcp-loopback-checksum', 'tcp-detached', 'tcp-input-output', 'tcp-reset-receive-retry', 'raw-tcp-ingress')
 cases += ('tcp-more', 'tcp-cork', 'tcp-receive-before-wait', 'tcp-close-capacity-retry', 'tcp-passive-capacity-retry',
-          'tcp-ack-batch', 'serial-tcp-credit', 'serial-loopback-credit', 'tcp-serial-train')
+          'tcp-ack-batch', 'serial-tcp-credit', 'serial-loopback-credit', 'tcp-serial-train', 'tcp-loopback-train')
 cases += ('ipv6-mld', 'ipv6-ra', 'ipv6-source-prefix', 'ipv6-global', 'ipv6-prepare-withdraw', 'ipv6-linklocal', 'raw-icmp-owner', 'raw-icmp-close', 'ipv4-options', 'ipv4-igmp', 'packet-tap', 'packet-ring')
 smp_cases = ('parallel-receive-retire', 'parallel-receive-reset', 'udp-caller-submit', 'udp-caller-stop',
              'tcp-owner-lookup', 'tcp-owner-train', 'tcp-owner-placement', 'tcp-physical-submit', 'tcp-resolved-output',

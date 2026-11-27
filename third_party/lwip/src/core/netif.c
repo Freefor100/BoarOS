@@ -1429,6 +1429,11 @@ netif_poll_budget(struct netif *netif, unsigned budget)
 
   /* Get a packet from the list. With SYS_LIGHTWEIGHT_PROT=1, this is protected */
   SYS_ARCH_PROTECT(lev);
+#if BOAROS_LWIP_LINUX_LOOPBACK && LWIP_HAVE_LOOPIF && !LWIP_NETIF_LOOPBACK_MULTITHREADING
+  int batch_eligible = budget > 1 && netif == &loop_netif &&
+                       !boaros_lwip_parallel_enabled();
+  int batching = 0;
+#endif
   while (handled < budget && netif->loop_first != NULL) {
     struct pbuf *in, *in_end;
 #if LWIP_LOOPBACK_MAX_PBUFS
@@ -1451,6 +1456,9 @@ netif_poll_budget(struct netif *netif, unsigned budget)
 #endif /* LWIP_LOOPBACK_MAX_PBUFS */
 
     /* 'in_end' now points to the last pbuf from 'in' */
+#if BOAROS_LWIP_LINUX_LOOPBACK && LWIP_HAVE_LOOPIF && !LWIP_NETIF_LOOPBACK_MULTITHREADING
+    int queued_successor = in_end != netif->loop_last;
+#endif
     if (in_end == netif->loop_last) {
       /* this was the last pbuf in the list */
       netif->loop_first = netif->loop_last = NULL;
@@ -1464,10 +1472,33 @@ netif_poll_budget(struct netif *netif, unsigned budget)
     SYS_ARCH_UNPROTECT(lev);
 
     handled++;
+#if BOAROS_LWIP_LINUX_LOOPBACK && LWIP_HAVE_LOOPIF && !LWIP_NETIF_LOOPBACK_MULTITHREADING
+    if (batching || (batch_eligible && queued_successor && handled < budget &&
+        in->tot_len >= IP_HLEN + TCP_HLEN + BOAROS_LWIP_LOOPBACK_MSS)) {
+      const struct ip_hdr *ip = in->payload;
+      /* Keep previously queued TCP data ahead of traffic handled by any
+       * other input path, including IPv4 fragment and option processing. */
+      int fixed_tcp = in->len >= IP_HLEN + TCP_HLEN && IPH_V(ip) == 4 &&
+          IPH_HL_BYTES(ip) == IP_HLEN && !(lwip_ntohs(IPH_OFFSET(ip)) & (IP_MF | IP_OFFMASK)) &&
+          IPH_PROTO(ip) == IP_PROTO_TCP;
+      if (batching) {
+        if (!fixed_tcp) boaros_lwip_tcp_ack_batch_flush();
+      } else if (fixed_tcp && boaros_lwip_raw_input_idle()) {
+        const struct tcp_hdr *tcp = (const void *)((const u8_t *)ip + IP_HLEN);
+        if (TCPH_HDRLEN_BYTES(tcp) == TCP_HLEN && TCPH_FLAGS(tcp) == TCP_ACK) {
+          boaros_lwip_tcp_loopback_batch_begin();
+          batching = 1;
+        }
+      }
+    }
+#endif
     loopback_input(netif, in);
     SYS_ARCH_PROTECT(lev);
   }
   SYS_ARCH_UNPROTECT(lev);
+#if BOAROS_LWIP_LINUX_LOOPBACK && LWIP_HAVE_LOOPIF && !LWIP_NETIF_LOOPBACK_MULTITHREADING
+  if (batching) boaros_lwip_tcp_ack_batch_end();
+#endif
   return handled;
 }
 

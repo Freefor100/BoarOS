@@ -62,6 +62,7 @@ void boaros_lwip_tcp_output(struct tcp_pcb *pcb);
 /* A serialized Ethernet receive pass may coalesce adjacent plain ACKs.
  * Flush before handing other traffic to a protocol or returning the scope. */
 void boaros_lwip_tcp_ack_batch_begin(void);
+void boaros_lwip_tcp_loopback_batch_begin(void);
 void boaros_lwip_tcp_ack_batch_flush(void);
 void boaros_lwip_tcp_ack_batch_end(void);
 void boaros_lwip_work_ready(void);
