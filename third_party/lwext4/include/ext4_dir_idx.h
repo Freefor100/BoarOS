@@ -106,6 +106,14 @@ int ext4_dir_dx_reset_parent_inode(struct ext4_inode_ref *dir,
 int ext4_dir_dx_check(struct ext4_inode_ref *dir, struct ext4_block *block);
 int ext4_dir_dx_is_node(struct ext4_inode_ref *dir, uint32_t logical, bool *is_node);
 int ext4_dir_parent_inode(struct ext4_inode_ref *dir, uint32_t *parent);
+struct ext4_dir_parent_edit {
+    struct ext4_block block;
+    struct ext4_dir_en *entry;
+};
+int ext4_dir_prepare_reparent(struct ext4_inode_ref *dir, uint32_t expected_parent,
+    struct ext4_dir_parent_edit *edit);
+int ext4_dir_write_parent(struct ext4_inode_ref *dir, struct ext4_dir_parent_edit *edit,
+    uint32_t new_parent);
 int ext4_dir_reparent(struct ext4_inode_ref *dir, uint32_t expected_parent,
                      uint32_t new_parent);
 

@@ -499,7 +499,7 @@ struct ext4_rename_result {
 enum { EXT4_RENAME_NOREPLACE = 1, EXT4_RENAME_EXCHANGE = 2 };
 
 /* Rename one directory entry without resolving an absolute pathname. Flags
- * are 0, EXT4_RENAME_NOREPLACE or EXT4_RENAME_EXCHANGE. Requires an active journal and caller-held
+ * are 0, EXT4_RENAME_NOREPLACE or EXT4_RENAME_EXCHANGE. Requires caller-held
  * namespace qualifications for the affected directories and inodes. A replaced inode keeps its contents; its last link is transferred
  * to the persistent orphan owner until the caller releases live references.
  * Results are published only on success. Within an outer transaction they
@@ -917,6 +917,9 @@ struct ext4_create_acl {
     const void *access, *defaults;
     size_t access_size, default_size;
 };
+int ext4_tmpfile_child_acl(const char *mount, uint32_t parent, uint32_t mode,
+    ext4_file *output, struct ext4_inode *initial, uint32_t uid, uint32_t gid,
+    const struct ext4_create_acl *acl);
 int ext4_create_child_acl(const char *mount, uint32_t parent, const char *name,
     uint32_t mode, uint32_t device, const char *target, ext4_file *output,
     struct ext4_inode *initial, uint32_t uid, uint32_t gid,

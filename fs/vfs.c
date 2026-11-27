@@ -6497,8 +6497,10 @@ LookupNames:
     if (path_is_mountpoint(source) || (target && path_is_mountpoint(target))) {
         result=-KERNEL_EBUSY;goto Finish;
     }
-    if ((old_trailing || new_trailing) &&
-        (source->file.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) {
+    if (((old_trailing || (new_trailing && !exchange)) &&
+         (source->file.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) ||
+        (new_trailing && exchange &&
+         (target->file.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)) {
         result = -KERNEL_ENOTDIR;
         goto Finish;
     }
@@ -6626,7 +6628,7 @@ Finish:
 int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,struct kernel_vfs_path *new_start,
     struct kernel_vfs_path *root,const char *old_input,const char *new_input,unsigned flags)
 {
-    return vfs_rename_at(old_start,new_start,root,old_input,new_input,flags,false);
+    return vfs_rename_at(old_start,new_start,root,old_input,new_input,flags,(flags & 2U)!=0);
 }
 
 int kernel_vfs_exchange_layer_entries(struct kernel_vfs_path *old_parent,

@@ -2605,8 +2605,8 @@ static int apply_namespace_create(void *context)
             request->mode | request->type, request->device, request->target, file,
             request->initial, request->uid, request->gid, request->prepare_acl ? &acl : NULL);
     else
-        result = ext4_tmpfile_child(request->mount, request->parent, request->mode | request->type,
-            file, request->initial, request->uid, request->gid);
+        result = ext4_tmpfile_child_acl(request->mount, request->parent, request->mode | request->type,
+            file, request->initial, request->uid, request->gid, request->prepare_acl ? &acl : NULL);
     if (!result && !request->prepare_acl && request->access_acl)
         result=ext4_file_set_acl(file,EXT4_XATTR_INDEX_POSIX_ACL_ACCESS,
             request->access_acl,request->access_size,false,false,0);
@@ -2680,9 +2680,10 @@ static int namespace_create_execute(struct lwext4_mount_adapter *adapter,struct 
     request->mode=mode;
     if (def) kernel_heap_release(adapter->instance.heap,def);
     if (access) kernel_heap_release(adapter->instance.heap,access);
-    request->prepare_acl = adapter->device.fs->ext2_format &&
+    request->prepare_acl = !adapter->device.fs->jbd_journal &&
         (request->access_acl || request->default_acl);
-    request->reuse_parent_times = request->qualified_parent && request->type == KERNEL_VFS_S_IFREG &&
+    request->reuse_parent_times = adapter->device.fs->jbd_journal &&
+        request->qualified_parent && request->type == KERNEL_VFS_S_IFREG &&
         !request->access_acl && !request->default_acl && !ext4_current_operation(adapter->device.fs);
     if (!result) {
         result=ext4_metadata_execute(adapter->mount_point,apply_namespace_create,request);
@@ -2752,7 +2753,7 @@ static int ext4_backend_create_common(struct kernel_vfs_mount *mount,
     if (adapter->instance.read_only) {
         return -KERNEL_EROFS;
     }
-    if (!adapter->device.fs->jbd_journal && (!adapter->device.fs->ext2_format || !path))
+    if (!path && adapter->device.fs->ext2_format)
         return -KERNEL_EOPNOTSUPP;
     heap_status = kernel_heap_allocate_zeroed(adapter->instance.heap,
                                               1U,
@@ -3171,8 +3172,6 @@ static int ext4_backend_mkdir(struct kernel_vfs_mount *mount,
         return -KERNEL_EROFS;
     }
 
-    if (!adapter->device.fs->jbd_journal && !adapter->device.fs->ext2_format)
-        return -KERNEL_EOPNOTSUPP;
     struct namespace_create request={.mount=adapter->mount_point,.parent=parent_inode,.path=path,.mode=mode&07777U,.type=KERNEL_VFS_S_IFDIR,.umask=umask};
     result=namespace_create_execute(adapter,&request);
     if (result != EOK) return lwext4_error(result);
@@ -4019,8 +4018,8 @@ static int ext4_backend_mknod(struct kernel_vfs_instance *instance,
 {
     if (!parent_inode || parent_inode > UINT32_MAX) return -KERNEL_EOVERFLOW;
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
-    if (!adapter->device.fs->jbd_journal &&
-        (!adapter->device.fs->ext2_format || type != KERNEL_VFS_S_IFREG))
+    if (adapter->instance.read_only) return -KERNEL_EROFS;
+    if (adapter->device.fs->ext2_format && type != KERNEL_VFS_S_IFREG)
         return -KERNEL_EOPNOTSUPP;
     struct namespace_create request = {.mount=adapter->mount_point, .parent=parent_inode,
         .path=name, .type=type, .mode=mode & 07777U, .device=device,.umask=umask};
@@ -4036,8 +4035,8 @@ static int ext4_backend_create_with_handle(struct kernel_vfs_mount *mount, uint6
     if (adapter->instance.read_only) return -KERNEL_EROFS;
     uint32_t type = mode & KERNEL_VFS_S_IFMT;
     struct ext4_fs *fs = adapter->device.fs;
-    if (!fs->jbd_journal && type != KERNEL_VFS_S_IFLNK &&
-        (!fs->ext2_format || (type != KERNEL_VFS_S_IFDIR && type != KERNEL_VFS_S_IFREG)))
+    if (fs->ext2_format && type != KERNEL_VFS_S_IFLNK &&
+        type != KERNEL_VFS_S_IFDIR && type != KERNEL_VFS_S_IFREG)
         return -KERNEL_EOPNOTSUPP;
     struct ext4_inode initial;
     *handle = (struct kernel_vfs_handle){0};

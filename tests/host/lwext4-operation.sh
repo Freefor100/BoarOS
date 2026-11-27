@@ -6,7 +6,8 @@ work=${EXT4_OPERATION_HOST_BUILD:-build/host/ext4-operation}
 mkdir -p "$work"
 ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -Wno-unused-but-set-variable -Wno-stringop-truncation \
-    -DBOAROS_MAX_CPUS=2 -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 \
+    -DBOAROS_MAX_CPUS=2 -DBOAROS_PAGE_SHIFT="${LWEXT4_HOST_PAGE_SHIFT:-12}" \
+    -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 \
     -DTEST_OPERATION_LIFECYCLE -Wl,--wrap=jbd_journal_accept_state_held -Wl,--wrap=jbd_journal_free_trans_state_held -Wl,--wrap=ext4_operation_publish_super \
     -Wl,--wrap=ext4_fs_alloc_inode,--wrap=ext4_fs_get_inode_ref,--wrap=ext4_fs_put_inode_ref,--wrap=ext4_dir_find_entry,--wrap=ext4_dir_add_entry \
     -Wl,--wrap=jbd_trans_get_write_access_range,--wrap=jbd_trans_prepare_unowned_range \

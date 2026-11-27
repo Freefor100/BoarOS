@@ -1531,7 +1531,7 @@ enum kernel_files_status kernel_files_renameat(
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
         !mm || !linux_result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     if ((flags & ~7U) || ((flags & 2U) && (flags & 5U))) { *linux_result = -KERNEL_EINVAL; return KERNEL_FILES_STATUS_OK; }
-    if (flags & 6U) { *linux_result = -KERNEL_ENOTSUP; return KERNEL_FILES_STATUS_OK; }
+    if (flags & 4U) { *linux_result = -KERNEL_ENOTSUP; return KERNEL_FILES_STATUS_OK; }
     enum kernel_heap_status allocation = kernel_heap_allocate(files->heap,
                                      2U * KERNEL_FS_PATH_MAX, (void **)&paths);
     if (allocation != KERNEL_HEAP_STATUS_OK) {

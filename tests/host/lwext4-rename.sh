@@ -16,6 +16,15 @@ ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
 check_fs() {
     e2fsck -fn "$1" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log"; exit 1; }
 }
+if [ "${1:-all}" = nojournal ]; then
+    for size in 1024 4096; do
+        truncate -s 4M "$work/full.img"
+        mkfs.ext4 -q -F -b "$size" -O ^has_journal "$work/full.img"
+        timeout 30 "$work/probe" "$work/full.img" nojournal-full
+        check_fs "$work/full.img"
+    done
+    exit 0
+fi
 if [ "${1:-all}" = ext2 ]; then
     for size in 1024 4096; do
         truncate -s 32M "$work/test.img"

@@ -146,7 +146,7 @@ def fixed_linux_image(argument):
     raise RuntimeError('Linux image has no fixed-build identity.json')
 
 
-def fixture(directory, program):
+def fixture(directory, program, *, block_size=4096, features=None):
     tree = directory / 'fixture'
     tree.mkdir()
     shutil.copy2(program, tree / 'init')
@@ -156,7 +156,10 @@ def fixture(directory, program):
     disk = directory / 'fixture.img'
     with disk.open('wb') as stream:
         stream.truncate(32 * 1024 * 1024)
-    run_logged(['mkfs.ext4', '-q', '-F', '-b', '4096', '-d', str(tree), str(disk)], directory / 'mkfs.log')
+    command = ['mkfs.ext4', '-q', '-F', '-b', str(block_size)]
+    if features:
+        command += ['-O', features]
+    run_logged(command + ['-d', str(tree), str(disk)], directory / 'mkfs.log')
     # debugfs works without host root privileges; Linux opens this console as init stdio.
     commands = directory / 'fixture.debugfs'
     commands.write_text('cd /dev\n'

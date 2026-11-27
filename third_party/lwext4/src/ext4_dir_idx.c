@@ -1530,23 +1530,38 @@ int ext4_dir_parent_inode(struct ext4_inode_ref *dir, uint32_t *parent)
     return r;
 }
 
-int ext4_dir_reparent(struct ext4_inode_ref *dir, uint32_t expected_parent,
-                     uint32_t new_parent)
+int ext4_dir_prepare_reparent(struct ext4_inode_ref *dir, uint32_t expected_parent,
+    struct ext4_dir_parent_edit *edit)
 {
     struct ext4_block block = EXT4_BLOCK_ZERO();
     struct ext4_dir_en *entry;
     int r = ext4_dir_parent_block(dir, &block, &entry, true);
     if (r != EOK) return r;
-    if (ext4_dir_en_get_inode(entry) != expected_parent) r = EUCLEAN;
-    if (r == EOK) {
-        ext4_dir_en_set_inode(entry, new_parent);
-        if (ext4_inode_has_flag(dir->inode, EXT4_INODE_FLAG_INDEX)) {
-            ext4_dir_set_dx_csum(dir, (void *)block.data);
-            r = ext4_trans_set_block_dirty(block.buf);
-        } else {
-            r = ext4_dir_mark_dirty(dir, &block);
-        }
+    if (ext4_dir_en_get_inode(entry) != expected_parent) {
+        ext4_block_set(dir->fs->bdev, &block);
+        return EUCLEAN;
     }
-    int release = ext4_block_set(dir->fs->bdev, &block);
+    *edit = (struct ext4_dir_parent_edit){block, entry};
+    return EOK;
+}
+
+int ext4_dir_write_parent(struct ext4_inode_ref *dir, struct ext4_dir_parent_edit *edit,
+    uint32_t new_parent)
+{
+    ext4_dir_en_set_inode(edit->entry, new_parent);
+    if (!ext4_inode_has_flag(dir->inode, EXT4_INODE_FLAG_INDEX))
+        return ext4_dir_mark_dirty(dir, &edit->block);
+    ext4_dir_set_dx_csum(dir, (void *)edit->block.data);
+    return ext4_trans_set_block_dirty(edit->block.buf);
+}
+
+int ext4_dir_reparent(struct ext4_inode_ref *dir, uint32_t expected_parent,
+                     uint32_t new_parent)
+{
+    struct ext4_dir_parent_edit edit = {0};
+    int r = ext4_dir_prepare_reparent(dir, expected_parent, &edit);
+    if (r) return r;
+    r = ext4_dir_write_parent(dir, &edit, new_parent);
+    int release = ext4_block_set(dir->fs->bdev, &edit.block);
     return r != EOK ? r : release;
 }

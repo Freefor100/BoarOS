@@ -3694,13 +3694,15 @@ static void nojournal_clean_write_error(struct ext4_fs *fs)
     puts("PASS failed clean superblock publication leaves dirty memory and blocks retry-clean");
 }
 
-static void nojournal_clean_flush_error(struct ext4_fs *fs)
+static void nojournal_clean_flush_error(struct ext4_fs *fs, bool final)
 {
     CHECK(!fs->jbd_journal);
     ext4_file file;CHECK(ext4_fopen(&file,"/file","r+")==EOK);
     CHECK(ext4_blockdev_flush(fs->bdev)==EOK);
-    disk.fail_flush=disk.flushes+1;
+    disk.fail_flush=disk.flushes+(final ? 2 : 1);
+    uint64_t before=disk.writes;
     CHECK(ext4_umount("/")==EIO);
+    CHECK(final ? disk.writes > before : disk.writes == before);
     CHECK(fs->nojournal_error==EIO);
     CHECK(!(ext4_get16(&fs->sb,state)&EXT4_SUPERBLOCK_STATE_VALID_FS));
     disk.fail_flush=0;uint64_t writes=disk.writes,flushes=disk.flushes;
@@ -3709,7 +3711,8 @@ static void nojournal_clean_flush_error(struct ext4_fs *fs)
     CHECK(ext4_remount("/",true)==EIO && ext4_remount("/",false)==EIO);
     CHECK(ext4_umount("/")==EIO && disk.writes==writes && disk.flushes==flushes);
     CHECK(fault_block_crash(&disk)==0);
-    puts("PASS final nojournal FLUSH failure: clean memory revoked, error sticky, no mutation/remount/retry-clean");
+    printf("PASS %s nojournal FLUSH failure: error sticky, no mutation/remount/retry-clean\n",
+           final ? "final" : "pre-clean");
 }
 
 static struct {
@@ -3892,7 +3895,19 @@ int main(int argc,char **argv)
     struct ext4_blockdev dev={.bdif=&iface,.part_size=disk.device.capacity_bytes};
     CHECK(ext4_device_register(&dev,"metadata")==EOK);
     bool readonly=!strcmp(argv[2],"nojournal-orphan-reopen") || !strcmp(argv[2],"owner-ro") || !strcmp(argv[2],"readonly") || !strcmp(argv[2],"stats-ro") || !strcmp(argv[2],"read-stats");
+    bool mount_barrier_failure=!strcmp(argv[2],"nojournal-mount-flush-error");
+    if (mount_barrier_failure) disk.fail_flush=1;
     int mounted=ext4_mount("metadata","/",readonly);
+    if (mount_barrier_failure) {
+        CHECK(mounted==EIO && disk.writes && disk.flushes==1);
+        CHECK(fault_block_crash(&disk)==0);
+        disk.fail_flush=0;
+        CHECK(ext4_mount("metadata","/",false)==EOK);
+        CHECK(fault_block_crash(&disk)==0);
+        fault_block_close(&disk);
+        puts("PASS mount rejects a failed dirty-marker barrier; successful mount persists its dirty marker");
+        return 0;
+    }
     if (!strcmp(argv[2],"nojournal-reject")) {
         CHECK(mounted==EUCLEAN && disk.writes==0);
         fault_block_close(&disk);puts("PASS dirty/error nojournal writable mount rejected without writes");return 0;
@@ -3908,7 +3923,8 @@ int main(int argc,char **argv)
         extent_read_failure(&dev,!strcmp(argv[2],"extent-read-error"),argc>3?strtoul(argv[3],NULL,10):0);
     else if(!strcmp(argv[2],"extent-lookup")){extent_lookup_checksums(&dev);}
     else if(!strcmp(argv[2],"extent-range")){public_batch_ranges(&dev);public_batch_boundaries(&dev);extent_range(&dev);legacy_range(&dev);legacy_leaf_batch(&dev);legacy_chain_abort(&dev);range_abort(&dev);unwritten_range_abort(&dev);fragmented_range(&dev);}
-    else if(!strcmp(argv[2],"nojournal-clean-flush-error")){nojournal_clean_flush_error(dev.fs);return 0;}
+    else if(!strcmp(argv[2],"nojournal-clean-flush-error")){nojournal_clean_flush_error(dev.fs,true);return 0;}
+    else if(!strcmp(argv[2],"nojournal-preclean-flush-error")){nojournal_clean_flush_error(dev.fs,false);return 0;}
     else if(!strcmp(argv[2],"nojournal-clean-write-error")){nojournal_clean_write_error(dev.fs);return 0;}
     else if(!strcmp(argv[2],"nojournal-clean-remount")) {
         CHECK(!dev.fs->jbd_journal && ext4_remount("/",true)==EOK && dev.fs->read_only);
