@@ -428,6 +428,8 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *heap, si
   *out = calloc(n, size); CHECK(*out); heap_last_allocation_size=n*size; ++heap_live; ++heap_allocations; return KERNEL_HEAP_STATUS_OK; }
 enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *heap, size_t size, void **out)
 { return kernel_heap_allocate_zeroed(heap, 1, size, out); }
+enum kernel_heap_status kernel_heap_allocate_nosleep(struct kernel_heap *heap, size_t size, void **out)
+{ return kernel_heap_allocate(heap, size, out); }
 void kernel_heap_release(struct kernel_heap *heap, void *allocation)
 {
     CHECK(heap == &test_heap && allocation && heap_live);

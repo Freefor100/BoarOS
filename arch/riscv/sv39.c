@@ -2950,23 +2950,31 @@ static enum riscv_sv39_status fork_commit_leaf_table(struct riscv_sv39_user_spac
         index = next_table_entry(child_entries, index, ENTRIES);
         if (index == ENTRIES) break;
         unsigned first = index & ~(WINDOW - 1U);
-        unsigned pending = 0;
+        unsigned pending = 0, count = 0;
         for (; index < first + WINDOW; index++) {
             uint64_t inherited = child_entries[index];
             if (!(inherited & RISCV_SV39_PTE_COW)) continue;
             uint64_t old = parent_entries[index];
             if (entry_address(old) != entry_address(inherited)) return RISCV_SV39_STATUS_STATE;
-            if (!(old & RISCV_SV39_PTE_COW)) pending |= 1U << (index - first);
+            if (old & RISCV_SV39_PTE_COW) continue;
+            pending |= 1U << (index - first);
+            count++;
         }
         if (!pending) continue;
 
         struct kernel_raw_guard guard __attribute__((cleanup(kernel_raw_scope_release))) = {0};
         if (metadata) kernel_raw_rwlock_write_acquire(metadata, &guard);
+        if (parent->cow_pages > UINT32_MAX - count) return RISCV_SV39_STATUS_STATE;
+        /* Prepare already validated and encoded these private leaves. A
+         * parent leaf that is still writable cannot hold a file COW marker.
+         * Keep each full-width PTE store atomic and order the batch once
+         * before the existing parent TLB synchronization. */
+        __atomic_thread_fence(__ATOMIC_RELEASE);
         for (unsigned slot = first; pending; pending >>= 1, slot++) {
             if (!(pending & 1U)) continue;
-            enum riscv_sv39_status status = mark_cow_leaf(parent, &parent_entries[slot], 0);
-            if (status) return status;
+            __atomic_store_n(&parent_entries[slot], child_entries[slot], __ATOMIC_RELAXED);
         }
+        parent->cow_pages += count;
         *changed = 1;
     }
     return RISCV_SV39_STATUS_OK;

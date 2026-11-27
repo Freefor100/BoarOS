@@ -420,6 +420,9 @@ struct tcp_pcb {
 #ifdef BOAROS_LWIP_LOOPBACK_MSS
   u8_t boaros_loopback; /* Both endpoints established through the loopback netif. */
 #endif
+#if BOAROS_LWIP_TCP_WRITEV
+  struct pbuf *boaros_progress_buffer;
+#endif
 
 #if LWIP_WND_SCALE
   u8_t snd_scale;

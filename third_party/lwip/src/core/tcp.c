@@ -408,6 +408,9 @@ tcp_free(struct tcp_pcb *pcb)
 {
   LWIP_ASSERT("tcp_free: LISTEN", pcb->state != LISTEN);
   LWIP_ASSERT("tcp_free: pending cork deadline", !pcb->boaros_cork_pending);
+#if BOAROS_LWIP_TCP_WRITEV
+  boaros_lwip_pbuf_retire_tcp_storage(pcb);
+#endif
 #ifdef BOAROS_LWIP_TCP_INFO
   boaros_lwip_tcp_info_retire(pcb);
 #endif

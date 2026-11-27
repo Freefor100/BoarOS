@@ -451,6 +451,19 @@ static struct kernel_socket *tcp_filter_socket(const struct tcp_pcb *pcb)
         return pcb->listener->callback_arg;
     return NULL;
 }
+
+static void *tcp_storage_allocate(struct tcp_pcb *pcb, uint32_t size, void **context)
+{
+    struct kernel_socket *socket=pcb->errf==tcp_failed ? pcb->callback_arg : NULL;
+    void *allocation;
+    if (!socket || kernel_heap_allocate_nosleep(socket->heap,size,&allocation)) return NULL;
+    *context=socket->heap;
+    return allocation;
+}
+
+static void tcp_storage_release(void *context, void *allocation)
+{ kernel_heap_release(context,allocation); }
+
 static int socket_udp_ingress_filter(struct udp_pcb *pcb,struct pbuf *p,struct netif *input,
     int ipv6,const void *network,uint16_t network_length,uint16_t header)
 {
@@ -6422,6 +6435,12 @@ int kernel_socket_stream_preparev(struct kernel_socket_write_request *request,
         kernel_cost_add_tag(preparing,COST_NETWORK_PREPARE_TICKS,kernel_cost_clock()-started);
 #endif
     if (error!=ERR_OK && error!=ERR_MEM) __builtin_trap();
+    /* Keep the user's page loans when the shared heap could not prepare
+     * the first packet. The connection owner can try its loopback buffer. */
+    if (error==ERR_MEM && !request->tcp_prepared && request->socket->tcp_loopback) {
+        request->tcp_prepare_size=0;
+        return 0;
+    }
     request->tcp_prepare_failed=error==ERR_MEM;
     return 1;
 }
@@ -7333,6 +7352,7 @@ void kernel_socket_network_initialize(void)
     if (!socket_initialized) {
         const struct boaros_lwip_hooks hooks = {
             .tcp_output = socket_tcp_output, .work = protocol_work_ready, .capacity = protocol_capacity,
+            .tcp_storage_allocate = tcp_storage_allocate, .tcp_storage_release = tcp_storage_release,
             .timewait_free = protocol_timewait_free, .tcp_info_retire = socket_tcp_info_retire,
             .udp_ingress_filter = socket_udp_ingress_filter, .tcp_ingress_filter = socket_tcp_ingress_filter,
             .udp_multicast_receive=socket_udp_multicast_receive,.netif_removed=socket_netif_removed,

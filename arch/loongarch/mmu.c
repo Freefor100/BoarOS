@@ -1361,16 +1361,84 @@ enum arch_mmu_status arch_mmu_user_space_destroy(struct arch_mmu_user_space *s)
     if (physical_page_release(s->allocator,s->root_address)!=PHYSICAL_PAGE_STATUS_OK) la_virt_fatal("root release");
     *s=(struct arch_mmu_user_space){.state=ARCH_MMU_USER_SPACE_DESTROYED}; return ARCH_MMU_STATUS_OK;
 }
+static uint64_t fork_child_entry(uint64_t leaf, int action)
+{
+    uint32_t permissions = 0;
+    if (!(leaf & PTE_NONE)) {
+        if (!(leaf & PTE_NR)) permissions |= ARCH_MMU_READ;
+        if (!(leaf & PTE_NX)) permissions |= ARCH_MMU_EXECUTE;
+        if (leaf & PTE_WRITE) permissions |= ARCH_MMU_WRITE;
+    }
+    int flags = pte_flags(leaf);
+    if (action == ARCH_MMU_FORK_PRIVATE) flags |= KERNEL_MM_LEAF_COW;
+    return encode(leaf & PTE_ADDRESS, permissions, flags) | (leaf & PTE_HUGE);
+}
+
+static enum arch_mmu_status fork_fill_leaf_table(struct arch_mmu_user_space *to,
+    const uint64_t *parent_entries, uint64_t base, int (*policy)(void *, uint64_t),
+    void *context, int *executable)
+{
+    uint64_t *child_entries = NULL;
+    for (unsigned index = 0; index < ENTRIES;) {
+        uint64_t refs[PHYSICAL_PAGE_REFERENCE_BATCH_MAX];
+        uint64_t entries[PHYSICAL_PAGE_REFERENCE_BATCH_MAX];
+        unsigned slots[PHYSICAL_PAGE_REFERENCE_BATCH_MAX];
+        unsigned count = 0, protected = 0, cow = 0;
+        while (index < ENTRIES && count < PHYSICAL_PAGE_REFERENCE_BATCH_MAX) {
+            unsigned slot = index++;
+            uint64_t leaf = parent_entries[slot];
+            if (!leaf) continue;
+            if (!(leaf & PTE_PRESENT) || (leaf & PTE_HUGE)) return ARCH_MMU_STATUS_STATE;
+            int action = policy ? policy(context, base + slot * BOAROS_PAGE_SIZE) :
+                ARCH_MMU_FORK_PRIVATE;
+            if (action == ARCH_MMU_FORK_SKIP) continue;
+            if (action != ARCH_MMU_FORK_PRIVATE && action != ARCH_MMU_FORK_SHARED)
+                return ARCH_MMU_STATUS_STATE;
+            uint64_t entry = fork_child_entry(leaf, action);
+            entries[count] = entry;
+            refs[count] = entry & PTE_ADDRESS;
+            slots[count++] = slot;
+            protected += !!(entry & PTE_NONE);
+            cow += !!(entry & PTE_COW);
+            if (!(entry & (PTE_NONE | PTE_NX))) *executable = 1;
+        }
+        if (!count) break;
+        if (to->leaf_pages > UINT32_MAX - (count - protected) ||
+            to->protected_pages > UINT32_MAX - protected || to->cow_pages > UINT32_MAX - cow)
+            return ARCH_MMU_STATUS_STATE;
+        if (!child_entries) {
+            uint64_t *slot;
+            enum arch_mmu_status status = walk_order(to, base + slots[0] * BOAROS_PAGE_SIZE, 0, 1, &slot);
+            if (status) return status;
+            child_entries = slot - slots[0];
+        }
+        for (unsigned i = 0; i < count; i++)
+            if (child_entries[slots[i]]) return ARCH_MMU_STATUS_CONFLICT;
+        /* The private child table has never been active. Acquire only after
+         * all fallible preparation for this batch, and let teardown own the
+         * published leaves if a later batch fails. */
+        physical_page_acquire_batch(to->allocator, refs, count);
+        for (unsigned i = 0; i < count; i++)
+            child_entries[slots[i]] = entries[i];
+        to->leaf_pages += count - protected;
+        to->protected_pages += protected;
+        to->cow_pages += cow;
+        resident_peak(to);
+    }
+    return ARCH_MMU_STATUS_OK;
+}
+
 static enum arch_mmu_status fork_tree(struct arch_mmu_user_space *to,struct arch_mmu_user_space *from,
-    uint64_t root,unsigned level,uint64_t base,int (*shared)(void *,uint64_t),void *context,int commit)
+    uint64_t root,unsigned level,uint64_t base,int (*shared)(void *,uint64_t),void *context,int commit,int *executable)
 {
     uint64_t *p=table(from,root), span=UINT64_C(1)<<(14+level*11);
+    if (!level && !commit) return fork_fill_leaf_table(to, p, base, shared, context, executable);
     for (unsigned i=0;i<ENTRIES;i++) {
         if (!p[i]) continue;
         uint64_t v=base+i*span;
         if (level && !(level == 1 && (p[i] & PTE_HUGE))) {
             if (!directory_entry(p[i])) return ARCH_MMU_STATUS_STATE;
-            enum arch_mmu_status status=fork_tree(to,from,p[i],level-1,v,shared,context,commit);
+            enum arch_mmu_status status=fork_tree(to,from,p[i],level-1,v,shared,context,commit,executable);
             if (status!=ARCH_MMU_STATUS_OK) return status;
         } else {
             uint64_t leaf=p[i]; uint32_t order=level?HUGE_ORDER:0, pages=1U<<order;
@@ -1386,17 +1454,21 @@ static enum arch_mmu_status fork_tree(struct arch_mmu_user_space *to,struct arch
                 }
                 arch_mmu_flush_address(v); continue;
             }
-            uint32_t perms=0;
-            if (!(leaf&PTE_NONE)) {
-                if (!(leaf&PTE_NR)) perms|=ARCH_MMU_READ;
-                if (!(leaf&PTE_NX)) perms|=ARCH_MMU_EXECUTE;
-                if (leaf&PTE_WRITE) perms|=ARCH_MMU_WRITE;
-            }
-            uint64_t physical=leaf&PTE_ADDRESS;
-            if (physical_page_acquire_order(from->allocator,physical,order)) la_virt_fatal("fork ref");
-            enum arch_mmu_status status=map_owned_order(to,v,physical,perms,
-                pte_flags(leaf) | (cow ? KERNEL_MM_LEAF_COW : 0),order);
-            if (status!=ARCH_MMU_STATUS_OK) { physical_page_release_order(from->allocator,physical,order); return status; }
+            uint64_t child_entry = fork_child_entry(leaf, action);
+            uint32_t *resident = child_entry & PTE_NONE ? &to->protected_pages : &to->leaf_pages;
+            if (*resident > UINT32_MAX - pages || ((child_entry & PTE_COW) && to->cow_pages > UINT32_MAX - pages))
+                return ARCH_MMU_STATUS_STATE;
+            uint64_t *slot;
+            enum arch_mmu_status status = walk_order(to, v, order, 1, &slot);
+            if (status) return status;
+            if (*slot) return ARCH_MMU_STATUS_CONFLICT;
+            if (physical_page_acquire_order(from->allocator, child_entry & PTE_ADDRESS, order))
+                la_virt_fatal("fork ref");
+            *slot = child_entry;
+            *resident += pages;
+            if (child_entry & PTE_COW) to->cow_pages += pages;
+            if (!(child_entry & (PTE_NONE | PTE_NX))) *executable = 1;
+            resident_peak(to);
         }
     }
     return ARCH_MMU_STATUS_OK;
@@ -1408,15 +1480,19 @@ enum arch_mmu_status arch_mmu_user_space_fork_prepare(struct arch_mmu_user_space
     struct arch_mmu_page_table kernel={.allocator=from->allocator,.state=ARCH_MMU_STATE_ACTIVE};
     enum arch_mmu_status status=arch_mmu_user_space_init(to,from->allocator,&kernel);
     if (status!=ARCH_MMU_STATUS_OK) return status;
-    status=fork_tree(to,from,from->root_address,2,0,shared,context,0);
+    int executable = 0;
+    status=fork_tree(to,from,from->root_address,2,0,shared,context,0,&executable);
     if (status!=ARCH_MMU_STATUS_OK) return status;
+    /* The first context activation publishes the child root and flushes user
+     * translations. Only the separate commit modifies parent permissions. */
+    if (executable) arch_mmu_sync_instructions();
     return ARCH_MMU_STATUS_OK;
 }
 enum arch_mmu_status arch_mmu_user_space_fork(struct arch_mmu_user_space *to,
     struct arch_mmu_user_space *from, int (*shared)(void *, uint64_t), void *context)
 {
     enum arch_mmu_status status = arch_mmu_user_space_fork_prepare(to, from, shared, context);
-    return status == ARCH_MMU_STATUS_OK ? fork_tree(to,from,from->root_address,2,0,shared,context,1) : status;
+    return status == ARCH_MMU_STATUS_OK ? fork_tree(to,from,from->root_address,2,0,shared,context,1,NULL) : status;
 }
 enum arch_mmu_status arch_mmu_user_resolve_cow(struct arch_mmu_user_space *s,uint64_t v,uint32_t perms)
 {
