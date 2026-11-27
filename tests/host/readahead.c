@@ -43,6 +43,23 @@ static void cached_page(struct kernel_open_file_description *file,uint64_t index
     assert(!physical_page_release(file->heap->page_allocator,physical));
 }
 
+static void positioned_read_ahead(struct kernel_open_file_description *file,
+    struct kernel_page_cache *cache)
+{
+    cold_stream(file,cache);
+    for (uint64_t page = 10; page <= 20; page += 10) {
+        uint64_t offset = page * BOAROS_PAGE_SIZE;
+        assert(!kernel_open_file_positioned_read_ahead(file,offset,256));
+        assert(!kernel_open_file_positioned_read_ahead(file,offset+32,65536));
+    }
+    assert(kernel_open_file_positioned_read_ahead(file,30*BOAROS_PAGE_SIZE,256));
+    struct kernel_page_cache_read_page demand;
+    assert(!kernel_page_cache_get_forward_page(cache,&file->file,30,&demand));
+    kernel_page_cache_put_batch(cache,&demand,1);
+    cached_page(file,31);
+    puts("PASS repeated positioned header reads train a bounded forward load");
+}
+
 static void unaligned_stream(struct kernel_open_file_description *file,struct kernel_page_cache *cache,size_t chunk)
 {
     cold_stream(file,cache);
@@ -209,6 +226,7 @@ int main(int argc,char **argv)
     prediction_boundaries(file,&cache);
     demand_reset_and_error_prefix(file,&cache);
     forward_seek_prediction(file,&cache);
+    positioned_read_ahead(file,&cache);
     kernel_page_cache_stop_worker(&cache);
     assert(!kernel_open_file_release(&file) && !kernel_vfs_unmount(&mount));
     assert(!kernel_page_cache_destroy(&cache) && !kernel_block_unregister(&disk));

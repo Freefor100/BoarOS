@@ -255,6 +255,9 @@ int kernel_open_file_memory_backed(struct kernel_open_file_description *file);
 /* Existing owner covers lifetime; sample the current OFD advice atomically.
  * RANDOM/NOREUSE prohibit optional reads and neighbour mappings. */
 int kernel_open_file_speculative_read_allowed(const struct kernel_open_file_description *);
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+bool kernel_open_file_positioned_read_ahead(struct kernel_open_file_description *,uint64_t,uint64_t);
+#endif
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES && BOAROS_PAGE_SIZE > 4096
 int kernel_open_file_read_forward_window(const struct kernel_open_file_description *,uint64_t);
 #endif

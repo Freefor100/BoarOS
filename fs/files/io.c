@@ -595,6 +595,12 @@ static enum kernel_files_status disk_read(
     enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
     size_t chunks=0;
     int no_reuse=kernel_open_file_read_no_reuse(description);
+    uint64_t read_start = position;
+    int cache_miss = 0;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    bool positioned_ahead = !advance && backing == &description->file &&
+        kernel_open_file_positioned_read_ahead(description,position,request);
+#endif
     while (total < request && !done) {
         /* As in kernel_vfs_pread, this snapshot only sizes the demand. The
          * cache still revalidates every requested page against live EOF. */
@@ -602,16 +608,18 @@ static enum kernel_files_status disk_read(
         if (position>=end) break;
         uint64_t remaining=request-total;
         if (remaining>end-position) remaining=end-position;
-        uint64_t batch_start=position;
-        int cache_miss=0;
         size_t start = position & BOAROS_PAGE_MASK;
         size_t count = (start + remaining + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
         if (count > KERNEL_PAGE_CACHE_READ_BATCH_MAX) count = KERNEL_PAGE_CACHE_READ_BATCH_MAX;
         struct kernel_page_cache_read_page pages[KERNEL_PAGE_CACHE_READ_BATCH_MAX];
         enum kernel_page_cache_status loaded;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+        bool forward_ahead = positioned_ahead;
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES && BOAROS_PAGE_SIZE > 4096
-        if (advance && count==1 && backing==&description->file &&
-            kernel_open_file_read_forward_window(description,position))
+        forward_ahead |= advance && count==1 && backing==&description->file &&
+            kernel_open_file_read_forward_window(description,position);
+#endif
+        if (count==1 && forward_ahead)
             loaded=kernel_page_cache_get_forward_page(cache,backing,position>>BOAROS_PAGE_SHIFT,pages);
         else
 #endif
@@ -672,12 +680,11 @@ static enum kernel_files_status disk_read(
             if (part->valid_bytes < BOAROS_PAGE_SIZE) { done = 1; break; }
             start = 0;
         }
-        /* 预测以整个需求批次的成功前缀为单位，避免将大读误作逐页小读。 */
-        kernel_open_file_read_progress(description,batch_start,(size_t)(position-batch_start),cache_miss);
         /* 包括错误或user fault之后未消费的成功页；不能靠下一次请求归还。 */
         kernel_uaccess_write_cursor_finish(&user_copy);
         kernel_page_cache_put_batch(cache, pages, count);
     }
+    kernel_open_file_read_progress(description,read_start,(size_t)total,cache_miss);
     if (chunks) KERNEL_FILES_NOTE(files,read_chunks,chunks);
     if (error) KERNEL_FILES_NOTE(files, read_failures, 1);
     KERNEL_FILES_NOTE(files, bytes_read, total);

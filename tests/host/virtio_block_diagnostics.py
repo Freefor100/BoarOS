@@ -64,6 +64,6 @@ uint16_t wire_used_read(volatile struct virtio_used_ring *ring) { return ring->i
         "tests/host/block_runtime.c", "-pthread",
         "drivers/virtio/transport.c", "drivers/virtio/split_queue.c",
         "kernel/raw_lock.c", "tests/host/sync/notifications.c",
-        "-Wl,--wrap=virtio_split_take,--wrap=kernel_raw_lock_acquire", "-o", str(exe),
+        "-Wl,--wrap=virtio_split_completion_index,--wrap=kernel_raw_lock_acquire", "-o", str(exe),
     ], cwd=root, check=True)
     subprocess.run([str(exe), *os.sys.argv[1:]], check=True)

@@ -180,7 +180,7 @@ static void pipeline_while_submitting(void)
         times[0].nanoseconds=100+group;
         CHECK(ext4_file_set_times(pipeline_file,7,times)==EOK);
         /* 真实年龄条件封口后续组，直到sealed FIFO确实没有空间。 */
-        group_now+=100000000;
+        group_now+=UINT64_C(5000000000);
     }
     CHECK(ext4_file_set_times(pipeline_file,7,times)==EAGAIN);
     CHECK(pipeline_waits==1 && pipeline_kind==EXT4_JOURNAL_WAIT_SEALED);
@@ -358,7 +358,8 @@ static void group_test(struct ext4_fs *fs)
     /* Repeated edits of one running block must reuse reserved payloads.
      * A fresh block/undo allocation per warm edit fails this cost contract. */
     CHECK(ext4_journal_group_progress("/",&after_repeat)==EOK && after_repeat.sealed==before_repeat.sealed);
-    CHECK(group_requests==1 && group_work[0]==1 && !group_work[1] && after_repeat.deadline_ns==100000000);
+    CHECK(group_requests==1 && group_work[0]==1 && !group_work[1] &&
+        after_repeat.deadline_ns==UINT64_C(5000000000));
     CHECK(payload_allocations==warmed_payloads);
     CHECK(disk.writes==writes && disk.flushes==flushes && fs->jbd_journal->committed_id==tid);
     struct ext4_inode committed, actual;
@@ -370,16 +371,17 @@ static void group_test(struct ext4_fs *fs)
     CHECK(ext4_journal_group_service("/",false)==EOK && disk.writes==writes);
     struct ext4_timestamp continuing[3] = {{1111,0},{2222,2},{3333,3}};
     for (unsigned edit=1;edit<=5;edit++) {
-        group_now=UINT64_C(90000000)*edit;
+        group_now=UINT64_C(900000000)*edit;
         continuing[0].nanoseconds=128+edit;
         CHECK(ext4_file_set_times(&f,7,continuing)==EOK);
         CHECK(ext4_journal_group_service("/",false)==EOK && disk.writes==writes);
     }
     CHECK(ext4_fraw_inode_fill(&f,&committed)==EOK);
-    CHECK(ext4_journal_group_progress("/",&after_repeat)==EOK && after_repeat.deadline_ns==500000000);
-    group_now=499999999;
+    CHECK(ext4_journal_group_progress("/",&after_repeat)==EOK &&
+        after_repeat.deadline_ns==UINT64_C(5000000000));
+    group_now=UINT64_C(4999999999);
     CHECK(ext4_journal_group_service("/",false)==EOK && disk.writes==writes);
-    group_now=500000000;
+    group_now=UINT64_C(5000000000);
     CHECK(ext4_journal_group_service("/",false)==EOK);
     CHECK(fs->jbd_journal->committed_id==tid+1);
     CHECK(disk.flushes-flushes < 32*2);
@@ -675,7 +677,7 @@ static void sync_group_during_commit(void)
     }
     CHECK(journal->running && journal->running->sequence==sync_group_probe.targets[0] && !journal->sealed_count);
     if (sync_group_probe.boundary) {
-        if (sync_group_probe.boundary==1) group_now+=100000000;
+        if (sync_group_probe.boundary==1) group_now+=UINT64_C(5000000000);
         else CHECK(ext4_journal_group_commit("/",true)==EOK);
         struct ext4_timestamp later[3]={{10212,1},{0,0},{0,0}};
         CHECK(ext4_file_set_times(sync_group_probe.file,1,later)==EOK);

@@ -49,7 +49,8 @@ static unsigned indirect_heads, fragment_dma;
 static uint32_t sg_used_length = UINT32_MAX;
 static unsigned char sg_read_status;
 static uint32_t (*underlying_ack)(void *);
-static void (*before_take)(void);
+static void (*after_snapshot)(void);
+static unsigned completion_snapshots;
 static struct kernel_wait_queue *late_wait_queue;
 static struct kernel_wait_node late_waiter;
 static unsigned late_wakes;
@@ -64,15 +65,17 @@ static void collect_for_test(struct virtio_block_device *device)
     KERNEL_RAW_SCOPE(guard,&device->metadata);
     collect_used_locked(device);
 }
-enum virtio_status __real_virtio_split_take(struct virtio_split_queue *, struct virtio_completion *);
-enum virtio_status __wrap_virtio_split_take(struct virtio_split_queue *queue, struct virtio_completion *completion)
+uint16_t __real_virtio_split_completion_index(const struct virtio_split_queue *);
+uint16_t __wrap_virtio_split_completion_index(const struct virtio_split_queue *queue)
 {
-    if (before_take) {
-        void (*hook)(void)=before_take;
-        before_take=NULL;
+    uint16_t end = __real_virtio_split_completion_index(queue);
+    completion_snapshots++;
+    if (after_snapshot) {
+        void (*hook)(void) = after_snapshot;
+        after_snapshot = NULL;
         hook();
     }
-    return __real_virtio_split_take(queue,completion);
+    return end;
 }
 static unsigned phase_hold, phase_held_head, phase_later_completed;
 static unsigned char *phase_held_status;
@@ -570,7 +573,7 @@ static void run_case(unsigned version, enum fault_kind kind)
     request_at(&device, 7)->owner = (struct kernel_io_context *)(uintptr_t)1;
     request_at(&device, 7)->completion = (struct kernel_wait_queue *)(uintptr_t)3;
     if (kind == DUPLICATE_SLOT) {
-        terminal_wait_device = &device; before_take = terminal_waiter; late_wakes = 0;
+        terminal_wait_device = &device; after_snapshot = terminal_waiter; late_wakes = 0;
     }
     enum kernel_block_status result = device.block.read(device.block.context, 0,
                                                        buffer, sizeof(buffer));
@@ -1143,7 +1146,7 @@ static void indirect_phase_reset_case(void)
     unsigned before = releases;
     assert(initialize_model(&device,registers,sizeof(registers),&allocator,dma_address,1000)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
     assert(device.transport.features & (UINT64_C(1) << 28));
-    assert(!device.block.write_phase_bytes && !device.max_phase_segments && releases==before+1);
+    assert(!device.block.write_phase_bytes && !device.max_indirect_segments && releases==before+1);
     struct phase_entry fallback = {{0, batch_output, 512 * 1024}, NULL};
     assert(kernel_block_write_phase(&device.block,phase_next,0,&fallback)==KERNEL_BLOCK_STATUS_OK);
     assert(!indirect_heads && device.statistics.requests==4);
@@ -1165,6 +1168,66 @@ static void indirect_phase_reset_case(void)
     assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
     puts("PASS indirect journal phase allocation fallback and pending-DMA timeout: confirmed reset before releasing published tables");
 }
+
+static void indirect_batch_case(unsigned version, int writing, int fragmented)
+{
+    struct riscv_virtio_mmio_block device = {0};
+    struct physical_page_allocator allocator = {0};
+    memset(registers, 0, sizeof(registers));
+    registers[0] = 0x74726976; registers[1] = version; registers[2] = 2;
+    registers[0x10 / 4] = 1U | (1U << 28) | (writing ? 0 : 1U << 5);
+    registers[0x34 / 4] = 64; registers[0x100 / 4] = sizeof(sg_disk) / 512;
+    fault = SG_BATCH; batch_popped = batch_pushed = clock_value = 0;
+    notifications = sg_max_segments = sg_max_bytes = indirect_heads = 0;
+    sg_fail_sector = UINT32_MAX; diagnostic_length = 0;
+    fragment_dma = fragmented;
+    assert(initialize_model(&device, registers, sizeof(registers), &allocator,
+        dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+
+    const unsigned window = 256 * 1024;
+    unsigned char *first = (void *)batch_output;
+    unsigned char *second = first + window + 4096;
+    memset(first, 0xa5, 2 * window + 4096);
+    memset(sg_disk, 0, 2 * window);
+    for (unsigned i = 0; i < 2 * window; i++) {
+        unsigned char value = (unsigned char)(i * 13 + i / 512);
+        if (writing) (i < window ? first : second)[i % window] = value;
+        else sg_disk[i] = value;
+    }
+    struct kernel_block_span writes[] = {{0, first, window}, {window, second, window}};
+    struct block_read_span reads[] = {{0, first, window, 0, 0}, {window, second, window, 0, 0}};
+    if (version == 2 && !writing && !fragmented) {
+        sg_used_length = 2 * window; /* The used length omits the status byte. */
+        sg_read_status = 0;
+        assert(kernel_block_read_batch(&device.block, reads, 2, NULL) == KERNEL_BLOCK_STATUS_IO);
+        assert(reads[0].status == KERNEL_BLOCK_STATUS_IO && !reads[0].completed &&
+            reads[1].status == KERNEL_BLOCK_STATUS_IO && !reads[1].completed);
+        assert(!device.queue.claimed && registers[0x70 / 4] == 15);
+        notifications = sg_max_segments = sg_max_bytes = indirect_heads = 0;
+    }
+    unsigned requests_before = device.statistics.requests;
+    enum kernel_block_status result = writing ?
+        kernel_block_write_batch_prio(&device.block, writes, 2, KERNEL_BLOCK_PRIO_LOW) :
+        kernel_block_read_batch(&device.block, reads, 2, NULL);
+    assert(result == KERNEL_BLOCK_STATUS_OK);
+    assert(sg_max_segments == (fragmented ? 62U : 2U));
+    assert(sg_max_bytes == (fragmented ? 62 * 4096 : 2 * window));
+    /* Each fragmented span retains its completed prefix while both first
+     * requests are in flight. The two 8 KiB suffixes are disk-disjoint. */
+    assert(indirect_heads == (fragmented ? 4U : 1U));
+    assert(device.statistics.requests - requests_before == indirect_heads);
+    assert(!device.statistics.bounce_requests);
+    assert(!memcmp(first, sg_disk, window) && !memcmp(second, sg_disk + window, window));
+    for (unsigned i = 0; i < 4096; i++) assert(first[window + i] == 0xa5);
+    if (!writing)
+        for (unsigned i = 0; i < 2; i++)
+            assert(reads[i].status == KERNEL_BLOCK_STATUS_OK && reads[i].completed == window);
+    assert(!device.active && !device.queue.inflight && !device.queue.claimed && !device.batch_claimed);
+    fragment_dma = 0;
+    assert(destroy_model(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations == releases);
+    printf("PASS ordinary indirect batch transport=%u write=%d fragmented=%d: %u requests, largest %u bytes/%u segments\n",
+        version, writing, fragmented, indirect_heads, sg_max_bytes, sg_max_segments);
+}
 static void late_harvest_case(unsigned version)
 {
     struct riscv_virtio_mmio_block device={0}; struct physical_page_allocator allocator={0};
@@ -1181,19 +1244,28 @@ static void late_harvest_case(unsigned version)
     for (unsigned i=0;i<8;i++) {
         requests[i]=reserve_request(&device); assert(requests[i]);
         requests[i]->completion=&done;
-        assert(publish_for_test(&device,requests[i],VIRTIO_BLOCK_REQUEST_OUT,i,
-            UINT64_C(0x82000000)+i*512,512,0)==KERNEL_BLOCK_STATUS_OK);
+    }
+    {
+        KERNEL_RAW_SCOPE(guard,&device.metadata);
+        for (unsigned i=0;i<8;i++) {
+            struct virtio_descriptor span = {.address=UINT64_C(0x82000000)+i*512,.length=512};
+            assert(publish_segments(&device,requests[i],VIRTIO_BLOCK_REQUEST_OUT,i,&span,1,0)==KERNEL_BLOCK_STATUS_OK);
+        }
+        assert(!device.queue.available->index && device.queue.next_available==8);
+        assert(virtio_split_notify(&device.queue,&device.transport,0)==VIRTIO_OK);
+        assert(device.queue.available->index==8);
     }
     late_waiter=(struct kernel_wait_node){.queue=&done};
     late_wait_queue=&done;
     done.head=done.tail=&late_waiter;
     __atomic_store_n(&done.registrations,1,__ATOMIC_RELEASE);
     assert(device.queue.used->index==device.queue.last_used);
-    /* This hook runs only on entry to the real queue take, after harvest's
-     * initial used-index snapshot. Eight completions become visible then. */
-    before_take=sg_device_step;
+    /* The first snapshot sees an empty ring. The next sees all eight. */
+    after_snapshot=sg_device_step;
+    completion_snapshots=0;
     block_irq(&device);
-    assert(!before_take && late_wakes==1 && !late_waiter.queue && !done.head);
+    assert(!after_snapshot && completion_snapshots==2);
+    assert(late_wakes==1 && !late_waiter.queue && !done.head);
     assert(!device.queue.inflight && device.statistics.wakes==1);
     late_wait_queue=NULL;
     for (unsigned i=0;i<8;i++) {
@@ -1202,7 +1274,7 @@ static void late_harvest_case(unsigned version)
     }
     end_call(&device,0);
     assert(!device.active && !device.queue.claimed);
-    printf("PASS late used harvest transport=%u: eight completions after empty snapshot wake the registered batch waiter once\n",version);
+    printf("PASS ring batch transport=%u: one publication, eight late completions in one snapshot and one wake\n",version);
     assert(destroy_model(&device)==RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations==releases);
 }
 static void notification_conditions_case(unsigned version)
@@ -1559,6 +1631,13 @@ int main(int argc, char **argv)
     if (argc==2 && !strcmp(argv[1],"large-phase")) {
         large_phase_case(1); large_phase_case(2); return 0;
     }
+    if (argc==2 && !strcmp(argv[1],"indirect-batch")) {
+        for (unsigned version = 1; version <= 2; version++)
+            for (int writing = 0; writing <= 1; writing++)
+                for (int fragmented = 0; fragmented <= 1; fragmented++)
+                    indirect_batch_case(version, writing, fragmented);
+        return 0;
+    }
     if (argc==2 && !strcmp(argv[1],"indirect-phase")) {
         for (unsigned version=1;version<=2;version++) {
             for (unsigned mode=0;mode<5;mode++) indirect_phase_case(version,mode);
@@ -1651,6 +1730,9 @@ int main(int argc, char **argv)
         late_harvest_case(version); notification_conditions_case(version);
         cross_cpu_notification_case(version);
         large_phase_case(version);
+        for (int writing = 0; writing <= 1; writing++)
+            for (int fragmented = 0; fragmented <= 1; fragmented++)
+                indirect_batch_case(version, writing, fragmented);
         for (unsigned mode=0;mode<5;mode++) indirect_phase_case(version,mode);
         if (version == 2) indirect_phase_reset_case();
         write_phase_case(version,0,1);
