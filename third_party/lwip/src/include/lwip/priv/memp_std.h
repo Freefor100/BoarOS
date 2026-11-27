@@ -50,6 +50,11 @@ LWIP_MEMPOOL(UDP_PCB,        MEMP_NUM_UDP_PCB,         sizeof(struct udp_pcb),  
 LWIP_MEMPOOL(TCP_PCB,        MEMP_NUM_TCP_PCB,         sizeof(struct tcp_pcb),        "TCP_PCB")
 LWIP_MEMPOOL(TCP_PCB_LISTEN, MEMP_NUM_TCP_PCB_LISTEN,  sizeof(struct tcp_pcb_listen), "TCP_PCB_LISTEN")
 LWIP_MEMPOOL(TCP_SEG,        MEMP_NUM_TCP_SEG,         sizeof(struct tcp_seg),        "TCP_SEG")
+#if BOAROS_LWIP_LOOPBACK_BODY_SLOTS
+LWIP_MEMPOOL(TCP_LOOPBACK_BODY, BOAROS_LWIP_LOOPBACK_BODY_SLOTS,
+             LWIP_MEM_ALIGN_SIZE(sizeof(struct tcp_seg)) + LWIP_MEM_ALIGN_SIZE(sizeof(struct pbuf)) +
+             LWIP_MEM_ALIGN_SIZE(PBUF_TRANSPORT) + BOAROS_LWIP_LOOPBACK_MSS, "TCP_LOOPBACK_BODY")
+#endif
 #endif /* LWIP_TCP */
 
 #if LWIP_ALTCP && LWIP_TCP

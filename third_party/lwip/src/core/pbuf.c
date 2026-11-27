@@ -215,6 +215,9 @@ pbuf_init_alloced_pbuf(struct pbuf *p, void *payload, u16_t tot_len, u16_t len, 
 
 #if BOAROS_LWIP_TCP_WRITEV
 #define PBUF_ALLOC_SRC_TCP_STORAGE PBUF_TYPE_ALLOC_SRC_MASK_APP_MIN
+#if BOAROS_LWIP_LOOPBACK_BODY_SLOTS
+#define PBUF_ALLOC_SRC_TCP_LOOPBACK (PBUF_TYPE_ALLOC_SRC_MASK_APP_MIN + 1U)
+#endif
 
 struct pbuf_tcp_storage {
   struct pbuf **slot;
@@ -282,7 +285,16 @@ pbuf_alloc_ram(pbuf_layer layer, u16_t length, int tcp_data, struct tcp_pcb *pcb
     return NULL;
   }
 #if BOAROS_LWIP_TCP_WRITEV
-  allocation = tcp_data ? boaros_lwip_mem_malloc_tcp_data(alloc_len) : mem_malloc(alloc_len);
+  allocation = NULL;
+#if BOAROS_LWIP_LOOPBACK_BODY_SLOTS
+  if (tcp_data && pcb && pcb->boaros_loopback && layer == PBUF_TRANSPORT &&
+      length == BOAROS_LWIP_LOOPBACK_MSS) {
+    allocation = memp_malloc(MEMP_TCP_LOOPBACK_BODY);
+    if (allocation) type = (pbuf_type)(PBUF_RAM | PBUF_ALLOC_SRC_TCP_LOOPBACK);
+  }
+#endif
+  if (!allocation)
+    allocation = tcp_data ? boaros_lwip_mem_malloc_tcp_data(alloc_len) : mem_malloc(alloc_len);
   /* A receiving loopback socket can retain the sender's backing storage
    * after ACK. One private, demand-allocated segment lets another connection
    * send even when the shared heap has no block of the required size. */
@@ -836,6 +848,10 @@ pbuf_deallocate(struct pbuf *p)
     } else if (alloc_src == PBUF_TYPE_ALLOC_SRC_MASK_STD_HEAP) {
       mem_free((u8_t *)p - p->allocation_prefix);
 #if BOAROS_LWIP_TCP_WRITEV
+#if BOAROS_LWIP_LOOPBACK_BODY_SLOTS
+    } else if (alloc_src == PBUF_ALLOC_SRC_TCP_LOOPBACK) {
+      memp_free(MEMP_TCP_LOOPBACK_BODY, (u8_t *)p - p->allocation_prefix);
+#endif
     } else if (alloc_src == PBUF_ALLOC_SRC_TCP_STORAGE) {
       pbuf_free_tcp_storage(p);
 #endif
@@ -1555,6 +1571,9 @@ pbuf_clone_shared(pbuf_layer layer, struct pbuf *p, u16_t private_length)
     if ((alloc_src != PBUF_TYPE_ALLOC_SRC_MASK_STD_HEAP
 #if BOAROS_LWIP_TCP_WRITEV
          && alloc_src != PBUF_ALLOC_SRC_TCP_STORAGE
+#if BOAROS_LWIP_LOOPBACK_BODY_SLOTS
+         && alloc_src != PBUF_ALLOC_SRC_TCP_LOOPBACK
+#endif
 #endif
         ) ||
         (source->flags & PBUF_FLAG_IS_CUSTOM))

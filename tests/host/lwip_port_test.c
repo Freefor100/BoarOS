@@ -235,6 +235,25 @@ static int tcp_body_cache_reuse(void)
     return STATS_GET(mem.used) != baseline ? 150 : 0;
 }
 
+#if BOAROS_LWIP_LOOPBACK_BODY_SLOTS
+static int tcp_dedicated_body_lifetime(struct tcp_pcb *sender)
+{
+    static unsigned char bytes[BOAROS_LWIP_LOOPBACK_MSS];
+    const mem_size_t baseline = STATS_GET(mem.used);
+    for (unsigned i = 0; i < sizeof(bytes); ++i) bytes[i] = (unsigned char)(i * 7U + 3U);
+    struct pbuf *body = boaros_lwip_pbuf_alloc_tcp_data(PBUF_TRANSPORT, sizeof(bytes), sender, 0);
+    if (!body || STATS_GET(mem.used) != baseline) return 151;
+    if (pbuf_take(body, bytes, sizeof(bytes)) != ERR_OK) return 152;
+    struct pbuf *view = pbuf_clone_shared(PBUF_RAW, body, 0);
+    if (!view || !view->next || view->next->payload != body->payload) return 153;
+    pbuf_free(body);
+    for (u16_t i = 0; i < sizeof(bytes); ++i)
+        if (pbuf_get_at(view, i) != bytes[i]) return 154;
+    pbuf_free(view);
+    return STATS_GET(mem.used) != baseline || lwip_stats.memp[MEMP_TCP_LOOPBACK_BODY]->used ? 155 : 0;
+}
+#endif
+
 static int tcp_data_heap_recovery(int trim)
 {
     void *left=mem_malloc(4200), *join=mem_malloc(trim ? 1000 : 64);
@@ -269,6 +288,13 @@ static int tcp_data_heap_recovery(int trim)
 
 static int tcp_copy_heap_reserve(struct tcp_pcb *sender, struct tcp_pcb *receiver)
 {
+#if BOAROS_LWIP_LOOPBACK_BODY_SLOTS
+    void *held_pool[BOAROS_LWIP_LOOPBACK_BODY_SLOTS];
+    for (unsigned i = 0; i < BOAROS_LWIP_LOOPBACK_BODY_SLOTS; ++i) {
+        held_pool[i] = memp_malloc(MEMP_TCP_LOOPBACK_BODY);
+        if (!held_pool[i]) return 156;
+    }
+#endif
     static unsigned char bytes[8192];
     const mem_size_t baseline=STATS_GET(mem.used),reserve=BOAROS_TCP_PROGRESS_RESERVE;
     const u32_t sequence=sender->snd_lbb;
@@ -374,6 +400,10 @@ static int tcp_copy_heap_reserve(struct tcp_pcb *sender, struct tcp_pcb *receive
     if (bulk_received!=sizeof(bytes) || STATS_GET(mem.used)!=baseline ||
         sender->unacked || sender->unsent || sender->snd_buf!=room) return 66;
     bulk_received=0;
+#if BOAROS_LWIP_LOOPBACK_BODY_SLOTS
+    for (unsigned i = 0; i < BOAROS_LWIP_LOOPBACK_BODY_SLOTS; ++i)
+        memp_free(MEMP_TCP_LOOPBACK_BODY, held_pool[i]);
+#endif
     return 0;
 }
 
@@ -635,6 +665,10 @@ int main(void)
     }
     int vector_result=tcp_vector_prefix(tcp_client,tcp_accepted,loop);
     if(vector_result) return vector_result;
+#if BOAROS_LWIP_LOOPBACK_BODY_SLOTS
+    int dedicated=tcp_dedicated_body_lifetime(tcp_client);
+    if(dedicated) return dedicated;
+#endif
     int recovery=tcp_data_heap_recovery(0);
     if(recovery) return recovery;
     recovery=tcp_data_heap_recovery(1);
