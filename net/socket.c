@@ -5575,6 +5575,14 @@ void kernel_socket_protocol_snapshot(uint64_t values[KERNEL_SOCKET_PROTOCOL_VALU
 int kernel_socket_is_tcp(const struct kernel_socket *socket)
 { return socket && socket->domain == KERNEL_SOCKET_DOMAIN_INET && socket->type == SOCKET_STREAM; }
 
+int kernel_socket_tcp_readable_bytes(struct kernel_socket *socket)
+{
+    if (!kernel_socket_is_tcp(socket)) return -KERNEL_ENOTTY;
+    SOCKET_ENDPOINT(state,socket);
+    if (socket->listening) return -KERNEL_EINVAL;
+    return (int)socket->rx_bytes;
+}
+
 int kernel_socket_tcp_receive_control(struct kernel_socket *socket, uint32_t flags)
 {
     /* The TCP endpoint has neither a queued asynchronous error nor urgent data. */

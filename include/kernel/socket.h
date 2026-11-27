@@ -148,6 +148,7 @@ int kernel_socket_write_unix(struct kernel_open_file_description **pin_owner,
     uint64_t count, uint32_t flags, int *user_fault, struct kernel_socket_message *message);
 void kernel_socket_abort_write(struct kernel_socket_write_request *request);
 int kernel_socket_is_tcp(const struct kernel_socket *socket);
+int kernel_socket_tcp_readable_bytes(struct kernel_socket *socket);
 int kernel_socket_tcp_receive_control(struct kernel_socket *, uint32_t flags);
 void kernel_socket_stream_begin(struct kernel_socket_write_request *request,
     struct kernel_open_file_description **pin_owner);

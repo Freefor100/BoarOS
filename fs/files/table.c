@@ -19,6 +19,7 @@
 #include <kernel/irq.h>
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
+#include <kernel/socket.h>
 #include <kernel/uaccess.h>
 #include <kernel/task.h>
 
@@ -101,6 +102,14 @@ enum kernel_files_status kernel_files_ioctl(
             *linux_result=kernel_vfs_file_attributes(&description->file,set,&flags);
             if (!set && !*linux_result && (kernel_copy_to_user(mm,argument,&flags,sizeof(flags),&copied) || copied!=sizeof(flags)))
                 *linux_result=-KERNEL_EFAULT;
+        }
+    } else if (description->kind==KERNEL_OPEN_FILE_KIND_SOCKET && command==UINT32_C(0x541b)) {
+        int32_t bytes=kernel_socket_tcp_readable_bytes(kernel_open_file_socket(description));
+        if (bytes<0) *linux_result=bytes;
+        else {
+            size_t copied=0;
+            *linux_result=kernel_copy_to_user(mm,argument,&bytes,sizeof(bytes),&copied) ||
+                copied!=sizeof(bytes) ? -KERNEL_EFAULT : 0;
         }
     } else if (description->kind==KERNEL_OPEN_FILE_KIND_SOCKET && command>=0x8901 && command<=0x8904) {
         int32_t value=0;size_t copied=0;
