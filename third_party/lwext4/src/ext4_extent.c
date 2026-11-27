@@ -2451,7 +2451,15 @@ static int extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock
 
 	/* allocate new block */
 	goal = ext4_ext_find_goal(inode_ref, path, iblock);
+	struct ext4_operation *operation=ext4_current_operation(inode_ref->fs);
+	bool file_data=operation && operation->trans && operation->trans->journal->grouped &&
+	    !reserve && ext4_inode_is_type(ext4_fs_super(inode_ref->fs),
+	        inode_ref->inode, EXT4_INODE_MODE_FILE);
+	if (file_data)
+		operation->append_allocation=ex && next==EXT_MAX_BLOCKS &&
+		    iblock==(uint64_t)to_le32(ex->first_block)+ext4_ext_get_actual_len(ex);
 	err = ext4_balloc_alloc_blocks(inode_ref, goal, allocated, &newblock, &allocated);
+	if (file_data) operation->append_allocation=false;
 	if (!newblock)
 		goto out2;
 
@@ -2474,6 +2482,8 @@ static int extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock
 
 	/* previous routine could use block we allocated */
 	newblock = ext4_ext_pblock(&newex);
+	if (file_data && newblock+allocated>operation->trans->file_allocation_end)
+		operation->trans->file_allocation_end=newblock+allocated;
     range->allocated = true;
     range->unwritten = reserve;
 

@@ -29,6 +29,16 @@ for block in 1024 4096; do
     "$work/probe" "$work/disk.img" operation-context
     cp "$work/disk.img" "$work/base.img"
     if [ "${GROUP_TEST_CASE:-}" != ordered-release ]; then
+        cp "$work/base.img" "$work/placement.img"
+        "$work/probe" "$work/placement.img" group-recycled-placement
+        e2fsck -fn "$work/placement.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+        cp "$work/base.img" "$work/placement.img"
+        "$work/probe" "$work/placement.img" group-recycled-placement-crash
+        "$work/probe" "$work/placement.img" group-recycled-placement-recover
+        e2fsck -fn "$work/placement.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    fi
+    if [ "${GROUP_TEST_CASE:-}" = recycled-placement ]; then continue; fi
+    if [ "${GROUP_TEST_CASE:-}" != ordered-release ]; then
         for cut in 0 1 2 3; do
             cp "$work/base.img" "$work/reuse.img"
             "$work/probe" "$work/reuse.img" group-data-reuse "$cut"

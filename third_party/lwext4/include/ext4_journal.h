@@ -182,6 +182,8 @@ struct jbd_trans {
 	TAILQ_ENTRY(jbd_trans) trans_node;
 	uint64_t reused_super_sequence;
 	struct jbd_parent_times parent_times;
+	ext4_fsblk_t file_allocation_end;
+	ext4_fsblk_t recycled_first;
 };
 
 struct jbd_journal {
@@ -235,6 +237,9 @@ struct jbd_journal {
 	RB_HEAD(jbd_block, jbd_block_rec) block_rec_root;
 
 	struct jbd_fs *jbd_fs;
+	/* One recently recycled file extent and the accepted file allocation frontier. */
+	ext4_fsblk_t reuse_first, file_allocation_end;
+	uint32_t reuse_count;
 };
 
 static inline int jbd_journal_error(const struct jbd_journal *journal)
@@ -422,8 +427,10 @@ static inline int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
 int jbd_journal_find_reusable(struct ext4_fs *fs, const void *bitmap,
     ext4_fsblk_t base, uint32_t start, uint32_t end, uint32_t maximum,
     bool inode, uint32_t *found, uint32_t *length);
+bool jbd_journal_find_recycled_range(struct ext4_fs *fs, const void *bitmap,
+    ext4_fsblk_t base, uint32_t start, uint32_t maximum, uint32_t *found);
 int jbd_trans_claim_blocks(struct ext4_block_group_ref *, struct ext4_block *,
-    uint32_t start, uint32_t end, uint32_t maximum, uint32_t *found,
+    uint32_t start, uint32_t end, uint32_t maximum, bool append, uint32_t *found,
     uint32_t *length, bool *contended);
 
 #ifdef __cplusplus

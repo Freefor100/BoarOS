@@ -1058,6 +1058,71 @@ static void group_data_reuse_recover(struct ext4_fs *fs, unsigned cut)
     printf("PASS block=%zu: replay after data recycle cut=%u\n",block,cut);
 }
 
+static void group_recycled_placement(struct ext4_fs *fs, bool crash)
+{
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    ext4_file retired, growing;
+    size_t block=fs->bdev->lg_bsize, size=384*1024, done;
+    unsigned char *bytes=malloc(size);
+    CHECK(bytes);
+    memset(bytes,0x62,size);
+    CHECK(ext4_fopen(&retired,"/recycled-placement","w+")==EOK);
+    CHECK(ext4_fpwrite(&retired,0,bytes,size,&done)==EOK && done==size);
+    struct ext4_inode_ref ref;
+    ext4_fsblk_t first,last;
+    CHECK(ext4_fs_get_inode_ref(fs,retired.inode,&ref)==EOK);
+    CHECK(ext4_fs_get_inode_dblk_idx(&ref,0,&first,false)==EOK && first);
+    CHECK(ext4_fs_get_inode_dblk_idx(&ref,size/block-1,&last,false)==EOK && last==first+size/block-1);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    CHECK(ext4_fopen(&growing,"/growing-placement","w+")==EOK);
+    CHECK(ext4_fpwrite(&growing,0,bytes,block,&done)==EOK && done==block);
+    CHECK(ext4_fs_get_inode_ref(fs,growing.inode,&ref)==EOK);
+    ext4_fsblk_t initial;
+    CHECK(ext4_fs_get_inode_dblk_idx(&ref,0,&initial,false)==EOK && initial>last);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    CHECK(ext4_journal_group_drain("/")==EOK);
+    CHECK(ext4_ftruncate(&retired,0,UINT32_MAX)==EOK && ext4_journal_group_commit("/",true)==EOK);
+    CHECK(!quarantine_blocks_reuse(fs,first,false));
+    uint64_t checkpoint=fs->jbd_journal->checkpoint_sequence;
+
+    memset(bytes,0x97,block);
+    CHECK(ext4_fpwrite(&growing,block,bytes,block,&done)==EOK && done==block);
+    CHECK(ext4_fpwrite(&growing,2*block,bytes,block,&done)==EOK && done==block);
+    CHECK(ext4_fs_get_inode_ref(fs,growing.inode,&ref)==EOK);
+    ext4_fsblk_t appended, following;
+    CHECK(ext4_fs_get_inode_dblk_idx(&ref,1,&appended,false)==EOK && appended==first);
+    CHECK(ext4_fs_get_inode_dblk_idx(&ref,2,&following,false)==EOK && following==appended+1);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    CHECK(ext4_journal_group_commit("/",true)==EOK && fs->jbd_journal->checkpoint_sequence==checkpoint);
+    if (crash) {
+        CHECK(fault_block_crash(&disk)==0);
+        free(bytes);
+        return;
+    }
+    CHECK(ext4_journal_group_drain("/")==EOK);
+    CHECK(ext4_blocks_get_direct(fs->bdev,bytes,appended,2)==EOK);
+    for (size_t i=0;i<2*block;i++) CHECK(bytes[i]==0x97);
+    CHECK(ext4_fclose(&growing)==EOK && ext4_fclose(&retired)==EOK);
+    free(bytes);
+    printf("PASS block=%zu: small append reuses a durable range at the allocation frontier, then stays contiguous\n",block);
+}
+
+static void group_recycled_placement_recover(struct ext4_fs *fs)
+{
+    ext4_file retired,growing;
+    size_t block=fs->bdev->lg_bsize,done;
+    unsigned char bytes[4096];
+    CHECK(ext4_fopen(&retired,"/recycled-placement","r")==EOK && !retired.fsize);
+    CHECK(ext4_fopen(&growing,"/growing-placement","r")==EOK && growing.fsize==3*block);
+    for (unsigned page=0;page<3;page++) {
+        CHECK(ext4_fpread(&growing,page*block,bytes,block,&done)==EOK && done==block);
+        for (size_t i=0;i<block;i++) CHECK(bytes[i]==(page ? 0x97 : 0x62));
+    }
+    CHECK(ext4_fclose(&growing)==EOK && ext4_fclose(&retired)==EOK);
+    printf("PASS block=%zu: replay recovers new owner and bytes before checkpoint\n",block);
+}
+
 static void group_fault(struct ext4_fs *fs, const char *kind, unsigned point)
 {
     struct ext4_journal_runtime runtime={.now_ns=group_clock};
@@ -3903,6 +3968,11 @@ int main(int argc,char **argv)
         group_data_reuse(dev.fs,cut,!strcmp(argv[2],"group-data-reuse-cached"));if(cut)return 0;
     }
     else if(!strcmp(argv[2],"group-data-reuse-recover")) {CHECK(argc==4);group_data_reuse_recover(dev.fs,strtoul(argv[3],NULL,10));}
+    else if(!strcmp(argv[2],"group-recycled-placement") || !strcmp(argv[2],"group-recycled-placement-crash")) {
+        bool crash=!strcmp(argv[2],"group-recycled-placement-crash");
+        group_recycled_placement(dev.fs,crash);if(crash)return 0;
+    }
+    else if(!strcmp(argv[2],"group-recycled-placement-recover"))group_recycled_placement_recover(dev.fs);
     else if(!strcmp(argv[2],"group-namespace-truncate"))group_namespace(dev.fs,false);
     else if(!strcmp(argv[2],"group-namespace-unlink"))group_namespace(dev.fs,true);
     else if(!strcmp(argv[2],"group-space"))group_space(dev.fs);
