@@ -170,8 +170,9 @@ static void concurrent_append(int fd)
 static void local_user_copy(int fd)
 {
     size_t page=(size_t)sysconf(_SC_PAGESIZE),size=2*page;
-    unsigned char *input=mmap(NULL,3*page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
-    unsigned char *output=mmap(NULL,3*page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    size_t mapped_length=17*page;
+    unsigned char *input=mmap(NULL,mapped_length,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    unsigned char *output=mmap(NULL,mapped_length,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
     CHECK(input!=MAP_FAILED && output!=MAP_FAILED);
     const size_t skew=257;
     for (size_t i=0;i<size;i++) input[skew+i]=(unsigned char)(i*17+i/page);
@@ -187,6 +188,18 @@ static void local_user_copy(int fd)
     CHECK(!fsync(fd) && pread(fd,output,size,0)==(ssize_t)size &&
         !memcmp(input+skew,output,size-skew));
     for (size_t i=size-skew;i<size;i++) CHECK(output[i]==(unsigned char)(input[skew+i]-1));
+
+    const size_t batch=16*page;
+    for (size_t i=0;i<batch;i++) input[skew+i]=(unsigned char)(i*23+i/page);
+    CHECK(pwrite(fd,input+skew,batch,0)==(ssize_t)batch);
+    CHECK(pread(fd,output,batch,0)==(ssize_t)batch && !memcmp(input+skew,output,batch));
+    for (size_t i=0;i<batch;i++) input[skew+i]++;
+    CHECK(!mprotect(input+batch,page,PROT_NONE));
+    CHECK(pwrite(fd,input+skew,batch,0)==(ssize_t)(batch-skew));
+    CHECK(!mprotect(input+batch,page,PROT_READ|PROT_WRITE));
+    CHECK(pread(fd,output,batch,0)==(ssize_t)batch && !memcmp(input+skew,output,batch-skew));
+    for (size_t i=batch-skew;i<batch;i++) CHECK(output[i]==(unsigned char)(input[skew+i]-1));
+    CHECK(!ftruncate(fd,size));
 
     for(size_t i=0;i<size;i++)input[i]=(unsigned char)(i*17+3);
     CHECK(pwrite(fd,input,size,0)==(ssize_t)size);
@@ -214,6 +227,8 @@ static void local_user_copy(int fd)
     CHECK(shared!=MAP_FAILED && pread(fd,shared,size,0)==(ssize_t)size);
     CHECK(!msync(shared,size,MS_SYNC));
     CHECK(pread(shared_fd,output,size,0)==(ssize_t)size && !memcmp(input,output,size));
+    CHECK(pwrite(shared_fd,shared,size,0)==(ssize_t)size);
+    CHECK(pread(shared_fd,output,size,0)==(ssize_t)size && !memcmp(input,output,size));
     /* A completed snapshot revoked the old W PTEs. The next kernel store must
      * enter the same alias write preparation as a user-mode store. */
     CHECK(pread(fd,shared,size,0)==(ssize_t)size && !fsync(shared_fd));
@@ -235,7 +250,7 @@ static void local_user_copy(int fd)
     int opened=open(name,O_RDONLY);CHECK(opened>=0 && !close(opened));
     memset(input+page-8,'x',8);errno=0;
     CHECK(open((char *)input+page-8,O_RDONLY)==-1 && errno==EFAULT);
-    CHECK(!munmap(input,3*page) && !munmap(output,3*page));
+    CHECK(!munmap(input,mapped_length) && !munmap(output,mapped_length));
     int tail=open("/vectors-eof-tail",O_RDWR|O_CREAT|O_TRUNC,0600);
     CHECK(tail>=0 && write(tail,"short file",10)==10 && !fsync(tail));
     CHECK(!posix_fadvise(tail,0,0,POSIX_FADV_DONTNEED));

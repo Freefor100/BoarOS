@@ -529,6 +529,27 @@ int arch_mmu_user_base_page(const struct arch_mmu_user_space *s,uint64_t address
     *physical=entry&PTE_ADDRESS;
     return 1;
 }
+
+unsigned la_mmu_readable_base_pages(const struct arch_mmu_user_space *s, uint64_t first,
+    unsigned count, uint64_t *physical)
+{
+    unsigned ready = 0;
+    while (ready < count) {
+        uint64_t address = first + (uint64_t)ready * BOAROS_PAGE_SIZE;
+        uint64_t *slot;
+        uint32_t order;
+        if (walk_leaf(s, address, &slot, &order) || order) break;
+        unsigned end = ready + ENTRIES - ((address >> BOAROS_PAGE_SHIFT) & (ENTRIES - 1));
+        if (end > count) end = count;
+        for (; ready < end; ready++, slot++) {
+            uint64_t entry = *slot;
+            if ((entry & (PTE_PRESENT | PTE_VALID | PTE_NONE | PTE_NR | PTE_HUGE)) !=
+                (PTE_PRESENT | PTE_VALID)) return ready;
+            physical[ready] = entry & PTE_ADDRESS;
+        }
+    }
+    return ready;
+}
 enum arch_mmu_status arch_mmu_user_leaf_probe_slot(const struct arch_mmu_user_space *s,
     uint64_t v, struct kernel_mm_leaf *out, unsigned *missing_tables, uint64_t **base_slot)
 {

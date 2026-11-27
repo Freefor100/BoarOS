@@ -138,6 +138,16 @@ unsigned kernel_mm_try_pin_user_read_batch(const struct kernel_mm *, uint64_t fi
     unsigned count, struct kernel_mm_user_pin *);
 void kernel_mm_unpin_user_read_batch(struct kernel_mm_user_pin *, unsigned count);
 
+#if defined(__loongarch__) && BOAROS_MAX_CPUS == 1
+struct kernel_mm_copy_target {
+    void *data;
+    uint64_t physical;
+};
+/* Complete a prefix of whole destination pages using the current user MM. */
+unsigned kernel_mm_copy_from_ready_user_pages(const struct kernel_mm *, uint64_t address,
+    const struct kernel_mm_copy_target *, unsigned count);
+#endif
+
 #if defined(__riscv) && BOAROS_MAX_CPUS == 1
 #define KERNEL_MM_COPY_READY_PAGES 16U
 /* Resident writable base pages, excluding shared file-write aliases. */
