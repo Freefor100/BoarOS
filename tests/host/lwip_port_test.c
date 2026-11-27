@@ -14,6 +14,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "lwip_shared_payload.h"
 #include "lwip_receive_policy.h"
 
@@ -23,6 +24,18 @@ static unsigned int tcp_connected;
 static struct tcp_pcb *tcp_accepted;
 static unsigned int bulk_received;
 static uint64_t simulated_ns = UINT64_C(1000000000);
+
+int boaros_lwip_tcp_socket_unfiltered(struct tcp_pcb *pcb)
+{
+    (void)pcb;
+    return 1;
+}
+
+struct pbuf *boaros_lwip_udp_copy_borrowed(struct pbuf *packet)
+{
+    (void)packet;
+    __builtin_trap();
+}
 
 static void counted_timeout(void *context)
 {
@@ -114,10 +127,17 @@ static int tcp_vector_prefix(struct tcp_pcb *sender, struct tcp_pcb *receiver, s
        !sender->unsent || sender->unsent->next || sender->unsent->len!=sizeof(seed)) return 47;
     struct tcp_seg *tail=sender->unsent;
     const u16_t tail_length=tail->p->tot_len;
-    void *held[MEMP_NUM_TCP_SEG];unsigned count=0;
-    while(count<MEMP_NUM_TCP_SEG && (held[count]=memp_malloc(MEMP_TCP_SEG))) count++;
-    if(!count) return 48;
-    memp_free(MEMP_TCP_SEG,held[--count]);
+    mem_size_t seed_charge=STATS_GET(mem.used);
+    struct pbuf *sample=boaros_lwip_pbuf_alloc_tcp_data(PBUF_TRANSPORT,512,NULL);
+    if(!sample) return 48;
+    mem_size_t segment_charge=STATS_GET(mem.used)-seed_charge;
+    pbuf_free(sample);
+    void *probe=mem_malloc(32);
+    if (!probe) return 48;
+    mem_size_t heap_header=STATS_GET(mem.used)-seed_charge-32;
+    mem_free(probe);
+    void *held=mem_malloc(MEM_SIZE-MEMP_NUM_TCP_PCB*256U-seed_charge-segment_charge-heap_header);
+    if (!held) return 48;
 
     /* One segment is available: scalar must roll back old tail and new queue. */
     if(tcp_write(sender,scalar,sizeof(scalar),TCP_WRITE_FLAG_COPY)!=ERR_MEM ||
@@ -138,7 +158,7 @@ static int tcp_vector_prefix(struct tcp_pcb *sender, struct tcp_pcb *receiver, s
     if(boaros_lwip_tcp_writev(sender,&remainder,1,179,0,&written)!=ERR_MEM || written ||
        sender->snd_queuelen!=2 || sender->snd_lbb!=original_sequence+1024 ||
        sender->snd_buf!=original_room-1024) return 51;
-    for(unsigned i=0;i<count;i++) memp_free(MEMP_TCP_SEG,held[i]);
+    mem_free(held);
     if(boaros_lwip_tcp_writev(sender,&remainder,1,179,0,&written)!=ERR_OK || written!=179 ||
        !tail->next->next || !(TCPH_FLAGS(tail->next->next->tcphdr)&TCP_PSH)) return 52;
 
@@ -163,6 +183,26 @@ static int tcp_vector_prefix(struct tcp_pcb *sender, struct tcp_pcb *receiver, s
 #endif
     return 0;
 }
+
+static unsigned progress_allocations;
+
+static void *allocate_progress(struct tcp_pcb *pcb, uint32_t bytes, void **context)
+{
+    (void)pcb;
+    (void)context;
+    void *result = malloc(bytes);
+    if (result) progress_allocations++;
+    return result;
+}
+
+static void free_progress(void *context, void *allocation)
+{
+    (void)context;
+    progress_allocations--;
+    free(allocation);
+}
+
+static err_t hold_received(void *, struct tcp_pcb *, struct pbuf *, err_t);
 
 static int tcp_copy_heap_reserve(struct tcp_pcb *sender, struct tcp_pcb *receiver)
 {
@@ -197,6 +237,43 @@ static int tcp_copy_heap_reserve(struct tcp_pcb *sender, struct tcp_pcb *receive
     struct pbuf *ack=pbuf_alloc(PBUF_IP,TCP_HLEN,PBUF_RAM);
     if (!ack) return 64;
     pbuf_free(ack);
+
+    const struct boaros_lwip_hooks hooks = {
+        .tcp_storage_allocate = allocate_progress, .tcp_storage_release = free_progress,
+    };
+    struct pbuf *held = NULL;
+    boaros_lwip_set_hooks(&hooks);
+    tcp_arg(receiver, &held);
+    tcp_recv(receiver, hold_received);
+    if (tcp_write(sender, bytes, sizeof(bytes), TCP_WRITE_FLAG_COPY) != ERR_OK ||
+        tcp_output(sender) != ERR_OK) return 67;
+    netif_poll_all();
+    if (!held || held->tot_len != sizeof(bytes) || progress_allocations != 1 ||
+        !sender->boaros_progress_buffer || sender->unacked || sender->snd_buf != room ||
+        tcp_write(sender, bytes, sizeof(bytes), TCP_WRITE_FLAG_COPY) != ERR_MEM) return 69;
+    for (u16_t i = 0; i < sizeof(bytes); i++)
+        if (pbuf_get_at(held, i) != bytes[i]) return 70;
+    tcp_recved(receiver, held->tot_len);
+    pbuf_free(held);
+    netif_poll_all();
+    if (progress_allocations || sender->boaros_progress_buffer) return 71;
+
+    struct tcp_pcb *closing = tcp_new();
+    if (!closing) return 72;
+    closing->boaros_loopback = 1;
+    struct pbuf *packet = boaros_lwip_pbuf_alloc_tcp_data(PBUF_TRANSPORT, sizeof(bytes), closing);
+    if (!packet || !closing->boaros_progress_buffer ||
+        pbuf_take(packet, bytes, sizeof(bytes)) != ERR_OK) return 73;
+    struct pbuf *view = pbuf_clone_shared(PBUF_RAW, packet, 0);
+    if (!view) return 74;
+    pbuf_free(packet);
+    tcp_abort(closing);
+    if (progress_allocations != 1 || pbuf_get_at(view, 7) != bytes[7]) return 75;
+    pbuf_free(view);
+    if (progress_allocations) return 76;
+    boaros_lwip_set_hooks(NULL);
+    tcp_arg(receiver, NULL);
+
     mem_free(filler);
     mem_free(fence);
     tcp_recv(receiver,receive_bulk);
@@ -242,7 +319,8 @@ static int tcp_shared_retransmit(struct tcp_pcb *sender, struct tcp_pcb *receive
     tcp_ack_now(receiver);
     if (tcp_output(receiver) != ERR_OK) return 59;
     netif_poll_all();
-    if (sender->unacked || sender->unsent || tcp_sndbuf(sender) != 32768) return 60;
+    if (sender->unacked || sender->unsent ||
+        tcp_sndbuf(sender) != BOAROS_LWIP_LOOPBACK_WINDOW) return 60;
     /* The ACK removed the original TX descriptor before RX consumes it. */
     for (u16_t i = 0; i < sizeof(bytes); i++)
         if (pbuf_get_at(held, i) != (unsigned char)(3U * i + 1U)) return 61;
@@ -252,6 +330,65 @@ static int tcp_shared_retransmit(struct tcp_pcb *sender, struct tcp_pcb *receive
     tcp_recv(receiver, NULL);
     netif_poll_all();
     return 0;
+}
+
+struct fin_window_case {
+    struct tcp_pcb *receiver;
+    unsigned bytes, eof;
+};
+
+static err_t fin_window_receive(void *context, struct tcp_pcb *pcb, struct pbuf *packet, err_t error)
+{
+    struct fin_window_case *test = context;
+    (void)pcb;
+    if (error != ERR_OK) __builtin_trap();
+    if (packet) {
+        test->bytes += packet->tot_len;
+        pbuf_free(packet);
+    } else test->eof++;
+    return ERR_OK;
+}
+
+static err_t fin_window_accept(void *context, struct tcp_pcb *pcb, err_t error)
+{
+    struct fin_window_case *test = context;
+    if (error != ERR_OK) __builtin_trap();
+    test->receiver = pcb;
+    tcp_arg(pcb, test);
+    tcp_recv(pcb, fin_window_receive);
+    return ERR_OK;
+}
+
+static int tcp_fin_window_case(const ip_addr_t *address)
+{
+    static unsigned char data[8192];
+    struct fin_window_case test = {0};
+    struct tcp_pcb *listener = tcp_new(), *sender = tcp_new();
+    if (!listener || !sender || tcp_bind(listener, address, 0) != ERR_OK) return 77;
+    u16_t port = listener->local_port;
+    tcp_set_receive_limit(listener, sizeof(data));
+    listener = tcp_listen(listener);
+    if (!listener) return 77;
+    tcp_arg(listener, &test);
+    tcp_accept(listener, fin_window_accept);
+    if (tcp_connect(sender, address, port, NULL) != ERR_OK) return 77;
+    netif_poll_all();
+    if (!test.receiver || sender->snd_wnd != sizeof(data)) return 78;
+    u32_t start = sender->snd_nxt;
+    if (tcp_write(sender, data, sizeof(data), TCP_WRITE_FLAG_COPY) != ERR_OK ||
+        tcp_shutdown(sender, 0, 1) != ERR_OK) return 79;
+    netif_poll_all();
+    if (test.bytes != sizeof(data) || test.eof || sender->snd_nxt != start + sizeof(data) ||
+        !sender->unsent || sender->unsent->len ||
+        !(TCPH_FLAGS(sender->unsent->tcphdr) & TCP_FIN)) return 80;
+    tcp_recved(test.receiver, sizeof(data));
+    netif_poll_all();
+    if (test.bytes != sizeof(data) || test.eof != 1 ||
+        test.receiver->rcv_nxt != start + sizeof(data) + 1 ||
+        sender->state != FIN_WAIT_2) return 81;
+    tcp_abort(sender);
+    netif_poll_all();
+    return tcp_close(listener) == ERR_OK ? 0 : 82;
 }
 
 int main(void)
@@ -344,6 +481,8 @@ int main(void)
         return 9;
     }
     receive_policy_cases();
+    int fin_result = tcp_fin_window_case(&loopback);
+    if (fin_result) return fin_result;
     tcp_before = lwip_stats.memp[MEMP_TCP_PCB]->used;
     listen_before = lwip_stats.memp[MEMP_TCP_PCB_LISTEN]->used;
     segment_before = lwip_stats.memp[MEMP_TCP_SEG]->used;
@@ -369,8 +508,10 @@ int main(void)
         return 13;
     }
     if (tcp_mss(tcp_client) != 8192 || tcp_mss(tcp_accepted) != 8192 ||
-        tcp_sndbuf(tcp_client) != 32768 || tcp_sndbuf(tcp_accepted) != 32768 ||
-        tcp_client->snd_wnd != 32768 || tcp_accepted->snd_wnd != 32768) {
+        tcp_sndbuf(tcp_client) != BOAROS_LWIP_LOOPBACK_WINDOW ||
+        tcp_sndbuf(tcp_accepted) != BOAROS_LWIP_LOOPBACK_WINDOW ||
+        tcp_client->snd_wnd != BOAROS_LWIP_LOOPBACK_WINDOW ||
+        tcp_accepted->snd_wnd != BOAROS_LWIP_LOOPBACK_WINDOW) {
         return 44;
     }
     int vector_result=tcp_vector_prefix(tcp_client,tcp_accepted,loop);
@@ -395,7 +536,7 @@ int main(void)
         held_count++;
     }
     if (held_count == 0U || tcp_sndbuf(tcp_client) == 0U ||
-        tcp_write(tcp_client, "x", 1U, TCP_WRITE_FLAG_COPY) != ERR_MEM) {
+        tcp_write(tcp_client, "x", 1U, 0) != ERR_MEM) {
         return 16;
     }
     for (unsigned int i = 0; i < held_count; i++) {

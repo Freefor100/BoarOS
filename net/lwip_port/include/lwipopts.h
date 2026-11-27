@@ -62,9 +62,11 @@
 #define MEMP_NUM_REASSDATA 8
 #define IP_FRAG 1
 #define BOAROS_LWIP_LINUX_LOOPBACK 1
-#define LWIP_PBUF_CUSTOM_DATA unsigned char boaros_udp_loopback, boaros_udp_rx_borrowed, boaros_tcp_coalesced;
+#define LWIP_PBUF_CUSTOM_DATA unsigned char boaros_udp_loopback, boaros_udp_rx_borrowed, \
+    boaros_tcp_coalesced, boaros_tcp_progress;
 #define LWIP_PBUF_CUSTOM_DATA_INIT(p) do { \
-  (p)->boaros_udp_loopback = 0; (p)->boaros_udp_rx_borrowed = 0; (p)->boaros_tcp_coalesced = 0; \
+  (p)->boaros_udp_loopback = 0; (p)->boaros_udp_rx_borrowed = 0; \
+  (p)->boaros_tcp_coalesced = 0; (p)->boaros_tcp_progress = 0; \
 } while (0)
 #define LWIP_NETIF_LOOPBACK 1
 #define LWIP_HAVE_LOOPIF 1

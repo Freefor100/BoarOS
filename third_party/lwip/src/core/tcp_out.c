@@ -404,14 +404,14 @@ tcp_create_segment(const struct tcp_pcb *pcb, struct pbuf *p, u8_t hdrflags, u32
 #if BOAROS_LWIP_TCP_WRITEV
 /* Only new COPY data is admitted against the heap reserve; control and a
  * split needed to transmit already-accepted data use ordinary allocation. */
-#define TCP_PBUF_ALLOC_COPY(layer, len) boaros_lwip_pbuf_alloc_tcp_data((layer), (len))
+#define TCP_PBUF_ALLOC_COPY(layer, len, pcb) boaros_lwip_pbuf_alloc_tcp_data((layer), (len), (pcb))
 #else
-#define TCP_PBUF_ALLOC_COPY(layer, len) pbuf_alloc((layer), (len), PBUF_RAM)
+#define TCP_PBUF_ALLOC_COPY(layer, len, pcb) pbuf_alloc((layer), (len), PBUF_RAM)
 #endif
 #if TCP_OVERSIZE
 static struct pbuf *
 tcp_pbuf_prealloc(pbuf_layer layer, u16_t length, u16_t max_length,
-                  u16_t *oversize, const struct tcp_pcb *pcb, u8_t apiflags,
+                  u16_t *oversize, struct tcp_pcb *pcb, u8_t apiflags,
                   u8_t first_seg)
 {
   struct pbuf *p;
@@ -448,7 +448,7 @@ tcp_pbuf_prealloc(pbuf_layer layer, u16_t length, u16_t max_length,
     }
   }
 #endif /* LWIP_NETIF_TX_SINGLE_PBUF */
-  p = TCP_PBUF_ALLOC_COPY(layer, alloc);
+  p = TCP_PBUF_ALLOC_COPY(layer, alloc, pcb);
   if (p == NULL) {
     return NULL;
   }
@@ -459,7 +459,7 @@ tcp_pbuf_prealloc(pbuf_layer layer, u16_t length, u16_t max_length,
   return p;
 }
 #else /* TCP_OVERSIZE */
-#define tcp_pbuf_prealloc(layer, length, mx, os, pcb, api, fst) TCP_PBUF_ALLOC_COPY(layer, length)
+#define tcp_pbuf_prealloc(layer, length, mx, os, pcb, api, fst) TCP_PBUF_ALLOC_COPY(layer, length, pcb)
 #endif /* TCP_OVERSIZE */
 
 #if TCP_CHECKSUM_ON_COPY
@@ -560,7 +560,7 @@ tcp_write_cursor_copy(struct tcp_write_cursor *input, void *dst, u16_t len
 /* Both writer paths copy directly into a final pbuf; only the inline path
  * knows the unsent tail and may reserve space to extend the segment. */
 static struct tcp_seg *
-tcp_copy_segment(const struct tcp_pcb *pcb, u16_t length, u16_t maximum,
+tcp_copy_segment(struct tcp_pcb *pcb, u16_t length, u16_t maximum,
                  u16_t *oversize, u8_t optlen, u8_t optflags, u8_t apiflags,
                  u8_t first, struct tcp_write_cursor *vector, const void *source)
 {
@@ -1266,7 +1266,8 @@ tcp_split_unsent_seg(struct tcp_pcb *pcb, u16_t split)
     return ERR_VAL;
   }
 
-  if (useg->len <= split) {
+  if (useg->len < split ||
+      (useg->len == split && !(TCPH_FLAGS(useg->tcphdr) & TCP_FIN))) {
     return ERR_OK;
   }
 
@@ -1320,7 +1321,7 @@ tcp_split_unsent_seg(struct tcp_pcb *pcb, u16_t split)
   split_flags = TCPH_FLAGS(useg->tcphdr);
   remainder_flags = 0; /* ACK added in tcp_output() */
 
-  if (split_flags & TCP_PSH) {
+  if (remainder && (split_flags & TCP_PSH)) {
     split_flags &= ~TCP_PSH;
     remainder_flags |= TCP_PSH;
   }
@@ -1436,6 +1437,7 @@ tcp_send_fin(struct tcp_pcb *pcb)
     if ((TCPH_FLAGS(last_unsent->tcphdr) & (TCP_SYN | TCP_FIN | TCP_RST)) == 0) {
       /* no SYN/FIN/RST flag in the header, we can add the FIN flag */
       TCPH_SET_FLAG(last_unsent->tcphdr, TCP_FIN);
+      pcb->snd_lbb++;
       tcp_set_flags(pcb, TF_FIN);
       return ERR_OK;
     }
@@ -1670,6 +1672,30 @@ tcp_ipv6_resize_head(struct tcp_pcb *pcb, struct netif *netif)
   return ERR_OK;
 }
 
+/* SYN still completes the handshake with a peer advertising zero space. Once
+ * connected, FIN consumes sequence space at the end of the data. */
+static inline u32_t
+tcp_output_window_end(const struct tcp_pcb *pcb, const struct tcp_seg *seg)
+{
+  return lwip_ntohl(seg->tcphdr->seqno) - pcb->lastack + seg->len +
+         ((pcb->flags & TF_FIN) && (TCPH_FLAGS(seg->tcphdr) & TCP_FIN));
+}
+
+static inline err_t
+tcp_prepare_output_head(struct tcp_pcb *pcb, struct netif *netif, u32_t wnd)
+{
+  err_t err = tcp_ipv6_resize_head(pcb, netif);
+  if (err != ERR_OK || !(pcb->flags & TF_FIN)) return err;
+  struct tcp_seg *head = pcb->unsent;
+  /* The peer can consume the whole tail now, then open its window for FIN. */
+  if (head && head->len && (TCPH_FLAGS(head->tcphdr) & TCP_FIN) &&
+      tcp_output_window_end(pcb, head) == wnd + 1) {
+    if (tcp_output_segment_busy(head)) return ERR_MEM;
+    return tcp_split_unsent_seg(pcb, head->len);
+  }
+  return ERR_OK;
+}
+
 /**
  * @ingroup tcp_raw
  * Find out what we can send and send it
@@ -1739,12 +1765,12 @@ tcp_output(struct tcp_pcb *pcb)
     return ERR_RTE;
   }
 
-  err = tcp_ipv6_resize_head(pcb,netif);
+  err = tcp_prepare_output_head(pcb, netif, wnd);
   if (err != ERR_OK) return err;
   seg = pcb->unsent;
 
   /* Handle the current segment not fitting within the window */
-  if (lwip_ntohl(seg->tcphdr->seqno) - pcb->lastack + seg->len > wnd) {
+  if (tcp_output_window_end(pcb, seg) > wnd) {
     /* We need to start the persistent timer when the next unsent segment does not fit
      * within the remaining (could be 0) send window and RTO timer is not running (we
      * have no in-flight data). If window is still too small after persist timer fires,
@@ -1771,8 +1797,7 @@ tcp_output(struct tcp_pcb *pcb)
     for (; useg->next != NULL; useg = useg->next);
   }
   /* data available and window allows it to be sent? */
-  while (seg != NULL &&
-         lwip_ntohl(seg->tcphdr->seqno) - pcb->lastack + seg->len <= wnd) {
+  while (seg != NULL && tcp_output_window_end(pcb, seg) <= wnd) {
     LWIP_ASSERT("RST not expected here!",
                 (TCPH_FLAGS(seg->tcphdr) & TCP_RST) == 0);
     /* Stop sending if the nagle algorithm would prevent it
@@ -1877,7 +1902,7 @@ tcp_output(struct tcp_pcb *pcb)
     } else {
       tcp_seg_free(seg);
     }
-    err = tcp_ipv6_resize_head(pcb,netif);
+    err = tcp_prepare_output_head(pcb, netif, wnd);
     if (err != ERR_OK) return err;
     seg = pcb->unsent;
   }

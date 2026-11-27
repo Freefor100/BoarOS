@@ -36,6 +36,8 @@ struct boaros_lwip_hooks {
     void (*work)(void);
     void (*loopback_publish)(struct netif *);
     void (*capacity)(int);
+    void *(*tcp_storage_allocate)(struct tcp_pcb *, uint32_t bytes, void **context);
+    void (*tcp_storage_release)(void *context, void *allocation);
     void (*timewait_free)(struct tcp_pcb *);
     void (*tcp_info_retire)(struct tcp_pcb *);
     struct boaros_lwip_tcp_context *(*tcp_context)(void);
@@ -64,6 +66,8 @@ void boaros_lwip_tcp_ack_batch_end(void);
 void boaros_lwip_work_ready(void);
 void boaros_lwip_loopback_publish(struct netif *);
 void boaros_lwip_capacity_available(int pool);
+void *boaros_lwip_tcp_storage_allocate(struct tcp_pcb *, uint32_t bytes, void **context);
+void boaros_lwip_tcp_storage_release(void *context, void *allocation);
 void boaros_lwip_tcp_timewait_free(struct tcp_pcb *pcb);
 void boaros_lwip_tcp_info_retire(struct tcp_pcb *pcb);
 struct boaros_lwip_tcp_context *boaros_lwip_tcp_context_lookup(void);

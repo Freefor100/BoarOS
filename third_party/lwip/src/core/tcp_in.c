@@ -2122,7 +2122,10 @@ tcp_receive(struct tcp_input_state *rx, struct tcp_pcb *pcb)
         if (rx->recv_data && !(pcb->flags & TF_RCVDATA)) {
           tcp_set_flags(pcb, TF_RCVDATA);
           tcp_ack_now(pcb);
-        } else if (rx->data_count > 1) {
+        } else if (rx->data_count > 1 ||
+                   (rx->recv_data && rx->recv_data->boaros_tcp_progress)) {
+          /* A loopback sender has just one buffer outside the shared heap.
+           * Release the TCP reference without waiting for a second segment. */
           tcp_ack_now(pcb);
         } else {
           tcp_ack(pcb);

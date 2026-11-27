@@ -56,6 +56,7 @@ static void receive_policy_cases(void)
     assert(test.connected == 1 && test.accepted);
     struct tcp_pcb *receiver = test.accepted;
     assert(receiver->snd_wnd == 4096 && sender->snd_wnd == 2048);
+    tcp_nagle_disable(sender);
 
     tcp_set_receive_limit(receiver, 8192);
     netif_poll_all();

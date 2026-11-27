@@ -292,7 +292,9 @@ void pbuf_free_ooseq(void);
 
 struct pbuf *pbuf_alloc(pbuf_layer l, u16_t length, pbuf_type type);
 #if BOAROS_LWIP_TCP_WRITEV
-struct pbuf *boaros_lwip_pbuf_alloc_tcp_data(pbuf_layer layer, u16_t length);
+struct tcp_pcb;
+struct pbuf *boaros_lwip_pbuf_alloc_tcp_data(pbuf_layer layer, u16_t length, struct tcp_pcb *);
+void boaros_lwip_pbuf_retire_tcp_storage(struct tcp_pcb *);
 #endif
 struct pbuf *pbuf_alloc_reference(void *payload, u16_t length, pbuf_type type);
 #if LWIP_SUPPORT_CUSTOM_PBUF
