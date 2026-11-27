@@ -8302,6 +8302,7 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
     uint64_t replacement = KERNEL_MM_NO_PAGE;
     uint64_t shared_preparation = KERNEL_MM_NO_PAGE;
     void *old_pointer = 0, *new_pointer;
+    uint64_t *cow_slot = NULL;
     unsigned missing = 0;
 #if BOAROS_COST_DIAGNOSTICS
     unsigned prepared_count = 0;
@@ -8322,7 +8323,6 @@ static __attribute__((noinline)) enum kernel_mm_status memory_fault(struct mm_op
         struct kernel_mm_leaf leaf;
         KERNEL_LOCK_SCOPE(vma_guard);
         KERNEL_RAW_WRITE_SCOPE(guard, &record->metadata);
-        uint64_t *cow_slot = NULL;
         status = fault_lookup_leaf(record,address,force,&leaf,&missing,
             access == KERNEL_MM_WRITE ? &cow_slot : NULL);
         if (status == KERNEL_MM_STATUS_OK && ((leaf.permissions & access) || (force && access == KERNEL_MM_READ))) {
@@ -8567,9 +8567,16 @@ prepare_memory_tables:
             status = KERNEL_MM_STATUS_CONFLICT;
         else {
             enum arch_mmu_status backend;
-            if (cookie) backend = arch_mmu_user_cow_commit(&record->space, address, cookie,
-                replacement, backend_permissions_from_mm(vma->permissions), &batch);
-            else {
+            if (cookie) {
+                uint32_t permissions = backend_permissions_from_mm(vma->permissions);
+                /* A continuously held writer keeps the leaf table alive. */
+                if (continuous_gate && !operation->shared && !force)
+                    backend = arch_mmu_user_cow_replace_prepared(&record->space, cow_slot,
+                        cookie, replacement, permissions, &batch);
+                else
+                    backend = arch_mmu_user_cow_commit(&record->space, address, cookie,
+                        replacement, permissions, &batch);
+            } else {
 #if !defined(BOAROS_ARCH_LOONGARCH)
                 if (window.mask && current_view && anonymous_fault_view_current(record,
                     window.first,window.end,view))
