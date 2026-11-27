@@ -76,7 +76,7 @@
 #define BOAROS_LWIP_LOOPBACK_CHECKSUM_FLAGS \
     (NETIF_CHECKSUM_ENABLE_ALL & ~(NETIF_CHECKSUM_GEN_TCP | NETIF_CHECKSUM_CHECK_TCP))
 
-/* Protocol and packet storage is bounded static memory, not kernel_heap. */
+/* Keep packet pools bounded independently of full TCP control blocks. */
 /* 独立构建目录中的实验覆盖；不传宏时保留生产预算。 */
 #ifndef BOAROS_LWIP_WINDOW_MSS
 #define BOAROS_LWIP_WINDOW_MSS 32
@@ -101,7 +101,12 @@
 #define MEM_LIBC_MALLOC 0
 #define MEMP_MEM_MALLOC 0
 #define MEMP_NUM_UDP_PCB 16
-#define MEMP_NUM_TCP_PCB 32
+#define MEMP_NUM_TCP_PCB 0
+/* Charge full PCBs from creation through final disposal, including TIME_WAIT.
+ * At today's 512-byte heap class, 2048 slots permit up to 1 MiB of object storage. */
+#define BOAROS_LWIP_TCP_PCB_LIMIT 2048U
+/* Keep the shared packet heap's ACK/FIN reserve independent of this quota. */
+#define BOAROS_TCP_PROGRESS_RESERVE (8U * 1024U)
 #define MEMP_NUM_TCP_PCB_LISTEN 16
 #define MEMP_NUM_TCP_SEG (128 * BOAROS_LWIP_POOL_SCALE)
 #define MEMP_NUM_PBUF (64 * BOAROS_LWIP_POOL_SCALE)

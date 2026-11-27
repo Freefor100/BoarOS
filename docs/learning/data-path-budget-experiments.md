@@ -69,14 +69,14 @@ python3 -B tests/cost/network-budget-experiment.py run --help
 | **协议池倍率（`p`）** | `BOAROS_LWIP_POOL_SCALE` | `4` 倍 | `4` 倍 | 缩放 TCP 段描述符（`128 × p`）、`pbuf` 头与缓冲池（`64 × p`） |
 | **协议堆倍率（`m`）** | `BOAROS_LWIP_MEM_SCALE` | `2` 倍（512 KiB） | `2` 倍（512 KiB） | 缩放 `lwIP` 动态协议堆大小（`256 KiB × m`） |
 
-> 活动 TCP 协议控制块（Protocol Control Block，PCB）上限固定为 32 个（监听 PCB 16 个、UDP PCB 16 个），不随候选配置放大。扩大内存池能缓解全局资源接纳压力，但无法消除单连接小窗口受往返时延（Round-Trip Time，RTT）限制的带宽延迟积上限，也不能替代多核连接归属分片与网卡完成处理优化。静态池数组体积与运行期堆峰值分开统计，避免用相近的动态堆峰值掩盖静态内存膨胀。
+> 早期实验使用上限为 32 个的完整 TCP 协议控制块（Protocol Control Block，PCB）静态池。重跑时以当前内核的 TCP 控制块配额为准。协议池倍率独立控制报文缓冲相关资源，窗口与往返时延（Round-Trip Time，RTT）共同限制单连接吞吐。静态池数组体积与运行期堆峰值分别统计。
 
 ### 3.2 用例格式与隔离执行
 
 用例采用五段格式 **`path:mode:kind:connections:direction`**：
 - `path`：`loopback` 或 `tap`（每次运行创建全新独立网络命名空间；附加 `netem` 延迟时按实测回显 RTT 解释）；
 - `mode`：`blocking`（阻塞）或 `nonblocking`（非阻塞）；
-- `kind`：`rr`（请求响应）、`bulk`（大块吞吐）或 `mixed`（大块流并发叠加 1 条独立请求响应控制连接，`near` 自动预留 4 个活动 PCB 余量）；
+- `kind`：`rr`（请求响应）、`bulk`（大块吞吐）或 `mixed`（大块流并发叠加 1 条独立请求响应控制连接）。`near` 档固定为回环 14 条或虚拟网卡 28 条连接。
 - `direction`：`rx` 或 `tx`。
 
 `build --profiles ...` 将构建清单绑定进内核 ELF；`run --variant label=kernel` 仅运行显式指定的内核（需要参照时传入 `--baseline` 或 `--linux-kernel`）。每次用例与重复均使用独立虚拟机启动和磁盘副本；只有接收端完整收齐全部字节并通过校验和才计为传输完成，混合用例还会额外校验控制连接在大流量期间是否真实持续推进。

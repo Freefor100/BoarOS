@@ -238,7 +238,56 @@ memp_init(void)
   /* check everything a first time to see if it worked */
   memp_overflow_check_all();
 #endif /* MEMP_OVERFLOW_CHECK >= 2 */
+#ifdef BOAROS_LWIP_TCP_PCB_LIMIT
+  STATS_STORE(memp[MEMP_TCP_PCB]->avail, BOAROS_LWIP_TCP_PCB_LIMIT);
+#endif
 }
+
+#ifdef BOAROS_LWIP_TCP_PCB_LIMIT
+_Static_assert(MEMP_STATS && BOAROS_LWIP_TCP_PCB_LIMIT <= UINT16_MAX,
+               "TCP PCB quota must fit the pool counters");
+static unsigned tcp_pcb_pending;
+
+static struct memp *
+tcp_pcb_allocate(void)
+{
+  SYS_ARCH_DECL_PROTECT(level);
+  SYS_ARCH_PROTECT(level);
+  if (MEMP_STATS_GET(used, MEMP_TCP_PCB) + tcp_pcb_pending >= BOAROS_LWIP_TCP_PCB_LIMIT) {
+    STATS_INC(memp[MEMP_TCP_PCB]->err);
+    SYS_ARCH_UNPROTECT(level);
+    return NULL;
+  }
+  /* Hold the quota without holding the shared lwIP memory lock in the
+   * backing heap. Concurrent protocol owners must count pending attempts. */
+  ++tcp_pcb_pending;
+  SYS_ARCH_UNPROTECT(level);
+  struct memp *storage = boaros_lwip_tcp_pcb_allocate(
+    MEMP_SIZE + MEMP_ALIGN_SIZE(sizeof(struct tcp_pcb)));
+  SYS_ARCH_PROTECT(level);
+  --tcp_pcb_pending;
+  if (storage) {
+    mem_size_t used = MEMP_STATS_GET(used, MEMP_TCP_PCB) + 1U;
+    STATS_STORE(memp[MEMP_TCP_PCB]->used, used);
+    if (used > MEMP_STATS_GET(max, MEMP_TCP_PCB))
+      STATS_STORE(memp[MEMP_TCP_PCB]->max, used);
+  } else {
+    STATS_INC(memp[MEMP_TCP_PCB]->err);
+  }
+  SYS_ARCH_UNPROTECT(level);
+  return storage;
+}
+
+static void
+tcp_pcb_release(struct memp *storage)
+{
+  SYS_ARCH_DECL_PROTECT(level);
+  boaros_lwip_tcp_pcb_release(storage);
+  SYS_ARCH_PROTECT(level);
+  MEMP_STATS_DEC(used, MEMP_TCP_PCB);
+  SYS_ARCH_UNPROTECT(level);
+}
+#endif
 
 static void *
 #if !MEMP_OVERFLOW_CHECK
@@ -355,6 +404,19 @@ memp_malloc_fn(memp_t type, const char *file, const int line)
   void *memp;
   LWIP_ERROR("memp_malloc: type < MEMP_MAX", (type < MEMP_MAX), return NULL;);
 
+#ifdef BOAROS_LWIP_TCP_PCB_LIMIT
+  if (type == MEMP_TCP_PCB) {
+    struct memp *storage = tcp_pcb_allocate();
+    if (!storage) return NULL;
+#if MEMP_OVERFLOW_CHECK
+    storage->file = file;
+    storage->line = line;
+    memp_overflow_init_element(storage, memp_pools[type]);
+#endif
+    return (u8_t *)storage + MEMP_SIZE;
+  }
+#endif
+
 #if MEMP_OVERFLOW_CHECK >= 2
   memp_overflow_check_all();
 #endif /* MEMP_OVERFLOW_CHECK >= 2 */
@@ -446,6 +508,17 @@ memp_free(memp_t type, void *mem)
   if (mem == NULL) {
     return;
   }
+
+#ifdef BOAROS_LWIP_TCP_PCB_LIMIT
+  if (type == MEMP_TCP_PCB) {
+    struct memp *storage = (struct memp *)((u8_t *)mem - MEMP_SIZE);
+#if MEMP_OVERFLOW_CHECK
+    memp_overflow_check_element(storage, memp_pools[type]);
+#endif
+    tcp_pcb_release(storage);
+    return;
+  }
+#endif
 
 #if MEMP_OVERFLOW_CHECK >= 2
   memp_overflow_check_all();

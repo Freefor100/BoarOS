@@ -7,6 +7,13 @@
 #include "boaros_lwip.h"
 
 #include <stdint.h>
+#if defined(__riscv) || defined(__loongarch__)
+#include <kernel/heap.h>
+#else
+/* Host lwIP tests stand in for the kernel heap using the host allocator. */
+extern void *malloc(size_t);
+extern void free(void *);
+#endif
 #include <kernel/cost.h>
 #if BOAROS_COST_DIAGNOSTICS
 #include <kernel/cpu.h>
@@ -254,6 +261,49 @@ void boaros_lwip_loopback_publish(struct netif *netif)
 { if (protocol_hooks.loopback_publish) protocol_hooks.loopback_publish(netif); }
 void boaros_lwip_capacity_available(int pool)
 { if (protocol_hooks.capacity) protocol_hooks.capacity(pool); }
+
+#if defined(__riscv) || defined(__loongarch__)
+/* File tables and the network share the root heap. It outlives detached
+ * TCP endpoints and the owners draining them during network shutdown. */
+static struct kernel_heap *tcp_pcb_heap;
+#endif
+
+void boaros_lwip_tcp_pcb_bind_heap(struct kernel_heap *heap)
+{
+#if defined(__riscv) || defined(__loongarch__)
+    struct kernel_heap *bound = __atomic_load_n(&tcp_pcb_heap, __ATOMIC_ACQUIRE);
+    if (!bound && __atomic_compare_exchange_n(&tcp_pcb_heap, &bound, heap, 0,
+            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+    if (bound != heap) __builtin_trap();
+#else
+    (void)heap;
+#endif
+}
+
+void *boaros_lwip_tcp_pcb_allocate(size_t size)
+{
+#if defined(__riscv) || defined(__loongarch__)
+    struct kernel_heap *heap = __atomic_load_n(&tcp_pcb_heap, __ATOMIC_ACQUIRE);
+    void *allocation;
+    if (!heap) return NULL;
+    enum kernel_heap_status status = kernel_heap_allocate_nosleep(heap, size, &allocation);
+    if (status == KERNEL_HEAP_STATUS_EMPTY) return NULL;
+    if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    return allocation;
+#else
+    return malloc(size);
+#endif
+}
+
+void boaros_lwip_tcp_pcb_release(void *allocation)
+{
+#if defined(__riscv) || defined(__loongarch__)
+    kernel_heap_release(__atomic_load_n(&tcp_pcb_heap, __ATOMIC_ACQUIRE), allocation);
+#else
+    free(allocation);
+#endif
+}
+
 void *boaros_lwip_tcp_storage_allocate(struct tcp_pcb *pcb, uint32_t bytes, void **context)
 {
     return protocol_hooks.tcp_storage_allocate ?

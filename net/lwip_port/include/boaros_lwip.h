@@ -1,5 +1,6 @@
 #ifndef BOAROS_LWIP_HOOKS_H
 #define BOAROS_LWIP_HOOKS_H
+#include <stddef.h>
 #include <stdint.h>
 uint32_t boaros_lwip_centiseconds(void);
 int boaros_lwip_ip6_mld_valid_header(void);
@@ -61,11 +62,16 @@ void boaros_lwip_tcp_output(struct tcp_pcb *pcb);
 /* A serialized Ethernet receive pass may coalesce adjacent plain ACKs.
  * Flush before handing other traffic to a protocol or returning the scope. */
 void boaros_lwip_tcp_ack_batch_begin(void);
+void boaros_lwip_tcp_loopback_batch_begin(void);
 void boaros_lwip_tcp_ack_batch_flush(void);
 void boaros_lwip_tcp_ack_batch_end(void);
 void boaros_lwip_work_ready(void);
 void boaros_lwip_loopback_publish(struct netif *);
 void boaros_lwip_capacity_available(int pool);
+struct kernel_heap;
+void boaros_lwip_tcp_pcb_bind_heap(struct kernel_heap *);
+void *boaros_lwip_tcp_pcb_allocate(size_t);
+void boaros_lwip_tcp_pcb_release(void *);
 void *boaros_lwip_tcp_storage_allocate(struct tcp_pcb *, uint32_t bytes, void **context);
 void boaros_lwip_tcp_storage_release(void *context, void *allocation);
 void boaros_lwip_tcp_timewait_free(struct tcp_pcb *pcb);

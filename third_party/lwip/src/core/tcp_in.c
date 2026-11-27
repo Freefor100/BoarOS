@@ -725,11 +725,30 @@ dropped:
   pbuf_free(p);
 }
 
+/* Keep one payload piece per original frame so the socket reader can commit
+ * a fault-free prefix at the same boundaries after the frames are chained. */
+#if !defined(LWIP_HOOK_TCP_INPACKET_PCB)
+static unsigned
+tcp_train_payload(const struct pbuf *p, int loopback_view)
+{
+  if (p->ref != 1 || p->len < TCP_HLEN) return 0;
+#if BOAROS_LWIP_LINUX_LOOPBACK
+  if (loopback_view && p->boaros_tcp_progress) return 0;
+#endif
+  const struct pbuf *view = p->next;
+  if (!view) return p->len - TCP_HLEN;
+  if (!loopback_view || p->len != TCP_HLEN || view->next || view->ref != 1 ||
+      !(view->flags & PBUF_FLAG_IS_CUSTOM) || p->tot_len != TCP_HLEN + view->len) return 0;
+  return view->len;
+}
+#endif
+
 /* Claim only a prefix of ordinary IPv4 data already present in this owner's
  * FIFO. Each packet is still validated with its original TCP checksum. */
 static unsigned
 tcp_receive_train(struct pbuf *const packets[], unsigned count,
-    struct netif *inp, const ip_addr_t *src, const ip_addr_t *dst, struct tcp_pcb **owner_bucket)
+    struct netif *inp, const ip_addr_t *src, const ip_addr_t *dst, struct tcp_pcb **owner_bucket,
+    int loopback_view)
 {
 #if defined(LWIP_HOOK_TCP_INPACKET_PCB)
   LWIP_UNUSED_ARG(packets);
@@ -738,10 +757,11 @@ tcp_receive_train(struct pbuf *const packets[], unsigned count,
   LWIP_UNUSED_ARG(src);
   LWIP_UNUSED_ARG(dst);
   LWIP_UNUSED_ARG(owner_bucket);
+  LWIP_UNUSED_ARG(loopback_view);
   return 0;
 #else
   struct pbuf *head=packets[0];
-  if (head->next || head->ref!=1 || head->len<=TCP_HLEN) return 0;
+  if (!tcp_train_payload(head, loopback_view)) return 0;
   struct tcp_hdr *first=head->payload;
   if (TCPH_HDRLEN_BYTES(first)!=TCP_HLEN || TCPH_FLAGS(first)!=TCP_ACK) return 0;
   struct tcp_input_state key={.inp=inp,.src=src,.dst=dst,.tcphdr=first};
@@ -762,10 +782,10 @@ tcp_receive_train(struct pbuf *const packets[], unsigned count,
   int push=0;
   for (;frames<count;frames++) {
     struct pbuf *p=packets[frames];
-    if (p->next || p->ref!=1 || p->len<=TCP_HLEN) break;
+    unsigned bytes=tcp_train_payload(p, loopback_view);
+    if (!bytes) break;
     const struct tcp_hdr *h=p->payload;
     unsigned flags=TCPH_FLAGS(h);
-    unsigned bytes=p->len-TCP_HLEN;
     if (TCPH_HDRLEN_BYTES(h)!=TCP_HLEN || (flags!=TCP_ACK && flags!=(TCP_ACK|TCP_PSH)) ||
         h->src!=first->src || h->dest!=first->dest || h->wnd!=first->wnd ||
         h->ackno!=first->ackno || lwip_ntohl(h->seqno)!=pcb->rcv_nxt+length ||
@@ -801,7 +821,7 @@ unsigned
 boaros_lwip_tcp_receive_train(struct pbuf *const packets[], unsigned count,
     struct netif *inp, const ip_addr_t *src, const ip_addr_t *dst, struct tcp_pcb **owner_bucket)
 {
-  return tcp_receive_train(packets,count,inp,src,dst,owner_bucket);
+  return tcp_receive_train(packets,count,inp,src,dst,owner_bucket,0);
 }
 #endif
 
@@ -814,10 +834,10 @@ static struct {
   ip_addr_t src, dst;
   const void *network;
   u32_t acknowledgments[8];
-  unsigned count, active;
+  unsigned count, active, loopback;
 } tcp_serial_acks;
 
-/* Only the outer serial NIC batch uses this storage. The IPv4 decoder has
+/* Only the outer serial receive pass uses this storage. The IPv4 decoder has
  * already accepted each network header. Keep its packet reference until the
  * original TCP input or one validated coalesced prefix consumes it. */
 static struct {
@@ -835,7 +855,7 @@ tcp_serial_data_flush(void)
   tcp_serial_data.count=0;
   for (unsigned i=0;i<count;) {
     unsigned merged=count-i>1 ? tcp_receive_train(&tcp_serial_data.packets[i],count-i,
-        tcp_serial_data.inp,&tcp_serial_data.src,&tcp_serial_data.dst,NULL) : 0;
+        tcp_serial_data.inp,&tcp_serial_data.src,&tcp_serial_data.dst,NULL,tcp_serial_acks.loopback) : 0;
     if (merged) {
       i+=merged;
     } else {
@@ -853,6 +873,13 @@ boaros_lwip_tcp_ack_batch_begin(void)
   LWIP_ASSERT("serial TCP receive batch", !tcp_serial_acks.active &&
               !boaros_lwip_parallel_enabled());
   tcp_serial_acks.active = 1;
+}
+
+void
+boaros_lwip_tcp_loopback_batch_begin(void)
+{
+  boaros_lwip_tcp_ack_batch_begin();
+  tcp_serial_acks.loopback = 1;
 }
 
 void
@@ -877,6 +904,7 @@ boaros_lwip_tcp_ack_batch_end(void)
 {
   tcp_serial_acks.active = 0;
   boaros_lwip_tcp_ack_batch_flush();
+  tcp_serial_acks.loopback = 0;
 }
 
 static int
@@ -968,8 +996,9 @@ tcp_serial_data_offer(struct pbuf *p,struct netif *inp,const ip_addr_t *src,
   LWIP_UNUSED_ARG(network_length);
   return 0;
 #else
-  if (!inp->hwaddr_len || !IP_IS_V4(dst) || network_length!=IP_HLEN ||
-      p->next || p->len<=TCP_HLEN || !boaros_lwip_raw_input_idle() ||
+  int shape = tcp_serial_acks.loopback ? tcp_train_payload(p,1) != 0 :
+              inp->hwaddr_len && !p->next && p->len > TCP_HLEN;
+  if (!shape || !IP_IS_V4(dst) || network_length!=IP_HLEN || !boaros_lwip_raw_input_idle() ||
       ip_addr_ismulticast(dst) || ip_addr_isbroadcast(dst,ip_current_netif())) return 0;
   const struct tcp_hdr *h=p->payload;
   unsigned flags=TCPH_FLAGS(h);
@@ -1009,9 +1038,10 @@ tcp_input(struct pbuf *p, struct netif *inp)
   u16_t network_length = ip_current_header_tot_len();
   const unsigned char *network = (const unsigned char *)ip_next_header_ptr() - network_length;
   if (!boaros_lwip_parallel_enabled() && tcp_serial_acks.active) {
-    if (p->len>TCP_HLEN && tcp_serial_data_offer(p,inp,src,dst,network,network_length)) return;
+    u16_t data_length = tcp_serial_acks.loopback ? p->tot_len : p->len;
+    if (data_length>TCP_HLEN && tcp_serial_data_offer(p,inp,src,dst,network,network_length)) return;
     if (tcp_serial_data.count) tcp_serial_data_flush();
-    if (tcp_serial_ack_offer(p, inp, src, dst, network, network_length)) {
+    if (!tcp_serial_acks.loopback && tcp_serial_ack_offer(p, inp, src, dst, network, network_length)) {
       return;
     }
     boaros_lwip_tcp_ack_batch_flush();
@@ -1229,6 +1259,7 @@ tcp_enter_timewait(struct tcp_pcb *pcb)
 {
   tcp_pcb_purge(pcb);
   TCP_RMV_ACTIVE(pcb);
+  pcb->tmr = tcp_ticks;
   tcp_set_state(pcb, TIME_WAIT);
 #if BOAROS_USER_SMP
   boaros_lwip_tcp_pcb_timewait(pcb);
@@ -1482,6 +1513,7 @@ tcp_process(struct tcp_input_state *rx, struct tcp_pcb *pcb)
         }
       } else if ((rx->flags & TCP_ACK) && (rx->ackno == pcb->snd_nxt) &&
                  pcb->unsent == NULL) {
+        pcb->tmr = tcp_ticks;
         tcp_set_state(pcb, FIN_WAIT_2);
       }
       break;

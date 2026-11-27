@@ -99,7 +99,7 @@ struct jbd_data {
 	/* Accepted payloads are immutable. Only ordered_io publishes completion;
 	 * readers observe it atomically, snapshots may outlive their list owner. */
 	unsigned references;
-	bool completed;
+	bool completed, superseded;
 	struct ext4_block block;
 	struct jbd_image *image;
 	struct jbd_source *source;
@@ -184,6 +184,8 @@ struct jbd_trans {
 struct jbd_journal {
 	/* Device data ordering, independent of log durability and STATE. */
 	struct kernel_mutex ordered_io;
+    struct kernel_raw_lock data_plan_lock;
+    struct jbd_data_plan *pending_data_plan;
 	/* Last durable commit, and sticky session error owned by this journal. */
 	uint32_t committed_id;
 	int error;
@@ -297,6 +299,14 @@ int jbd_journal_complete_data(struct jbd_journal *, ext4_fsblk_t, uint32_t);
 struct jbd_data_range { ext4_fsblk_t first; uint32_t count; };
 #define JBD_COMPLETE_RANGES_MAX 16U
 /* The physical ranges must be sorted and disjoint. */
+#define JBD_DATA_PLAN_CAPACITY (EXT4_WRITE_PHASE_SPANS + 1)
+struct jbd_data_plan {
+    unsigned used;
+    struct jbd_data *data[JBD_DATA_PLAN_CAPACITY];
+};
+int jbd_journal_plan_data(struct jbd_journal *, const struct jbd_data_range *,
+    unsigned count, struct jbd_data_plan *);
+int jbd_journal_submit_data_plan(struct jbd_journal *, struct jbd_data_plan *);
 int jbd_journal_complete_data_batch(struct jbd_journal *, const struct jbd_data_range *, unsigned);
 bool jbd_journal_overlaps_data(struct jbd_journal *, const struct ext4_block_write *);
 int jbd_trans_revoke_block(struct jbd_trans *trans,

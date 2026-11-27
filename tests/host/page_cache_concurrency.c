@@ -664,11 +664,24 @@ static enum kernel_block_status image_read(void *context, uint64_t off, void *ou
     assert(!metadata_pressure_io);
     return pread(image_fd, out, size, off) == (ssize_t)size ? KERNEL_BLOCK_STATUS_OK : KERNEL_BLOCK_STATUS_IO;
 }
+#ifdef CACHE_HOST_DETACHED_WRITEBACK
+static unsigned detached_armed, detached_entered, detached_resume;
+#endif
 static enum kernel_block_status image_write(void *context, uint64_t off, const void *in, size_t size)
 {
     (void)context;
     assert(!kernel_cpu_current()->raw_locks);
     assert(!metadata_pressure_io);
+#ifdef CACHE_HOST_DETACHED_WRITEBACK
+    if (__atomic_load_n(&detached_armed,__ATOMIC_ACQUIRE) &&
+        kernel_page_cache_is_executor(current_cache) && size >= BOAROS_PAGE_SIZE &&
+        *(const unsigned char *)in == 0x57 &&
+        ((const unsigned char *)in)[BOAROS_PAGE_SIZE-1] == 0x57 &&
+        __atomic_exchange_n(&detached_armed,0,__ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&detached_entered,1,__ATOMIC_RELEASE);
+        wait_progress(&detached_resume,1);
+    }
+#endif
     return pwrite(image_fd, in, size, off) == (ssize_t)size ? KERNEL_BLOCK_STATUS_OK : KERNEL_BLOCK_STATUS_IO;
 }
 static enum kernel_block_status image_flush(void *context)
@@ -1382,6 +1395,123 @@ static void *append_during_snapshot(void *argument)
     __atomic_store_n(&request->done,1,__ATOMIC_RELEASE);
     return NULL;
 }
+
+
+#ifdef CACHE_HOST_DETACHED_WRITEBACK
+static unsigned detach_plan_armed, detach_plan_resume;
+static struct jbd_data_plan *detach_held_plan;
+int __real_jbd_journal_submit_data_plan(struct jbd_journal *, struct jbd_data_plan *);
+int __wrap_jbd_journal_submit_data_plan(struct jbd_journal *journal, struct jbd_data_plan *plan)
+{
+    if (plan->used && __atomic_exchange_n(&detach_plan_armed,0,__ATOMIC_ACQ_REL)) {
+        __atomic_store_n(&detach_held_plan,plan,__ATOMIC_RELEASE);
+        wait_progress(&detach_plan_resume,1);
+    }
+    return __real_jbd_journal_submit_data_plan(journal,plan);
+}
+
+struct detached_sync_request {
+    struct kernel_vfs_file *file;
+    uint64_t error;
+    unsigned done;
+};
+static void *sync_detached_append(void *argument)
+{
+    struct detached_sync_request *request=argument;
+    cache_test_attach(2);
+    assert(!kernel_vfs_sync(request->file,0,&request->error));
+    __atomic_store_n(&request->done,1,__ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void detached_append(struct kernel_page_cache *cache, const char *path)
+{
+    image_fd=open(path,O_RDWR);
+    assert(image_fd>=0);
+    struct stat st;
+    assert(!fstat(image_fd,&st));
+    struct kernel_block_device disk={.read=image_read,.write=image_write,.flush=image_flush,
+        .capacity_bytes=st.st_size,.logical_block_size=512,.cache_mode=KERNEL_BLOCK_CACHE_WRITEBACK};
+    struct kernel_vfs_mount mount={0};
+    assert(!kernel_vfs_mount_ext4(&mount,&disk,&backend_heap,cache,0));
+    current_cache=cache;
+    assert(!kernel_vfs_start_journal_worker(&mount));
+    assert(!kernel_page_cache_start_worker(cache));
+    struct kernel_vfs_file file={0};
+    size_t range=2*BOAROS_PAGE_CACHE_WRITEBACK_PAGES*BOAROS_PAGE_SIZE;
+    unsigned char *bytes=malloc(range);
+    assert(bytes);
+    memset(bytes,0x57,range);
+    size_t done;
+    assert(!kernel_vfs_create(&mount,"/detached-append",0600,&file));
+    assert(!kernel_vfs_pwrite(&file,0,bytes,range,&done) && done==range);
+    __atomic_store_n(&detached_armed,1,__ATOMIC_RELEASE);
+    uint64_t error=kernel_vfs_error_sequence(&file);
+    assert(!kernel_vfs_sync_file_range(&file,0,range,KERNEL_SYNC_FILE_RANGE_WRITE,&error));
+    wait_progress(&detached_entered,1);
+
+    pthread_t writer;
+    struct append_snapshot_request request={.file=&file,.offset=range,.length=64};
+    unsigned parks=mm_test_parked(1);
+    assert(!pthread_create(&writer,NULL,append_during_snapshot,&request));
+    while (!__atomic_load_n(&request.done,__ATOMIC_ACQUIRE) && mm_test_parked(1)==parks) sched_yield();
+    assert(__atomic_load_n(&request.done,__ATOMIC_ACQUIRE) &&
+        "non-overlapping append must complete while older physical I/O is held");
+    assert(!pthread_join(writer,NULL));
+    pthread_t sync;
+    struct detached_sync_request request_sync={.file=&file,.error=error};
+    parks=mm_test_parked(2);
+    assert(!pthread_create(&sync,NULL,sync_detached_append,&request_sync));
+    while (!__atomic_load_n(&request_sync.done,__ATOMIC_ACQUIRE) && mm_test_parked(2)==parks) sched_yield();
+    assert(!__atomic_load_n(&request_sync.done,__ATOMIC_ACQUIRE) &&
+        "fsync cannot complete before the old data reaches the device");
+    __atomic_store_n(&detached_resume,1,__ATOMIC_RELEASE);
+    assert(!pthread_join(sync,NULL));
+    assert(!kernel_vfs_sync_file_range(&file,0,range,KERNEL_SYNC_FILE_RANGE_WAIT_AFTER,&error));
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&file)));
+    assert(!kernel_vfs_pread(&file,0,bytes,range,&done,NULL) && done==range);
+    for (size_t i=0;i<range;i++) assert(bytes[i]==0x57);
+    assert(!kernel_vfs_pread(&file,range,bytes,64,&done,NULL) && done==64);
+    for (size_t i=0;i<done;i++) assert(bytes[i]==0x62);
+    assert(!kernel_vfs_close(&file));
+    struct kernel_vfs_file retire={0};
+    assert(!kernel_vfs_create(&mount,"/detached-retire",0600,&retire));
+    memset(bytes,0x53,range);
+    assert(!kernel_vfs_pwrite(&retire,0,bytes,range,&done) && done==range);
+    __atomic_store_n(&detach_plan_armed,1,__ATOMIC_RELEASE);
+    error=kernel_vfs_error_sequence(&retire);
+    assert(!kernel_vfs_sync_file_range(&retire,0,range,KERNEL_SYNC_FILE_RANGE_WRITE,&error));
+    struct jbd_data_plan *plan;
+    while (!(plan=__atomic_load_n(&detach_held_plan,__ATOMIC_ACQUIRE))) sched_yield();
+    assert(plan->used);
+    struct lwext4_mount_adapter *adapter=mount.private_data;
+    struct ext4_journal_progress progress;
+    assert(!ext4_journal_group_progress(adapter->mount_point,&progress));
+    uint64_t target=progress.accepted;
+    while (progress.durable<target) {
+        assert(!ext4_journal_group_commit(adapter->mount_point,true));
+        assert(!ext4_journal_group_progress(adapter->mount_point,&progress));
+    }
+    /* Commit won ordered_io. A durability waiter must observe returned
+     * ordered controls even though the unsubmitted request is still held. */
+    for (unsigned i=0;i<plan->used;i++)
+        assert(!plan->data[i]);
+    __atomic_store_n(&detach_plan_resume,1,__ATOMIC_RELEASE);
+    assert(!kernel_vfs_sync_file_range(&retire,0,range,KERNEL_SYNC_FILE_RANGE_WAIT_AFTER,&error));
+    assert(!kernel_vfs_sync(&retire,0,&error));
+    assert(!kernel_page_cache_invalidate_node(cache,kernel_vfs_file_node(&retire)));
+    assert(!kernel_vfs_pread(&retire,0,bytes,range,&done,NULL) && done==range);
+    for (size_t i=0;i<range;i++) assert(bytes[i]==0x53);
+    assert(!kernel_vfs_close(&retire));
+    free(bytes);
+    puts("PASS commit before detached submit: progress returns plan references before wake");
+    kernel_page_cache_stop_worker(cache);
+    assert(!kernel_vfs_unmount(&mount) && !close(image_fd) && !kernel_page_cache_destroy(cache));
+    current_cache=NULL;
+    puts("PASS detached ordered data: new EOF proceeds while older data writes, both ranges survive fsync");
+}
+
+#endif
 static void append_snapshot(struct kernel_page_cache *cache,const char *path)
 {
     image_fd=open(path,O_RDWR);assert(image_fd>=0);
@@ -4444,6 +4574,10 @@ static void metadata_allocator_pressure(struct kernel_page_cache *cache,const ch
 int main(int argc, char **argv)
 {
     setvbuf(stdout,0,_IONBF,0);
+#ifdef CACHE_HOST_DETACHED_WRITEBACK
+    extern unsigned mm_test_boot_cpus;
+    if (argc==3 && !strcmp(argv[2],"detached-append")) mm_test_boot_cpus=1;
+#endif
     cache_test_attach(0);
     struct physical_page_allocator pages = {0};
     struct kernel_heap heap = {0};
@@ -4490,6 +4624,9 @@ int main(int argc, char **argv)
         if (!strcmp(argv[2],"small-files-sync")) {small_files_sync_case(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"admission-credit")) {admission_credit_case(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"same-disk-admission")) {same_disk_admission(&cache,argv[1]);goto owners;}
+#ifdef CACHE_HOST_DETACHED_WRITEBACK
+        if (!strcmp(argv[2],"detached-append")) {detached_append(&cache,argv[1]);goto owners;}
+#endif
         if (!strcmp(argv[2],"append-snapshot")) {append_snapshot(&cache,argv[1]);goto owners;}
         if (!strcmp(argv[2],"domain-start-failure")) {writeback_start_failure(&cache,argv[1]);return 0;}
         if (!strcmp(argv[2],"progress-owners")) {progress_writeback_owners(&cache,argv[1]);goto owners;}

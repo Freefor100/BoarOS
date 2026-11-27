@@ -442,6 +442,7 @@ void jbd_free(void *pointer)
  * publish reclaimed quota only after the allocator has consumed the batch. */
 static void free_controls(void **objects,unsigned count)
 {
+    if (!count) return;
     struct jbd_memory *memory=((union jbd_allocation *)objects[0]-1)->owner.memory;
     void *retired=NULL;
     size_t cached=0,released=0;

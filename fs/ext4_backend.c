@@ -3598,6 +3598,24 @@ static int ext4_backend_complete_data_range(struct kernel_vfs_node *node, uint64
         ext4_fdata_complete(lwext4_node_file(node), start, end - start));
 }
 
+static void release_data_inode(void *guard)
+{
+    kernel_lock_release(guard);
+}
+
+static int ext4_backend_complete_data_detached(struct kernel_vfs_node *node,
+    uint64_t start, uint64_t end)
+{
+    struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
+    KERNEL_LOCK_SCOPE(service);
+    kernel_rwlock_read(&adapter->journal_service, &service);
+    KERNEL_LOCK_SCOPE(node_guard);
+    kernel_vfs_node_lock(node, &node_guard, 0);
+    int result = ext4_fdata_complete_detached(lwext4_node_file(node), start, end,
+        release_data_inode, &node_guard);
+    return result == ENOTSUP ? -KERNEL_EOPNOTSUPP : complete_data_result(adapter, result);
+}
+
 static int ext4_backend_complete_data_batch(const struct kernel_vfs_data_range *ranges, unsigned count)
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(ranges[0].node->instance);
@@ -4149,6 +4167,7 @@ static void initialize_backend(void)
     ops->writeback_small_candidate = ext4_backend_writeback_small_candidate;
     ops->writeback_mapped = ext4_backend_writeback_mapped;
     ops->writeback_growth = ext4_backend_writeback_growth;
+    ops->complete_data_detached = ext4_backend_complete_data_detached;
     ops->direct_io = ext4_backend_direct_io;
     ops->direct_alignment = ext4_backend_direct_alignment;
     ops->seek_sparse = ext4_backend_seek_sparse;
