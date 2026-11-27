@@ -700,7 +700,9 @@ void ext4_bcache_scope_begin(struct ext4_bcache *bc, struct ext4_writeback_scope
 static inline void scope_track_locked(struct ext4_buf *buf)
 {
     struct ext4_writeback_scope *scope=buf->bc->writeback_scope;
-    if (!scope || buf->writeback_scope) return;
+    if (!scope) return;
+    scope->modified=true;
+    if (buf->writeback_scope) return;
     if (!buf->refctr || buf->refctr==UINT32_MAX) __builtin_trap();
     buf->writeback_scope=scope;buf->writeback_next=scope->head;scope->head=buf;
     buf->refctr++;

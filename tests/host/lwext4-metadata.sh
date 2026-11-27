@@ -70,6 +70,12 @@ if [ "${1:-all}" = nojournal-orphan-probe ]; then
         check_fs "$work/orphan.img"
         timeout 30 "$work/probe" "$work/orphan.img" seed
         check_fs "$work/orphan.img"
+        cp "$work/orphan.img" "$work/mount-failure.img"
+        timeout 30 "$work/probe" "$work/mount-failure.img" nojournal-mount-flush-error
+        timeout 30 "$work/probe" "$work/mount-failure.img" nojournal-reject
+        cp "$work/orphan.img" "$work/preclean-failure.img"
+        timeout 30 "$work/probe" "$work/preclean-failure.img" nojournal-preclean-flush-error
+        timeout 30 "$work/probe" "$work/preclean-failure.img" nojournal-reject
         cp "$work/orphan.img" "$work/flush-failure.img"
         timeout 30 "$work/probe" "$work/flush-failure.img" nojournal-clean-flush-error
         timeout 30 "$work/probe" "$work/flush-failure.img" nojournal-reject

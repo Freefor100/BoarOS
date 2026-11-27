@@ -168,21 +168,6 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 				"last umount error: superblock fs_error flag\n");
 
 
-	if (!fs->read_only) {
-		/* Recovery must see the original disk superblock. The journal start
-		 * barrier records RECOVER only after its format has been checked. */
-		if (!fs->ext2_format &&
-		    !ext4_sb_feature_com(ext4_fs_super(fs), EXT4_FCOM_HAS_JOURNAL)) {
-			ext4_set16(ext4_fs_super(fs), mount_count,
-				ext4_get16(ext4_fs_super(fs), mount_count) + 1);
-			ext4_set16(ext4_fs_super(fs), state,
-				ext4_get16(ext4_fs_super(fs), state) & ~EXT4_SUPERBLOCK_STATE_VALID_FS);
-			r = ext4_sb_write(fs->bdev, ext4_fs_super(fs));
-			if (r != EOK)
-				return r;
-		}
-	}
-
 	return r;
 }
 

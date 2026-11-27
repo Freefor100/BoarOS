@@ -120,6 +120,7 @@ struct ext4_writeback_scope {
 	struct ext4_buf *head;
 	struct ext4_writeback_scope *previous;
 	struct ext4_scope_batch *batch;
+	bool modified;
 };
 
 /**@brief   Single block descriptor*/

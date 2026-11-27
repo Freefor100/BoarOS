@@ -748,7 +748,7 @@ static void ext2_namespace(struct ext4_fs *fs)
     puts("PASS ext2 namespace, open overwritten inode and last-reference reclaim");
 }
 
-static void ext2_full(struct ext4_fs *fs)
+static void nojournal_full(struct ext4_fs *fs)
 {
     uint32_t root = EXT4_INODE_ROOT_INDEX;
     ext4_file file;
@@ -772,7 +772,8 @@ static void ext2_full(struct ext4_fs *fs)
           ext4_fs_available_blocks(fs) == blocks);
     CHECK(ext4_create_child("/", root, "after-full", 0100644,
         0, NULL, NULL, NULL, 0, 0) == EOK);
-    puts("PASS ext2 ENOSPC returns inode and block space before publishing the name");
+    printf("PASS nojournal %s ENOSPC returns inode and block space before publishing the name\n",
+        fs->ext2_format ? "ext2" : "ext4");
 }
 
 static void ext2_failed_create(struct ext4_fs *fs, unsigned index)
@@ -822,7 +823,7 @@ int main(int argc, char **argv)
     }
     CHECK((ext2 ? ext4_mount_ext2("rename", "/", readonly) :
         ext4_mount("rename", "/", readonly)) == EOK);
-    if (!ext2) {
+    if (ext4_sb_feature_com(&dev.fs->sb, EXT4_FCOM_HAS_JOURNAL)) {
         CHECK(ext4_recover("/") == EOK); CHECK(ext4_journal_start("/") == EOK);
     }
     bool reclaim_probe = argc >= 4 && !strcmp(argv[3], "orphan-reclaim") &&
@@ -841,7 +842,8 @@ int main(int argc, char **argv)
     }
     else if (!strcmp(argv[2], "basic")) basic(dev.fs);
     else if (!strcmp(argv[2], "ext2-namespace")) ext2_namespace(dev.fs);
-    else if (!strcmp(argv[2], "ext2-full")) ext2_full(dev.fs);
+    else if (!strcmp(argv[2], "ext2-full") || !strcmp(argv[2], "nojournal-full"))
+        nojournal_full(dev.fs);
     else if (!strcmp(argv[2], "ext2-io")) {
         CHECK(argc == 4);
         unsigned index = strtoul(argv[3], NULL, 10);
