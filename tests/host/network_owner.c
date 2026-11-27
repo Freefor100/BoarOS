@@ -3207,8 +3207,9 @@ static void protocol_transaction(void)
     locks=acquired;services=protocol_services;
     CHECK(kernel_socket_reserve_read(server,NULL,&read,&reader,1,0, NULL)==1);
     CHECK(acquired==locks && protocol_services==services);
-    kernel_socket_finish_read(&read,0);
-    CHECK(acquired==locks && protocol_services==services);
+    CHECK(kernel_socket_finish_read(&read,0)==1 && reader==(void *)server);
+    CHECK(acquired==locks+1 && protocol_services==services);
+    CHECK(!server->receive_credit && !server->retired_head && !(server->work_flags & SOCKET_WORK_REAP));
     struct kernel_socket_protocol_scope scope;kernel_socket_protocol_enter(&scope);
     locks=acquired;services=protocol_services;
     CHECK(write_buffer(client,"y",1,0)==1);
@@ -3223,7 +3224,7 @@ static void protocol_transaction(void)
     kernel_socket_protocol_leave(&scope);
     kernel_socket_destroy(server);kernel_socket_destroy(client);kernel_socket_destroy(listener);
     for(unsigned i=0;i<4;i++) (void)kernel_socket_service_pending((struct kernel_socket_service_budget){8,8,1});
-    puts("PASS socket transaction: commit service before handoff, one owner for receive/service, no empty finish lock or nested service");
+    puts("PASS socket transaction: send service before handoff, inline read retirement, no nested service");
 }
 
 static void receive_prefix(void)
