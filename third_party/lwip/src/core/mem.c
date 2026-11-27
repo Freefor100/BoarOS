@@ -340,6 +340,9 @@ struct mem {
   mem_size_t prev;
   /** 1: this area is used; 0: this area is unused */
   u8_t used;
+#if BOAROS_LWIP_TCP_WRITEV
+  u8_t tcp_body;
+#endif
 #if MEM_OVERFLOW_CHECK
   /** this keeps track of the user allocation size for guard checks */
   mem_size_t user_size;
@@ -421,6 +424,9 @@ static struct mem * LWIP_MEM_LFREE_VOLATILE lfree;
 /* A complete failed body scan can bound the largest free extent. Allocating
  * only shrinks free extents. Free and trim publish the coalesced extent. */
 static mem_size_t tcp_free_extent_upper;
+/* Retain one exact full-sized body in the same backing heap. It is idle
+ * storage, excluded from live charges, and can rejoin adjacent holes. */
+static struct mem *tcp_idle_body;
 #endif
 
 #if MEM_SANITY_CHECK
@@ -523,6 +529,28 @@ tcp_free_extent_grew(struct mem *block)
 }
 #endif
 
+static void
+free_linked_block(struct mem *mem)
+{
+  mem->used = 0;
+  if (mem < lfree) lfree = mem;
+#if BOAROS_LWIP_TCP_WRITEV
+  tcp_free_extent_grew(plug_holes(mem));
+#else
+  (void)plug_holes(mem);
+#endif
+}
+
+#if BOAROS_LWIP_TCP_WRITEV
+static void
+tcp_release_idle_body(void)
+{
+  struct mem *idle = tcp_idle_body;
+  tcp_idle_body = NULL;
+  free_linked_block(idle);
+}
+#endif
+
 /**
  * Zero the heap and initialize start, end and lowest-free
  */
@@ -552,6 +580,7 @@ mem_init(void)
   lfree = (struct mem *)(void *)ram;
 #if BOAROS_LWIP_TCP_WRITEV
   tcp_free_extent_upper = MEM_SIZE_ALIGNED;
+  tcp_idle_body = NULL;
 #endif
 
   MEM_STATS_AVAIL(avail, MEM_SIZE_ALIGNED);
@@ -665,7 +694,11 @@ mem_free(void *rmem)
   /* protect the heap from concurrent access */
   LWIP_MEM_FREE_PROTECT();
   /* mem has to be in a used state */
-  if (!mem->used) {
+  if (!mem->used
+#if BOAROS_LWIP_TCP_WRITEV
+      || mem == tcp_idle_body
+#endif
+      ) {
     LWIP_MEM_ILLEGAL_FREE("mem_free: illegal memory: double free");
     LWIP_MEM_FREE_UNPROTECT();
     LWIP_DEBUGF(MEM_DEBUG | LWIP_DBG_LEVEL_SEVERE, ("mem_free: illegal memory: double free?\n"));
@@ -683,21 +716,14 @@ mem_free(void *rmem)
     return;
   }
 
-  /* mem is now unused. */
-  mem->used = 0;
-
-  if (mem < lfree) {
-    /* the newly freed struct is now the lowest */
-    lfree = mem;
-  }
-
   MEM_STATS_DEC_USED(used, mem->next - (mem_size_t)(((u8_t *)mem - ram)));
-
-  /* finally, see if prev or next are free also */
 #if BOAROS_LWIP_TCP_WRITEV
-  tcp_free_extent_grew(plug_holes(mem));
-#else
-  (void)plug_holes(mem);
+  if (mem->tcp_body && !tcp_idle_body) tcp_idle_body = mem;
+  else
+#endif
+    free_linked_block(mem);
+#if BOAROS_LWIP_TCP_WRITEV
+  if (tcp_idle_body && !STATS_GET(mem.used)) tcp_release_idle_body();
 #endif
   MEM_SANITY();
 #if LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT
@@ -774,6 +800,9 @@ mem_trim(void *rmem, mem_size_t new_size)
     return rmem;
   }
 
+#if BOAROS_LWIP_TCP_WRITEV
+  mem->tcp_body = 0;
+#endif
   mem2 = ptr_to_mem(mem->next);
   if (mem2->used == 0) {
     /* The next struct is unused, we can simply move it at little */
@@ -902,13 +931,20 @@ mem_malloc(mem_size_t size_in)
   sys_mutex_lock(&mem_mutex);
   LWIP_MEM_ALLOC_PROTECT();
 #if BOAROS_LWIP_TCP_WRITEV
+retry_after_idle:
   if (reserve) {
     const mem_size_t used = STATS_GET(mem.used);
     const mem_size_t limit = MEM_SIZE_ALIGNED - reserve;
     budget = used < limit ? limit - used : 0;
     if (budget < size + SIZEOF_STRUCT_MEM) goto exhausted;
+    if (tcp_idle_body && tcp_idle_body->next - mem_to_ptr(tcp_idle_body) == size + SIZEOF_STRUCT_MEM) {
+      mem = tcp_idle_body;
+      tcp_idle_body = NULL;
+      MEM_STATS_INC_USED(used, size + SIZEOF_STRUCT_MEM);
+      goto allocated;
+    }
     if (size >= BOAROS_LWIP_LOOPBACK_MSS &&
-        tcp_free_extent_upper < size + SIZEOF_STRUCT_MEM) goto exhausted;
+        tcp_free_extent_upper < size + SIZEOF_STRUCT_MEM) goto reclaim_idle;
   }
 #endif
 #if LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT
@@ -985,6 +1021,10 @@ mem_malloc(mem_size_t size_in)
            */
           mem->used = 1;
         }
+#if BOAROS_LWIP_TCP_WRITEV
+        mem->tcp_body = reserve && size >= BOAROS_LWIP_LOOPBACK_MSS &&
+          size <= BOAROS_LWIP_LOOPBACK_MSS + 256U && charge == size + SIZEOF_STRUCT_MEM;
+#endif
         MEM_STATS_INC_USED(used, charge);
 #if LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT
 mem_malloc_adjust_lfree:
@@ -1009,20 +1049,7 @@ mem_malloc_adjust_lfree:
           lfree = cur;
           LWIP_ASSERT("mem_malloc: !lfree->used", ((lfree == ram_end) || (!lfree->used)));
         }
-        LWIP_MEM_ALLOC_UNPROTECT();
-        sys_mutex_unlock(&mem_mutex);
-        LWIP_ASSERT("mem_malloc: allocated memory not above ram_end.",
-                    (mem_ptr_t)mem + SIZEOF_STRUCT_MEM + size <= (mem_ptr_t)ram_end);
-        LWIP_ASSERT("mem_malloc: allocated memory properly aligned.",
-                    ((mem_ptr_t)mem + SIZEOF_STRUCT_MEM) % MEM_ALIGNMENT == 0);
-        LWIP_ASSERT("mem_malloc: sanity check alignment",
-                    (((mem_ptr_t)mem) & (MEM_ALIGNMENT - 1)) == 0);
-
-#if MEM_OVERFLOW_CHECK
-        mem_overflow_init_element(mem, size_in);
-#endif
-        MEM_SANITY();
-        return (u8_t *)mem + SIZEOF_STRUCT_MEM + MEM_SANITY_OFFSET;
+        goto allocated;
       }
     }
 #if LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT
@@ -1036,6 +1063,11 @@ mem_malloc_adjust_lfree:
       budget >= size + 2U * SIZEOF_STRUCT_MEM + MIN_SIZE_ALIGNED - MEM_ALIGNMENT) {
     tcp_free_extent_upper = size + SIZEOF_STRUCT_MEM - 1U;
   }
+reclaim_idle:
+  if (tcp_idle_body) {
+    tcp_release_idle_body();
+    goto retry_after_idle;
+  }
 exhausted:
 #endif
   MEM_STATS_INC(err);
@@ -1043,6 +1075,19 @@ exhausted:
   sys_mutex_unlock(&mem_mutex);
   LWIP_DEBUGF(MEM_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("mem_malloc: could not allocate %"S16_F" bytes\n", (s16_t)size));
   return NULL;
+
+allocated:
+  LWIP_MEM_ALLOC_UNPROTECT();
+  sys_mutex_unlock(&mem_mutex);
+  LWIP_ASSERT("mem_malloc: allocated memory not above ram_end.",
+              (mem_ptr_t)mem + SIZEOF_STRUCT_MEM + size <= (mem_ptr_t)ram_end);
+  LWIP_ASSERT("mem_malloc: allocated memory properly aligned.",
+              ((mem_ptr_t)mem + SIZEOF_STRUCT_MEM) % MEM_ALIGNMENT == 0);
+  LWIP_ASSERT("mem_malloc: sanity check alignment",
+              (((mem_ptr_t)mem) & (MEM_ALIGNMENT - 1)) == 0);
+  mem_overflow_init_element(mem, size_in);
+  MEM_SANITY();
+  return (u8_t *)mem + SIZEOF_STRUCT_MEM + MEM_SANITY_OFFSET;
 }
 
 #if BOAROS_LWIP_TCP_WRITEV

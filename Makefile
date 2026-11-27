@@ -1862,14 +1862,16 @@ test-poll-host:
 	build/host/poll-snapshot
 
 .PHONY: test-epoll-host test-epoll-riscv
+EPOLL_HOST_FLAGS := -std=c11 -O1 -g -Wall -Wextra -Werror -DBOAROS_HOST_IRQ_STATE=1 -DBOAROS_PAGE_SHIFT=12 \
+	-ffunction-sections -fdata-sections -Wl,--gc-sections -Itests/host/random -idirafter include \
+	-fsanitize=address,undefined -Wl,--wrap=kernel_raw_lock_acquire
+EPOLL_HOST_SOURCES := tests/host/epoll_delivery.c kernel/raw_lock.c tests/host/cpu_context.c
 test-epoll-host:
 	@mkdir -p build/host
-	cc -std=c11 -O1 -g -Wall -Wextra -Werror -DBOAROS_HOST_IRQ_STATE=1 -DBOAROS_PAGE_SHIFT=12 \
-		-DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 \
-		-ffunction-sections -fdata-sections -Wl,--gc-sections \
-		-Itests/host/random -idirafter include -fsanitize=address,undefined \
-		tests/host/epoll_delivery.c kernel/raw_lock.c tests/host/cpu_context.c -Wl,--wrap=kernel_raw_lock_acquire -o build/host/epoll-delivery
+	cc $(EPOLL_HOST_FLAGS) -DBOAROS_MAX_CPUS=2 -DBOAROS_USER_SMP=1 $(EPOLL_HOST_SOURCES) -o build/host/epoll-delivery
 	build/host/epoll-delivery
+	cc $(EPOLL_HOST_FLAGS) -DBOAROS_MAX_CPUS=1 -DBOAROS_LOCK_DEBUG=1 $(EPOLL_HOST_SOURCES) -o build/host/epoll-delivery-up
+	build/host/epoll-delivery-up stale-stream
 test-epoll-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	python3 -B tests/riscv/epoll.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
 

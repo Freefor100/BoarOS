@@ -800,16 +800,32 @@ struct epoll_candidate {
     struct linux_epoll_event event;
 };
 
+enum epoll_candidate_status { EPOLL_CANDIDATE_EMPTY, EPOLL_CANDIDATE_READY, EPOLL_CANDIDATE_STALE };
+
 /* poll和wait共用候选刷新；只跨可能睡眠的目标query持有item/OFD借用。 */
-static int epoll_candidate_refresh(struct kernel_epoll_wait_request *request, struct epoll_candidate *candidate)
+static enum epoll_candidate_status epoll_candidate_refresh(
+    struct kernel_epoll_wait_request *request, struct epoll_candidate *candidate)
 {
     struct kernel_epoll *epoll = request->epoll;
     EPOLL_STATE(irq);
     struct kernel_epoll_item *item = request->observing ? request->current : epoll->ready_head;
     if (!item || (!request->observing && !request->scanning && epoll->scan_owner)) {
         epoll_state_release(&irq);
-        return 0;
+        return EPOLL_CANDIDATE_EMPTY;
     }
+    struct kernel_open_file_description *target = item->linked && !item->oneshot_disarmed
+        ? item->target_file : NULL;
+#if BOAROS_MAX_CPUS == 1
+    /* With IRQs disabled the epoll association and the stream readiness
+     * snapshot stay valid through the removal of a stale ready item. */
+    uint32_t stream_events;
+    int stream_known = target && __atomic_load_n(&target->references, __ATOMIC_RELAXED) &&
+        epoll_stream_snapshot(target, item->events, &stream_events);
+    if (stream_known && !stream_events && !request->observing) {
+        epoll_remove_from_ready_list(epoll, item);
+        return epoll->ready_head ? EPOLL_CANDIDATE_STALE : EPOLL_CANDIDATE_EMPTY;
+    }
+#endif
     if (!request->observing) {
         /* The first candidate and the scan owner are claimed together. */
         if (!request->scanning) {
@@ -825,29 +841,27 @@ static int epoll_candidate_refresh(struct kernel_epoll_wait_request *request, st
     *candidate = (struct epoll_candidate){.control = item->control_generation,
         .notification = item->notification_generation, .interest = item->events,
         .event.data = item->data};
-    if (item->linked && !item->oneshot_disarmed && item->target_file) {
-        struct kernel_open_file_description *target=item->target_file;
 #if BOAROS_MAX_CPUS == 1
-        /* The epoll lock protects the weak target pointer. With IRQs
-         * disabled, a live stream can be polled before a closer can run. */
-        if (__atomic_load_n(&target->references,__ATOMIC_RELAXED) &&
-            epoll_stream_snapshot(target,candidate->interest,&candidate->event.events))
-            return 1;
+    if (stream_known) {
+        candidate->event.events = stream_events;
+        return EPOLL_CANDIDATE_READY;
+    }
 #endif
+    if (target) {
         if (kernel_open_file_acquire(target)==KERNEL_OPEN_FILE_STATUS_OK) request->target=target;
         else if (__atomic_load_n(&target->references,__ATOMIC_RELAXED)) __builtin_trap();
         /* 末引用可已归零；关闭者须取得此锁拆关联后才能释放存储。
          * 该窗口只跳过已退休目标，不复活OFD，也不查询其关闭中的后端。 */
     }
     epoll_state_release(&irq);
-    if (!request->target) return 1;
+    if (!request->target) return EPOLL_CANDIDATE_READY;
     candidate->event.events = kernel_open_file_poll(request->target, candidate->interest, 0) &
         (candidate->interest | KERNEL_POLLERR | KERNEL_POLLHUP);
     epoll_state_acquire(&irq);
     if (!item->linked || item->oneshot_disarmed || candidate->control != item->control_generation)
         candidate->event.events = 0;
     epoll_state_release(&irq);
-    return 1;
+    return EPOLL_CANDIDATE_READY;
 }
 
 static int epoll_candidate_finish(struct kernel_epoll_wait_request *request,
@@ -961,7 +975,7 @@ uint32_t kernel_epoll_poll(struct kernel_epoll *epoll, uint32_t requested_events
     uint32_t revents = 0;
     struct epoll_observe_cursor cursor = {0};
     while (epoll_observe_next(&request, &cursor)) {
-        if (!epoll_candidate_refresh(&request, &candidate)) __builtin_trap();
+        if (epoll_candidate_refresh(&request, &candidate) != EPOLL_CANDIDATE_READY) __builtin_trap();
         int ready = candidate.event.events != 0;
         int pruned = epoll_candidate_finish(&request, &candidate, 0, ready);
         if (ready) { revents = KERNEL_POLLIN | KERNEL_POLLRDNORM; break; }
@@ -976,7 +990,10 @@ static int64_t epoll_deliver(struct kernel_epoll_wait_request *request,
 {
     int64_t delivered = 0;
     struct epoll_candidate candidate;
-    while ((size_t)delivered < maximum && epoll_candidate_refresh(request, &candidate)) {
+    while ((size_t)delivered < maximum) {
+        enum epoll_candidate_status state = epoll_candidate_refresh(request, &candidate);
+        if (state == EPOLL_CANDIDATE_EMPTY) break;
+        if (state == EPOLL_CANDIDATE_STALE) continue;
         int copied_event = 0;
         if (candidate.event.events) {
             size_t copied = 0;

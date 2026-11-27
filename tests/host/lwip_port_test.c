@@ -215,6 +215,26 @@ static err_t hold_pair_received(void *context, struct tcp_pcb *pcb, struct pbuf 
     return ERR_OK;
 }
 
+static int tcp_body_cache_reuse(void)
+{
+    const mem_size_t baseline = STATS_GET(mem.used);
+    const mem_size_t length = BOAROS_LWIP_LOOPBACK_MSS + 144;
+    void *left = mem_malloc(length);
+    void *guard = mem_malloc(64);
+    void *body = boaros_lwip_mem_malloc_tcp_data(length);
+    if (!left || !guard || !body) return 146;
+    mem_free(left);
+    mem_free(body);
+    if (boaros_lwip_mem_malloc_tcp_data(length) != body) return 147;
+    mem_free(body);
+    /* A normal allocation that needs this extent can coalesce it again. */
+    void *wide = mem_malloc(MEM_SIZE - 2 * length - baseline);
+    if (!wide || wide != body) return 149;
+    mem_free(wide);
+    mem_free(guard);
+    return STATS_GET(mem.used) != baseline ? 150 : 0;
+}
+
 static int tcp_data_heap_recovery(int trim)
 {
     void *left=mem_malloc(4200), *join=mem_malloc(trim ? 1000 : 64);
@@ -507,6 +527,8 @@ int main(void)
     unsigned int held_count = 0;
 
     lwip_init();
+    int body_reuse = tcp_body_cache_reuse();
+    if (body_reuse) return body_reuse;
     shared_payload_cases();
     udp_before = lwip_stats.memp[MEMP_UDP_PCB]->used;
     pbuf_before = lwip_stats.memp[MEMP_PBUF]->used;
