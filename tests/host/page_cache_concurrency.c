@@ -1896,7 +1896,7 @@ static void version_capacity_case(struct kernel_page_cache *cache,struct kernel_
 {
     size_t capacity=physical_page_total(cache->allocator)/32;
     if(capacity<262144U/BOAROS_PAGE_SIZE)capacity=262144U/BOAROS_PAGE_SIZE;
-    if(capacity>4194304U/BOAROS_PAGE_SIZE)capacity=4194304U/BOAROS_PAGE_SIZE;
+    if(capacity>16U*1024U*1024U/BOAROS_PAGE_SIZE)capacity=16U*1024U*1024U/BOAROS_PAGE_SIZE;
     const size_t count=capacity+3;
     struct retained_version versions[count];memset(versions,0,sizeof(versions));
     uint64_t addresses[count];
@@ -1926,7 +1926,7 @@ static void version_capacity_case(struct kernel_page_cache *cache,struct kernel_
     assert(kernel_page_cache_reclaim(cache,BOAROS_PAGE_CACHE_WRITEBACK_PAGES)==BOAROS_PAGE_CACHE_WRITEBACK_PAGES && released==count);
     version_releases=NULL;tracked_version_pages=NULL;tracked_version_count=0;
     assert(!physical_page_release(cache->allocator,pinned));
-    printf("PASS version pool capacity: idle=%zu pages scaled to RAM and <=4MiB, pressure frees surplus before cache pages, %u-page reserve writes with allocations rejected\n",
+    printf("PASS version pool capacity: idle=%zu pages scaled to RAM and <=16MiB, pressure frees surplus before cache pages, %u-page reserve writes with allocations rejected\n",
         capacity,(unsigned)BOAROS_PAGE_CACHE_WRITEBACK_PAGES);
 }
 static void version_oom_case(struct kernel_page_cache *cache,struct kernel_vfs_file *file)
@@ -4582,8 +4582,14 @@ int main(int argc, char **argv)
     struct physical_page_allocator pages = {0};
     struct kernel_heap heap = {0};
     struct kernel_page_cache cache = {0};
+    void *version_arena = NULL;
+    size_t arena_size = sizeof(pool);
+    if (argc == 3 && !strcmp(argv[2], "version-pool")) {
+        arena_size = 160U * 1024U * 1024U;
+        assert(!posix_memalign(&version_arena, BOAROS_PAGE_SIZE, arena_size));
+    }
     struct boot_memory_layout layout = {.usable_count = 1,
-        .usable = {{(uintptr_t)pool, sizeof(pool)}}};
+        .usable = {{(uintptr_t)(version_arena ? version_arena : pool), arena_size}}};
     assert(!physical_page_allocator_init(&pages, &layout));
     assert(!physical_page_allocator_bind_access(&pages, access_page));
     assert(!physical_page_allocator_finalize(&pages));
@@ -4721,6 +4727,7 @@ owners:
     kernel_heap_get_statistics(&backend_heap,&backend_stats);
     assert(!backend_stats.live_allocations && !backend_stats.current_pages &&
         physical_page_available(&backend_pages)==backend_baseline && !physical_page_allocator_audit(&backend_pages));
+    free(version_arena);
     puts("PASS ordinary cache construction: real pressure hooks, shared protection, owner return");
     return 0;
 }
