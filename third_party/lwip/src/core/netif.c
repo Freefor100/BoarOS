@@ -1261,20 +1261,20 @@ netif_loop_output(struct netif *netif, struct pbuf *p)
   LWIP_ASSERT("netif_loop_output: invalid netif", netif != NULL);
   LWIP_ASSERT("netif_loop_output: invalid pbuf", p != NULL);
 
-  /* Only a socket UDP send to lo may give up its private, complete pbuf.
-   * The IP owner prevents netif_poll_budget from removing it during send. */
+  /* The sender gives up a private, complete pbuf. The IP owner prevents
+   * netif_poll_budget from removing it before the sender sees the handoff. */
 #if BOAROS_LWIP_LINUX_LOOPBACK && LWIP_HAVE_LOOPIF && !LWIP_NETIF_LOOPBACK_MULTITHREADING
-  int inline_input = p->boaros_udp_loopback == BOAROS_UDP_LOOPBACK_TRANSFER_INLINE;
+  int inline_input = p->boaros_loopback_transfer == BOAROS_LOOPBACK_TRANSFER_INLINE;
   int adopt = netif == &loop_netif &&
-              (inline_input || p->boaros_udp_loopback == BOAROS_UDP_LOOPBACK_TRANSFER);
-  LWIP_ASSERT("private socket UDP payload", !adopt ||
+              (inline_input || p->boaros_loopback_transfer == BOAROS_LOOPBACK_TRANSFER);
+  LWIP_ASSERT("private loopback packet", !adopt ||
               (!p->next && p->ref == 1 && p->storage_refs == 1 &&
                pbuf_match_type(p, PBUF_RAM) && !(p->flags & PBUF_FLAG_IS_CUSTOM)));
   /* The IP owner serializes this test with lo queue publication. Do not
    * bypass older packets, and leave input to the caller after output ends. */
   if (adopt && inline_input && netif->loop_first == NULL) {
     p->flags = 0;
-    p->boaros_udp_loopback = BOAROS_UDP_LOOPBACK_INLINE;
+    p->boaros_loopback_transfer = BOAROS_LOOPBACK_INLINE;
     loopback_emitted(netif, p);
     return ERR_OK;
   }
@@ -1319,7 +1319,7 @@ netif_loop_output(struct netif *netif, struct pbuf *p)
 #if BOAROS_LWIP_LINUX_LOOPBACK && LWIP_HAVE_LOOPIF && !LWIP_NETIF_LOOPBACK_MULTITHREADING
   if (adopt) {
     p->flags = 0;
-    p->boaros_udp_loopback = BOAROS_UDP_LOOPBACK_QUEUED;
+    p->boaros_loopback_transfer = BOAROS_LOOPBACK_QUEUED;
   }
 #endif
   if (netif->loop_first != NULL) {
@@ -1407,8 +1407,8 @@ void
 boaros_lwip_udp_loopback_input(struct netif *netif, struct pbuf *p)
 {
   LWIP_ASSERT("inline UDP packet", netif == &loop_netif &&
-              p->boaros_udp_loopback == BOAROS_UDP_LOOPBACK_INLINE);
-  p->boaros_udp_loopback = 0;
+              p->boaros_loopback_transfer == BOAROS_LOOPBACK_INLINE);
+  p->boaros_loopback_transfer = 0;
   loopback_input(netif, p);
 }
 #endif
