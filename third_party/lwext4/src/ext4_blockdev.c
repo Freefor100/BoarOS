@@ -780,11 +780,13 @@ static int blocks_set_phase(struct ext4_blockdev *bdev,
 	if (!bdev || !bdev->bdif || !bdev->bdif->ph_bsize) return EINVAL;
 	if (try_only && !bdev->bdif->bwrite_phase_try) return ENOTSUP;
 	uint32_t sector = bdev->bdif->ph_bsize;
+	uint32_t spans = 0;
 	for (const struct ext4_block_write *io = first; io; io = io->next) {
 		if (!io->data || !io->size || io->offset % sector || io->size % sector ||
 		    io->offset < bdev->part_offset || io->offset - bdev->part_offset > bdev->part_size ||
 		    io->size > bdev->part_size - (io->offset - bdev->part_offset) ||
 		    io->size - 1 > UINTPTR_MAX - (uintptr_t)io->data) return EINVAL;
+		spans++;
 	}
 	if (!first) return EOK;
 	ext4_bdif_lock(bdev);
@@ -805,8 +807,7 @@ static int blocks_set_phase(struct ext4_blockdev *bdev,
 		if (r != EOK) break;
 	}
 	if (!try_only || r != EAGAIN)
-		for (const struct ext4_block_write *io = first; io; io = io->next)
-			__atomic_fetch_add(&bdev->bdif->bwrite_ctr, 1, __ATOMIC_RELAXED);
+		__atomic_fetch_add(&bdev->bdif->bwrite_ctr, spans, __ATOMIC_RELAXED);
 	ext4_bdif_unlock(bdev);
 	return r;
 }
