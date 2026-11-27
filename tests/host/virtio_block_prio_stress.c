@@ -235,35 +235,32 @@ static void test_quota_and_anti_starvation(unsigned version)
            &allocator, dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
     assert(begin_call(&device, 0));
 
-    struct block_request *low_reqs[8] = {0};
+    struct block_request *low_reqs[6] = {0};
     struct block_request *high_reqs[8] = {0};
 
-    /* 1. Allocate 4 low-priority requests (capped at 4) */
-    for (unsigned i = 0; i < 4; i++) {
+    /* Low-priority requests leave the last two slots to other callers. */
+    for (unsigned i = 0; i < 6; i++) {
         low_reqs[i] = try_reserve_request(&device, KERNEL_BLOCK_PRIO_LOW);
         assert(low_reqs[i] != NULL);
         assert(low_reqs[i]->priority == (uint8_t)KERNEL_BLOCK_PRIO_LOW);
     }
-    assert(!low_slots_under_cap(&device));
-
-    /* 2. 5th low-priority request must be rejected */
+    assert(!low_slots_can_progress(&device));
     assert(try_reserve_request(&device, KERNEL_BLOCK_PRIO_LOW) == NULL);
 
-    /* 3. High-priority request can still allocate remaining 4 slots */
-    for (unsigned i = 0; i < 4; i++) {
+    for (unsigned i = 0; i < 2; i++) {
         high_reqs[i] = try_reserve_request(&device, KERNEL_BLOCK_PRIO_HIGH);
         assert(high_reqs[i] != NULL);
         assert(high_reqs[i]->priority == (uint8_t)KERNEL_BLOCK_PRIO_HIGH);
     }
 
-    /* 4. Total slots exhausted (8/8) */
     assert(try_reserve_request(&device, KERNEL_BLOCK_PRIO_HIGH) == NULL);
     assert(try_reserve_request(&device, KERNEL_BLOCK_PRIO_LOW) == NULL);
 
-    /* 5. Reader anti-starvation: release 1 low-priority request (low_count drops to 3) */
-    release_request_owner(&device, low_reqs[3]);
-    low_reqs[3] = NULL;
-    assert(low_slots_under_cap(&device));
+    release_request_owner(&device, low_reqs[5]);
+    low_reqs[5] = NULL;
+    assert(!low_slots_can_progress(&device));
+    for (unsigned i = 0; i < 2; i++) release_request_owner(&device, high_reqs[i]);
+    assert(low_slots_can_progress(&device));
 
     /* A registered high priority reader makes low priority yield. */
     struct kernel_wait_node reader_waiter = {0};
@@ -281,17 +278,13 @@ static void test_quota_and_anti_starvation(unsigned version)
     release_request_owner(&device, high_extra);
 
     /* Without a registered reader, low priority can allocate. */
-    low_reqs[3] = try_reserve_request(&device, KERNEL_BLOCK_PRIO_LOW);
-    assert(low_reqs[3] != NULL);
+    low_reqs[5] = try_reserve_request(&device, KERNEL_BLOCK_PRIO_LOW);
+    assert(low_reqs[5] != NULL);
 
-    /* Clean up all allocated requests */
-    for (unsigned i = 0; i < 4; i++) {
-        if (low_reqs[i]) release_request_owner(&device, low_reqs[i]);
-        if (high_reqs[i]) release_request_owner(&device, high_reqs[i]);
-    }
-    assert(low_slots_under_cap(&device));
+    for (unsigned i = 0; i < 6; i++) release_request_owner(&device, low_reqs[i]);
+    assert(low_slots_can_progress(&device));
 
-    /* 6. Verify high priority can allocate all 8 slots when uncontended */
+    /* High-priority callers can allocate all eight slots. */
     for (unsigned i = 0; i < 8; i++) {
         high_reqs[i] = try_reserve_request(&device, KERNEL_BLOCK_PRIO_HIGH);
         assert(high_reqs[i] != NULL);
@@ -406,7 +399,7 @@ static void test_descriptor_accounting_drift(unsigned version)
         unsigned heads[8];
 
         for (unsigned i = 0; i < batch_count; i++) {
-            enum kernel_block_priority p = (i % 3 == 0) ? KERNEL_BLOCK_PRIO_LOW :
+            enum kernel_block_priority p = (i < 6 && i % 3 == 0) ? KERNEL_BLOCK_PRIO_LOW :
                                            (i % 3 == 1) ? KERNEL_BLOCK_PRIO_NORMAL :
                                                           KERNEL_BLOCK_PRIO_HIGH;
             reqs[i] = reserve_request_prio(&device, p);

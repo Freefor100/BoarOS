@@ -1615,19 +1615,18 @@ Finish:
 
 static uint64_t ext4_group_age_deadline(const struct jbd_trans *running)
 {
-	const uint64_t idle_ns = 100000000;
-	/* Revokes and quarantine hold reusable space until checkpoint. File
-	 * data records can keep joining while commit/reclaim targets are idle. */
+	const uint64_t idle_ns = UINT64_C(100000000);
+	/* Revokes and quarantine hold reusable space until checkpoint. */
 	if (running->revoke_count || !LIST_EMPTY(&running->quarantine))
 		return running->first_dirty_ns + idle_ns;
-	/* Keep repeated background snapshots joinable. An explicit sync target,
-	 * resource pressure or an ordinary metadata operation can seal earlier. */
-	if (running->background_times_only)
+	/* Keep metadata joinable up to the usual ext4 commit interval when
+	 * the group has no ordered buffers to return. Prewritten data still
+	 * crosses the precommit barrier before its metadata becomes durable. */
+	if (running->background_times_only || !running->ordered_count)
 		return running->first_dirty_ns + UINT64_C(5000000000);
-	/* Metadata that keeps arriving can share its current log record. Bound
-	 * both the wait after the last edit and the lifetime of the group. */
+	/* Bound the retention of ordered buffers when new writes keep joining. */
 	uint64_t idle = running->last_dirty_ns + idle_ns;
-	uint64_t maximum = running->first_dirty_ns + 500000000;
+	uint64_t maximum = running->first_dirty_ns + UINT64_C(500000000);
 	return idle < maximum ? idle : maximum;
 }
 
@@ -1928,12 +1927,16 @@ static int __ext4_trans_finish(struct ext4_mountpoint *mp,int error,unsigned *wo
          * but retain the active owner through acceptance or complete abort. */
         ext4_operation_detach_locked(operation, result != EOK);
         if (result == EOK) {
-            bool running = journal->running != NULL;
+            struct jbd_trans *running = journal->running;
+            uint64_t deadline = running ? ext4_group_age_deadline(running) : 0;
             bool due = ext4_group_due(mp, false);
             result = jbd_journal_accept_state_held(journal, trans, now);
-            /* 首组要登记原有期限；普通合并不改变期限，也不重复叫醒消费者。 */
             if (result == EOK) {
-                if ((!running && journal->running) || (!due && ext4_group_due(mp, false)))
+                /* Register the first deadline and rearm a sleeping worker
+                 * when new ordered buffers or quarantine move it earlier. */
+                running = journal->running;
+                if (running && (!deadline || ext4_group_age_deadline(running) < deadline ||
+                    (!due && ext4_group_due(mp, false))))
                     request |= EXT4_JOURNAL_WORK_COMMIT;
                 /* 私有准备已占预算；接纳前压力可能已满足，不能只比较接纳边沿。 */
                 if (jbd_journal_checkpoint_ready(journal)) request |= EXT4_JOURNAL_WORK_CHECKPOINT;

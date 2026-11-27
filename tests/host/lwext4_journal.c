@@ -246,6 +246,58 @@ static void write_unwritten_range(struct ext4_blockdev *dev)
 static uint64_t ordered_now;
 static uint64_t ordered_clock(void *context) { (void)context; return ordered_now; }
 
+static void count_commit_requests(void *context, unsigned work)
+{
+    if (work & EXT4_JOURNAL_WORK_COMMIT) (*(unsigned *)context)++;
+}
+
+static void metadata_age_test(struct ext4_blockdev *dev)
+{
+    CHECK(ext4_journal_start("/") == EOK);
+    ext4_file file;
+    CHECK(ext4_fopen(&file,"/removable","w") == EOK && ext4_fclose(&file) == EOK);
+    CHECK(ext4_fopen(&file,"/probe","r+") == EOK);
+    unsigned requests = 0;
+    const struct ext4_journal_runtime runtime = {
+        .context = &requests, .now_ns = ordered_clock, .request = count_commit_requests,
+    };
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024) == EOK);
+    struct jbd_journal *journal = dev->fs->jbd_journal;
+    struct ext4_journal_progress progress;
+    const uint64_t start = 1;
+    ordered_now = start;
+    CHECK(ext4_file_set_mode(&file,0640) == EOK && requests == 1);
+    uint64_t group = journal->accepted_sequence;
+    ordered_now = start + UINT64_C(200000000);
+    CHECK(ext4_journal_group_commit("/",false) == EOK);
+    CHECK(journal->running && journal->running->sequence == group && journal->durable_sequence < group);
+    ordered_now = start + UINT64_C(4900000000);
+    CHECK(ext4_file_set_mode(&file,0600) == EOK && requests == 1);
+    CHECK(journal->accepted_sequence == group);
+    ordered_now = start + UINT64_C(5000000000);
+    CHECK(ext4_journal_group_commit("/",false) == EOK && journal->durable_sequence == group);
+
+    CHECK(ext4_file_set_mode(&file,0644) == EOK);
+    uint64_t target;
+    CHECK(ext4_file_sync_metadata_prepare(&file,false,&target) == EOK && target == group + 1);
+    CHECK(ext4_journal_group_commit("/",false) == EOK && journal->durable_sequence == target);
+
+    uint64_t first_dirty = ordered_now;
+    CHECK(ext4_file_set_mode(&file,0640) == EOK);
+    requests = 0;
+    ordered_now += UINT64_C(30000000);
+    CHECK(ext4_fremove("/removable") == EOK);
+    CHECK(journal->running && !LIST_EMPTY(&journal->running->quarantine));
+    CHECK(requests == 1 && ext4_journal_group_progress("/",&progress) == EOK);
+    CHECK(!progress.commit_ready && progress.deadline_ns == first_dirty + UINT64_C(100000000));
+    ordered_now = progress.deadline_ns;
+    CHECK(ext4_journal_group_commit("/",false) == EOK && journal->durable_sequence == target + 1);
+    CHECK(ext4_journal_group_checkpoint("/") == EOK && !journal->quarantined_inodes);
+    CHECK(ext4_fclose(&file) == EOK && ext4_journal_stop("/") == EOK);
+    CHECK(ext4_umount("/") == EOK && fault_block_crash(&disk) == 0);
+    puts("PASS metadata age cap, fixed-target sync and earlier quarantine deadline notification");
+}
+
 static void ordered_idle_test(struct ext4_blockdev *dev)
 {
     CHECK(ext4_journal_start("/") == EOK);
@@ -1898,6 +1950,10 @@ int main(int argc, char **argv)
     }
     if (!strcmp(argv[2], "ordered-idle")) {
         ordered_idle_test(&dev);
+        return 0;
+    }
+    if (!strcmp(argv[2], "metadata-age")) {
+        metadata_age_test(&dev);
         return 0;
     }
 #endif

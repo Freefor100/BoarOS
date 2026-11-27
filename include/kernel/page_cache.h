@@ -8,10 +8,10 @@
 #include <kernel/page.h>
 
 #ifndef BOAROS_PAGE_CACHE_WRITEBACK_PAGES
-#define BOAROS_PAGE_CACHE_WRITEBACK_PAGES (131072U / BOAROS_PAGE_SIZE)
+#define BOAROS_PAGE_CACHE_WRITEBACK_PAGES (262144U / BOAROS_PAGE_SIZE)
 #endif
-#if BOAROS_PAGE_CACHE_WRITEBACK_PAGES < 1 || BOAROS_PAGE_CACHE_WRITEBACK_PAGES > (131072U / BOAROS_PAGE_SIZE)
-#error "BOAROS_PAGE_CACHE_WRITEBACK_PAGES must fit the 128 KiB window"
+#if BOAROS_PAGE_CACHE_WRITEBACK_PAGES < 1 || BOAROS_PAGE_CACHE_WRITEBACK_PAGES > (262144U / BOAROS_PAGE_SIZE)
+#error "BOAROS_PAGE_CACHE_WRITEBACK_PAGES must fit the 256 KiB window"
 #endif
 
 #ifndef BOAROS_PAGE_CACHE_DIRTY_AGE
@@ -177,7 +177,7 @@ enum kernel_page_cache_status kernel_page_cache_get_for_fault(
     struct kernel_page_cache *,const struct kernel_vfs_file *,uint64_t,
     uint64_t *,size_t *,int read_window,int no_reuse);
 
-#define KERNEL_PAGE_CACHE_READ_BATCH_MAX (131072U / BOAROS_PAGE_SIZE)
+#define KERNEL_PAGE_CACHE_READ_BATCH_MAX FILE_READ_BATCH_MAX
 struct kernel_page_cache_read_page {
     uint64_t physical_address;
     size_t valid_bytes;
@@ -193,7 +193,7 @@ struct kernel_page_cache_read_page {
 enum kernel_page_cache_status kernel_page_cache_get_batch(
     struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t first,
     struct kernel_page_cache_read_page *pages, size_t count, int no_reuse);
-#if BOAROS_PAGE_CACHE_READAHEAD_PAGES && BOAROS_PAGE_SIZE > 4096
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
 /* Borrow only the demand page. Optional neighbours share its disk submission. */
 enum kernel_page_cache_status kernel_page_cache_get_forward_page(
     struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t,

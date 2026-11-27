@@ -2230,6 +2230,14 @@ static inline enum kernel_page_cache_status read_page_result(const struct file_r
     return error == -KERNEL_ENOMEM ? KERNEL_PAGE_CACHE_STATUS_NO_MEMORY :
         error ? KERNEL_PAGE_CACHE_STATUS_IO : KERNEL_PAGE_CACHE_STATUS_OK;
 }
+static inline void wake_completed_read(struct kernel_page_cache_entry *entry)
+{
+#if BOAROS_MAX_CPUS == 1
+    /* 同核只有一个执行者。后来登记的读者会在休眠前复查已发布结果。 */
+    if (!__atomic_load_n(&entry->ready.registrations,__ATOMIC_RELAXED)) return;
+#endif
+    cache_wake(&entry->ready);
+}
 static void complete_read_page(void *context, unsigned index, const struct file_read_span *span)
 {
     struct read_pages_progress *progress = context;
@@ -2237,7 +2245,7 @@ static void complete_read_page(void *context, unsigned index, const struct file_
     enum kernel_page_cache_status status = read_page_result(span, entry_valid_bytes(entry));
     __atomic_store_n(&entry->load_status, (uint32_t)status | CACHE_LOAD_EARLY, __ATOMIC_RELEASE);
     progress->completed |= UINT32_C(1) << index;
-    cache_wake(&entry->ready);
+    wake_completed_read(entry);
 }
 /* 单页保持一次同步完成；批量按页发布，生产者借用留到整批DMA排空后归还。 */
 static size_t load_read_pages(struct kernel_page_cache *cache, struct kernel_vfs_node *node,
@@ -2294,7 +2302,7 @@ static size_t load_read_pages(struct kernel_page_cache *cache, struct kernel_vfs
                 enum kernel_page_cache_status status = statuses[i-first];
                 failed += status != 0;
                 if (status || !outputs || !outputs[i]) entry_return(entry);
-                if (!(progress.completed & (UINT32_C(1) << i))) cache_wake(&entry->ready);
+                if (!(progress.completed & (UINT32_C(1) << i))) wake_completed_read(entry);
                 if (status && !entry_users(entry) && !entry_retired(entry)) {
                     remove_entry(cache, entry); clean = 1;
                 }
@@ -3177,7 +3185,7 @@ enum kernel_page_cache_status kernel_page_cache_get_batch(
     struct kernel_page_cache_read_page *pages,size_t count,int no_reuse)
 { return get_batch(cache,file,first,pages,count,no_reuse,0,false); }
 
-#if BOAROS_PAGE_CACHE_READAHEAD_PAGES && BOAROS_PAGE_SIZE > 4096
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
 enum kernel_page_cache_status kernel_page_cache_get_forward_page(
     struct kernel_page_cache *cache,const struct kernel_vfs_file *file,uint64_t first,
     struct kernel_page_cache_read_page *page)
@@ -3793,8 +3801,8 @@ static int complete_writeback(struct kernel_page_cache *cache,
 _Static_assert(BOAROS_PAGE_SIZE <= UINT32_MAX && BOAROS_PAGE_CACHE_WRITEBACK_PAGES <= UINT8_MAX,
     "writeback page offsets and span indices must fit their stored representation");
 _Static_assert(BOAROS_PAGE_CACHE_WRITEBACK_PAGES * (sizeof(struct prepared_writeback) +
-    sizeof(struct file_write_span) + sizeof(struct kernel_page_cache_entry *)) <= BOAROS_PAGE_SIZE,
-    "a complete writeback workspace must fit one physical page");
+    sizeof(struct file_write_span) + sizeof(struct kernel_page_cache_entry *)) <= 2U*BOAROS_PAGE_SIZE,
+    "a complete writeback workspace must fit two physical pages");
 
 struct writeback_workspace {
     struct prepared_writeback *prepared;

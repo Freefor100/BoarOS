@@ -78,7 +78,7 @@ static void worker_notification_case(struct lwext4_mount_adapter *adapter,struct
     __atomic_store_n(&notify_pause,1,__ATOMIC_RELEASE);
     __atomic_store_n(&notify_resume,1,__ATOMIC_RELEASE);
     while(__atomic_load_n(&notify_entered,__ATOMIC_ACQUIRE)<2)sched_yield();
-    assert(notify_deadline==notify_now+100000000);
+    assert(notify_deadline==notify_now+UINT64_C(5000000000));
     pthread_t syncing;assert(!pthread_create(&syncing,NULL,notify_sync,&file));
     uint64_t target=0;
     while(!target) {
@@ -100,5 +100,5 @@ static void worker_notification_case(struct lwext4_mount_adapter *adapter,struct
     __atomic_store_n(&notify_adapter,NULL,__ATOMIC_RELEASE);
     assert(!kernel_vfs_close(&file) && !kernel_vfs_unlink_at(root,root,"worker-notify",0) &&
            !ext4_journal_group_drain(adapter->mount_point));
-    puts("PASS worker notifications: first dirty prepare/park wake survives, eight merges request only commit once, original 100ms deadline and immediate fixed-target fsync survive later acceptance");
+    puts("PASS worker notifications: first dirty prepare/park wake survives, eight merges request commit once, the five-second metadata deadline and immediate fixed-target fsync survive later acceptance");
 }

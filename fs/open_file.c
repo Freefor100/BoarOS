@@ -101,6 +101,27 @@ int kernel_open_file_fallocate(struct kernel_open_file_description *file,
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
 enum { READ_TRACKED = 1, READ_FORWARD_SEEK = 2 };
 
+bool kernel_open_file_positioned_read_ahead(struct kernel_open_file_description *file,
+    uint64_t offset,uint64_t length)
+{
+    bool small = length <= 512 && length <= BOAROS_PAGE_SIZE - (offset & BOAROS_PAGE_MASK);
+    if ((!small && (length < 16384 ||
+        !__atomic_load_n(&file->positioned_read_header,__ATOMIC_RELAXED))) ||
+        !kernel_open_file_speculative_read_allowed(file)) return false;
+    uint64_t page = (offset >> BOAROS_PAGE_SHIFT) + 1;
+    KERNEL_RAW_SCOPE(prediction,&file->offset_lock.lock.metadata);
+    uint64_t header = file->positioned_read_header;
+    unsigned matches = file->positioned_read_matches;
+    /* Repeated sub-page reads can be record headers. Train only when a
+     * substantial demand follows in the same page, including overlapping reads. */
+    if (!small && header == page) {
+        if (matches < 4) matches++;
+    } else if (header && header != page && matches) matches--;
+    file->positioned_read_matches = matches;
+    __atomic_store_n(&file->positioned_read_header,small ? page : 0,__ATOMIC_RELAXED);
+    return small && matches >= 2;
+}
+
 static inline int follows_read_end(unsigned state,uint64_t end,uint64_t offset)
 {
     /* Small relative seeks can keep the sequential read state. */

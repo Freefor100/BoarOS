@@ -76,8 +76,9 @@ struct kernel_open_file_description {
     struct kernel_shm_limits *proc_shm_limits;
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
     uint64_t read_end,readahead_cookie,readahead_end; /* Last field is a page boundary. */
+    uint64_t positioned_read_header;
     unsigned readahead_pages;
-    uint8_t read_sequential;
+    uint8_t read_sequential, positioned_read_matches;
 #endif
     struct kernel_flock_owner flock_owner;
     struct kernel_flock_identity flock_identity; /* Pathless private inode. */
