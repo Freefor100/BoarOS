@@ -8121,12 +8121,12 @@ int kernel_vfs_node_writeback(struct kernel_vfs_node *node,
     int result = instance->ops->writeback(node, spans, count, wait);
     for (size_t i = 0; i < count; i++) {
         if (spans[i].written > spans[i].size) __builtin_trap();
-        if (wait && wait->sequence && spans[i].written) __builtin_trap();
+        if (file_writeback_wait_pending(wait) && spans[i].written) __builtin_trap();
         if (!result && spans[i].written != spans[i].size) result = -KERNEL_EIO;
     }
     /* One backend submission publishes one error before its cache completion;
      * foreground, background and mount callers only propagate this result. */
-    if (wait && wait->sequence) {
+    if (file_writeback_wait_pending(wait)) {
         if (result != -KERNEL_EAGAIN || !instance->ops->wait_writeback) __builtin_trap();
     } else if (result) kernel_vfs_record_writeback_error(node, result);
     return result;

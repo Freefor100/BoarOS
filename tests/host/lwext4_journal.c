@@ -223,9 +223,15 @@ static void write_deferred_prewrite(struct ext4_blockdev *dev)
     dev->bdif->bwrite_batch = unexpected_prewrite;
     dev->bdif->bwrite_batch_try_phase = defer_prewrite;
     kernel_io_context_current()->background_reclaim = 1;
+    struct jbd_journal *journal=dev->fs->jbd_journal;
+    uint64_t accepted=journal->accepted_sequence;
+    struct file_writeback_wait wait={0};
+    CHECK(ext4_fpwrite_batch_wait(&file, &span, 1, &wait) == EAGAIN &&
+        wait.device_phase && !wait.sequence && !span.written && !owner.references);
+    CHECK(journal->accepted_sequence == accepted && !ext4_fsize(&file));
     CHECK(ext4_fpwrite_batch(&file, &span, 1) == EOK && span.written == length);
     kernel_io_context_current()->background_reclaim = 0;
-    CHECK(try_prewrite_calls == 1 && owner.references == 1);
+    CHECK(try_prewrite_calls == 2 && owner.references == 1);
     dev->bdif->bwrite_batch = NULL;
     dev->bdif->bwrite_batch_try_phase = NULL;
     CHECK(ext4_journal_group_commit("/", true) == EOK);

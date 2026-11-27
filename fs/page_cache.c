@@ -3349,12 +3349,28 @@ static unsigned cached_user_batch(const struct kernel_vfs_write_source *source,
         return 0;
     const struct kernel_uaccess_iovec *iov = source->user.iov;
     *address = iov->base + source->user.offset;
-    if ((*address & BOAROS_PAGE_MASK) || source->user.offset >= iov->length)
+    if (source->user.offset >= iov->length)
         return 0;
     uint64_t available = iov->length - source->user.offset;
     if (limit > available) limit = available;
     size_t pages = limit / BOAROS_PAGE_SIZE;
-    return pages > KERNEL_MM_USER_READ_BATCH ? KERNEL_MM_USER_READ_BATCH : (unsigned)pages;
+    unsigned maximum = KERNEL_MM_USER_READ_BATCH - !!(*address & BOAROS_PAGE_MASK);
+    return pages > maximum ? maximum : (unsigned)pages;
+}
+
+/* One offset applies to the entire contiguous source. Consecutive destination
+ * pages borrow the shared boundary page once and still copy in file order. */
+static inline void copy_cached_user_page(struct kernel_vfs_write_source *source,
+    unsigned char *destination, const struct kernel_mm_user_pin *pins, size_t skew)
+{
+    source->data = (const unsigned char *)pins[0].page + skew;
+    kernel_vfs_write_source_copy(source, destination, BOAROS_PAGE_SIZE - skew);
+    if (skew) {
+        source->data = pins[1].page;
+        kernel_vfs_write_source_copy(source, destination + BOAROS_PAGE_SIZE - skew, skew);
+        source->chunks++;
+    }
+    kernel_vfs_write_source_advance(source, BOAROS_PAGE_SIZE);
 }
 
 /* The VFS write-operation owner fixes the append position. The candidates
@@ -3367,8 +3383,10 @@ static __attribute__((noinline)) size_t copy_cached_append_batch(
     uint64_t address;
     unsigned count = cached_user_batch(source, offset, limit, &address);
     if (count < 2) return 0;
+    size_t skew = address & BOAROS_PAGE_MASK;
+    unsigned extra = skew != 0;
     struct kernel_task_io_buffer scratch = {0};
-    struct kernel_mm_user_pin pair_pins[2];
+    struct kernel_mm_user_pin pair_pins[3];
     void *pair_entries[2];
     struct kernel_mm_user_pin *pins = pair_pins;
     void **entries = pair_entries;
@@ -3397,19 +3415,18 @@ static __attribute__((noinline)) size_t copy_cached_append_batch(
     }
     kernel_heap_release_small_batch(cache->heap, entries + built, headers - built);
     physical_page_release_batch(cache->allocator, pages + built, owned - built);
-    memset(pins, 0, built * sizeof(*pins));
+    memset(pins, 0, (built + extra) * sizeof(*pins));
     unsigned pinned = built ?
-        kernel_mm_try_pin_user_read_batch(source->mm, address, built, pins) : 0;
+        kernel_mm_try_pin_user_read_batch(source->mm, address - skew, built + extra, pins) : 0;
+    unsigned complete = pinned > extra ? pinned - extra : 0;
     struct kernel_vfs_write_source copy = *source;
-    for (unsigned i = 0; i < pinned; i++) {
+    for (unsigned i = 0; i < complete; i++) {
         struct kernel_page_cache_entry *entry = entries[i];
-        copy.data = pins[i].page;
-        kernel_vfs_write_source_copy(&copy, entry->data, BOAROS_PAGE_SIZE);
-        kernel_vfs_write_source_advance(&copy, BOAROS_PAGE_SIZE);
+        copy_cached_user_page(&copy, entry->data, pins + i, skew);
     }
     kernel_mm_unpin_user_read_batch(pins, pinned);
     unsigned published = 0;
-    if (pinned) {
+    if (complete) {
         KERNEL_LOCK_SCOPE(io);
         kernel_vfs_node_lock(node, &io, 1);
         if (kernel_vfs_node_size(node) == offset) {
@@ -3422,7 +3439,7 @@ static __attribute__((noinline)) size_t copy_cached_append_batch(
 #endif
                     {
                         struct kernel_page_cache_entry *next = index_at_or_after(node, first);
-                        for (; published < pinned; published++) {
+                        for (; published < complete; published++) {
                             if (next && next->page_index == first + published) break;
                             struct kernel_page_cache_entry *entry = entries[published];
                             prepare_entry_publication(entry, KERNEL_PAGE_CACHE_STATUS_OK);
@@ -3455,11 +3472,11 @@ static __attribute__((noinline)) size_t copy_cached_append_batch(
     size_t bytes = (size_t)published * BOAROS_PAGE_SIZE;
     if (published) source->data = NULL;
     source->user.offset += bytes;
-    source->chunks += published;
+    source->chunks += published * (1 + extra);
     return bytes;
 }
 
-/* A resident, page-aligned overwrite can keep its inode writer across the
+/* A resident overwrite of whole file pages can keep its inode writer across the
  * copy. Source faults and closed destination entries fall back at the first
  * unaccepted page. A batch never takes the cache mutex until publishing dirt. */
 static __attribute__((noinline)) size_t copy_cached_overwrite_batch(
@@ -3472,17 +3489,21 @@ static __attribute__((noinline)) size_t copy_cached_overwrite_batch(
     uint64_t address;
     unsigned count = cached_user_batch(source, offset, limit, &address);
     if (count < 2) return 0;
+    size_t skew = address & BOAROS_PAGE_MASK;
+    unsigned extra = skew != 0;
 
     struct kernel_task_io_buffer scratch = {0};
     if (kernel_task_io_buffer_acquire(&scratch, cache->allocator)) return 0;
     struct cached_write_workspace *work = scratch.data;
-    memset(work->pins, 0, count * sizeof(work->pins[0]));
+    memset(work->pins, 0, (count + extra) * sizeof(work->pins[0]));
     struct kernel_mm_user_pin *pins = work->pins;
-    count = kernel_mm_try_pin_user_read_batch(source->mm, address, count, pins);
-    if (!count) {
+    unsigned pinned = kernel_mm_try_pin_user_read_batch(source->mm, address - skew, count + extra, pins);
+    if (pinned <= extra) {
+        kernel_mm_unpin_user_read_batch(pins, pinned);
         kernel_task_io_buffer_release(&scratch);
         return 0;
     }
+    count = pinned - extra;
     struct kernel_page_cache_write_borrow *writers = work->writers;
     memset(writers, 0, count * sizeof(writers[0]));
     unsigned used = 0;
@@ -3509,12 +3530,9 @@ static __attribute__((noinline)) size_t copy_cached_overwrite_batch(
                 if (used) entry_borrows_add(cache->record, used);
             }
         }
-        for (unsigned i = 0; i < used; i++) {
-            source->data = pins[i].page;
-            kernel_vfs_write_source_copy(source, writers[i].entry->data, BOAROS_PAGE_SIZE);
-            kernel_vfs_write_source_advance(source, BOAROS_PAGE_SIZE);
-        }
-        kernel_mm_unpin_user_read_batch(pins, count);
+        for (unsigned i = 0; i < used; i++)
+            copy_cached_user_page(source, writers[i].entry->data, pins + i, skew);
+        kernel_mm_unpin_user_read_batch(pins, pinned);
         if (used) {
             CACHE_SCOPE(guard, cache);
             unsigned newly_dirty = 0;
@@ -4270,9 +4288,9 @@ static int writeback_run(struct kernel_page_cache *cache,
         if (submitted) result=submitted;
         /* 后端已结束实际访问；完成发布只依赖entry借用和缓存保护。 */
         if (io.lock) kernel_lock_release(&io);
-        if (wait.sequence) {
+        if (file_writeback_wait_pending(&wait)) {
             /* No span was accepted. Release the snapshot before waiting and
-             * qualify the current cache pages again after journal progress. */
+             * qualify the current cache pages again after backend progress. */
             for (size_t i=0;i<done;i++)
                 if (prepared[i].version) writeback_unprepare(cache,entries[first+i],&prepared[i]);
             struct kernel_vfs_node *node=entries[first]->node;

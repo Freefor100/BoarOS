@@ -266,6 +266,7 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
  * transfer owner. A successful admission still drains published I/O. */
 enum kernel_block_status kernel_block_try_write_phase(struct kernel_block_device *device,
     kernel_block_phase_next_fn next, const void *next_context, const void *first);
+void kernel_block_wait_write_phase(struct kernel_block_device *device);
 
 /* Preflight all spans before I/O. Disk ranges may overlap, but mutable outputs
  * must be disjoint from each other and these descriptors. Every span reports

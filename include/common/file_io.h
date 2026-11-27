@@ -3,6 +3,7 @@
 #define BOAROS_COMMON_FILE_IO_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <common/block_io.h>
 
@@ -73,7 +74,10 @@ struct file_write_span {
 struct file_writeback_wait {
     uint64_t sequence;
     unsigned kind;
+    bool device_phase;
 };
+static inline bool file_writeback_wait_pending(const struct file_writeback_wait *wait)
+{ return wait && (wait->sequence || wait->device_phase); }
 
 struct file_write_set {
     struct file_write_span *spans;

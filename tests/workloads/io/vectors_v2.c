@@ -173,6 +173,21 @@ static void local_user_copy(int fd)
     unsigned char *input=mmap(NULL,3*page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
     unsigned char *output=mmap(NULL,3*page,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
     CHECK(input!=MAP_FAILED && output!=MAP_FAILED);
+    const size_t skew=257;
+    for (size_t i=0;i<size;i++) input[skew+i]=(unsigned char)(i*17+i/page);
+    CHECK(pwrite(fd,input+skew,size,0)==(ssize_t)size && !fsync(fd));
+    CHECK(pread(fd,output,size,0)==(ssize_t)size && !memcmp(input+skew,output,size));
+    for (size_t i=0;i<size;i++) input[skew+i]++;
+    CHECK(pwrite(fd,input+skew,size,0)==(ssize_t)size);
+    CHECK(pread(fd,output,size,0)==(ssize_t)size && !memcmp(input+skew,output,size));
+    for (size_t i=0;i<size;i++) input[skew+i]++;
+    CHECK(!mprotect(input+2*page,page,PROT_NONE));
+    CHECK(pwrite(fd,input+skew,size,0)==(ssize_t)(size-skew));
+    CHECK(!mprotect(input+2*page,page,PROT_READ|PROT_WRITE));
+    CHECK(!fsync(fd) && pread(fd,output,size,0)==(ssize_t)size &&
+        !memcmp(input+skew,output,size-skew));
+    for (size_t i=size-skew;i<size;i++) CHECK(output[i]==(unsigned char)(input[skew+i]-1));
+
     for(size_t i=0;i<size;i++)input[i]=(unsigned char)(i*17+3);
     CHECK(pwrite(fd,input,size,0)==(ssize_t)size);
     /* Cold destination faults return to the copy owner before page preparation. */
