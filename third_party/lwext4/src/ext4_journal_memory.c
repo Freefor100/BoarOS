@@ -263,6 +263,18 @@ void jbd_source_get(struct jbd_source *source)
     if (!references || references==UINT32_MAX) __builtin_trap();
 }
 
+static bool source_unlink_last_locked(struct jbd_memory *memory,struct jbd_source *source)
+{
+    if (source->memory != memory) __builtin_trap();
+    uint32_t references = __atomic_fetch_sub(&source->references,1,__ATOMIC_ACQ_REL);
+    if (!references) __builtin_trap();
+    if (references > 1) return false;
+    /* Lookup and final retirement share this lock. Readers can still find
+     * live sources, and a zero reference count cannot be resurrected. */
+    RB_REMOVE(jbd_source_tree,&memory->sources,source);
+    return true;
+}
+
 static bool source_drop(struct jbd_source *source)
 {
     uint32_t references=__atomic_load_n(&source->references,__ATOMIC_RELAXED);
@@ -273,12 +285,7 @@ static bool source_drop(struct jbd_source *source)
     struct jbd_memory *memory=source->memory;
     {
         KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
-        references=__atomic_fetch_sub(&source->references,1,__ATOMIC_ACQ_REL);
-        if (!references) __builtin_trap();
-        if (references>1) return false;
-        /* Lookup and final retirement share the short lock. A reader-only
-         * source remains discoverable, and zero references cannot resurrect. */
-        RB_REMOVE(jbd_source_tree,&memory->sources,source);
+        if (!source_unlink_last_locked(memory,source)) return false;
     }
     source->owner.release(source->owner.context);
     release_borrow(memory,source->owner.bytes);
@@ -298,17 +305,95 @@ static int source_get_existing(struct jbd_source *source,const struct file_data_
     return EOK;
 }
 
-int jbd_source_borrow(struct jbd_journal *journal,const struct file_data_source *owner,
-    struct jbd_source **out)
+static __attribute__((noinline)) void refill_source_controls(struct jbd_journal *journal,
+    struct jbd_source_controls *controls, size_t source_bytes)
+{
+    int index;
+    size_t charge = allocation_class(sizeof(struct jbd_source), &index);
+    if (!charge || index < 0) return;
+    unsigned limit = controls->remaining;
+    if (limit > JBD_SOURCE_CONTROL_BATCH) limit = JBD_SOURCE_CONTROL_BATCH;
+    struct jbd_memory *memory = journal->memory;
+    unsigned fresh;
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard, &memory->metadata);
+        if (memory->closing || !room_locked(memory, source_bytes)) return;
+        while (controls->count < limit && memory->allocation_cache[index]) {
+            void *entry = memory->allocation_cache[index];
+            memory->allocation_cache[index] = *(void **)entry;
+            controls->entries[controls->count++] = entry;
+        }
+        size_t bytes = controls->count * charge;
+        if (memory->cached < bytes) __builtin_trap();
+        memory->cached -= bytes;
+        account_change(memory, bytes, true);
+
+        fresh = limit - controls->count;
+        /* The current payload has priority over speculative controls. */
+        while (fresh && (fresh * charge > SIZE_MAX - source_bytes ||
+            !room_locked(memory, fresh * charge + source_bytes))) fresh--;
+        if (fresh) {
+            reserve_locked(memory, fresh * charge);
+            if (!memory->references || memory->references > UINT32_MAX - fresh) __builtin_trap();
+            memory->references += fresh;
+        }
+    }
+    if (!fresh) return;
+
+    void *new_entries[JBD_SOURCE_CONTROL_BATCH];
+    unsigned allocated = 0;
+#if CONFIG_USE_USER_BATCH_CALLOC
+    allocated = ext4_user_calloc_batch_nosleep(fresh, charge, new_entries);
+#else
+    while (allocated < fresh) {
+        void *entry = ext4_calloc(1, charge);
+        if (!entry) break;
+        new_entries[allocated++] = entry;
+    }
+#endif
+    {
+        KERNEL_TASK_LOCK_SCOPE(guard, &memory->metadata);
+        size_t reserved = fresh * charge, used = allocated * charge;
+        unsigned unused = fresh - allocated;
+        if (memory->reserved < reserved || memory->used > SIZE_MAX - used ||
+            memory->references <= unused) __builtin_trap();
+        memory->reserved -= reserved;
+        memory->references -= unused;
+        memory->used += used;
+        if (memory->peak < memory->used) memory->peak = memory->used;
+        account_change(memory, used, true);
+    }
+    for (unsigned i = 0; i < allocated; i++) {
+        union jbd_allocation *entry = new_entries[i];
+        entry->owner.memory = memory;
+        entry->owner.bytes = charge;
+        controls->entries[controls->count++] = entry + 1;
+    }
+}
+
+int jbd_source_borrow_control(struct jbd_journal *journal, const struct file_data_source *owner,
+    struct jbd_source **out, bool estimated_absent, struct jbd_source_controls *controls)
 {
     struct jbd_memory *memory=journal->memory;
     struct jbd_source key={.owner.context=owner->context};
-    {
+    if (!estimated_absent) {
         KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
         struct jbd_source *source=RB_FIND(jbd_source_tree,&memory->sources,&key);
         if (source) return source_get_existing(source,owner,out);
     }
-    struct jbd_source *candidate=jbd_alloc(journal,sizeof(*candidate));
+    struct jbd_source *candidate = NULL;
+    if (estimated_absent && controls && controls->remaining) {
+        if (!controls->count) refill_source_controls(journal, controls, owner->bytes);
+        if (controls->count) {
+            controls->remaining--;
+            candidate = controls->entries[--controls->count];
+            memset(candidate, 0, sizeof(*candidate));
+        } else {
+            /* The ordinary allocator can refill a cold cache later. */
+            controls->remaining = 0;
+        }
+    }
+    if (!candidate) candidate = jbd_alloc(journal, sizeof(*candidate));
     if (candidate) {
         candidate->owner=*owner;
         candidate->memory=memory;
@@ -319,19 +404,27 @@ int jbd_source_borrow(struct jbd_journal *journal,const struct file_data_source 
     for (unsigned attempt=0;;attempt++) {
         {
             KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
-            struct jbd_source *source=RB_FIND(jbd_source_tree,&memory->sources,&key);
+            struct jbd_source *source;
+            if (candidate && !memory->closing && room_locked(memory,owner->bytes)) {
+                /* The insertion detects a concurrently published owner and
+                 * finds the insertion point in the same tree traversal. */
+                source=RB_INSERT(jbd_source_tree,&memory->sources,candidate);
+                if (!source) {
+                    memory->used+=owner->bytes;memory->borrowed+=owner->bytes;
+                    if (memory->peak<memory->used) memory->peak=memory->used;
+                    *out=candidate;
+                    published=true;
+                    break;
+                }
+            } else {
+                source=RB_FIND(jbd_source_tree,&memory->sources,&key);
+            }
             if (source) {result=source_get_existing(source,owner,out);break;}
             if (!candidate) return ENOMEM;
-            if (!memory->closing && room_locked(memory,owner->bytes)) {
-                memory->used+=owner->bytes;memory->borrowed+=owner->bytes;
-                if (memory->peak<memory->used) memory->peak=memory->used;
-                if (RB_INSERT(jbd_source_tree,&memory->sources,candidate)) __builtin_trap();
-                *out=candidate;
-                published=true;
-                break;
-            }
         }
         if (attempt) {budget_failure(journal);break;}
+        /* Let ordinary reclaim consume the staged slack before retrying. */
+        if (controls) jbd_source_return_controls(controls);
         trim_owner(memory,0);
     }
     if (published) {
@@ -345,9 +438,10 @@ int jbd_source_borrow(struct jbd_journal *journal,const struct file_data_source 
 }
 
 bool jbd_source_estimate(struct jbd_journal *journal,const struct file_data_source *const *sources,
-    unsigned count,size_t *minimum)
+    unsigned count,size_t *minimum,uint64_t *absent)
 {
     if (!count) return true;
+    if (absent) memset(absent,0,((count+63U)/64U)*sizeof(*absent));
     struct jbd_memory *memory=journal->memory;
     size_t control=jbd_allocation_charge(sizeof(struct jbd_source));
     KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
@@ -357,6 +451,7 @@ bool jbd_source_estimate(struct jbd_journal *journal,const struct file_data_sour
         unsigned previous=0;
         while (previous<i && sources[previous]->context!=sources[i]->context) previous++;
         if (previous!=i) continue;
+        if (absent) absent[i/64U]|=UINT64_C(1)<<(i%64U);
         if (sources[i]->bytes>SIZE_MAX-control || sources[i]->bytes+control>SIZE_MAX-*minimum)
             return false;
         *minimum+=sources[i]->bytes+control;
@@ -440,15 +535,16 @@ void jbd_free(void *pointer)
 /* These controls no longer own a payload borrow. Their allocation
  * references keep the owner alive through the actual free;
  * publish reclaimed quota only after the allocator has consumed the batch. */
-static void free_controls(void **objects,unsigned count)
+static void free_controls(struct jbd_memory *memory,void **objects,unsigned count,size_t borrowed)
 {
-    if (!count) return;
-    struct jbd_memory *memory=((union jbd_allocation *)objects[0]-1)->owner.memory;
     void *retired=NULL;
     size_t cached=0,released=0;
     unsigned retired_count=0;
     {
         KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
+        if (memory->used < borrowed || memory->borrowed < borrowed) __builtin_trap();
+        memory->used -= borrowed;
+        memory->borrowed -= borrowed;
         for (unsigned i=0;i<count;i++) {
             void *pointer=objects[i];
             union jbd_allocation *allocation=(union jbd_allocation *)pointer-1;
@@ -476,6 +572,15 @@ static void free_controls(void **objects,unsigned count)
     }
     if (destroy) destroy_memory(memory);
 }
+void jbd_source_return_controls(struct jbd_source_controls *controls)
+{
+    if (!controls->count) return;
+    struct jbd_memory *memory =
+        ((union jbd_allocation *)controls->entries[0] - 1)->owner.memory;
+    free_controls(memory, controls->entries, controls->count, 0);
+    controls->count = 0;
+}
+
 void jbd_data_put(struct jbd_data *data)
 {
     unsigned old=__atomic_fetch_sub(&data->references,1,__ATOMIC_ACQ_REL);
@@ -490,17 +595,38 @@ void jbd_data_free_list(struct jbd_data *data,unsigned count)
 {
     while (data) {
         void *controls[32];unsigned n=0;
+        bool has_source=false;
         for (unsigned i=0;data && i<16;i++) {
             struct jbd_data *next=TAILQ_NEXT(data,node);
             if (!count--) __builtin_trap();
             unsigned old=__atomic_fetch_sub(&data->references,1,__ATOMIC_ACQ_REL);
             if (!old) __builtin_trap();
             if (old!=1) {data=next;continue;}
-            if (data->source && source_drop(data->source)) controls[n++]=data->source;
             jbd_image_free(data->image);
+            has_source |= data->source != NULL;
             controls[n++]=data;data=next;
         }
-        free_controls(controls,n);
+        if (!n) continue;
+        struct jbd_memory *memory=((union jbd_allocation *)controls[0]-1)->owner.memory;
+        size_t borrowed=0;
+        if (has_source) {
+            unsigned records=n;
+            {
+                KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
+                for (unsigned i=0;i<records;i++) {
+                    struct jbd_source *source=((struct jbd_data *)controls[i])->source;
+                    if (source && source_unlink_last_locked(memory,source)) controls[n++]=source;
+                }
+            }
+            /* These callbacks may release page-cache versions and notify
+             * writers. Return the combined journal charge after they finish. */
+            for (unsigned i=records;i<n;i++) {
+                struct jbd_source *source=controls[i];
+                source->owner.release(source->owner.context);
+                borrowed+=source->owner.bytes;
+            }
+        }
+        free_controls(memory,controls,n,borrowed);
     }
     if (count) __builtin_trap();
 }

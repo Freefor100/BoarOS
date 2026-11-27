@@ -15,6 +15,6 @@ ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     "$root/third_party/lwext4/src/ext4_journal_memory.c" \
     "$root/tests/host/lwext4_memory_owner.c" "$root/tests/host/block_runtime.c" \
     "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" \
-    -I"$root/tests/host/block_model" -pthread -o "$work/probe"
+    -I"$root/tests/host/block_model" -Wl,--wrap=kernel_raw_lock_acquire -pthread -o "$work/probe"
 "$work/probe" 1024
 "$work/probe" 4096

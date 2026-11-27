@@ -2226,7 +2226,10 @@ int jbd_trans_write_data(struct jbd_trans *trans, ext4_fsblk_t lba,
 	int r = EOK;
 	if (stable) {
 		struct jbd_source *borrow;
-		r = jbd_source_borrow(journal, source, &borrow);
+        struct jbd_source_controls *controls = trans->source_controls;
+        bool estimated_absent = controls && controls->estimated_absent == source;
+        if (estimated_absent) controls->estimated_absent = NULL;
+		r = jbd_source_borrow_control(journal, source, &borrow, estimated_absent, controls);
 		if (r != EOK) goto Failed;
 		/* A fresh zeroed record owns no old source or image. Do not
 		 * re-enter journal STATE for each newly ordered data block. */
@@ -4151,9 +4154,9 @@ Commit:
     return true;
 }
 
-unsigned jbd_journal_operation_resources(struct jbd_journal *journal, const struct jbd_trans *allocated,
+unsigned jbd_journal_write_resources(struct jbd_journal *journal, const struct jbd_trans *allocated,
     size_t payloads, size_t data_images,
-	const struct file_data_source *const *sources, unsigned count)
+	const struct file_data_source *const *sources, unsigned count, uint64_t *absent)
 {
 	if (allocated && allocated->journal != journal) __builtin_trap();
 	/* Private metadata needs undo/version/control space; borrowed file data
@@ -4169,7 +4172,7 @@ unsigned jbd_journal_operation_resources(struct jbd_journal *journal, const stru
 	size_t record = jbd_allocation_charge(sizeof(struct jbd_data));
 	if (payloads > (SIZE_MAX - minimum) / record) return JBD_JOURNAL_MEMORY;
 	minimum += payloads * record;
-    if (!jbd_source_estimate(journal,sources,count,&minimum)) return JBD_JOURNAL_MEMORY;
+    if (!jbd_source_estimate(journal,sources,count,&minimum,absent)) return JBD_JOURNAL_MEMORY;
 	unsigned logs = 1 + jbd_log_images_needed(journal, 1, 0, true);
     unsigned missing = jbd_budget_room(journal, minimum) ? 0 : JBD_JOURNAL_MEMORY;
     unsigned available = jbd_log_free_blocks(journal);
