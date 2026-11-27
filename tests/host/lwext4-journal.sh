@@ -27,7 +27,13 @@ write-unwritten|ordered-idle|metadata-age|deferred-prewrite|deferred-admission|m
         mkfs.ext4 -q -F -b "$block" "$work/writeback-base.img"
         debugfs -w -R "write $work/data /probe" "$work/writeback-base.img" >/dev/null 2>&1
         for scenario in $cases; do
-            cp "$work/writeback-base.img" "$work/writeback.img"
+            if [ "$scenario" = metadata-age ]; then
+                truncate -s 32M "$work/writeback.img"
+                mkfs.ext4 -q -F -b "$block" -N 64 "$work/writeback.img"
+                debugfs -w -R "write $work/data /probe" "$work/writeback.img" >/dev/null 2>&1
+            else
+                cp "$work/writeback-base.img" "$work/writeback.img"
+            fi
             timeout 30 "$work/probe" "$work/writeback.img" "$scenario"
             e2fsck -fn "$work/writeback.img" > "$work/writeback-fsck.log" 2>&1 ||
                 { cat "$work/writeback-fsck.log"; exit 1; }
