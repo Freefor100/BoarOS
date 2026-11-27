@@ -28,7 +28,7 @@ sequenceDiagram
     participant Target as 目标 OFD（管道/套接字/子 epoll）
     participant User as 用户态事件缓冲
 
-    Caller->>Lock: 获取锁，摘取候选 item，递增 item 引用，尝试借用 target_file<br/>记录 (control_generation, notification_generation)
+    Caller->>Lock: 获取锁，交付者在摘取首个候选时取得扫描权<br/>借用 item 与 target_file，记录两个代次
     Lock-->>Caller: 释放锁（开中断）
     Caller->>Target: kernel_open_file_poll(target, interest)（目标自身同步域）
     Target-->>Caller: 返回实时 revents
@@ -44,7 +44,7 @@ sequenceDiagram
 
 ### 2.1 单项借用与 `ready` / `pending` 双链隔离
 
-- **独占扫描者（`scan_owner`）**：同一 `epoll` 实例同一时刻只有一个交付调用通过 `epoll_scan_begin()` 成为 `scan_owner`。扫描开始后，新到达的异步通知（`kernel_epoll_wait_callback()`）若发现该项不在 `ready` 上，会写入独立的 **`pending` 链表**，绝不篡改扫描者正在消费的 `ready` 链表。
+- **独占扫描者（`scan_owner`）**：`epoll_candidate_refresh()` 在同一临界区内为交付者取得扫描权、摘取首个候选并借用目标。空队列或扫描权已被占用时立即返回。请求记录自己是否取得扫描权，只有取得扫描权的请求才进入 `epoll_scan_finish()` 的临界区。扫描期间到达的异步通知把尚未在 `ready` 链表中的登记项加入 `pending` 链表。
 - **避免 `maxevents` 较小时的整链搬运**：交付循环每次只从 `ready_head` 摘下**唯一一个 `current` 候选**，递增其引用计数并置位 `item->in_scan = 1`。如果 `maxevents` 很小（例如只取 1 条事件），剩余未扫描的项原封不动留在 `ready` 链表上，不会像传统批量摘链实现那样产生冗余的摘取、加引用与重新挂回操作。
 - **本轮 LT 去重**：水平触发（LT）项在完成交付后被归还到 `pending` 而非 `ready`，确保同一轮 `epoll_wait` 内不会把同一个 LT 项重复交付多次；直到 `epoll_scan_finish()` 结束本轮扫描时，才把 `pending` 链去重合并回 `ready` 链，并在仍有就绪项时通知等待者。
 

@@ -97,7 +97,7 @@ struct kernel_epoll_wait_request {
     struct kernel_open_file_description *file, *target;
     struct kernel_epoll_item *current;
     struct kernel_epoll_wait_request *previous;
-    uint8_t observing;
+    uint8_t observing, scanning;
 };
 
 int kernel_epoll_create(struct kernel_heap *heap,
