@@ -522,3 +522,14 @@ void ext4_user_free(void *pointer)
         kernel_heap_release(lwext4_heap, pointer);
     }
 }
+
+void ext4_user_free_small_batch(void *const *objects, unsigned count)
+{
+    struct kernel_heap *heap = lwext4_heap;
+    while (count) {
+        unsigned batch = count < 16U ? count : 16U;
+        kernel_heap_release_small_batch(heap, objects, batch);
+        objects += batch;
+        count -= batch;
+    }
+}

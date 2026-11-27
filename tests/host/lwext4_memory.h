@@ -5,4 +5,5 @@ void *ext4_user_malloc(size_t size);
 void *ext4_user_calloc(size_t count, size_t size);
 void *ext4_user_realloc(void *pointer, size_t size);
 void ext4_user_free(void *pointer);
+void ext4_user_free_small_batch(void *const *objects, unsigned count);
 #endif

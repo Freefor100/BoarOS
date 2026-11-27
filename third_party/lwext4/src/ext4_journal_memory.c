@@ -45,6 +45,9 @@ union jbd_allocation {
 };
 _Static_assert(sizeof(struct jbd_trans) + sizeof(union jbd_allocation) <=
     (16U << (JBD_ALLOCATION_CACHE_BUCKETS - 1)), "transaction control exceeds journal cache classes");
+_Static_assert(sizeof(struct jbd_source) + sizeof(union jbd_allocation) <= 1024 &&
+    sizeof(struct jbd_data) + sizeof(union jbd_allocation) <= 1024,
+    "ordered-write controls must fit the heap's small classes");
 static inline size_t allocation_class(size_t bytes, int *index)
 {
     if (bytes<sizeof(void *)) bytes=sizeof(void *);
@@ -69,15 +72,18 @@ static void reference_locked(struct jbd_memory *memory)
     if (!memory->references || memory->references==UINT32_MAX) __builtin_trap();
     memory->references++;
 }
-static bool dereference_locked(struct jbd_memory *memory)
+static bool dereference_many_locked(struct jbd_memory *memory,unsigned count)
 {
-    if (!memory->references) __builtin_trap();
-    if (--memory->references) return false;
+    if (memory->references < count) __builtin_trap();
+    memory->references -= count;
+    if (memory->references) return false;
     if (memory->used || memory->reserved || memory->cached || memory->borrowed ||
         memory->image_cache || !RB_EMPTY(&memory->sources)) __builtin_trap();
     for (unsigned i=0;i<JBD_ALLOCATION_CACHE_BUCKETS;i++) if (memory->allocation_cache[i]) __builtin_trap();
     return true;
 }
+static bool dereference_locked(struct jbd_memory *memory)
+{ return dereference_many_locked(memory,1); }
 static void account_change(struct jbd_memory *memory,size_t bytes,bool acquiring)
 {
     if (bytes && memory->account.context)
@@ -537,7 +543,6 @@ void jbd_free(void *pointer)
  * publish reclaimed quota only after the allocator has consumed the batch. */
 static void free_controls(struct jbd_memory *memory,void **objects,unsigned count,size_t borrowed)
 {
-    void *retired=NULL;
     size_t cached=0,released=0;
     unsigned retired_count=0;
     {
@@ -552,23 +557,24 @@ static void free_controls(struct jbd_memory *memory,void **objects,unsigned coun
             size_t charge=allocation->owner.bytes;
             if (cache_control_locked(memory,pointer,charge)) cached+=charge;
             else {
-                *(void **)pointer=retired;retired=pointer;
-                released+=charge;retired_count++;
+                objects[retired_count++]=allocation;
+                released+=charge;
             }
         }
         account_change(memory,cached,false);
     }
-    if (!retired) return;
-    while (retired) {
-        void *pointer=retired;retired=*(void **)pointer;
-        ext4_free((union jbd_allocation *)pointer-1);
-    }
+    if (!retired_count) return;
+#if CONFIG_USE_USER_BATCH_FREE
+    ext4_user_free_small_batch(objects,retired_count);
+#else
+    for (unsigned i=0;i<retired_count;i++) ext4_free(objects[i]);
+#endif
     bool destroy=false;
     {
         KERNEL_TASK_LOCK_SCOPE(guard,&memory->metadata);
         if (memory->used<released) __builtin_trap();
         memory->used-=released;account_change(memory,released,false);
-        while (retired_count--) destroy=dereference_locked(memory);
+        destroy=dereference_many_locked(memory,retired_count);
     }
     if (destroy) destroy_memory(memory);
 }
