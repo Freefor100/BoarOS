@@ -346,14 +346,37 @@ static void metadata_age_test(struct ext4_blockdev *dev)
     ordered_now += UINT64_C(30000000);
     CHECK(ext4_fremove("/removable") == EOK);
     CHECK(journal->running && !LIST_EMPTY(&journal->running->quarantine));
-    CHECK(requests == 1 && ext4_journal_group_progress("/",&progress) == EOK);
-    CHECK(!progress.commit_ready && progress.deadline_ns == first_dirty + UINT64_C(100000000));
-    ordered_now = progress.deadline_ns;
-    CHECK(ext4_journal_group_commit("/",false) == EOK && journal->durable_sequence == target + 1);
-    CHECK(ext4_journal_group_checkpoint("/") == EOK && !journal->quarantined_inodes);
+    CHECK(!requests && ext4_journal_group_progress("/",&progress) == EOK);
+    CHECK(!progress.commit_ready && progress.deadline_ns == first_dirty + UINT64_C(5000000000));
+    ordered_now = first_dirty + UINT64_C(100000000);
+    CHECK(ext4_journal_group_commit("/",false) == EOK && journal->durable_sequence == target);
+    CHECK(journal->quarantined_inodes == 1);
+    CHECK(ext4_journal_group_drain("/") == EOK && journal->durable_sequence == target + 1);
+    CHECK(!journal->quarantined_inodes);
+
+    /* An allocator reaching the held inode must drive its real checkpoint
+     * even though the normal metadata commit deadline is still in the future. */
+    struct ext4_mount_stats stats;
+    ext4_file filler;
+    for (unsigned i = 0;; i++) {
+        CHECK(ext4_mount_point_stats("/", &stats) == EOK);
+        if (stats.free_inodes_count == 1) break;
+        CHECK(i < 64 && stats.free_inodes_count > 1);
+        char name[32];
+        snprintf(name, sizeof(name), "/reuse-fill-%u", i);
+        CHECK(ext4_fopen(&filler, name, "w") == EOK && ext4_fclose(&filler) == EOK);
+    }
+    CHECK(ext4_journal_group_drain("/") == EOK);
+    CHECK(ext4_fremove("/reuse-fill-0") == EOK);
+    CHECK(journal->quarantined_inodes == 1);
+    uint64_t reuse_target = journal->accepted_sequence;
+    CHECK(ext4_journal_group_progress("/", &progress) == EOK && !progress.commit_ready);
+    CHECK(ext4_fopen(&filler, "/reuse-now", "w") == EOK);
+    CHECK(journal->checkpoint_sequence >= reuse_target && !journal->quarantined_inodes);
+    CHECK(ext4_fclose(&filler) == EOK);
     CHECK(ext4_fclose(&file) == EOK && ext4_journal_stop("/") == EOK);
     CHECK(ext4_umount("/") == EOK && fault_block_crash(&disk) == 0);
-    puts("PASS metadata age cap, fixed-target sync and earlier quarantine deadline notification");
+    puts("PASS metadata age cap, fixed-target sync and checkpoint-driven quarantine reuse");
 }
 
 static void ordered_idle_test(struct ext4_blockdev *dev)

@@ -1616,12 +1616,10 @@ Finish:
 static uint64_t ext4_group_age_deadline(const struct jbd_trans *running)
 {
 	const uint64_t idle_ns = UINT64_C(100000000);
-	/* Revokes and quarantine hold reusable space until checkpoint. */
-	if (running->revoke_count || !LIST_EMPTY(&running->quarantine))
-		return running->first_dirty_ns + idle_ns;
 	/* Keep metadata joinable up to the usual ext4 commit interval when
 	 * the group has no ordered buffers to return. Prewritten data still
-	 * crosses the precommit barrier before its metadata becomes durable. */
+	 * crosses the precommit barrier before its metadata becomes durable.
+	 * Space pressure requests the owning checkpoint through trans_start. */
 	if (running->background_times_only || !running->ordered_count)
 		return running->first_dirty_ns + UINT64_C(5000000000);
 	/* Bound the retention of ordered buffers when new writes keep joining. */
@@ -1941,7 +1939,7 @@ static int __ext4_trans_finish(struct ext4_mountpoint *mp,int error,unsigned *wo
             result = jbd_journal_accept_state_held(journal, trans, now);
             if (result == EOK) {
                 /* Register the first deadline and rearm a sleeping worker
-                 * when new ordered buffers or quarantine move it earlier. */
+                 * when new ordered buffers move it earlier. */
                 running = journal->running;
                 if (running && (!deadline || ext4_group_age_deadline(running) < deadline ||
                     (!due && ext4_group_due(mp, false))))
