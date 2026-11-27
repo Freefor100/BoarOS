@@ -489,7 +489,7 @@ static void cache_wake(struct kernel_wait_queue *queue)
 /* A pool outlives the cache while a journal/DMA borrower still owns a
  * version. Idle entries have no borrowers; their page and object move together. */
 #define CACHE_VERSION_IDLE_MIN (262144U / BOAROS_PAGE_SIZE)
-#define CACHE_VERSION_IDLE_MAX (4194304U / BOAROS_PAGE_SIZE)
+#define CACHE_VERSION_IDLE_MAX (16U * 1024U * 1024U / BOAROS_PAGE_SIZE)
 struct version_pool {
     struct kernel_raw_lock lock;
     struct kernel_heap *heap;
@@ -530,8 +530,8 @@ static struct version_pool *version_pool_new(struct kernel_heap *heap,
     size_t limit=physical_page_total(allocator)/32;
     if (limit<CACHE_VERSION_IDLE_MIN) limit=CACHE_VERSION_IDLE_MIN;
     if (limit>CACHE_VERSION_IDLE_MAX) limit=CACHE_VERSION_IDLE_MAX;
-    /* 不预分配；保留实际归还的一组存储，避免checkpoint后立即重新分配。
-     * 空闲页仍由压力回收优先释放，小内存保持原有最小容量。 */
+    /* Reuse an ordered writeback group's worth of versions, allocated only
+     * as needed. Pressure can reclaim idle versions above the worker reserve. */
     *pool=(struct version_pool){.heap=heap,.allocator=allocator,.references=1,.idle_limit=limit};
     kernel_raw_lock_init(&pool->lock,KERNEL_RAW_RANK_OBJECT);
     kernel_wait_queue_init(&pool->ready);
@@ -587,7 +587,8 @@ static void version_idle_return(struct version_pool *pool,struct cache_version *
             }
             list=tail->next;
             tail->next=pool->idle;pool->idle=first;pool->idle_count+=count;
-            cache_wake(&pool->ready);
+            /* version_wait() registers under this same pool lock. */
+            if (kernel_wait_queue_registrations(&pool->ready)) cache_wake(&pool->ready);
         }
     }
     while (list) {
