@@ -128,7 +128,7 @@ static int tcp_vector_prefix(struct tcp_pcb *sender, struct tcp_pcb *receiver, s
     struct tcp_seg *tail=sender->unsent;
     const u16_t tail_length=tail->p->tot_len;
     mem_size_t seed_charge=STATS_GET(mem.used);
-    struct pbuf *sample=boaros_lwip_pbuf_alloc_tcp_data(PBUF_TRANSPORT,512,NULL);
+    struct pbuf *sample=boaros_lwip_pbuf_alloc_tcp_data(PBUF_TRANSPORT,512,NULL,0);
     if(!sample) return 48;
     mem_size_t segment_charge=STATS_GET(mem.used)-seed_charge;
     pbuf_free(sample);
@@ -204,6 +204,17 @@ static void free_progress(void *context, void *allocation)
 
 static err_t hold_received(void *, struct tcp_pcb *, struct pbuf *, err_t);
 
+static err_t hold_pair_received(void *context, struct tcp_pcb *pcb, struct pbuf *p, err_t error)
+{
+    (void)pcb;
+    struct pbuf **frames = context;
+    if (error != ERR_OK || !p) return ERR_VAL;
+    if (!frames[0]) frames[0] = p;
+    else if (!frames[1]) frames[1] = p;
+    else return ERR_MEM;
+    return ERR_OK;
+}
+
 static int tcp_copy_heap_reserve(struct tcp_pcb *sender, struct tcp_pcb *receiver)
 {
     static unsigned char bytes[8192];
@@ -258,10 +269,34 @@ static int tcp_copy_heap_reserve(struct tcp_pcb *sender, struct tcp_pcb *receive
     netif_poll_all();
     if (progress_allocations || sender->boaros_progress_buffer) return 71;
 
+    const struct kernel_socket_write_segment pair[] = {{bytes,sizeof(bytes)}, {bytes,sizeof(bytes)}};
+    struct pbuf *frames[2] = {NULL,NULL};
+    tcp_arg(receiver, frames);
+    tcp_recv(receiver, hold_pair_received);
+    u16_t written = 0;
+    if (boaros_lwip_tcp_writev(sender, pair, 2, 2 * sizeof(bytes), 0, &written) != ERR_OK ||
+        written != 2 * sizeof(bytes) || progress_allocations != 2 ||
+        !sender->boaros_progress_buffer || !sender->boaros_progress_pair) return 100;
+    if (boaros_lwip_tcp_writev(sender, pair, 2, 2 * sizeof(bytes), 0, &written) != ERR_MEM || written)
+        return 101;
+    if (sender->cwnd < 2 * sizeof(bytes)) sender->cwnd = 2 * sizeof(bytes);
+    if (tcp_output(sender) != ERR_OK) return 102;
+    netif_poll_all();
+    if (!frames[0] || !frames[1] || sender->unacked || progress_allocations != 2) return 103;
+    for (unsigned i=0; i<2; ++i) {
+        for (u16_t j=0; j<sizeof(bytes); ++j)
+            if (pbuf_get_at(frames[i], j) != bytes[j]) return 104;
+        tcp_recved(receiver, frames[i]->tot_len);
+        pbuf_free(frames[i]);
+        if (progress_allocations != 1U-i || sender->boaros_progress_buffer ||
+            (!!sender->boaros_progress_pair != !i)) return 105;
+    }
+    netif_poll_all();
+
     struct tcp_pcb *closing = tcp_new();
     if (!closing) return 72;
     closing->boaros_loopback = 1;
-    struct pbuf *packet = boaros_lwip_pbuf_alloc_tcp_data(PBUF_TRANSPORT, sizeof(bytes), closing);
+    struct pbuf *packet = boaros_lwip_pbuf_alloc_tcp_data(PBUF_TRANSPORT, sizeof(bytes), closing, 0);
     if (!packet || !closing->boaros_progress_buffer ||
         pbuf_take(packet, bytes, sizeof(bytes)) != ERR_OK) return 73;
     struct pbuf *view = pbuf_clone_shared(PBUF_RAW, packet, 0);
