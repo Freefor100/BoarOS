@@ -402,8 +402,9 @@ struct ext4_inode_block_range {
 int ext4_fs_get_inode_dblk_range(struct ext4_inode_ref *inode_ref,
     ext4_lblk_t iblock, uint32_t max_blocks, bool create,
     struct ext4_inode_block_range *range);
-/* The first overwritten_blocks receive complete data in this transaction.
- * Any write failure must abort the private mapping changes. */
+/* The first overwritten_blocks receive complete data. The journal caller
+ * can abort a private conversion. Without a journal, an unwritten run stays
+ * hidden until the caller completes its data write and publishes the extent. */
 int ext4_fs_get_inode_dblk_write_range(struct ext4_inode_ref *inode_ref,
     ext4_lblk_t iblock, uint32_t max_blocks, uint32_t overwritten_blocks,
     struct ext4_inode_block_range *range);

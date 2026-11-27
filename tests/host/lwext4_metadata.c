@@ -1597,6 +1597,54 @@ static int nojournal_partial_batch(struct ext4_blockdev *bdev,
     CHECK(dev_write(bdev,spans[0].buffer,spans[0].offset/512,1)==EOK);
     return EIO;
 }
+
+static void nojournal_unwritten_write(struct ext4_fs *fs)
+{
+    unsigned block = fs->bdev->lg_bsize;
+    unsigned char *bytes = malloc(6 * block), *readback = malloc(6 * block);
+    CHECK(bytes && readback && !fs->jbd_journal);
+    ext4_file file;
+    CHECK(ext4_create_child("/", EXT4_INODE_ROOT_INDEX, "unwritten-write", 0100600,
+        0, NULL, &file, NULL, 0, 0) == EOK);
+    CHECK(ext4_ftruncate(&file, 6 * block, UINT32_MAX) == EOK);
+    size_t ready;
+    bool complete;
+    CHECK(ext4_file_prepare_write(&file, 0, 6 * block, &ready, &complete) == EOK);
+    CHECK(ready == 6 * block && !complete);
+    struct ext4_inode_ref inode;
+    struct ext4_inode_block_range range;
+    CHECK(ext4_fs_get_inode_ref_read(fs, file.inode, &inode) == EOK);
+    CHECK(ext4_fs_get_inode_dblk_range(&inode, 0, 6, false, &range) == EOK);
+    CHECK(range.block && range.unwritten && range.count == 6);
+    CHECK(ext4_fs_put_inode_ref(&inode) == EOK);
+    memset(bytes, 0xcc, 6 * block);
+    CHECK(ext4_blocks_set_direct(fs->bdev, bytes, range.block, 6) == EOK);
+    struct owned_file_page source;
+    owned_page_init(&source, 3 * block, 0x61);
+    struct file_write_span span = {.offset = block, .buffer = source.bytes, .size = 3 * block,
+        .source = {&source, owned_page_retain, owned_page_release, 3 * block}};
+    size_t done;
+    fs->bdev->bdif->bwrite_batch = nojournal_partial_batch;
+    CHECK(ext4_fpwrite_batch(&file, &span, 1) == EIO && !span.written);
+    fs->bdev->bdif->bwrite_batch = NULL;
+    CHECK(ext4_fpread(&file, 0, readback, 6 * block, &done) == EOK && done == 6 * block);
+    for (size_t i = 0; i < done; ++i) CHECK(!readback[i]);
+
+    forbidden_lba = (range.block + 1) * block / 512;
+    forbidden_writes = 0;
+    CHECK(ext4_fpwrite_batch(&file, &span, 1) == EOK && span.written == 3 * block);
+    CHECK(forbidden_writes == 1);
+    forbidden_lba = UINT64_MAX;
+    CHECK(ext4_fpread(&file, 0, readback, 6 * block, &done) == EOK && done == 6 * block);
+    for (size_t i = 0; i < done; ++i)
+        CHECK(readback[i] == (i >= block && i < 4 * block ? 0x61 : 0));
+    CHECK(ext4_fclose(&file) == EOK && source.references == 1 && !source.retains);
+    owned_page_release(&source);
+    free(bytes);
+    free(readback);
+    printf("PASS nojournal unwritten data: one payload write, partial failure hides stale sectors, block=%u\n", block);
+}
+
 static unsigned nojournal_batches;
 static int nojournal_second_batch(struct ext4_blockdev *bdev,
     const struct kernel_block_span *spans,unsigned count)
@@ -3944,6 +3992,7 @@ int main(int argc,char **argv)
     }
     else if(!strcmp(argv[2],"verify-direct-metadata-reuse")) verify_direct_metadata_reuse(dev.fs,argc>3?strtoul(argv[3],NULL,10):0);
     else if(!strcmp(argv[2],"nojournal-direct"))nojournal_direct_file(dev.fs);
+    else if(!strcmp(argv[2],"nojournal-unwritten-write"))nojournal_unwritten_write(dev.fs);
     else if(!strcmp(argv[2],"seed"))seed();
     else if(!strcmp(argv[2],"operation-context"))operation_context_test(dev.fs);
 #ifdef TEST_OPERATION_LIFECYCLE

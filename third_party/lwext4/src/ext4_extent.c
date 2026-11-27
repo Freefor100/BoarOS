@@ -2289,7 +2289,7 @@ static int ext4_ext_zero_unwritten_range(struct ext4_inode_ref *inode_ref,
  * a potentially 128 MiB zero version in the journal operation. An abort still
  * exposes only the original unwritten zeros; initialized neighbors are untouched. */
 static int ext4_ext_initialize_unsplit(struct ext4_inode_ref *inode_ref,
-    struct ext4_extent_path **path, ext4_lblk_t iblock, uint32_t blocks)
+    struct ext4_extent_path **path, ext4_lblk_t iblock, uint32_t blocks, bool written)
 {
     struct ext4_fs *fs = inode_ref->fs;
     if (fs->jbd_journal && fs->jbd_journal->error) return fs->jbd_journal->error;
@@ -2306,9 +2306,19 @@ static int ext4_ext_initialize_unsplit(struct ext4_inode_ref *inode_ref,
     void *zeros = ext4_calloc(1, block_size);
     if (!zeros) return ENOMEM;
     ext4_fsblk_t physical = ext4_ext_pblock(ex);
+    uint32_t first_written = written ? iblock - first : count;
     for (uint32_t i = 0; i < count; i++) {
+        if (i == first_written) {
+            i += blocks - 1;
+            continue;
+        }
         r = ext4_blocks_set_direct(fs->bdev, zeros, physical + i, 1);
         if (r != EOK) break;
+    }
+    if (written) {
+        ext4_bcache_invalidate_lba(fs->bdev->bc, physical, first_written);
+        uint32_t tail = first_written + blocks;
+        ext4_bcache_invalidate_lba(fs->bdev->bc, physical + tail, count - tail);
     }
     ext4_free(zeros);
     if (r == EOK) r = ext4_blockdev_flush(fs->bdev);
@@ -2364,6 +2374,10 @@ static int extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock
 
     err = extent_lookup_range(inode_ref,iblock,max_blocks,range);
     if (err || !create || (range->block && (!range->unwritten || reserve))) return err;
+    if (range->unwritten && overwritten_blocks && !ext4_current_trans(inode_ref->fs)) {
+        if (range->count > overwritten_blocks) range->count = overwritten_blocks;
+        return EOK;
+    }
     *range = (struct ext4_inode_block_range){0};
 
 	/* Only allocation or unwritten conversion needs a mutable ancestor path. */
@@ -2418,7 +2432,7 @@ static int extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock
 			err = ext4_ext_convert_to_initialized(
 			    inode_ref, &path, iblock, zero_range);
             if (err == ENOSPC)
-                err = ext4_ext_initialize_unsplit(inode_ref, &path, iblock, zero_range);
+                err = ext4_ext_initialize_unsplit(inode_ref, &path, iblock, zero_range, false);
 			if (err != EOK)
 				goto out2;
 
@@ -2511,8 +2525,33 @@ int ext4_extent_get_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
 int ext4_extent_write_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
     uint32_t max_blocks, uint32_t overwritten_blocks, struct ext4_inode_block_range *range)
 {
-    if (!ext4_current_trans(inode_ref->fs)) overwritten_blocks = 0;
     return extent_get_range(inode_ref, iblock, max_blocks, true, false, overwritten_blocks, range);
+}
+
+int ext4_extent_complete_write(struct ext4_inode_ref *ref, ext4_lblk_t first,
+    ext4_fsblk_t physical, uint32_t blocks)
+{
+    struct ext4_extent_path *path = NULL;
+    int result = ext4_find_extent(ref, first, &path, 0);
+    if (result) return result;
+    struct ext4_extent *extent = path[ext_depth(ref->inode)].extent;
+    if (!extent) result = EUCLEAN;
+    else {
+        ext4_lblk_t start = to_le32(extent->first_block);
+        uint32_t count = ext4_ext_get_actual_len(extent);
+        if (first < start || first - start >= count || blocks > count - (first - start) ||
+            physical != ext4_ext_pblock(extent) + (first - start)) result = EUCLEAN;
+        else if (ext4_ext_is_unwritten(extent)) {
+            result = ext4_ext_convert_to_initialized(ref, &path, first, blocks);
+            if (result == ENOSPC)
+                result = ext4_ext_initialize_unsplit(ref, &path, first, blocks, true);
+        }
+    }
+    if (path) {
+        ext4_ext_drop_refs(ref, path, 0);
+        ext4_free(path);
+    }
+    return result;
 }
 
 int ext4_extent_reserve_range(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,
