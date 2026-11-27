@@ -1546,6 +1546,7 @@ int jbd_journal_start(struct jbd_fs *jbd_fs,
 	struct ext4_fs *fs = jbd_fs->inode_ref.fs;
 	memset(journal, 0, sizeof(*journal));
     kernel_mutex_init(&journal->ordered_io,39,(uintptr_t)journal);
+    kernel_raw_lock_init(&journal->data_plan_lock, KERNEL_RAW_RANK_OBJECT);
 	if (fs->read_only)
 		return EROFS;
 	r = jbd_check_features(jbd_fs);
@@ -1991,6 +1992,121 @@ static void jbd_collect_range_data(struct jbd_trans *trans,
     }
 }
 
+static void jbd_release_data_plan(struct jbd_data_plan *plan)
+{
+    for (unsigned i = 0; i < plan->used; i++)
+        if (plan->data[i]) jbd_data_put(plan->data[i]);
+    plan->used = 0;
+}
+
+/* The device owner retires completed plan references before it publishes
+ * journal progress. Registration also checks completion after borrowing. */
+static void jbd_prune_data_plan(struct jbd_journal *journal)
+{
+    unsigned cursor = 0;
+    bool more;
+    do {
+        struct jbd_data *drop[16];
+        unsigned used = 0;
+        {
+            KERNEL_RAW_SCOPE(guard, &journal->data_plan_lock);
+            struct jbd_data_plan *plan = journal->pending_data_plan;
+            if (!plan) return;
+            unsigned end = cursor + 16;
+            if (end > plan->used) end = plan->used;
+            for (; cursor < end; cursor++) {
+                struct jbd_data *data = plan->data[cursor];
+                if (data && __atomic_load_n(&data->completed, __ATOMIC_ACQUIRE)) {
+                    drop[used++] = data;
+                    plan->data[cursor] = NULL;
+                }
+            }
+            more = cursor < plan->used;
+        }
+        for (unsigned i = 0; i < used; i++) jbd_data_put(drop[i]);
+    } while (more);
+}
+
+static void jbd_supersede_plan_data(struct jbd_journal *journal, struct jbd_data *old)
+{
+    __atomic_store_n(&old->superseded, true, __ATOMIC_RELEASE);
+    {
+        KERNEL_RAW_SCOPE(guard, &journal->data_plan_lock);
+        struct jbd_data_plan *plan = journal->pending_data_plan;
+        if (!plan) return;
+        unsigned i = 0;
+        while (i < plan->used && plan->data[i] != old) i++;
+        if (i == plan->used) return;
+        plan->data[i] = NULL;
+    }
+    jbd_data_put(old);
+}
+
+int jbd_journal_plan_data(struct jbd_journal *journal, const struct jbd_data_range *ranges,
+    unsigned count, struct jbd_data_plan *plan)
+{
+    bool more = false;
+    {
+        JBD_STATE_READ_SCOPE(journal);
+        if (jbd_journal_error(journal)) return jbd_journal_error(journal);
+        unsigned capacity = JBD_DATA_PLAN_CAPACITY;
+        jbd_collect_range_data(journal->committing, ranges, count, plan->data, capacity, &plan->used, &more);
+        struct jbd_trans *trans;
+        TAILQ_FOREACH(trans, &journal->sealed_queue, trans_node) {
+            if (plan->used == capacity) break;
+            jbd_collect_range_data(trans, ranges, count, plan->data, capacity, &plan->used, &more);
+        }
+        jbd_collect_range_data(journal->running, ranges, count, plan->data, capacity, &plan->used, &more);
+        if (!more && plan->used) {
+            {
+                KERNEL_RAW_SCOPE(guard, &journal->data_plan_lock);
+                if (journal->pending_data_plan) more = true;
+                else journal->pending_data_plan = plan;
+            }
+            if (!more) jbd_prune_data_plan(journal);
+        }
+    }
+    if (more) {
+        jbd_release_data_plan(plan);
+        return ENOTSUP;
+    }
+    return EOK;
+}
+
+int jbd_journal_submit_data_plan(struct jbd_journal *journal, struct jbd_data_plan *plan)
+{
+    KERNEL_LOCK_SCOPE(io);
+    if (!plan->used) return EOK;
+    kernel_mutex_lock(&journal->ordered_io, &io);
+    {
+        KERNEL_RAW_SCOPE(guard, &journal->data_plan_lock);
+        if (journal->pending_data_plan != plan) __builtin_trap();
+        journal->pending_data_plan = NULL;
+    }
+    int result = jbd_journal_error(journal);
+    if (!result) {
+        bool submitted[JBD_DATA_PLAN_CAPACITY];
+        struct jbd_io_phase phase = {0};
+        for (unsigned i = 0; i < plan->used; i++) {
+            struct jbd_data *data = plan->data[i];
+            submitted[i] = data && !__atomic_load_n(&data->completed, __ATOMIC_ACQUIRE) &&
+                !__atomic_load_n(&data->superseded, __ATOMIC_ACQUIRE);
+            if (submitted[i])
+                jbd_phase_add(journal, &phase, &data->io, data->block.data,
+                    data->block.lb_id, 0, journal->block_size);
+        }
+        if (phase.first) {
+            result = ext4_blocks_set_phase(journal->jbd_fs->bdev, phase.first);
+            if (result) __atomic_store_n(&journal->error, result, __ATOMIC_RELEASE);
+            else for (unsigned i = 0; i < plan->used; i++)
+                if (submitted[i])
+                    __atomic_store_n(&plan->data[i]->completed, true, __ATOMIC_RELEASE);
+        }
+    }
+    jbd_release_data_plan(plan);
+    return result;
+}
+
 static int jbd_complete_ranges(struct jbd_journal *journal,
     const struct jbd_data_range *ranges, unsigned count, struct jbd_data **data,
     unsigned capacity)
@@ -2020,6 +2136,7 @@ static int jbd_complete_ranges(struct jbd_journal *journal,
         else for (unsigned i=0;i<used;i++)
             __atomic_store_n(&data[i]->completed,true,__ATOMIC_RELEASE);
         for (unsigned i=0;i<used;i++) jbd_data_put(data[i]);
+        if (!error) jbd_prune_data_plan(journal);
         /* Concurrent writers can replace an accepted running version while
          * this phase owns its snapshot. A serial mount has excluded them. */
         if (error || (serial && !more)) return error;
@@ -3138,6 +3255,7 @@ static int jbd_submit_phase(struct jbd_trans *trans, struct jbd_io_phase *phase,
             struct jbd_data *data;
             TAILQ_FOREACH(data,&trans->data_queue,node)
                 __atomic_store_n(&data->completed,true,__ATOMIC_RELEASE);
+            jbd_prune_data_plan(trans->journal);
         }
         kernel_lock_release(ordered);
     }
@@ -3693,6 +3811,7 @@ int jbd_journal_accept_state_held(struct jbd_journal *journal, struct jbd_trans 
 			if (old) {
 				TAILQ_REMOVE(&running->data_queue, old, node);
 				RB_REMOVE(jbd_data_tree, &running->data_root, old);
+				jbd_supersede_plan_data(journal, old);
 				jbd_data_free(old);
 			} else running->ordered_count++;
 			RB_INSERT(jbd_data_tree, &running->data_root, data);

@@ -317,6 +317,9 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t start, uint64_t end);
 int kernel_page_cache_submit_range(struct kernel_page_cache *, struct kernel_vfs_node *,
     uint64_t start, uint64_t end, bool collect);
+/* Best-effort writeback without waiting for data I/O or a range queue slot. */
+void kernel_page_cache_hint_writeback(struct kernel_page_cache *, struct kernel_vfs_node *,
+    uint64_t start, uint64_t end);
 void kernel_page_cache_wait_range(struct kernel_page_cache *, struct kernel_vfs_node *,
     uint64_t start, uint64_t end);
 /* 调用者保活 node/OFD，按后端策略就地处理或把请求交给 CPU0 队列。

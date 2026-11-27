@@ -222,9 +222,7 @@ int kernel_open_file_advise(struct kernel_open_file_description *file,int64_t of
 #endif
         return 0;
     }
-    /* Writeback acceptance is a hint, not a durability barrier. Preserve its
-     * dirty/error owner even when the attempted writeback cannot make progress. */
-    (void)kernel_page_cache_writeback_range(cache,node,start,end);
+    kernel_page_cache_hint_writeback(cache,node,start,end);
     uint64_t size=kernel_vfs_node_size(node);
     uint64_t first=(start>>BOAROS_PAGE_SHIFT)+!!(start&BOAROS_PAGE_MASK);
     uint64_t after=end>>BOAROS_PAGE_SHIFT;

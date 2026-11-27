@@ -66,6 +66,7 @@ struct kernel_io_context {
     /* Accepted progress I/O avoids admission recursion; this is not a
      * cache-worker identity or permission to reuse its workspace. */
     unsigned background_reclaim;
+    bool defer_range_data;
     int backend_read;
     struct kernel_lock_guard backend_guard;
     struct ext4_operation *ext4_operations;

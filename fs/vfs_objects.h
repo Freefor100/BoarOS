@@ -380,6 +380,7 @@ struct kernel_vfs_backend {
     int (*writeback)(struct kernel_vfs_node *node,
         struct file_write_span *spans, size_t count, struct file_writeback_wait *);
     int (*wait_writeback)(struct kernel_vfs_instance *, const struct file_writeback_wait *);
+    int (*complete_data_detached)(struct kernel_vfs_node *, uint64_t start, uint64_t end);
     /* One transaction for independent inodes. A failure leaves all their
      * bytes dirty so the caller can retry them individually. */
     int (*writeback_files)(struct kernel_vfs_node *const *, const struct file_write_set *,

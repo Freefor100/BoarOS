@@ -4374,7 +4374,8 @@ static int writeback_run(struct kernel_page_cache *cache,
         if (done) kernel_vfs_node_lock(entries[first]->node,&io,0);
         capture_writeback(cache,entries+first,prepared,done,limit);
         struct file_writeback_wait wait = {0};
-        struct file_writeback_wait *defer = background ? &wait : NULL;
+        struct file_writeback_wait *defer = background ||
+            kernel_io_context_current()->defer_range_data ? &wait : NULL;
         int submitted=0;
         for (size_t i=0;i<done && !submitted;i++) {
             if (!prepared[i].version) continue;
@@ -5070,10 +5071,26 @@ int kernel_page_cache_writeback_mount(struct kernel_page_cache *cache,
     return result;
 }
 
-static int range_has_dirty(struct kernel_vfs_node *node, uint64_t first, uint64_t last)
+static bool range_needs_submit(struct kernel_page_cache_record *record,
+    struct kernel_vfs_node *node, uint64_t first, uint64_t last, uint64_t end, bool hint)
 {
     struct kernel_page_cache_entry *entry = dirty_at_or_after(node, first);
-    return entry && entry->page_index <= last;
+    if (!entry || entry->page_index > last) return false;
+    if (!hint) return true;
+    if (record->range_count == RANGE_WRITEBACK_SLOTS) return false;
+
+    struct kernel_page_cache_entry *tail =
+        RB_MAX(kernel_page_cache_dirty_tree, &kernel_vfs_node_dirty_pages(node)->tree);
+    if (last > tail->page_index) last = tail->page_index;
+    /* Reuse a queued owner only while its remaining range covers the dirty
+     * pages. New dirt behind the worker's published cursor needs a new hint. */
+    for (struct range_writeback *item = record->range_head; item; item = item->next) {
+        if (item->window.node == node && item->first <= entry->page_index &&
+            item->window.last >= last &&
+            (item->window.end >= end || (item->window.end >> BOAROS_PAGE_SHIFT) > last))
+            return false;
+    }
+    return true;
 }
 
 static void wait_range_progress(struct kernel_wait_token *token)
@@ -5083,15 +5100,15 @@ static void wait_range_progress(struct kernel_wait_token *token)
         __builtin_trap();
 }
 
-int kernel_page_cache_submit_range(struct kernel_page_cache *cache,
-    struct kernel_vfs_node *node, uint64_t start, uint64_t end, bool collect)
+static int submit_range(struct kernel_page_cache *cache, struct kernel_vfs_node *node,
+    uint64_t start, uint64_t end, bool collect, bool hint)
 {
     struct kernel_page_cache_record *record = cache->record;
     uint64_t first = start >> BOAROS_PAGE_SHIFT;
     uint64_t last = (end - 1) >> BOAROS_PAGE_SHIFT;
     {
         CACHE_SCOPE(check, cache);
-        if (!range_has_dirty(node, first, last))
+        if (!range_needs_submit(record, node, first, last, end, hint))
             return 0;
     }
     struct range_writeback *request = NULL;
@@ -5106,7 +5123,7 @@ int kernel_page_cache_submit_range(struct kernel_page_cache *cache,
                 result = -KERNEL_EIO;
                 break;
             }
-            if (!range_has_dirty(node, first, last))
+            if (!range_needs_submit(record, node, first, last, end, hint))
                 break;
             if (record->range_count < RANGE_WRITEBACK_SLOTS) {
                 if (kernel_vfs_node_acquire(node))
@@ -5150,6 +5167,18 @@ int kernel_page_cache_submit_range(struct kernel_page_cache *cache,
     }
     kernel_heap_release(cache->heap, request);
     return result;
+}
+
+int kernel_page_cache_submit_range(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t start, uint64_t end, bool collect)
+{
+    return submit_range(cache, node, start, end, collect, false);
+}
+
+void kernel_page_cache_hint_writeback(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t start, uint64_t end)
+{
+    (void)submit_range(cache, node, start, end, true, true);
 }
 
 void kernel_page_cache_wait_range(struct kernel_page_cache *cache,
@@ -5485,9 +5514,28 @@ static void run_range_writeback(struct kernel_page_cache *cache,
             return;
         }
         struct kernel_vfs_data_range range;
-        if (writeback_range_window(request, &range)) {
-            request->window.result = kernel_vfs_node_complete_data_range(range.node, range.start, range.end);
-            if (request->window.result) request->window.done = 1;
+        struct foreground_writeback *window = &request->window;
+        struct kernel_vfs_instance *instance = window->node->instance;
+        bool defer = request->collect && !instance->namespace_parallel &&
+            instance->ops->complete_data_detached && instance->ops->writeback_growth &&
+            window->last - window->cursor >= BOAROS_PAGE_CACHE_WRITEBACK_PAGES &&
+            instance->ops->writeback_growth(window->node, window->cursor << BOAROS_PAGE_SHIFT);
+        if (defer) window->mapped_candidate = false;
+        bool previous_defer = io->defer_range_data;
+        io->defer_range_data = defer;
+        bool complete = writeback_range_window(request, &range);
+        io->defer_range_data = previous_defer;
+        if (complete) {
+            int result = defer ? instance->ops->complete_data_detached(range.node, range.start, range.end) :
+                -KERNEL_EOPNOTSUPP;
+            if (result == -KERNEL_EOPNOTSUPP)
+                result = kernel_vfs_node_complete_data_range(range.node, range.start, range.end);
+            else if (result)
+                kernel_vfs_record_writeback_error(range.node, result);
+            if (result) {
+                window->result = result;
+                window->done = 1;
+            }
         }
         io->background_reclaim = previous;
     } else {
