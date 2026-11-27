@@ -1090,6 +1090,19 @@ static int block_write_phase(struct ext4_blockdev *device,
     }
 }
 
+static int block_try_write_phase(struct ext4_blockdev *device,
+                                const struct ext4_block_write *first)
+{
+    struct lwext4_mount_adapter *adapter = device->bdif->p_user;
+    enum kernel_block_status status = kernel_block_try_write_phase(adapter->block,
+        block_phase_next, NULL, first);
+    if (status == KERNEL_BLOCK_STATUS_NOT_SUBMITTED) return EAGAIN;
+    if (status == KERNEL_BLOCK_STATUS_NO_MEMORY) return ENOMEM;
+    if (status != KERNEL_BLOCK_STATUS_OK) return EIO;
+    kernel_block_note_writeback(adapter->block);
+    return EOK;
+}
+
 static void block_read_error(struct block_read_span *span)
 {
     switch (span->status) {
@@ -1935,8 +1948,10 @@ static int mount_ext_filesystem(struct kernel_vfs_mount *mount,
     adapter->interface.bwrite_batch = block_write_batch;
     adapter->interface.bwrite_phase = block_write_phase;
     adapter->interface.write_phase_bytes = kernel_block_write_phase_bytes(block);
-    if (adapter->interface.write_phase_bytes)
+    if (adapter->interface.write_phase_bytes) {
         adapter->interface.bwrite_batch_try_phase = block_write_batch_try_phase;
+        adapter->interface.bwrite_phase_try = block_try_write_phase;
+    }
     adapter->interface.close = block_close;
     adapter->interface.flush = block_flush;
     adapter->interface.lock = 0;
@@ -3485,14 +3500,16 @@ static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
 }
 
 static int ext4_backend_writeback_mapped(struct kernel_vfs_node *node,
-    struct file_write_span *spans, size_t count)
+    struct file_write_span *spans, size_t count, bool try_only)
 {
-    int result = ext4_fpwrite_mapped_batch(lwext4_node_file(node), spans, count);
-    if (result != ENOTSUP) for (size_t i = 0; i < count; i++) {
+    ext4_file *file = lwext4_node_file(node);
+    int result = try_only ? ext4_fpwrite_mapped_try(file, spans, count) :
+        ext4_fpwrite_mapped_batch(file, spans, count);
+    if (result != ENOTSUP && (!try_only || result != EAGAIN)) for (size_t i = 0; i < count; i++) {
         COST_ADD(BACKEND_REQUESTED, spans[i].size);
         COST_ADD(BACKEND_ACCEPTED, spans[i].written);
     }
-    if (!result)
+    if (!result && !try_only)
         kernel_block_note_writeback(lwext4_instance(node->instance)->block);
     return result == ENOTSUP ? -KERNEL_EOPNOTSUPP : lwext4_error(result);
 }

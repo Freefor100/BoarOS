@@ -1881,6 +1881,32 @@ static struct jbd_data *jbd_trans_find_data(struct jbd_trans *trans, ext4_fsblk_
 	return RB_FIND(jbd_data_tree, &trans->data_root, &key);
 }
 
+static bool jbd_trans_overlaps_data(struct jbd_trans *trans, ext4_fsblk_t first, uint64_t count)
+{
+    if (!trans || !trans->ordered_count) return false;
+    struct jbd_data key = {.block.lb_id = first};
+    struct jbd_data *data = RB_NFIND(jbd_data_tree, &trans->data_root, &key);
+    return data && data->block.lb_id - first < count;
+}
+
+bool jbd_journal_overlaps_data(struct jbd_journal *journal, const struct ext4_block_write *writes)
+{
+    if (!__atomic_load_n(&journal->ordered_trees, __ATOMIC_ACQUIRE)) return false;
+    struct ext4_blockdev *bdev = journal->jbd_fs->bdev;
+    JBD_STATE_READ_SCOPE(journal);
+    for (; writes; writes = writes->next) {
+        ext4_fsblk_t first = (writes->offset - bdev->part_offset) / journal->block_size;
+        uint64_t count = writes->size / journal->block_size;
+        if (jbd_trans_overlaps_data(journal->running, first, count) ||
+            jbd_trans_overlaps_data(journal->committing, first, count))
+            return true;
+        struct jbd_trans *trans;
+        TAILQ_FOREACH(trans, &journal->sealed_queue, trans_node)
+            if (jbd_trans_overlaps_data(trans, first, count)) return true;
+    }
+    return false;
+}
+
 bool jbd_journal_borrow_data(struct ext4_fs *fs, ext4_fsblk_t lba,
     struct jbd_data_borrow *borrow)
 {

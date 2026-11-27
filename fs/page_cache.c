@@ -4577,7 +4577,8 @@ static void close_mapped_writers(struct kernel_page_cache_record *record,
 }
 
 static int submit_mapped_writeback(struct kernel_vfs_node *node,
-    struct kernel_page_cache_entry **entries, struct file_write_span *spans, size_t count)
+    struct kernel_page_cache_entry **entries, struct file_write_span *spans, size_t count,
+    bool try_only)
 {
     for (size_t i = 0; i < count; i++) {
         struct kernel_page_cache_entry *entry = entries[i];
@@ -4586,15 +4587,15 @@ static int submit_mapped_writeback(struct kernel_vfs_node *node,
             .offset = (entry->page_index << BOAROS_PAGE_SHIFT) + begin,
             .buffer = entry->data + begin, .size = entry->dirty_end - begin};
     }
-    int result = node->instance->ops->writeback_mapped(node, spans, count);
-    if (result && result != -KERNEL_EOPNOTSUPP)
+    int result = node->instance->ops->writeback_mapped(node, spans, count, try_only);
+    if (result && result != -KERNEL_EOPNOTSUPP && (!try_only || result != -KERNEL_EAGAIN))
         kernel_vfs_record_writeback_error(node, result);
     return result;
 }
 
 static void finish_mapped_writeback(struct kernel_page_cache *cache,
     struct kernel_page_cache_entry **entries, const struct file_write_span *spans,
-    size_t count, int result, bool keep_for_fallback)
+    size_t count, int result, bool not_submitted, bool keep_borrows)
 {
     for (size_t i = 0; i < count; i++) {
         struct kernel_page_cache_entry *entry = entries[i];
@@ -4602,15 +4603,14 @@ static void finish_mapped_writeback(struct kernel_page_cache *cache,
         entry->retry_blocked = 0;
         const struct prepared_writeback done = {.begin=entry->dirty_begin,.end=entry->dirty_end,
             .generation=entry->generation,.written=spans[i].written};
-        if (result == -KERNEL_EOPNOTSUPP) {
+        if (not_submitted) {
             entry->writeback = 0;
             cache->record->writeback_active--;
             publish_cache_page_state(entry);
             if (__atomic_load_n(&entry->ready.registrations, __ATOMIC_RELAXED))
                 cache_wake(&entry->ready);
-            if (keep_for_fallback) continue;
         } else (void)complete_writeback(cache, entry, &done, result);
-        entry_return(entry);
+        if (!keep_borrows) entry_return(entry);
     }
 }
 
@@ -4654,11 +4654,12 @@ static void writeback_window(void *argument)
     struct file_write_span single_span;
     while (mapped && count) {
         struct file_write_span *spans = request->workspace ? request->workspace->spans : &single_span;
-        result = submit_mapped_writeback(request->node, request->selected, spans, count);
+        result = submit_mapped_writeback(request->node, request->selected, spans, count, false);
         bool completed_batch = !result;
         {
             CACHE_SCOPE(guard,cache);
-            finish_mapped_writeback(cache, request->selected, spans, count, result, true);
+            bool fallback = result == -KERNEL_EOPNOTSUPP;
+            finish_mapped_writeback(cache, request->selected, spans, count, result, fallback, fallback);
             /* Finish the current batch and qualify the next with one
              * acquisition. Keep the inode borrow bounded to four batches. */
             if (!result && ++submitted < mapped_windows && request->cursor <= request->last) {
@@ -5222,10 +5223,11 @@ static struct range_writeback *run_mapped_range_batch(struct kernel_page_cache *
     }
     int result = 0;
     if (pages) {
-        result = submit_mapped_writeback(node, work->selected, work->spans, pages);
+        result = submit_mapped_writeback(node, work->selected, work->spans, pages, false);
         {
             CACHE_SCOPE(complete, cache);
-            finish_mapped_writeback(cache, work->selected, work->spans, pages, result, false);
+            finish_mapped_writeback(cache, work->selected, work->spans, pages, result,
+                result == -KERNEL_EOPNOTSUPP, false);
         }
         if (!result) group_returned(record->group);
     }
@@ -5810,12 +5812,53 @@ static void pressure_wait(void *context)
     }
 }
 
+static int write_background_mapped(struct kernel_page_cache *cache,
+    struct kernel_page_cache_entry **entries, size_t count, struct file_write_span *spans)
+{
+    struct kernel_vfs_node *node = entries[0]->node;
+    const struct kernel_vfs_backend *ops = node->instance->ops;
+    if (!ops->writeback_mapped || !ops->wait_writeback || !kernel_vfs_node_writeback_allowed(node))
+        return -KERNEL_EOPNOTSUPP;
+    for (;;) {
+        KERNEL_LOCK_SCOPE(io);
+        kernel_vfs_node_lock(node, &io, 0);
+        {
+            CACHE_SCOPE(select, cache);
+            uint64_t end = kernel_vfs_node_size(node);
+            for (size_t i = 0; i < count; i++)
+                if (entry_retired(entries[i]) || !entries[i]->dirty_end ||
+                    !can_writeback_mapped(entries[i], end))
+                    return -KERNEL_EOPNOTSUPP;
+            /* The cache entries stay borrowed and their write gates closed
+             * until the device stops reading. The inode guards the mapping. */
+            close_mapped_writers(cache->record, entries, count);
+        }
+        int result = submit_mapped_writeback(node, entries, spans, count, true);
+        {
+            CACHE_SCOPE(complete, cache);
+            finish_mapped_writeback(cache, entries, spans, count, result,
+                result == -KERNEL_EOPNOTSUPP || result == -KERNEL_EAGAIN, true);
+        }
+        kernel_lock_release(&io);
+        if (!result) group_returned(cache->record->group);
+        if (result != -KERNEL_EAGAIN) return result;
+        struct file_writeback_wait wait = {.device_phase = true};
+        result = ops->wait_writeback(node->instance, &wait);
+        if (result) {
+            kernel_vfs_record_writeback_error(node, result);
+            return result;
+        }
+    }
+}
+
 static void write_dirty_batch(struct kernel_page_cache *cache,
     struct kernel_page_cache_entry **batch,size_t count,struct writeback_workspace *workspace)
 {
     struct kernel_page_cache_record *r=cache->record;
-    size_t used;
-    int result=writeback_run(cache,batch,count,UINT64_MAX,&used,workspace,1);
+    size_t used=count;
+    int result=write_background_mapped(cache,batch,count,workspace->spans);
+    if (result == -KERNEL_EOPNOTSUPP)
+        result=writeback_run(cache,batch,count,UINT64_MAX,&used,workspace,1);
     {
         CACHE_SCOPE(guard,cache);
         if (!result) r->statistics.worker_written+=used;
