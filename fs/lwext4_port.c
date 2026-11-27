@@ -496,6 +496,15 @@ void *ext4_user_calloc(size_t count, size_t size)
     return status == KERNEL_HEAP_STATUS_OK ? pointer : 0;
 }
 
+unsigned ext4_user_calloc_batch_nosleep(unsigned count, size_t size, void **out)
+{
+    if (!lwext4_heap) return 0;
+    kernel_io_context_inline()->allocation_depth++;
+    unsigned allocated = kernel_heap_allocate_zeroed_batch_nosleep(lwext4_heap, count, size, out);
+    kernel_io_context_inline()->allocation_depth--;
+    return allocated;
+}
+
 void *ext4_user_realloc(void *pointer, size_t size)
 {
     void *result = 0;

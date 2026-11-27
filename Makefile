@@ -557,9 +557,10 @@ else
 OBJECTS += $(BUILD_DIR)/tests/riscv/smp_cases.o
 OBJECTS += $(BUILD_DIR)/tests/riscv/smp_registers.o
 LDFLAGS += -Wl,--wrap=riscv_context_switch,--wrap=sbi_remote_sfence
-LDFLAGS += -Wl,--wrap=sbi_probe_extension,--wrap=sbi_hart_start,--wrap=sbi_hart_status,--wrap=sbi_set_timer
+LDFLAGS += -Wl,--wrap=sbi_probe_extension,--wrap=sbi_hart_start,--wrap=sbi_hart_status
 LDFLAGS += -Wl,--wrap=physical_page_allocate
 $(BUILD_DIR)/tests/riscv/smp_cases.o: CPPFLAGS += -DBOAROS_SMP_NEGATIVE=$(SMP_NEGATIVE)
+$(BUILD_DIR)/arch/riscv/timer.o: CPPFLAGS += -DBOAROS_RISCV_TIMER_TEST=1
 endif
 ifeq ($(FILES_SMP_TEST),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/files_smp.o

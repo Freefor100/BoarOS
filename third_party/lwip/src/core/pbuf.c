@@ -217,7 +217,7 @@ pbuf_init_alloced_pbuf(struct pbuf *p, void *payload, u16_t tot_len, u16_t len, 
 #define PBUF_ALLOC_SRC_TCP_STORAGE PBUF_TYPE_ALLOC_SRC_MASK_APP_MIN
 
 struct pbuf_tcp_storage {
-  struct tcp_pcb *owner;
+  struct pbuf **slot;
   void *context;
 };
 #define SIZEOF_TCP_STORAGE LWIP_MEM_ALIGN_SIZE(sizeof(struct pbuf_tcp_storage))
@@ -232,12 +232,16 @@ void
 boaros_lwip_pbuf_retire_tcp_storage(struct tcp_pcb *pcb)
 {
   SYS_ARCH_DECL_PROTECT(level);
-  if (!__atomic_load_n(&pcb->boaros_progress_buffer, __ATOMIC_RELAXED)) return;
+  if (!__atomic_load_n(&pcb->boaros_progress_buffer, __ATOMIC_RELAXED) &&
+      !__atomic_load_n(&pcb->boaros_progress_pair, __ATOMIC_RELAXED)) return;
   SYS_ARCH_PROTECT(level);
-  struct pbuf *p = pcb->boaros_progress_buffer;
-  if (p) {
-    pbuf_tcp_storage(p)->owner = NULL;
-    __atomic_store_n(&pcb->boaros_progress_buffer, NULL, __ATOMIC_RELAXED);
+  struct pbuf **slots[] = {&pcb->boaros_progress_buffer, &pcb->boaros_progress_pair};
+  for (unsigned i = 0; i < LWIP_ARRAYSIZE(slots); ++i) {
+    struct pbuf *p = *slots[i];
+    if (p) {
+      pbuf_tcp_storage(p)->slot = NULL;
+      __atomic_store_n(slots[i], NULL, __ATOMIC_RELAXED);
+    }
   }
   SYS_ARCH_UNPROTECT(level);
 }
@@ -248,15 +252,15 @@ pbuf_free_tcp_storage(struct pbuf *p)
   struct pbuf_tcp_storage *storage = pbuf_tcp_storage(p);
   SYS_ARCH_DECL_PROTECT(level);
   SYS_ARCH_PROTECT(level);
-  if (storage->owner)
-    __atomic_store_n(&storage->owner->boaros_progress_buffer, NULL, __ATOMIC_RELAXED);
+  if (storage->slot)
+    __atomic_store_n(storage->slot, NULL, __ATOMIC_RELAXED);
   SYS_ARCH_UNPROTECT(level);
   boaros_lwip_tcp_storage_release(storage->context, storage);
 }
 #endif
 
 static inline struct pbuf *
-pbuf_alloc_ram(pbuf_layer layer, u16_t length, int tcp_data, struct tcp_pcb *pcb)
+pbuf_alloc_ram(pbuf_layer layer, u16_t length, int tcp_data, struct tcp_pcb *pcb, int pair)
 {
   const u16_t offset = (u16_t)layer;
   const mem_size_t payload_len = (mem_size_t)(LWIP_MEM_ALIGN_SIZE(offset) + LWIP_MEM_ALIGN_SIZE(length));
@@ -282,20 +286,24 @@ pbuf_alloc_ram(pbuf_layer layer, u16_t length, int tcp_data, struct tcp_pcb *pcb
   /* A receiving loopback socket can retain the sender's backing storage
    * after ACK. One private, demand-allocated segment lets another connection
    * send even when the shared heap has no block of the required size. */
-  if (!allocation && pcb && pcb->boaros_loopback &&
-      !__atomic_load_n(&pcb->boaros_progress_buffer, __ATOMIC_RELAXED)) {
-    void *context = NULL;
-    storage = boaros_lwip_tcp_storage_allocate(pcb, alloc_len + SIZEOF_TCP_STORAGE, &context);
-    if (storage) {
-      storage->owner = pcb;
-      storage->context = context;
-      allocation = (u8_t *)storage + SIZEOF_TCP_STORAGE;
-      type = (pbuf_type)(PBUF_RAM | PBUF_ALLOC_SRC_TCP_STORAGE);
+  if (!allocation && pcb && pcb->boaros_loopback) {
+    struct pbuf **slot = &pcb->boaros_progress_buffer;
+    if (pair && __atomic_load_n(slot, __ATOMIC_RELAXED)) slot = &pcb->boaros_progress_pair;
+    if (!__atomic_load_n(slot, __ATOMIC_RELAXED)) {
+      void *context = NULL;
+      storage = boaros_lwip_tcp_storage_allocate(pcb, alloc_len + SIZEOF_TCP_STORAGE, &context);
+      if (storage) {
+        storage->slot = slot;
+        storage->context = context;
+        allocation = (u8_t *)storage + SIZEOF_TCP_STORAGE;
+        type = (pbuf_type)(PBUF_RAM | PBUF_ALLOC_SRC_TCP_STORAGE);
+      }
     }
   }
 #else
   LWIP_UNUSED_ARG(tcp_data);
   LWIP_UNUSED_ARG(pcb);
+  LWIP_UNUSED_ARG(pair);
   allocation = mem_malloc(alloc_len);
 #endif
   if (allocation == NULL) {
@@ -306,7 +314,7 @@ pbuf_alloc_ram(pbuf_layer layer, u16_t length, int tcp_data, struct tcp_pcb *pcb
                          length, length, type, 0);
   p->allocation_prefix = prefix;
 #if BOAROS_LWIP_TCP_WRITEV
-  if (storage) __atomic_store_n(&pcb->boaros_progress_buffer, p, __ATOMIC_RELAXED);
+  if (storage) __atomic_store_n(storage->slot, p, __ATOMIC_RELAXED);
 #endif
   LWIP_ASSERT("pbuf_alloc: pbuf->payload properly aligned",
               ((mem_ptr_t)p->payload % MEM_ALIGNMENT) == 0);
@@ -315,9 +323,9 @@ pbuf_alloc_ram(pbuf_layer layer, u16_t length, int tcp_data, struct tcp_pcb *pcb
 
 #if BOAROS_LWIP_TCP_WRITEV
 struct pbuf *
-boaros_lwip_pbuf_alloc_tcp_data(pbuf_layer layer, u16_t length, struct tcp_pcb *pcb)
+boaros_lwip_pbuf_alloc_tcp_data(pbuf_layer layer, u16_t length, struct tcp_pcb *pcb, int pair)
 {
-  return pbuf_alloc_ram(layer, length, 1, pcb);
+  return pbuf_alloc_ram(layer, length, 1, pcb, pair);
 }
 #endif
 
@@ -404,7 +412,7 @@ pbuf_alloc(pbuf_layer layer, u16_t length, pbuf_type type)
       break;
     }
     case PBUF_RAM:
-      p = pbuf_alloc_ram(layer, length, 0, NULL);
+      p = pbuf_alloc_ram(layer, length, 0, NULL, 0);
       break;
     default:
       LWIP_ASSERT("pbuf_alloc: erroneous type", 0);

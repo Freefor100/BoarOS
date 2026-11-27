@@ -404,15 +404,15 @@ tcp_create_segment(const struct tcp_pcb *pcb, struct pbuf *p, u8_t hdrflags, u32
 #if BOAROS_LWIP_TCP_WRITEV
 /* Only new COPY data is admitted against the heap reserve; control and a
  * split needed to transmit already-accepted data use ordinary allocation. */
-#define TCP_PBUF_ALLOC_COPY(layer, len, pcb) boaros_lwip_pbuf_alloc_tcp_data((layer), (len), (pcb))
+#define TCP_PBUF_ALLOC_COPY(layer, len, pcb, pair) boaros_lwip_pbuf_alloc_tcp_data((layer), (len), (pcb), (pair))
 #else
-#define TCP_PBUF_ALLOC_COPY(layer, len, pcb) pbuf_alloc((layer), (len), PBUF_RAM)
+#define TCP_PBUF_ALLOC_COPY(layer, len, pcb, pair) pbuf_alloc((layer), (len), PBUF_RAM)
 #endif
 #if TCP_OVERSIZE
 static struct pbuf *
 tcp_pbuf_prealloc(pbuf_layer layer, u16_t length, u16_t max_length,
                   u16_t *oversize, struct tcp_pcb *pcb, u8_t apiflags,
-                  u8_t first_seg)
+                  u8_t first_seg, int pair)
 {
   struct pbuf *p;
   u16_t alloc = length;
@@ -448,7 +448,8 @@ tcp_pbuf_prealloc(pbuf_layer layer, u16_t length, u16_t max_length,
     }
   }
 #endif /* LWIP_NETIF_TX_SINGLE_PBUF */
-  p = TCP_PBUF_ALLOC_COPY(layer, alloc, pcb);
+  LWIP_UNUSED_ARG(pair);
+  p = TCP_PBUF_ALLOC_COPY(layer, alloc, pcb, pair);
   if (p == NULL) {
     return NULL;
   }
@@ -459,7 +460,7 @@ tcp_pbuf_prealloc(pbuf_layer layer, u16_t length, u16_t max_length,
   return p;
 }
 #else /* TCP_OVERSIZE */
-#define tcp_pbuf_prealloc(layer, length, mx, os, pcb, api, fst) TCP_PBUF_ALLOC_COPY(layer, length, pcb)
+#define tcp_pbuf_prealloc(layer, length, mx, os, pcb, api, fst, pair) TCP_PBUF_ALLOC_COPY(layer, length, pcb, pair)
 #endif /* TCP_OVERSIZE */
 
 #if TCP_CHECKSUM_ON_COPY
@@ -562,18 +563,19 @@ tcp_write_cursor_copy(struct tcp_write_cursor *input, void *dst, u16_t len
 static struct tcp_seg *
 tcp_copy_segment(struct tcp_pcb *pcb, u16_t length, u16_t maximum,
                  u16_t *oversize, u8_t optlen, u8_t optflags, u8_t apiflags,
-                 u8_t first, struct tcp_write_cursor *vector, const void *source)
+                 u8_t first, struct tcp_write_cursor *vector, const void *source, int pair)
 {
 #if !TCP_OVERSIZE
   LWIP_UNUSED_ARG(pcb); LWIP_UNUSED_ARG(maximum); LWIP_UNUSED_ARG(oversize);
   LWIP_UNUSED_ARG(apiflags); LWIP_UNUSED_ARG(first);
 #endif
+  LWIP_UNUSED_ARG(pair);
 #if BOAROS_COST_DIAGNOSTICS
   struct kernel_cost_tag allocation = kernel_cost_capture();
   uint64_t started = allocation.epoch ? kernel_cost_clock() : 0;
 #endif
   struct pbuf *p = tcp_pbuf_prealloc(PBUF_TRANSPORT, length + optlen, maximum,
-                                  oversize, pcb, apiflags, first);
+                                  oversize, pcb, apiflags, first, pair);
   if (!p) {
 #if BOAROS_COST_DIAGNOSTICS
     if (allocation.epoch)
@@ -725,6 +727,14 @@ tcp_write_common(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags,
   LWIP_ERROR("tcp_write: invalid pcb", pcb != NULL, return ERR_ARG);
 
   mss_local = tcp_write_mss(pcb);
+#if BOAROS_LWIP_TCP_WRITEV
+  /* Let an ordinary full-sized pair in this write advance together when the
+   * first segment already needed private storage. Earlier writes and short
+   * writes keep the one-segment progress allowance. */
+  int may_pair = vector && pcb->boaros_loopback && len >= 2U * mss_local &&
+      !__atomic_load_n(&pcb->boaros_progress_buffer, __ATOMIC_RELAXED) &&
+      !__atomic_load_n(&pcb->boaros_progress_pair, __ATOMIC_RELAXED);
+#endif
 
   LWIP_ASSERT_CORE_LOCKED();
 
@@ -846,7 +856,7 @@ tcp_write_common(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags,
        * a segment. A header will never be prepended. */
       if (apiflags & TCP_WRITE_FLAG_COPY) {
         /* Data is copied */
-        if ((concat_p = tcp_pbuf_prealloc(PBUF_RAW, seglen, space, &oversize, pcb, apiflags, 1)) == NULL) {
+        if ((concat_p = tcp_pbuf_prealloc(PBUF_RAW, seglen, space, &oversize, pcb, apiflags, 1, 0)) == NULL) {
           LWIP_DEBUGF(TCP_OUTPUT_DEBUG | LWIP_DBG_LEVEL_SERIOUS,
                       ("tcp_write : could not allocate memory for pbuf copy size %"U16_F"\n",
                        seglen));
@@ -923,6 +933,11 @@ tcp_write_common(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags,
     if (apiflags & TCP_WRITE_FLAG_COPY) {
       next_queuelen = queuelen + 1;
       if (next_queuelen > LWIP_MIN(TCP_SND_QUEUELEN, TCP_SNDQUEUELEN_OVERFLOW)) goto memerr;
+      int pair = 0;
+#if BOAROS_LWIP_TCP_WRITEV
+      pair = may_pair && prev_seg && prev_seg->len == mss_local && seglen == mss_local &&
+             __atomic_load_n(&pcb->boaros_progress_buffer, __ATOMIC_RELAXED) == prev_seg->p;
+#endif
       seg = tcp_copy_segment(pcb, seglen, mss_local,
 #if TCP_OVERSIZE
                              &next_oversize,
@@ -930,7 +945,7 @@ tcp_write_common(struct tcp_pcb *pcb, const void *arg, u16_t len, u8_t apiflags,
                              NULL,
 #endif
                              optlen, optflags, apiflags, queue == NULL, vector,
-                             vector ? NULL : (const u8_t *)arg + pos);
+                             vector ? NULL : (const u8_t *)arg + pos, pair);
       if (!seg) goto memerr;
       tcp_segment_header(seg, pcb, 0, pcb->snd_lbb + pos, optlen);
     } else {
@@ -1176,7 +1191,7 @@ boaros_lwip_tcp_preparev(const struct kernel_socket_write_segment *segments,
     u16_t take = LWIP_MIN(mss, len);
     u16_t unused = 0;
     struct tcp_seg *seg = tcp_copy_segment(NULL, take, take, &unused, 0, 0,
-        TCP_WRITE_FLAG_COPY, 0, &input, NULL);
+        TCP_WRITE_FLAG_COPY, 0, &input, NULL, 0);
     if (!seg) return ERR_MEM;
     *owner = seg;
     owner = &seg->next;

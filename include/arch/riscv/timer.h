@@ -15,10 +15,20 @@ enum riscv_timer_status {
     RISCV_TIMER_STATUS_EARLY_INTERRUPT,
 };
 
+struct riscv_trap_frame;
+int riscv_timer_probe_fault(struct riscv_trap_frame *frame);
+extern const char riscv_timer_compare_continue[];
+
 enum riscv_timer_status riscv_timer_start(uint32_t timebase_frequency,
                                           uint32_t ticks_per_second);
+/* The caller has disabled this hart's timer interrupt. */
+enum riscv_timer_status riscv_timer_stop(void);
 enum riscv_timer_status riscv_timer_handle_interrupt(
     uint64_t *elapsed_ticks);
+#if BOAROS_SMP_TEST
+uint64_t riscv_smp_test_timer_compare_deadline(uint64_t deadline);
+enum riscv_timer_status riscv_timer_test_set_periodic_deadline(uint64_t deadline);
+#endif
 /* Independent scheduler event; zero cancels, periodic tick phase is preserved. */
 enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline);
 #if defined(__riscv)

@@ -160,6 +160,8 @@ struct jbd_trans {
 	unsigned reserved_logs;
 	/* Nonzero sequence binds a delta reservation to the actual running group. */
 	uint64_t reservation_group_sequence;
+    /* The private span's preflight result and staged controls. */
+    struct jbd_source_controls *source_controls;
 	uint64_t reservation_group_revision;
 	unsigned ordered_count, revoke_count;
 	bool frozen;
@@ -389,9 +391,15 @@ struct jbd_journal_reclaim {
 };
 /* Caller holds STATE. Report actual missing resources independently; an
  * allocated transaction already charges its control storage to the budget. */
-unsigned jbd_journal_operation_resources(struct jbd_journal *journal, const struct jbd_trans *allocated,
-    size_t payloads, size_t data_images,
-    const struct file_data_source *const *sources, unsigned count);
+unsigned jbd_journal_write_resources(struct jbd_journal *journal, const struct jbd_trans *allocated,
+    size_t payloads, size_t data_images, const struct file_data_source *const *sources,
+    unsigned count, uint64_t *absent);
+static inline unsigned jbd_journal_operation_resources(struct jbd_journal *journal,
+    const struct jbd_trans *allocated, size_t payloads, size_t data_images,
+    const struct file_data_source *const *sources, unsigned count)
+{
+    return jbd_journal_write_resources(journal, allocated, payloads, data_images, sources, count, NULL);
+}
 /* Choose a still-owned resource release after its unreached retirement stage.
  * Pure memory pressure may retire ordered data at commit; log and quarantine
  * ownership always require checkpoint. Recheck resources after the wait. */

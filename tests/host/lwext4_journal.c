@@ -9,6 +9,7 @@
 #include <kernel/sync.h>
 #include <ext4_inode.h>
 #include <ext4_journal.h>
+#include <ext4_journal_memory.h>
 #include <ext4_errno.h>
 #include <ext4_misc.h>
 #include <ext4_crc32.h>
@@ -341,6 +342,108 @@ static void write_deferred_prewrite(struct ext4_blockdev *dev)
     CHECK(ext4_fclose(&file) == EOK && ext4_journal_stop("/") == EOK);
     CHECK(ext4_umount("/") == EOK && fault_block_crash(&disk) == 0);
     puts("PASS occupied device phase: deferred data stayed ordered and matched after commit");
+}
+
+static void source_estimate_handoff(struct ext4_blockdev *dev)
+{
+    CHECK(ext4_journal_start("/") == EOK);
+    const struct ext4_journal_runtime runtime = {.now_ns = resource_now};
+    CHECK(ext4_journal_group_enable("/", &runtime, 4 * 1024 * 1024) == EOK);
+    struct jbd_journal *journal = dev->fs->jbd_journal;
+    for (unsigned count = 32; count <= 64; count *= 2) {
+        struct resource_source owner[64] = {{0}};
+        struct file_data_source source[64];
+        const struct file_data_source *inputs[65];
+        struct jbd_source *loans[64];
+        size_t block = dev->lg_bsize, length = count * block;
+        unsigned char *input = malloc(length), *output = malloc(length);
+        struct file_write_span spans[64] = {{0}};
+        CHECK(input && output);
+        for (unsigned i = 0; i < count; i++) {
+            owner[i].data = input + i * block;
+            source[i] = (struct file_data_source){&owner[i], resource_retain, resource_release, block};
+            inputs[i] = &source[i];
+            memset(owner[i].data, i + 1, block);
+            spans[i] = (struct file_write_span){
+                .offset = i * block, .buffer = owner[i].data, .size = block, .source = source[i]};
+        }
+        inputs[count] = inputs[0];
+        uint64_t absent[2] = {UINT64_MAX, UINT64_MAX};
+        size_t minimum = 0;
+        CHECK(jbd_source_estimate(journal, inputs, count + 1, &minimum, absent));
+        CHECK(absent[0] == (UINT64_MAX >> (64 - count)));
+        if (count == 64) CHECK(!absent[1]);
+        size_t single = 0;
+        CHECK(jbd_source_estimate(journal, inputs, 1, &single, NULL));
+        CHECK(single > block && minimum == count * single);
+
+        /* The budget check can be stale. Another borrower publishes the
+         * same identity before the request uses its absence prediction. */
+        struct jbd_source *existing;
+        CHECK(jbd_source_borrow(journal, inputs[0], &existing) == EOK);
+        for (unsigned i = 0; i < count; i++)
+            CHECK(jbd_source_borrow_control(journal, inputs[i], &loans[i], true, NULL) == EOK);
+        CHECK(loans[0] == existing && owner[0].references == 1);
+        struct file_data_source mismatch = source[0];
+        mismatch.bytes++;
+        struct jbd_source *invalid = NULL;
+        CHECK(jbd_source_borrow_control(journal, &mismatch, &invalid, true, NULL) == EINVAL && !invalid);
+        minimum = 0;
+        CHECK(jbd_source_estimate(journal, inputs, count, &minimum, absent) && !minimum && !absent[0]);
+        jbd_source_put(existing);
+        for (unsigned i = 0; i < count; i++) {
+            CHECK(owner[i].references == 1);
+            jbd_source_put(loans[i]);
+            CHECK(!owner[i].references);
+        }
+        size_t cached_bytes = jbd_memory_used(journal);
+        struct jbd_source_controls controls = {.remaining = JBD_SOURCE_CONTROL_BATCH};
+        struct jbd_source *cached;
+        CHECK(jbd_source_borrow_control(journal, inputs[0], &cached, true, &controls) == EOK);
+        CHECK(controls.count && controls.count < JBD_SOURCE_CONTROL_BATCH && owner[0].references == 1);
+        jbd_source_return_controls(&controls);
+        CHECK(!controls.count && owner[0].references == 1);
+        jbd_source_put(cached);
+        CHECK(!owner[0].references && jbd_memory_used(journal) == cached_bytes);
+
+        /* The allowance fits exactly the first source and its control.
+         * Staging the rest of the batch must not consume that prefix. */
+        jbd_trim_cache(journal, 0);
+        size_t normal_limit = jbd_memory_limit(journal);
+        jbd_memory_set_limit(journal, jbd_memory_used(journal) + single);
+        controls = (struct jbd_source_controls){.remaining = JBD_SOURCE_CONTROL_BATCH};
+        CHECK(jbd_source_borrow_control(journal, inputs[0], &cached, true, &controls) == EOK);
+        CHECK(!controls.count && owner[0].references == 1);
+        struct jbd_source *second;
+        CHECK(jbd_source_borrow_control(journal, inputs[0], &second, true, &controls) == EOK);
+        CHECK(second == cached && owner[0].references == 1);
+        jbd_source_put(second);
+        jbd_source_put(cached);
+        jbd_memory_set_limit(journal, normal_limit);
+        CHECK(!owner[0].references);
+
+        ext4_file file;
+        struct ext4_delalloc delalloc = {0};
+        CHECK(ext4_fopen(&file, count == 32 ? "/sources32" : "/sources64", "w+") == EOK);
+        file.delalloc = &delalloc;
+        kernel_io_context_current()->defer_range_data = true;
+        CHECK(ext4_fpwrite_batch(&file, spans, count) == EOK);
+        kernel_io_context_current()->defer_range_data = false;
+        for (unsigned i = 0; i < count; i++) CHECK(spans[i].written == block && owner[i].references == 1);
+        CHECK(ext4_journal_group_commit("/", true) == EOK);
+        CHECK(ext4_journal_group_checkpoint("/") == EOK);
+        for (unsigned i = 0; i < count; i++) CHECK(!owner[i].references);
+        size_t got;
+        CHECK(ext4_fpread(&file, 0, output, length, &got) == EOK && got == length);
+        CHECK(!memcmp(input, output, length));
+        CHECK(ext4_fclose(&file) == EOK);
+        free(input);
+        free(output);
+        printf("PASS source estimate: %u distinct sources, duplicates and stale absence, block=%u\n",
+            count, dev->lg_bsize);
+    }
+    CHECK(ext4_journal_stop("/") == EOK);
+    CHECK(ext4_umount("/") == EOK && fault_block_crash(&disk) == 0);
 }
 
 static void write_unwritten_range(struct ext4_blockdev *dev)
@@ -2196,6 +2299,10 @@ int main(int argc, char **argv)
         return 0;
     }
 #ifdef TEST_WRITEBACK_REGRESSIONS
+    if (!strcmp(argv[2], "source-estimate")) {
+        source_estimate_handoff(&dev);
+        return 0;
+    }
     if (!strcmp(argv[2], "deferred-prewrite")) {
         write_deferred_prewrite(&dev);
         return 0;

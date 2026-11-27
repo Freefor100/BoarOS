@@ -22,6 +22,8 @@
 
 void *ext4_user_malloc(size_t size);
 void *ext4_user_calloc(size_t count, size_t size);
+#define CONFIG_USE_USER_BATCH_CALLOC 1
+unsigned ext4_user_calloc_batch_nosleep(unsigned count, size_t size, void **out);
 void *ext4_user_realloc(void *pointer, size_t size);
 void ext4_user_free(void *pointer);
 

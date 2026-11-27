@@ -52,11 +52,24 @@ unsigned jbd_memory_cached_images(const struct jbd_journal *);
  * allocation callbacks report only locally owned active storage. */
 /* Index and charge live external owners together; the last reader may put
  * after the journal itself has stopped. */
-int jbd_source_borrow(struct jbd_journal *,const struct file_data_source *,struct jbd_source **);
+#define JBD_SOURCE_CONTROL_BATCH 16U
+struct jbd_source_controls {
+    const struct file_data_source *estimated_absent;
+    void *entries[JBD_SOURCE_CONTROL_BATCH];
+    unsigned count, remaining;
+};
+int jbd_source_borrow_control(struct jbd_journal *, const struct file_data_source *,
+    struct jbd_source **, bool estimated_absent, struct jbd_source_controls *);
+static inline int jbd_source_borrow(struct jbd_journal *journal,
+    const struct file_data_source *owner, struct jbd_source **source)
+{
+    return jbd_source_borrow_control(journal, owner, source, false, NULL);
+}
+void jbd_source_return_controls(struct jbd_source_controls *);
 void jbd_source_get(struct jbd_source *);
 void jbd_source_put(struct jbd_source *);
 bool jbd_source_estimate(struct jbd_journal *,const struct file_data_source *const *,
-    unsigned,size_t *);
+    unsigned,size_t *,uint64_t *);
 void jbd_memory_owner_uncharge(struct jbd_memory *, size_t);
 bool jbd_memory_pin_home(struct jbd_journal *, struct ext4_buf *);
 bool jbd_memory_bind_private(struct jbd_journal *, struct ext4_block *client,

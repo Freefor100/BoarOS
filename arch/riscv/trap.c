@@ -219,7 +219,8 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         return;
     }
 
-    if (!from_user && (riscv_uaccess_fault(frame) || riscv_hwprobe_fault(frame))) return;
+    if (!from_user && (riscv_uaccess_fault(frame) || riscv_hwprobe_fault(frame) ||
+        riscv_timer_probe_fault(frame))) return;
 
     if (from_user &&
         (frame->scause & RISCV_SCAUSE_INTERRUPT) == 0U) {
@@ -470,7 +471,12 @@ void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
 #if BOAROS_USER_SMP
         kernel_cpu_current()->user_returns++;
 #endif
-    } else kernel_scheduler_prepare_idle_return();
+    } else if (frame->scause != 2U ||
+               frame->sepc != (uintptr_t)riscv_timer_compare_continue) {
+        /* The timer probe must return to startup before an idle handoff
+         * can run a task that depends on that timer. */
+        kernel_scheduler_prepare_idle_return();
+    }
 #if BOAROS_COST_DIAGNOSTICS
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) kernel_cost_user_return();
 #endif

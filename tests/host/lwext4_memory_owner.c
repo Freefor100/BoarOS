@@ -3,6 +3,7 @@
 #include <ext4_journal.h>
 #include <ext4_errno.h>
 #include <kernel/cpu.h>
+#include <kernel/raw_lock.h>
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -14,6 +15,15 @@ static bool fail_calloc, fail_malloc, block_calloc, fail_blocked_calloc;
 static pthread_mutex_t gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed=PTHREAD_COND_INITIALIZER;
 static unsigned gate_state;
+static _Thread_local unsigned *count_metadata_locks;
+
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
+{
+    if (count_metadata_locks && lock->rank == KERNEL_RAW_RANK_OBJECT + 1)
+        ++*count_metadata_locks;
+    __real_kernel_raw_lock_acquire(lock, guard);
+}
 
 void *ext4_user_malloc(size_t bytes)
 {
@@ -51,6 +61,14 @@ int jbd_trans_borrow_private(struct jbd_trans *trans,struct ext4_block *block,
 int jbd_trans_get_write_access_range(struct jbd_trans *trans,struct ext4_block *block,
     uint32_t offset,uint32_t length)
 { (void)trans;(void)block;(void)offset;(void)length;abort(); }
+int jbd_trans_prepare_unowned_range(struct jbd_trans *trans,struct ext4_block *block,
+    uint32_t offset,uint32_t length)
+{ (void)trans;(void)block;(void)offset;(void)length;abort(); }
+int jbd_trans_prepare_inode_replacement(struct jbd_trans *trans,struct ext4_block *block,
+    uint32_t offset,uint32_t length)
+{ (void)trans;(void)block;(void)offset;(void)length;abort(); }
+int jbd_trans_get_new_access(struct jbd_trans *trans,struct ext4_block *block)
+{ (void)trans;(void)block;abort(); }
 
 static void start(struct jbd_journal *journal,unsigned size,size_t limit)
 {
@@ -242,11 +260,13 @@ static void ordered_batch_outlives_stop(unsigned size)
     enum { COUNT=35 };
     for (unsigned i=0;i<COUNT-1;i++) {
         struct jbd_data *data=jbd_alloc(&journal,sizeof(*data));assert(data);
+        data->references=1;
         *tail=data;tail=&TAILQ_NEXT(data,node);
         assert(jbd_source_borrow(&journal,&sources[i%2],&data->source)==EOK);
         if (!i) {reader=data->source;jbd_source_get(reader);}
     }
     struct jbd_data *last=jbd_alloc(&journal,sizeof(*last));assert(last);*tail=last;
+    last->references=1;
     last->image=jbd_image_alloc(&journal);assert(last->image);
     memset(last->image->data,0x47,size);
     struct ext4_block_payload *image_reader=&last->image->payload;ext4_block_payload_get(image_reader);
@@ -266,6 +286,33 @@ static void ordered_batch_outlives_stop(unsigned size)
     jbd_memory_snapshot(owner,&stats);
     assert(!stats.used && !stats.cached && !stats.borrowed && !account.active);
     jbd_memory_put(owner);assert(!live && account.references==1);
+}
+
+static void ordered_batch_releases_independent_sources(unsigned size)
+{
+    struct jbd_journal journal;
+    start(&journal,size,1024*1024);
+    enum { COUNT = 16 };
+    struct external_source storage[COUNT];
+    struct jbd_data *first = NULL, **tail = &first;
+    for (unsigned i = 0; i < COUNT; i++) {
+        struct file_data_source owner = source_start(&storage[i],NULL,size);
+        struct jbd_data *data = jbd_alloc(&journal,sizeof(*data));
+        assert(data && jbd_source_borrow(&journal,&owner,&data->source) == EOK);
+        data->references = 1;
+        source_release(&storage[i]);
+        *tail = data;
+        tail = &TAILQ_NEXT(data,node);
+    }
+    unsigned acquisitions = 0;
+    count_metadata_locks = &acquisitions;
+    jbd_data_free_list(first,COUNT);
+    count_metadata_locks = NULL;
+    assert(acquisitions <= 3);
+    assert(!jbd_memory_used(&journal));
+    for (unsigned i = 0; i < COUNT; i++) assert(!storage[i].references);
+    jbd_memory_stop(&journal);
+    assert(!live);
 }
 struct borrowing_task {
     struct jbd_journal *journal;
@@ -373,6 +420,7 @@ int main(int argc,char **argv)
 {
     assert(argc==2);unsigned size=(unsigned)strtoul(argv[1],NULL,10);assert(size==1024 || size==4096);
     payload_outlives_record_and_stop(size);pools_and_failed_allocations(size);transaction_controls_reuse(size);
+    ordered_batch_releases_independent_sources(size);
     concurrent_reservation(size);borrowed_source_outlives_stop(size);
     ordered_batch_outlives_stop(size);
     source_candidate_race(size,false);source_candidate_race(size,true);

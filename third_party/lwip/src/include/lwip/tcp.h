@@ -422,6 +422,7 @@ struct tcp_pcb {
 #endif
 #if BOAROS_LWIP_TCP_WRITEV
   struct pbuf *boaros_progress_buffer;
+  struct pbuf *boaros_progress_pair;
 #endif
 
 #if LWIP_WND_SCALE

@@ -6021,6 +6021,7 @@ static int ext4_write_spans(ext4_file *file, ext4_file *owner,
 	uint64_t write_end = 0;
 	size_t blocks = 0, data_images = 0;
 	unsigned source_count = 0;
+    uint64_t absent_sources[(EXT4_FILE_WRITEBACK_MAX + 63U) / 64U];
 	bool fresh_try = mode == EXT4_WRITE_FRESH_TRY;
 	bool synchronous = mode == EXT4_WRITE_SYNCHRONOUS;
 	unsigned block_size = ext4_sb_get_block_size(ext4_fs_super(&file->mp->fs));
@@ -6063,6 +6064,8 @@ static int ext4_write_spans(ext4_file *file, ext4_file *owner,
 	struct jbd_journal *journal = file->mp->fs.jbd_journal;
 	struct ext4_operation *operation=ext4_current_operation(&file->mp->fs);
 	bool outer=!operation;
+    bool remember_absent = journal && journal->grouped && outer &&
+        kernel_io_context_current()->defer_range_data;
 	bool prewrite_fresh = file->mp->journal_runtime.prewrite_fresh;
 #if BOAROS_MAX_CPUS == 1
 	prewrite_fresh = prewrite_fresh || blocks >= (128U * 1024U) / block_size;
@@ -6082,14 +6085,16 @@ static int ext4_write_spans(ext4_file *file, ext4_file *owner,
 	int r = outer || batch ? EOK : ext4_track_nested_file(owner);
 	if (r) return r;
 Retry:
+    if (remember_absent) memset(absent_sources, 0, sizeof(absent_sources));
 	r = batch || fresh_try ? EOK : ext4_prepare_growth(file, write_end);
 	if (!r && journal && journal->grouped && outer && !fresh_try) {
 		while (!r) {
             struct jbd_journal_reclaim goal;
             {
             EXT4_STATE_READ_SCOPE(state, &file->mp->fs);
-            unsigned resources = jbd_journal_operation_resources(journal, NULL,
-                blocks, data_images, sources, source_count);
+            unsigned resources = jbd_journal_write_resources(journal, NULL,
+                blocks, data_images, sources, source_count,
+                remember_absent ? absent_sources : NULL);
             if (!resources) break;
             r = ext4_group_reclaim_goal(file->mp, resources, &goal);
             }
@@ -6146,9 +6151,21 @@ Retry:
     struct ext4_inode_block_range range = {0};
     ext4_lblk_t range_next = 0;
     uint64_t mapping_end = 0;
+    unsigned source_index = 0;
+    struct jbd_trans *data_trans = remember_absent ? ext4_current_trans(fs) : NULL;
+    struct jbd_source_controls source_controls = {0};
+    if (data_trans) {
+        source_controls.remaining = source_count;
+        data_trans->source_controls = &source_controls;
+    }
 	for (unsigned i = 0; i < count && !r; i++) {
 		struct file_write_span *span = &spans[i];
 		if (!span->size) continue;
+        if (data_trans && source_index < source_count && sources[source_index] == &span->source) {
+            bool absent = absent_sources[source_index / 64U] & (UINT64_C(1) << (source_index % 64U));
+            source_controls.estimated_absent = absent ? &span->source : NULL;
+            source_index++;
+        }
 		file->fpos = span->offset;
         uint64_t old_size = ext4_inode_get_size(ext4_fs_super(fs), ref.inode);
         if (direct && direct->count) {
@@ -6275,6 +6292,10 @@ Retry:
     int direct_result = journal && r ? r : ext4_direct_write_flush(&ref, file, direct, &range, range_next, wait);
     if (!r) r = direct_result;
     ext4_free(direct);
+    if (data_trans) {
+        data_trans->source_controls = NULL;
+        jbd_source_return_controls(&source_controls);
+    }
     struct ext4_timestamp times[3];
     unsigned fields = !r && file->mp->inode_observer.snapshot
         ? file->mp->inode_observer.snapshot(file->time_owner, times) : 0;
