@@ -2509,6 +2509,12 @@ tcp_output_control_segment_netif(const struct tcp_pcb *pcb, struct pbuf *p,
   }
 #endif
   TCP_STATS_INC(tcp.xmit);
+#if BOAROS_LWIP_LINUX_LOOPBACK && LWIP_HAVE_LOOPIF && !LWIP_NETIF_LOOPBACK_MULTITHREADING
+  /* This private control packet has no retransmission owner. On serial lo
+   * the receive queue can take it after the IP header is complete. */
+  int transfer = netif == netif_get_loopif() && !boaros_lwip_parallel_enabled();
+  if (transfer) p->boaros_loopback_transfer = BOAROS_LOOPBACK_TRANSFER;
+#endif
 #if BOAROS_USER_SMP
   struct netif **ack_batch = boaros_lwip_tcp_context_current()->input_ack_batch;
   if (use_resolved_path && pcb->boaros_path4.interface == netif && pcb->boaros_path4.mtu &&
@@ -2539,6 +2545,9 @@ tcp_output_control_segment_netif(const struct tcp_pcb *pcb, struct pbuf *p,
     err = tcp_ip_output(pcb, p, netif, src, dst, NULL, NULL);
   }
 
+#if BOAROS_LWIP_LINUX_LOOPBACK && LWIP_HAVE_LOOPIF && !LWIP_NETIF_LOOPBACK_MULTITHREADING
+  if (transfer && p->boaros_loopback_transfer == BOAROS_LOOPBACK_QUEUED) return err;
+#endif
   pbuf_free(p);
   return err;
 }

@@ -399,6 +399,19 @@ static int tcp_shared_retransmit(struct tcp_pcb *sender, struct tcp_pcb *receive
     return 0;
 }
 
+static int tcp_loopback_control_lifetime(struct tcp_pcb *sender, struct netif *loop)
+{
+    if (loop->loop_first) return 90;
+    mem_size_t baseline = STATS_GET(mem.used);
+    mem_size_t historical_peak = STATS_GET(mem.max);
+    lwip_stats.mem.max = baseline;
+    if (tcp_send_empty_ack(sender) != ERR_OK || !loop->loop_first) return 91;
+    if (STATS_GET(mem.used) <= baseline || STATS_GET(mem.max) != STATS_GET(mem.used)) return 92;
+    netif_poll_all();
+    if (STATS_GET(mem.max) < historical_peak) lwip_stats.mem.max = historical_peak;
+    return STATS_GET(mem.used) != baseline ? 93 : 0;
+}
+
 struct fin_window_case {
     struct tcp_pcb *receiver;
     unsigned bytes, eof;
@@ -606,6 +619,8 @@ int main(void)
     if(recovery) return recovery;
     int reserve_result=tcp_copy_heap_reserve(tcp_client,tcp_accepted);
     if(reserve_result) return reserve_result;
+    int control_result=tcp_loopback_control_lifetime(tcp_client,loop);
+    if(control_result) return control_result;
     int retransmit_result=tcp_shared_retransmit(tcp_client,tcp_accepted,loop);
     if(retransmit_result) return retransmit_result;
     static unsigned char bulk[20000];

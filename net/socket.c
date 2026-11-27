@@ -6100,8 +6100,8 @@ static int datagram_send_owned(struct kernel_socket_write_request *request, int 
             if (route==netif_get_loopif() && !payload->next && !ip_addr_ismulticast(&remote)) {
                 /* The outer synchronous send can finish its own input.
                  * Queued requests share the worker's packet budget. */
-                payload->boaros_udp_loopback=protocol_depth==1 && !request->queued?
-                    BOAROS_UDP_LOOPBACK_TRANSFER_INLINE:BOAROS_UDP_LOOPBACK_TRANSFER;
+                payload->boaros_loopback_transfer=protocol_depth==1 && !request->queued?
+                    BOAROS_LOOPBACK_TRANSFER_INLINE:BOAROS_LOOPBACK_TRANSFER;
             }
         }
         if (IP_IS_V4(&remote)) payload->flags|=PBUF_FLAG_IP4_LOCAL_DF;
@@ -6116,12 +6116,12 @@ static int datagram_send_owned(struct kernel_socket_write_request *request, int 
     /* Transfer the sole reference after output has returned and reset the
      * netif hints. The input may free the payload before returning. */
     request->protocol_payload=NULL;
-    if (payload->boaros_udp_loopback==BOAROS_UDP_LOOPBACK_INLINE) {
+    if (payload->boaros_loopback_transfer==BOAROS_LOOPBACK_INLINE) {
         COST_ADD(NETWORK_LOOP_PACKETS, 1);
         boaros_lwip_udp_loopback_input(route,payload);
         /* An ICMP reply may have put new work on a loopback queue. */
         if (!loopback_pending) request->progressed|=SOCKET_WRITE_LOOPBACK_INLINE;
-    } else if (payload->boaros_udp_loopback!=BOAROS_UDP_LOOPBACK_QUEUED)
+    } else if (payload->boaros_loopback_transfer!=BOAROS_LOOPBACK_QUEUED)
         kernel_socket_pbuf_free(payload);
     return failure?failure:(int)request->payload_size;
 }

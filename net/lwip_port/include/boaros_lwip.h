@@ -18,10 +18,10 @@ struct udp_pcb;
 /* Socket sends offer a private pbuf. Loopback output either adopts it into
  * its queue or leaves it for the same protocol owner to deliver after send. */
 enum {
-    BOAROS_UDP_LOOPBACK_TRANSFER = 1,
-    BOAROS_UDP_LOOPBACK_QUEUED,
-    BOAROS_UDP_LOOPBACK_TRANSFER_INLINE,
-    BOAROS_UDP_LOOPBACK_INLINE,
+    BOAROS_LOOPBACK_TRANSFER = 1,
+    BOAROS_LOOPBACK_QUEUED,
+    BOAROS_LOOPBACK_TRANSFER_INLINE,
+    BOAROS_LOOPBACK_INLINE,
 };
 void boaros_lwip_udp_loopback_input(struct netif *, struct pbuf *);
 struct udp_pcb *boaros_lwip_udp4_local_target(struct netif *, const struct ip_addr *,
