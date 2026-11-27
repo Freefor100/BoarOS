@@ -5752,7 +5752,7 @@ static void release_borrowed_root(struct kernel_cpu *cpu)
 static enum kernel_mm_status activate_mm(const struct kernel_mm *next,
     uint64_t kernel_context,int borrow_kernel_root)
 {
-#if defined(BOAROS_ARCH_LOONGARCH)
+#if defined(BOAROS_ARCH_LOONGARCH) && BOAROS_MAX_CPUS > 1
     (void)borrow_kernel_root;
 #endif
     /* 在整个本地交接期间不允许被抢占；这里不分配、不进固件、无两个MM锁嵌套。 */
@@ -5798,10 +5798,15 @@ static enum kernel_mm_status activate_mm(const struct kernel_mm *next,
         /* A root switch already flushed translations. Record only captured
          * generations; a concurrent newer publication needs its own sync. */
         int resumed=0;
-#if !defined(BOAROS_ARCH_LOONGARCH)
+#if !defined(BOAROS_ARCH_LOONGARCH) || BOAROS_MAX_CPUS == 1
+        /* LoongArch advances the translation generation for new mappings
+         * as well as changes to existing ones. */
         resumed=cpu->borrowed_mm_allocator && cpu->borrowed_mm_context==context &&
             cpu->borrowed_mm_identity==record->futex_id &&
-            cpu->borrowed_mm_generation==generation && !arch_mmu_new_translation_needs_sync();
+            cpu->borrowed_mm_generation==generation;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+        resumed=resumed && !arch_mmu_new_translation_needs_sync();
+#endif
 #endif
         if (!changed && !resumed && (joining || cpu->active_mm_generation != generation)) arch_mmu_flush_all();
         if (record->instruction_seen[logical] != instructions) {
@@ -5815,7 +5820,7 @@ static enum kernel_mm_status activate_mm(const struct kernel_mm *next,
         cpu->active_mm_record_page=next->record_page_address;
         cpu->active_mm_generation = generation;
     }
-#if !defined(BOAROS_ARCH_LOONGARCH)
+#if !defined(BOAROS_ARCH_LOONGARCH) || BOAROS_MAX_CPUS == 1
     else if (borrow_kernel_root && (previous || cpu->borrowed_mm_allocator)) {
         if (previous) {
             if (cpu->borrowed_mm_allocator) __builtin_trap();
