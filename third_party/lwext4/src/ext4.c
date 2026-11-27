@@ -238,15 +238,20 @@ static uint64_t delalloc_range(struct ext4_delalloc *da,uint64_t first,uint64_t 
 static uint64_t delalloc_spans(struct ext4_delalloc *da,
     const struct file_write_span *spans,unsigned count,size_t block,bool clear)
 {
-    uint64_t total=0,last=0;
+    uint64_t total=0, first=0, last=0;
     for (unsigned i=0;i<count;i++) {
         const struct file_write_span *span=&spans[i];
         if (!span->size) continue;
-        uint64_t first=span->offset/block,end=(span->offset+span->size+block-1)/block;
-        if (first<last)first=last;
-        total+=delalloc_range(da,first,end,clear);last=end;
+        uint64_t begin=span->offset/block, end=(span->offset+span->size+block-1)/block;
+        /* Cache spans describe payload ownership, not reservation runs.
+         * Adjacent pages and fragments in one block share one tree walk. */
+        if (begin>last) {
+            total+=delalloc_range(da,first,last,clear);
+            first=begin;
+        }
+        if (end>last) last=end;
     }
-    return total;
+    return total+delalloc_range(da,first,last,clear);
 }
 struct ext4_small_writeback_result {
     uint64_t size;
