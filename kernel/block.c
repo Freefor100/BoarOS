@@ -562,6 +562,15 @@ enum kernel_block_status kernel_block_try_write_phase(struct kernel_block_device
     kernel_block_phase_next_fn next, const void *next_context, const void *first)
 { return write_phase(device, next, next_context, first, 1); }
 
+/* A failed try-write owns no device I/O. Wait for the same two admission
+ * qualifications with file-system and page-cache ownership released. */
+void kernel_block_wait_write_phase(struct kernel_block_device *device)
+{
+    struct kernel_block_device *disk=physical(device);
+    KERNEL_LOCK_SCOPE(io); kernel_rwlock_read(&disk->phase_barrier, &io);
+    KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_read(&disk->transfer_lock, &transfer);
+}
+
 struct translated_completion {
     struct block_read_span *spans;
     const struct block_read_completion *completion;

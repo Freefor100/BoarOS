@@ -1708,7 +1708,7 @@ static int ext4_group_wait_with_retry(struct ext4_mountpoint *mp, uint64_t targe
 	if (mp->journal_runtime.request) mp->journal_runtime.request(mp->journal_runtime.context,
 		EXT4_JOURNAL_WORK_COMMIT | (kind == EXT4_JOURNAL_WAIT_CHECKPOINT ? EXT4_JOURNAL_WORK_CHECKPOINT : 0));
 	if (retry && mp->journal_runtime.wait) {
-		*retry = (struct file_writeback_wait){target, kind};
+		*retry = (struct file_writeback_wait){.sequence=target, .kind=kind};
 		return EAGAIN;
 	}
 	if (mp->journal_runtime.wait) return mp->journal_runtime.wait(mp->journal_runtime.context, target, kind);
@@ -5918,15 +5918,22 @@ static int ext4_write_discard_range(struct ext4_inode_ref *ref,
 }
 static int ext4_direct_write_flush(struct ext4_inode_ref *ref, ext4_file *file,
     struct ext4_direct_write_batch *batch, struct ext4_inode_block_range *range,
-    ext4_lblk_t range_next)
+    ext4_lblk_t range_next, struct file_writeback_wait *wait)
 {
     if (!batch || !batch->count) return EOK;
     struct ext4_blockdev *bdev = ref->fs->bdev;
-    bool rollback = ext4_current_trans(ref->fs) != NULL;
+    struct jbd_trans *transaction = ext4_current_trans(ref->fs);
+    bool rollback = transaction != NULL;
     bool try_phase = rollback && bdev->bdif->bwrite_batch_try_phase &&
         kernel_io_context_current()->background_reclaim;
     int r = ext4_trans_write_data_batch(bdev, batch->blocks, batch->count, try_phase);
     if (r == EAGAIN && try_phase) {
+        if (wait) {
+            /* No I/O from this phase was submitted. Abort the private
+             * mapping and let the cache retry outside inode qualification. */
+            wait->device_phase = true;
+            return EAGAIN;
+        }
         /* An exclusive device phase has not admitted these fresh blocks.
          * The transaction can keep the same snapshots as ordered data and
          * leave device progress to the journal after dropping the inode. */
@@ -6106,13 +6113,13 @@ Retry:
             block_size <= span->source_size - (source_offset - block_offset);
         /* The supplied block already includes the zero gap after old EOF. */
         if (!covers_eof && span->offset > old_size && old_size % block_size) {
-            r = ext4_direct_write_flush(&ref, file, direct, &range, range_next);
+            r = ext4_direct_write_flush(&ref, file, direct, &range, range_next, wait);
             if (!r) r = ext4_zero_allocated_eof_tail_mode(&ref, old_size, span->offset, synchronous);
         }
         size_t consumed = 0;
 		while (consumed < span->size && !r) {
             if (direct && (direct->bytes >= direct->byte_limit || direct->count == direct->capacity)) {
-                r = ext4_direct_write_flush(&ref, file, direct, &range, range_next);
+                r = ext4_direct_write_flush(&ref, file, direct, &range, range_next, wait);
                 if (r) break;
             }
 			uint32_t offset = file->fpos % block_size;
@@ -6177,7 +6184,7 @@ Retry:
                 bool overlap = n && physical * block_size >= direct->blocks[n-1].offset &&
                     physical * block_size - direct->blocks[n-1].offset < direct->blocks[n-1].size;
                 if ((!merge && n == direct->capacity) || overlap || direct->bytes + block_size > direct->byte_limit) {
-                    r = ext4_direct_write_flush(&ref, file, direct, &range, range_next); n = 0; merge = false;
+                    r = ext4_direct_write_flush(&ref, file, direct, &range, range_next, wait); n = 0; merge = false;
                 }
                 if (!r && merge) {
                     direct->blocks[n-1].size += block_size;
@@ -6190,7 +6197,7 @@ Retry:
                 }
                 if (!r) direct->bytes += block_size;
             } else {
-                r = ext4_direct_write_flush(&ref, file, direct, &range, range_next);
+                r = ext4_direct_write_flush(&ref, file, direct, &range, range_next, wait);
                 if (!r) r = synchronous
                     ? ext4_trans_write_data_sync(fs->bdev, physical, data_offset, input, data_length, allocated)
                     : ext4_trans_write_data(fs->bdev, physical, data_offset, input, data_length, allocated, &span->source);
@@ -6208,7 +6215,7 @@ Retry:
     /* A journal abort drops the private extent tree and every physical claim.
      * The direct path instead keeps any device-completed prefix. */
     if (r && !journal) r = ext4_write_discard_range(&ref, &range, range_next, r);
-    int direct_result = journal && r ? r : ext4_direct_write_flush(&ref, file, direct, &range, range_next);
+    int direct_result = journal && r ? r : ext4_direct_write_flush(&ref, file, direct, &range, range_next, wait);
     if (!r) r = direct_result;
     ext4_free(direct);
     struct ext4_timestamp times[3];
@@ -6239,6 +6246,7 @@ Completed:
 	if (ext4_file_rolled_back(file, r)) {
 		file->fsize = saved_size; file->fpos = saved_pos;
 		for (unsigned i = 0; i < count; i++) spans[i].written = 0;
+        if (wait && wait->device_phase) return r;
 		if (r == EAGAIN && outer && ext4_operation_resource_retry(&file->mp->fs)) goto Retry;
         if (outer && ext4_operation_retry_reclaim(file->mp, &r)) goto Retry;
 	}

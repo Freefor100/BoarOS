@@ -3515,7 +3515,12 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node,
 static int ext4_backend_wait_writeback(struct kernel_vfs_instance *instance,
     const struct file_writeback_wait *wait)
 {
-    return lwext4_error(journal_wait(lwext4_instance(instance), wait->sequence, wait->kind));
+    struct lwext4_mount_adapter *adapter=lwext4_instance(instance);
+    if (wait->device_phase) {
+        kernel_block_wait_write_phase(adapter->block);
+        return lwext4_error(mount_error(adapter));
+    }
+    return lwext4_error(journal_wait(adapter, wait->sequence, wait->kind));
 }
 
 static int ext4_backend_writeback_files(struct kernel_vfs_node *const *nodes,
