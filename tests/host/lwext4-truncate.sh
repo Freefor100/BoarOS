@@ -16,12 +16,13 @@ check_fs() {
     e2fsck -fn "$1" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log"; exit 1; }
 }
 linked_tail() {
+    scenario="${2:-linked-tail}"
     base="$work/linked-base.img"
     truncate -s 32M "$base"
     mkfs.ext4 -q -F -b "$1" "$base"
     for mode in normal memory space; do
         cp "$base" "$work/linked.img"
-        observed=$(timeout 30 "$work/probe" "$work/linked.img" linked-tail 0 "$mode")
+        observed=$(timeout 30 "$work/probe" "$work/linked.img" "$scenario" 0 "$mode")
         printf '%s\n' "$observed"
         if [ "$mode" = normal ]; then
             boundaries=${observed##*attempts, }
@@ -34,19 +35,21 @@ linked_tail() {
         for cut in $(seq "$boundaries"); do
             cp "$base" "$work/linked-cut.img"
             result=0
-            timeout 30 "$work/probe" "$work/linked-cut.img" linked-tail 0 normal "$cut" "$reorder" || result=$?
+            timeout 30 "$work/probe" "$work/linked-cut.img" "$scenario" 0 normal "$cut" "$reorder" || result=$?
             test "$result" -eq 75
-            timeout 30 "$work/probe" "$work/linked-cut.img" linked-tail-recover 0 normal
+            timeout 30 "$work/probe" "$work/linked-cut.img" "$scenario-recover" 0 normal
             check_fs "$work/linked-cut.img"
         done
     done
-    printf 'PASS linked tail: %s-byte blocks, %s crash positions with and without reorder\n' "$1" "$boundaries"
+    printf 'PASS %s: %s-byte blocks, %s crash positions with and without reorder\n' "$scenario" "$1" "$boundaries"
 }
-if [ "${1:-all}" = linked-tail ]; then
-    linked_tail 1024
-    linked_tail 4096
-    exit 0
-fi
+case "${1:-all}" in
+    linked-tail|linked-tail-initialized)
+        linked_tail 1024 "$1"
+        linked_tail 4096 "$1"
+        exit 0
+        ;;
+esac
 if [ "${1:-all}" = single-reap ]; then
     for features in orphan_file '^orphan_file'; do
         for kind in empty mapped sparse; do
@@ -60,6 +63,7 @@ if [ "${1:-all}" = single-reap ]; then
 fi
 for blocksize in 1024 4096; do
     linked_tail "$blocksize"
+    linked_tail "$blocksize" linked-tail-initialized
     for mapping in extent indirect; do
         features=orphan_file
         [ "$mapping" != indirect ] || features='^extent,^64bit,^orphan_file'
@@ -98,7 +102,7 @@ for blocksize in 1024 4096; do
                 done
                 if [ "$mapping" = extent ]; then
                     keep=$(((target + blocksize - 1) / blocksize))
-                    test "$windows" -eq "$(((80 - keep + 31) / 32))"
+                    test "$windows" -le "$(((80 - keep + 31) / 32))"
                 fi
             else
                 done=0

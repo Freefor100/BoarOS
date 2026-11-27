@@ -958,30 +958,41 @@ static inline void lru_read_run_finish(struct kernel_page_cache_record *record,
 }
 #endif
 
-static int cleanup_entry(struct kernel_page_cache *cache,
-                         struct kernel_page_cache_entry *entry,
-                         uint64_t *pages_released)
+/* A retired entry cannot gain new borrowers. Check under cache protection
+ * before its cleanup owner can release the backing page and node. */
+static int entry_cleanup_ready(const struct kernel_page_cache_entry *entry)
 {
-    {
-        CACHE_SCOPE(guard,cache);
-        /* 退休项已禁止新借用；在索引保护内确认最后借用结束后，
-         * cleanup持有唯一存储owner，实际页/node/堆释放留在锁外。 */
-        if (entry_users(entry) || (__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&UINT32_MAX)) return 0;
-    }
-    while (entry->page_references_owned != 0U) {
-        (void)physical_page_release(cache->allocator,
-                                  entry->physical_address);
-        entry->page_references_owned--;
-        (*pages_released)++;
-    }
-    entry->physical_address = 0U;
-    entry->data = NULL;
+    return !entry_users(entry) &&
+        !(__atomic_load_n(&entry->writes,__ATOMIC_ACQUIRE)&UINT32_MAX);
+}
+
+static int cleanup_release_node(struct kernel_page_cache *cache,
+    struct kernel_page_cache_entry *entry)
+{
     if (entry->node != 0 &&
         kernel_vfs_node_release(&entry->node) != 0) {
         return 0;
     }
     kernel_heap_release(cache->heap, entry);
     return 1;
+}
+
+static int cleanup_entry(struct kernel_page_cache *cache,
+                         struct kernel_page_cache_entry *entry,
+                         uint64_t *pages_released)
+{
+    {
+        CACHE_SCOPE(guard,cache);
+        if (!entry_cleanup_ready(entry)) return 0;
+    }
+    while (entry->page_references_owned != 0U) {
+        (void)physical_page_release(cache->allocator, entry->physical_address);
+        entry->page_references_owned--;
+        (*pages_released)++;
+    }
+    entry->physical_address = 0;
+    entry->data = NULL;
+    return cleanup_release_node(cache,entry);
 }
 
 static enum kernel_page_cache_status abandon_entry(
@@ -1012,14 +1023,50 @@ static int drain_cleanup_entries(struct kernel_page_cache *cache,
     struct kernel_page_cache_entry **entries, size_t limit, uint64_t *pages_released)
 {
     int failed=0;
-    while (*entries && limit--) {
-        struct kernel_page_cache_entry *entry=*entries;
-        *entries=entry->cleanup_next;
-        if (!cleanup_entry(cache,entry,pages_released)) {
+    while (*entries && limit) {
+        struct kernel_page_cache_entry *ready[PHYSICAL_PAGE_REFERENCE_BATCH_MAX];
+        unsigned count=0;
+        {
             CACHE_SCOPE(guard,cache);
-            entry->cleanup_next=cache->record->cleanup_entries;
-            cache->record->cleanup_entries=entry;
-            failed=1;
+            for (unsigned i=0; *entries && limit && i<PHYSICAL_PAGE_REFERENCE_BATCH_MAX; i++,limit--) {
+                struct kernel_page_cache_entry *entry=*entries;
+                *entries=entry->cleanup_next;
+                if (entry_cleanup_ready(entry)) ready[count++]=entry;
+                else {
+                    entry->cleanup_next=cache->record->cleanup_entries;
+                    cache->record->cleanup_entries=entry;
+                    failed=1;
+                }
+            }
+        }
+        uint64_t pages[PHYSICAL_PAGE_REFERENCE_BATCH_MAX];
+        unsigned used=0;
+        for (unsigned i=0;i<count;i++) {
+            struct kernel_page_cache_entry *entry=ready[i];
+            while (entry->page_references_owned) {
+                pages[used++]=entry->physical_address;
+                entry->page_references_owned--;
+                if (used==PHYSICAL_PAGE_REFERENCE_BATCH_MAX) {
+                    physical_page_release_batch(cache->allocator,pages,used);
+                    *pages_released+=used;
+                    used=0;
+                }
+            }
+            entry->physical_address=0;
+            entry->data=NULL;
+        }
+        if (used) {
+            physical_page_release_batch(cache->allocator,pages,used);
+            *pages_released+=used;
+        }
+        for (unsigned i=0;i<count;i++) {
+            struct kernel_page_cache_entry *entry=ready[i];
+            if (!cleanup_release_node(cache,entry)) {
+                CACHE_SCOPE(guard,cache);
+                entry->cleanup_next=cache->record->cleanup_entries;
+                cache->record->cleanup_entries=entry;
+                failed=1;
+            }
         }
     }
     return !failed;

@@ -1691,9 +1691,14 @@ static int ext4_ext_remove_idx(struct ext4_inode_ref *inode_ref,
 	return err;
 }
 
+struct ext4_extent_free_run {
+    ext4_fsblk_t first;
+    uint32_t count;
+};
+
 static int ext4_ext_remove_leaf(struct ext4_inode_ref *inode_ref,
 				struct ext4_extent_path *path, ext4_lblk_t from,
-				ext4_lblk_t to)
+				ext4_lblk_t to, const struct ext4_extent_free_run *run)
 {
 
 	int32_t depth = ext_depth(inode_ref->inode);
@@ -1706,6 +1711,10 @@ static int ext4_ext_remove_leaf(struct ext4_inode_ref *inode_ref,
 
 	start_ex = ex;
 	new_entries = to_le16(eh->entries_count);
+	if (run) {
+		err = ext4_ext_free_blocks(inode_ref, run->first, run->count, 0);
+		if (err != EOK) return err;
+	}
 	while (ex <= EXT_LAST_EXTENT(path[depth].header) &&
 	       to_le32(ex->first_block) <= to) {
 		int32_t new_len = 0;
@@ -1742,8 +1751,10 @@ static int ext4_ext_remove_leaf(struct ext4_inode_ref *inode_ref,
 			}
 		}
 
-		int r = ext4_ext_remove_blocks(inode_ref, ex, start, start + len - 1);
-		if (r != EOK) return r;
+		if (!run) {
+			err = ext4_ext_remove_blocks(inode_ref, ex, start, start + len - 1);
+			if (err != EOK) return err;
+		}
 		/*
 		 * Set the first block of the extent if it is presented.
 		 */
@@ -1777,7 +1788,8 @@ static int ext4_ext_remove_leaf(struct ext4_inode_ref *inode_ref,
 					   sizeof(struct ext4_extent));
 
 	eh->entries_count = to_le16(new_entries);
-	ext4_ext_dirty(inode_ref, path + depth);
+	err = ext4_ext_dirty(inode_ref, path + depth);
+	if (err != EOK) return err;
 
 	/*
 	 * If the extent pointer is pointed to the first extent of the node, and
@@ -1823,7 +1835,7 @@ ext4_ext_next_allocated_block(struct ext4_extent_path *path);
 /* Takes ownership of any prepared path, which may already cover from. */
 static int ext4_extent_remove_space_path(struct ext4_inode_ref *inode_ref,
     ext4_lblk_t from, ext4_lblk_t to, struct ext4_extent_path *path,
-    bool at_start)
+    bool at_start, const struct ext4_extent_free_run *run)
 {
 	int ret = EOK;
 	int32_t depth = ext_depth(inode_ref->inode);
@@ -1948,8 +1960,8 @@ static int ext4_extent_remove_space_path(struct ext4_inode_ref *inode_ref,
 			if (leaf_to > to)
 				leaf_to = to;
 
-			ret = ext4_ext_remove_leaf(inode_ref, path, leaf_from,
-					           leaf_to);
+			ret = ext4_ext_remove_leaf(inode_ref, path, leaf_from, leaf_to, run);
+			run = NULL;
 			if (ret != EOK) goto out;
 			ext4_ext_drop_refs(inode_ref, path + i, 0);
 			i--;
@@ -2022,7 +2034,7 @@ out:
 int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
                             ext4_lblk_t to)
 {
-    return ext4_extent_remove_space_path(inode_ref, from, to, NULL, false);
+    return ext4_extent_remove_space_path(inode_ref, from, to, NULL, false, NULL);
 }
 
 #define EXT4_RECLAIM_EXTENT_RUN 256U
@@ -2045,7 +2057,8 @@ int ext4_extent_remove_tail(struct ext4_inode_ref *inode_ref, uint64_t keep,
     }
     if (result != EOK) return result;
 
-    struct ext4_extent *extent = path[ext_depth(inode_ref->inode)].extent;
+    struct ext4_extent_path *leaf = path + ext_depth(inode_ref->inode);
+    struct ext4_extent *extent = leaf->extent;
     if (!extent) { *done = true; goto Release; }
     uint32_t length = ext4_ext_get_actual_len(extent);
     uint64_t start = to_le32(extent->first_block);
@@ -2055,21 +2068,39 @@ int ext4_extent_remove_tail(struct ext4_inode_ref *inode_ref, uint64_t keep,
 
     uint64_t first = end > window ? end - window : 0;
     if (first < keep) first = keep;
-    if (expanded && first > start && first > keep &&
-        (ext4_ext_is_unwritten(extent) || (!keep && !ext4_inode_get_links_cnt(inode_ref->inode)))) {
+    bool at_start = first >= start;
+    struct ext4_extent_free_run released;
+    const struct ext4_extent_free_run *run = NULL;
+    if (expanded && first > keep) {
         struct ext4_fs *fs = inode_ref->fs;
-        ext4_fsblk_t physical = ext4_ext_pblock(extent) + length - 1;
-        if (physical >= fs->bdev->lg_bcnt) { result = EUCLEAN; goto Release; }
-        /* A longer run still updates one bitmap under one block-group
-         * qualification. Do not add more extent records or groups to the
-         * ordinary window. The journal bounds each revoke lookup's lock hold. */
-        uint32_t run = ext4_fs_addr_to_idx_bg(ext4_fs_super(fs), physical) + 1;
-        if (run > EXT4_RECLAIM_EXTENT_RUN) run = EXT4_RECLAIM_EXTENT_RUN;
-        if (run > length) run = length;
-        uint64_t candidate = end - run;
-        if (candidate < keep) candidate = keep;
+        ext4_fsblk_t physical_end = ext4_ext_pblock(extent) + length;
+        if (physical_end > fs->bdev->lg_bcnt) { result = EUCLEAN; goto Release; }
+        uint32_t width = ext4_fs_addr_to_idx_bg(ext4_fs_super(fs), physical_end - 1) + 1;
+        if (width > EXT4_RECLAIM_EXTENT_RUN) width = EXT4_RECLAIM_EXTENT_RUN;
+        uint64_t lower = end > width ? end - width : 0;
+        if (lower < keep) lower = keep;
+        /* The accepted file size excludes this suffix. Coalesce adjacent
+         * physical ranges in the same leaf and block group before the
+         * transaction updates their common allocation bitmap. */
+        uint64_t candidate = start;
+        while (candidate > lower && extent > EXT_FIRST_EXTENT(leaf->header)) {
+            struct ext4_extent *previous = extent - 1;
+            uint64_t previous_start = to_le32(previous->first_block);
+            uint32_t previous_length = ext4_ext_get_actual_len(previous);
+            if (!previous_length || previous_start + previous_length != candidate ||
+                ext4_ext_pblock(previous) + previous_length != physical_end - (end - candidate))
+                break;
+            candidate = previous_start;
+            extent = previous;
+        }
+        if (candidate < lower) candidate = lower;
         if (candidate < first) {
             first = candidate;
+            leaf->extent = extent;
+            at_start = true;
+            released = (struct ext4_extent_free_run){
+                .first = physical_end - (end - first), .count = end - first};
+            run = &released;
             *expanded = true;
         }
     }
@@ -2077,14 +2108,14 @@ int ext4_extent_remove_tail(struct ext4_inode_ref *inode_ref, uint64_t keep,
     if (single_root) {
         uint64_t from = first < start ? start : first;
         result = ext4_ext_remove_leaf(inode_ref, &root, (ext4_lblk_t)from,
-            (ext4_lblk_t)(end - 1));
+            (ext4_lblk_t)(end - 1), run);
         if (result == EOK && !root.header->entries_count)
             root.header->max_entries_count = to_le16(ext4_ext_space_root(inode_ref));
     } else {
         /* The highest extent already owns the writable path. A wider
          * logical window can reuse the allocation for its rewalk. */
         result = ext4_extent_remove_space_path(inode_ref, (ext4_lblk_t)first,
-            (ext4_lblk_t)(end - 1), path, first >= start);
+            (ext4_lblk_t)(end - 1), path, at_start, run);
     }
     if (result == EOK && (first == keep || (single_root && !root.header->entries_count)))
         *done = true;
