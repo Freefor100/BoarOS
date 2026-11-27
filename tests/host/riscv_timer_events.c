@@ -1,5 +1,6 @@
 /* Real timer state machine; the fixture supplies TIME/SBI/IRQ hardware only. */
 #include <arch/riscv/timer.h>
+#include <arch/riscv/trap.h>
 #include <kernel/cpu.h>
 #include <assert.h>
 #include <stdio.h>
@@ -7,7 +8,13 @@ static struct kernel_cpu cpus[BOAROS_MAX_CPUS];
 static unsigned current;
 static uint64_t now, programmed[BOAROS_MAX_CPUS];
 static unsigned set_calls;
-static int set_error;
+static int set_error, direct;
+static unsigned direct_calls;
+const char riscv_timer_compare_probe[1], riscv_timer_compare_continue[1];
+void host_timer_set_compare(uint64_t deadline)
+{ direct_calls++;programmed[current]=deadline; }
+int host_timer_try_compare(uint64_t deadline)
+{ if (!direct) return 0;host_timer_set_compare(deadline);return 1; }
 void *allocator_host_cpu_get(void) { return &cpus[current]; }
 uint64_t riscv_time_read(void) { return now; }
 long sbi_probe_extension(unsigned long ext) { assert(ext==0x54494d45);return 1; }
@@ -23,9 +30,37 @@ static void interrupt(uint64_t at,uint64_t expected_ticks,uint64_t expected_dead
         (unsigned long long)programmed[current]);
     assert(status==RISCV_TIMER_STATUS_OK && ticks==expected_ticks && programmed[current]==expected_deadline);
 }
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argv;
     for (unsigned i=0;i<BOAROS_MAX_CPUS;i++) cpus[i].initialized=KERNEL_CPU_INITIALIZED;
+    if (argc > 1) {
+        direct=1;
+        now=1000;assert(!riscv_timer_start(100,1));
+        assert(direct_calls==1 && !set_calls && programmed[0]==1100);
+        assert(!riscv_timer_set_scheduler_deadline(1020));
+        assert(direct_calls==2 && !set_calls && programmed[0]==1020);
+        interrupt(1020,0,1100);
+        interrupt(1100,1,1200);
+        assert(direct_calls==4 && !set_calls);
+#if BOAROS_MAX_CPUS>1
+        current=1;direct=0;now=1000;
+        assert(!riscv_timer_start(100,1) && set_calls==1 && programmed[1]==1100);
+        current=0;interrupt(1200,1,1300);
+        assert(direct_calls==5 && set_calls==1);
+#endif
+        unsigned before_stop=direct_calls, sbi_before_stop=set_calls;
+        assert(!riscv_timer_stop() && programmed[0]==UINT64_MAX);
+        assert(direct_calls==before_stop+1 && set_calls==sbi_before_stop);
+        assert(!cpus[0].timer_deadline && riscv_timer_stop()==RISCV_TIMER_STATUS_NOT_STARTED);
+        puts("PASS timer events: direct compare, periodic phase, per-CPU SBI fallback and stop");
+        return 0;
+    }
+    struct riscv_trap_frame frame = {.scause=2,.sepc=(uintptr_t)riscv_timer_compare_probe};
+    assert(riscv_timer_probe_fault(&frame) && frame.sepc==(uintptr_t)riscv_timer_compare_continue);
+    assert(!riscv_timer_probe_fault(&frame));
+    frame.scause=7;frame.sepc=(uintptr_t)riscv_timer_compare_probe;
+    assert(!riscv_timer_probe_fault(&frame) && frame.sepc==(uintptr_t)riscv_timer_compare_probe);
     now=1000;assert(!riscv_timer_start(100,1) && programmed[0]==1100);
     interrupt(1001,0,1100); /* STIP may outlive a completed timer reprogram. */
     assert(!riscv_timer_set_scheduler_deadline(1020));
@@ -63,5 +98,9 @@ int main(void)
     current=0;interrupt(1550,0,1600);assert(programmed[1]==2050);
     current=1;interrupt(2050,0,2100);
 #endif
-    puts("PASS timer events: pending/cancelled/replaced IRQ, reused hardware deadline, periodic phase, zero false ticks, SBI failure and CPU ownership");
+    set_error=-1;
+    assert(riscv_timer_stop()==RISCV_TIMER_STATUS_SBI_SET_FAILED);
+    set_error=0;
+    assert(!riscv_timer_stop() && programmed[current]==UINT64_MAX);
+    puts("PASS timer events: pending/cancelled/replaced IRQ, reused hardware deadline, periodic phase, zero false ticks, SBI failure, stop and CPU ownership");
 }

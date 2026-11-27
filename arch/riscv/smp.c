@@ -260,7 +260,7 @@ void riscv_smp_secondary_high(void)
                 riscv_smp_fail("stop-root-owner",-1);
             __atomic_store_n(&cpu->state, KERNEL_CPU_QUIESCING, __ATOMIC_RELEASE);
             asm volatile("csrw sie, zero" ::: "memory");
-            (void)sbi_set_timer(UINT64_MAX);
+            (void)riscv_timer_stop();
             riscv_smp_fail("HSM-stop-returned", sbi_hart_stop());
         }
     }

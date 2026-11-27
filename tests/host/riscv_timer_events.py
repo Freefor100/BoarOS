@@ -5,13 +5,22 @@ import os,subprocess,tempfile
 root=Path(__file__).resolve().parents[2]
 source=(root/'arch/riscv/timer.c').read_text()
 # Translate only CSR/IRQ instructions; all deadline/state/error code is unchanged.
+start=source.index('    unsigned direct;')
+end=source.index('    return direct;',start) + len('    return direct;')
+source=source[:start]+'    return host_timer_try_compare(deadline);\n'+source[end:]
+start=source.index('    asm volatile("csrw 0x14d, %0"')
+end=source.index('\n',start)
+source=source[:start]+'    host_timer_set_compare(deadline);'+source[end:]
 start=source.index('    asm volatile("fence rw, i')
 end=source.index('    return value;',start)
 source=source[:start]+'    value=riscv_time_read();\n'+source[end:]
 start=source.index('    asm volatile("csrs sie, %0')
 end=source.index('    return RISCV_TIMER_STATUS_OK;',start)
 source=source[:start]+'    host_timer_enable(stie);\n'+source[end:]
-source='void host_timer_enable(unsigned long);\n'+source
+source=('#include <stdint.h>\n'
+        'int host_timer_try_compare(uint64_t);\n'
+        'void host_timer_set_compare(uint64_t);\n'
+        'void host_timer_enable(unsigned long);\n')+source
 with tempfile.TemporaryDirectory(prefix='boaros-timer-events-') as directory:
     work=Path(directory);(work/'timer.c').write_text(source)
     for cpus in (1,2):
@@ -20,3 +29,4 @@ with tempfile.TemporaryDirectory(prefix='boaros-timer-events-') as directory:
             '-DBOAROS_PAGE_SHIFT=12',f'-DBOAROS_MAX_CPUS={cpus}','-Itests/host/random','-idirafter','include',
             '-Iarch/riscv','tests/host/riscv_timer_events.c',str(work/'timer.c'),'-o',str(exe)],cwd=root,check=True)
         subprocess.run([str(exe)],check=True)
+        subprocess.run([str(exe),'direct'],check=True)

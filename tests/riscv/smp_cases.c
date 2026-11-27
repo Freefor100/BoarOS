@@ -88,12 +88,11 @@ long __wrap_sbi_probe_extension(unsigned long extension)
     if (BOAROS_SMP_NEGATIVE == 1 && extension == SBI_EXT_RFENCE) return 0;
     return __real_sbi_probe_extension(extension);
 }
-long __real_sbi_set_timer(uint64_t);
-long __wrap_sbi_set_timer(uint64_t deadline)
+uint64_t riscv_smp_test_timer_compare_deadline(uint64_t deadline)
 {
     if (BOAROS_SMP_NEGATIVE==7 && kernel_cpu_current()->logical_id==kernel_cpu_get_boot_count()-1)
-        return __real_sbi_set_timer(UINT64_MAX); /* 清掉旧 STIP，本核收不到 timer，ONLINE 握手须超时。 */
-    return __real_sbi_set_timer(deadline);
+        return UINT64_MAX; /* 清除旧的定时中断，触发上线握手超时。 */
+    return deadline;
 }
 long __real_sbi_hart_start(uint64_t, uint64_t, uint64_t);
 long __wrap_sbi_hart_start(uint64_t hart, uint64_t entry, uint64_t opaque)
@@ -245,9 +244,8 @@ static void edge_wait(void *mode_argument)
     while (!__atomic_load_n(&edge_can_park, __ATOMIC_ACQUIRE)) {}
     if (mode == 1) {
         uintptr_t irq = arch_interrupt_save();
-        require(!sbi_set_timer(UINT64_MAX), "disable-CPU1-timer");
         asm volatile("csrc sie, %0" :: "r"((uintptr_t)32) : "memory");
-        kernel_cpu_current()->timer.armed = 0;
+        require(!riscv_timer_stop(), "disable-CPU1-timer");
         arch_interrupt_restore(irq);
     }
     enum kernel_wait_wake_reason reason;
@@ -309,7 +307,11 @@ static void edge_cases(void)
     edge_finished = edge_can_park = 0;
     edge_deadline = riscv_time_read() + 500000;
     irq = arch_interrupt_save();
-    require(!sbi_set_timer(UINT64_MAX), "deadline-disable-CPU0-periodic");
+    uint64_t periodic = kernel_cpu_current()->timer.next_deadline;
+    /* Keep the unchanged hardware/software comparison invariant. The remote
+     * event is earlier than this suppressed periodic deadline. */
+    require(!riscv_timer_test_set_periodic_deadline(edge_deadline + 100000000),
+            "deadline-delay-CPU0-periodic");
     require(kernel_thread_create_joinable_mask(edge_wait, (void *)2, &edge_join, 2) ==
             KERNEL_SCHEDULER_STATUS_OK, "remote-deadline-create");
     __atomic_store_n(&edge_can_park, 1, __ATOMIC_RELEASE);
@@ -317,6 +319,9 @@ static void edge_cases(void)
     /* 不park/yield：仅CPU1的期限IPI能重装CPU0已取消的硬件timer。 */
     wait_flag(&edge_finished, "remote-deadline-rearm");
     kernel_thread_join(&edge_join);
+    irq = arch_interrupt_save();
+    require(!riscv_timer_test_set_periodic_deadline(periodic), "deadline-restore-CPU0-periodic");
+    arch_interrupt_restore(irq);
     require(kernel_wait_queue_close(&edge_queue) == KERNEL_SCHEDULER_STATUS_OK &&
             kernel_wait_queue_destroy(&edge_queue) == KERNEL_SCHEDULER_STATUS_OK, "edge-queue-owner");
     virt_uart_puts("BoarOS: SMP early wake, WFI boundary and remote deadline passed\n");

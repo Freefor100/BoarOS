@@ -63,7 +63,7 @@ struct kernel_cpu {
     unsigned wait_notification_depth;
 #if BOAROS_MAX_CPUS > 1
     uint32_t logical_id, state, events, outbound;
-    struct { uint64_t period, next_deadline; int armed; } timer;
+    struct { uint64_t period, next_deadline; int armed, direct; } timer;
     struct kernel_sched_runqueue runqueue;
     /* Requested affinity may permit a different CPU; service/reservation can
      * narrow it further, so a positive count still requires the real check. */

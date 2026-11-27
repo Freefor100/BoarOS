@@ -2,6 +2,7 @@
 #include <kernel/cpu.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/timer.h>
+#include <arch/riscv/trap.h>
 
 #include "timer_internal.h"
 
@@ -14,7 +15,7 @@
 struct riscv_timer_state {
     uint64_t period;
     uint64_t next_deadline;
-    int armed;
+    int armed, direct;
 };
 
 #if BOAROS_MAX_CPUS > 1
@@ -22,6 +23,50 @@ struct riscv_timer_state {
 #else
 static struct riscv_timer_state timer_state;
 #endif
+
+/* Probe actual supervisor access, including firmware's counter enables.
+ * The trap fixup recognizes only this one instruction. Timer IRQs remain
+ * disabled until its first deadline and backend have both been published. */
+extern const char riscv_timer_compare_probe[], riscv_timer_compare_continue[];
+
+static __attribute__((noinline,noclone)) int riscv_timer_try_compare(uint64_t deadline)
+{
+    unsigned direct;
+    asm volatile("li %0, 0\n"
+        ".globl riscv_timer_compare_probe\n"
+        "riscv_timer_compare_probe:\n"
+        "csrw 0x14d, %1\n"
+        "li %0, 1\n"
+        ".globl riscv_timer_compare_continue\n"
+        "riscv_timer_compare_continue:"
+        : "=&r"(direct) : "r"(deadline) : "memory");
+    return direct;
+}
+
+int riscv_timer_probe_fault(struct riscv_trap_frame *frame)
+{
+    if (frame->scause != 2 || frame->sepc != (uintptr_t)riscv_timer_compare_probe)
+        return 0;
+    frame->sepc = (uintptr_t)riscv_timer_compare_continue;
+    return 1;
+}
+
+static uint64_t compare_deadline(uint64_t deadline)
+{
+#if BOAROS_RISCV_TIMER_TEST
+    return riscv_smp_test_timer_compare_deadline(deadline);
+#else
+    return deadline;
+#endif
+}
+
+static long program_deadline(uint64_t deadline)
+{
+    deadline = compare_deadline(deadline);
+    if (!timer_state.direct) return sbi_set_timer(deadline);
+    asm volatile("csrw 0x14d, %0" : : "r"(deadline) : "memory");
+    return 0;
+}
 
 uint64_t riscv_time_read_ordered(void)
 {
@@ -65,7 +110,6 @@ enum riscv_timer_status riscv_timer_start(uint32_t timebase_frequency,
 {
     uint64_t period;
     uint64_t deadline;
-    long probe_result;
     unsigned long stie = RISCV_SIE_STIE;
 
     if (timebase_frequency == 0U || ticks_per_second == 0U ||
@@ -76,18 +120,21 @@ enum riscv_timer_status riscv_timer_start(uint32_t timebase_frequency,
         return RISCV_TIMER_STATUS_ALREADY_STARTED;
     }
 
-    probe_result = sbi_probe_extension(SBI_EXT_TIME);
-    if (probe_result < 0L) {
-        return RISCV_TIMER_STATUS_SBI_PROBE_FAILED;
-    }
-    if (probe_result == 0L) {
-        return RISCV_TIMER_STATUS_SBI_TIME_UNAVAILABLE;
-    }
-
     period = timebase_frequency / ticks_per_second;
     deadline = riscv_time_read() + period;
-    if (sbi_set_timer(deadline) != 0L) {
-        return RISCV_TIMER_STATUS_SBI_SET_FAILED;
+    timer_state.direct = riscv_timer_try_compare(compare_deadline(deadline));
+    if (!timer_state.direct) {
+        long probe_result = sbi_probe_extension(SBI_EXT_TIME);
+        if (probe_result < 0L) {
+            return RISCV_TIMER_STATUS_SBI_PROBE_FAILED;
+        }
+        if (probe_result == 0L) {
+            return RISCV_TIMER_STATUS_SBI_TIME_UNAVAILABLE;
+        }
+        deadline = riscv_time_read() + period;
+        if (program_deadline(deadline) != 0L) {
+            return RISCV_TIMER_STATUS_SBI_SET_FAILED;
+        }
     }
 
     timer_state.period = period;
@@ -101,6 +148,15 @@ enum riscv_timer_status riscv_timer_start(uint32_t timebase_frequency,
                  :
                  : "r"(stie)
                  : "memory");
+    return RISCV_TIMER_STATUS_OK;
+}
+
+enum riscv_timer_status riscv_timer_stop(void)
+{
+    if (!timer_state.armed) return RISCV_TIMER_STATUS_NOT_STARTED;
+    if (program_deadline(UINT64_MAX)) return RISCV_TIMER_STATUS_SBI_SET_FAILED;
+    kernel_cpu_current()->timer_deadline = 0;
+    timer_state.armed = 0;
     return RISCV_TIMER_STATUS_OK;
 }
 
@@ -125,6 +181,19 @@ static uint64_t earlier_deadline(uint64_t periodic, uint64_t event)
     return event && (int64_t)(event - periodic) < 0 ? event : periodic;
 }
 
+#if BOAROS_RISCV_TIMER_TEST
+/* The fixture moves the comparator and its software periodic value together. */
+enum riscv_timer_status riscv_timer_test_set_periodic_deadline(uint64_t deadline)
+{
+    if (!timer_state.armed) return RISCV_TIMER_STATUS_NOT_STARTED;
+    uint64_t event = kernel_cpu_current()->timer_deadline;
+    if (program_deadline(earlier_deadline(deadline, event)))
+        return RISCV_TIMER_STATUS_SBI_SET_FAILED;
+    timer_state.next_deadline = deadline;
+    return RISCV_TIMER_STATUS_OK;
+}
+#endif
+
 enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
 {
     if (!timer_state.armed) return RISCV_TIMER_STATUS_NOT_STARTED;
@@ -135,7 +204,7 @@ enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
     if (cpu->timer_deadline != deadline) {
         uint64_t periodic = timer_state.next_deadline;
         uint64_t target = earlier_deadline(periodic, deadline);
-        if (target != earlier_deadline(periodic, cpu->timer_deadline) && sbi_set_timer(target) != 0L)
+        if (target != earlier_deadline(periodic, cpu->timer_deadline) && program_deadline(target) != 0L)
             status = RISCV_TIMER_STATUS_SBI_SET_FAILED;
         else cpu->timer_deadline = deadline;
     }
@@ -155,7 +224,7 @@ enum riscv_timer_status riscv_timer_handle_interrupt(uint64_t *elapsed_ticks)
         &candidate_deadline, &candidate_elapsed);
     if (status != RISCV_TIMER_STATUS_OK) return status;
     if (event && (int64_t)(now - event) >= 0) event = 0;
-    if (sbi_set_timer(earlier_deadline(candidate_deadline, event)) != 0L)
+    if (program_deadline(earlier_deadline(candidate_deadline, event)) != 0L)
         return RISCV_TIMER_STATUS_SBI_SET_FAILED;
     timer_state.next_deadline = candidate_deadline;
     kernel_cpu_current()->timer_deadline = event;
