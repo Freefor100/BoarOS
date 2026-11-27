@@ -204,6 +204,51 @@ static int unexpected_prewrite(struct ext4_blockdev *dev, const struct kernel_bl
     return EIO;
 }
 
+#ifdef TEST_JBD_RECORD_COPY
+static bool borrow_during_prewrite;
+static struct ext4_block during_prewrite;
+
+static int write_checked_prewrite(struct ext4_blockdev *dev, const struct kernel_block_span *spans,
+    unsigned count)
+{
+    if (borrow_during_prewrite)
+        CHECK(ext4_block_get(dev, &during_prewrite, spans[0].offset / dev->lg_bsize) == EOK);
+    for (unsigned i = 0; i < count; i++) {
+        int r = write_device(dev, spans[i].buffer, spans[i].offset / 512, spans[i].size / 512);
+        if (r) return r;
+    }
+    return EOK;
+}
+
+static void check_prewrite_cache(struct ext4_blockdev *dev, ext4_file *file,
+    unsigned char *input, size_t length)
+{
+    struct ext4_inode_ref ref;
+    struct ext4_inode_block_range range;
+    CHECK(ext4_fs_get_inode_ref_read(dev->fs, file->inode, &ref) == EOK);
+    CHECK(ext4_fs_get_inode_dblk_range(&ref, 0, 4, false, &range) == EOK && range.count == 4);
+    CHECK(ext4_fs_put_inode_ref(&ref) == EOK);
+    ext4_bcache_invalidate_lba(dev->bc, range.block, range.count);
+    struct kernel_block_span span = {range.block * dev->lg_bsize, input, length};
+    dev->bdif->bwrite_batch = unexpected_prewrite;
+    dev->bdif->bwrite_batch_try_phase = write_checked_prewrite;
+    private_borrow_cache = dev->bc;
+    private_borrow_lba = range.block;
+    private_borrow_lookups = 0;
+    CHECK(ext4_trans_write_data_batch(dev, &span, 1, true) == EOK);
+    CHECK(!private_borrow_lookups);
+    private_borrow_cache = NULL;
+    memset(input, 0x92, length);
+    borrow_during_prewrite = true;
+    CHECK(ext4_trans_write_data_batch(dev, &span, 1, true) == EOK);
+    CHECK(!memcmp(during_prewrite.data, input, dev->lg_bsize));
+    borrow_during_prewrite = false;
+    CHECK(ext4_block_set(dev, &during_prewrite) == EOK);
+    dev->bdif->bwrite_batch = NULL;
+    dev->bdif->bwrite_batch_try_phase = NULL;
+}
+#endif
+
 static void write_deferred_prewrite(struct ext4_blockdev *dev)
 {
     CHECK(ext4_journal_start("/") == EOK);
@@ -239,6 +284,11 @@ static void write_deferred_prewrite(struct ext4_blockdev *dev)
     size_t got;
     CHECK(ext4_fpread(&file, 0, output, length, &got) == EOK && got == length);
     CHECK(memcmp(input, output, length) == 0);
+#ifdef TEST_JBD_RECORD_COPY
+    check_prewrite_cache(dev, &file, input, length);
+    CHECK(ext4_fpread(&file, 0, output, length, &got) == EOK && got == length);
+    CHECK(memcmp(input, output, length) == 0);
+#endif
     free(input); free(output);
     CHECK(ext4_fclose(&file) == EOK && ext4_journal_stop("/") == EOK);
     CHECK(ext4_umount("/") == EOK && fault_block_crash(&disk) == 0);

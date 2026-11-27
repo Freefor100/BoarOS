@@ -529,6 +529,15 @@ void ext4_bcache_cancel_fresh(struct ext4_buf *buf)
     buf->fresh_load = buf->loading = false;
     if (bc->bdev->bdif->wake_read) bc->bdev->bdif->wake_read(buf);
 }
+
+bool ext4_bcache_has_lba(struct ext4_bcache *bc, uint64_t first, uint64_t end)
+{
+    KERNEL_TASK_LOCK_SCOPE(guard, &bc->metadata);
+    struct ext4_buf key = {.lba = first};
+    struct ext4_buf *buf = RB_NFIND(ext4_buf_lba, &bc->lba_root, &key);
+    return buf && buf->lba < end;
+}
+
 void ext4_bcache_invalidate_lba(struct ext4_bcache *bc, uint64_t from, uint32_t cnt)
 {
     if (!cnt) return;
