@@ -350,6 +350,7 @@ int ext4_bcache_fini_dynamic(struct ext4_bcache *bc);
  * @param   bc block cache descriptor
  * @param   from starting lba
  * @param   cnt block counts*/
+bool ext4_bcache_has_lba(struct ext4_bcache *bc, uint64_t first, uint64_t end);
 void ext4_bcache_invalidate_lba(struct ext4_bcache *bc,
 				uint64_t from,
 				uint32_t cnt);

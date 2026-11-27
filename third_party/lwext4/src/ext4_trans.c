@@ -147,14 +147,18 @@ int ext4_trans_block_get(struct ext4_blockdev *bdev,
 int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
     struct kernel_block_span *spans, unsigned count, bool try_phase)
 {
-    int checked=ext4_blocks_check_batch(bdev,spans,count);
+    uint64_t bounds[2];
+    int checked=ext4_blocks_check_batch(bdev,spans,count,try_phase ? bounds : NULL);
     if (checked || !count) return checked;
+    bool query_range = try_phase && bounds[1] - bounds[0] > 1;
     /* Drain older nonjournal data before exposing a possibly partial device
      * write. On error retire cached preimages: they must neither hide a
      * completed prefix nor be written back over it later. */
-    for (unsigned i=0;i<count;i++) for (uint32_t j=0;j<spans[i].size/bdev->lg_bsize;j++) {
-        int r=ext4_block_flush_lba(bdev,spans[i].offset/bdev->lg_bsize+j);
-        if (r) return r;
+    if (!query_range || ext4_bcache_has_lba(bdev->bc, bounds[0], bounds[1])) {
+        for (unsigned i=0;i<count;i++) for (uint32_t j=0;j<spans[i].size/bdev->lg_bsize;j++) {
+            int r=ext4_block_flush_lba(bdev,spans[i].offset/bdev->lg_bsize+j);
+            if (r) return r;
+        }
     }
     int r = ext4_blocks_submit_batch(bdev, spans, count, try_phase);
     if (try_phase && r == EAGAIN) return r;
@@ -163,6 +167,9 @@ int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
             spans[i].offset/bdev->lg_bsize,spans[i].size/bdev->lg_bsize);
         return r;
     }
+    /* Recheck after the device phase. Any owned cache preimage that has
+     * appeared meanwhile still needs the same in-place update below. */
+    if (query_range && !ext4_bcache_has_lba(bdev->bc, bounds[0], bounds[1])) return EOK;
     for (unsigned i = 0; i < count; i++) for (uint32_t j = 0; j < spans[i].size / bdev->lg_bsize; j++) {
         struct ext4_block cached = EXT4_BLOCK_ZERO();
         struct ext4_buf *old = ext4_bcache_find_get(bdev->bc, &cached, spans[i].offset / bdev->lg_bsize + j, NULL);

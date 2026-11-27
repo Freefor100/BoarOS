@@ -208,9 +208,10 @@ int ext4_blocks_set_phase(struct ext4_blockdev *bdev,
 int ext4_blocks_try_set_phase(struct ext4_blockdev *bdev,
     const struct ext4_block_write *first);
 /* Disjoint whole-block byte ranges relative to the
- * filesystem. Borrows caller storage; all offsets are restored before return. */
+ * filesystem. lba_bounds optionally returns the half-open enclosing block range
+ * of a nonempty batch. */
 int ext4_blocks_check_batch(struct ext4_blockdev *bdev,
-    const struct kernel_block_span *spans,unsigned count);
+    const struct kernel_block_span *spans, unsigned count, uint64_t lba_bounds[2]);
 int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
 	struct kernel_block_span *spans, unsigned count);
 /* The caller checked this exact array before preparing the device write. */

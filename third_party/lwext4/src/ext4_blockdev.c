@@ -709,7 +709,7 @@ int ext4_blocks_set_direct(struct ext4_blockdev *bdev, const void *buf,
 }
 
 int ext4_blocks_check_batch(struct ext4_blockdev *bdev,
-	const struct kernel_block_span *spans, unsigned count)
+	const struct kernel_block_span *spans, unsigned count, uint64_t lba_bounds[2])
 {
 	if (!bdev || !bdev->bdif || count > (bdev->bdif->write_phase_bytes ?
 	    EXT4_WRITE_PHASE_SPANS : EXT4_BLOCK_BATCH_MAX) ||
@@ -735,12 +735,16 @@ int ext4_blocks_check_batch(struct ext4_blockdev *bdev,
 		if (spans[i].offset < first) first = spans[i].offset;
 		if (end > last) last = end;
 	}
+	if (lba_bounds && count) {
+		lba_bounds[0] = first / bdev->lg_bsize;
+		lba_bounds[1] = last / bdev->lg_bsize;
+	}
     return EOK;
 }
 int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
     struct kernel_block_span *spans,unsigned count)
 {
-    int checked=ext4_blocks_check_batch(bdev,spans,count);
+    int checked=ext4_blocks_check_batch(bdev,spans,count,NULL);
     if (checked || !count) return checked;
     return ext4_blocks_submit_batch(bdev,spans,count,false);
 }
