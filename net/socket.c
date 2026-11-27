@@ -1137,7 +1137,11 @@ static void protocol_work_ready(void)
 }
 static void protocol_capacity(int pool)
 {
-    if (pool != -1 && pool != MEMP_TCP_SEG && pool != MEMP_PBUF && pool != MEMP_PBUF_POOL) return;
+    if (pool != -1 && pool != MEMP_TCP_SEG && pool != MEMP_PBUF && pool != MEMP_PBUF_POOL
+#if BOAROS_LWIP_LOOPBACK_BODY_SLOTS
+        && pool != MEMP_TCP_LOOPBACK_BODY
+#endif
+        ) return;
     /* 协议池及其等待链归协议 owner；只在实际有等待者时触碰
      * 跨核端点状态与worker通知存储，真实归还仍逐次推进代次。 */
 #if BOAROS_USER_SMP
