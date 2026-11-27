@@ -190,7 +190,7 @@ void kernel_vfs_node_written(struct kernel_vfs_node *node, uint64_t end);
  * bytes surrounding buffer; logical offset/size still define completion and EOF.
  * Shared source ownership is charged once. */
 int kernel_vfs_node_writeback(struct kernel_vfs_node *node,
-    struct file_write_span *spans, size_t count);
+    struct file_write_span *spans, size_t count, struct file_writeback_wait *);
 
 /* 调用者已有node owner；尺寸由inode修改者发布，不重复查询生命周期。 */
 uint64_t kernel_vfs_node_size(const struct kernel_vfs_node *node);

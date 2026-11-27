@@ -69,6 +69,12 @@ struct file_write_span {
     size_t source_size;
 };
 
+/* A backend can return a fixed progress target before accepting any span. */
+struct file_writeback_wait {
+    uint64_t sequence;
+    unsigned kind;
+};
+
 struct file_write_set {
     struct file_write_span *spans;
     unsigned count;

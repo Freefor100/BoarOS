@@ -90,6 +90,9 @@ struct ext4_blockdev_iface {
 	/* Physical byte spans; borrows descriptors and payload until I/O stops. */
 	int (*bwrite_batch)(struct ext4_blockdev *bdev,
 		const struct kernel_block_span *spans, unsigned count);
+	/* EAGAIN means the device phase could not be entered and no span was submitted. */
+	int (*bwrite_batch_try_phase)(struct ext4_blockdev *bdev,
+		const struct kernel_block_span *spans, unsigned count);
 	int (*bwrite_phase)(struct ext4_blockdev *bdev,
 		const struct ext4_block_write *first);
 	/* Larger disjoint write arrays use the same phase transport. */
@@ -207,7 +210,7 @@ int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
 	struct kernel_block_span *spans, unsigned count);
 /* The caller checked this exact array before preparing the device write. */
 int ext4_blocks_submit_batch(struct ext4_blockdev *bdev,
-    struct kernel_block_span *spans, unsigned count);
+	struct kernel_block_span *spans, unsigned count, bool try_phase);
 
 /**@brief   Binds a bcache to block device.
  * @param   bdev block device descriptor

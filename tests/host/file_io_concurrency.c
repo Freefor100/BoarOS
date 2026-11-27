@@ -73,8 +73,8 @@ int __wrap_ext4_fpwrite_mapped_batch(ext4_file *file, struct file_write_span *sp
     }
     return __real_ext4_fpwrite_mapped_batch(file, spans, count);
 }
-int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct file_write_span *,size_t);
-int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_write_span *spans,size_t count)
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct file_write_span *,size_t, struct file_writeback_wait *);
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_write_span *spans,size_t count, struct file_writeback_wait *wait)
 {
     if (node == __atomic_load_n(&fail_range_node, __ATOMIC_ACQUIRE) &&
         __atomic_exchange_n(&fail_range_writeback, 0, __ATOMIC_ACQ_REL)) {
@@ -85,7 +85,7 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_wr
         sparse_spans+=count;
         for (size_t i=0;i<count;i++) sparse_source_bytes+=spans[i].source_size;
     }
-    return __real_kernel_vfs_node_writeback(node,spans,count);
+    return __real_kernel_vfs_node_writeback(node,spans,count,wait);
 }
 static unsigned direct_inode_held,direct_inode_release;
 enum kernel_uaccess_status __real_kernel_uaccess_pin_user_page(struct kernel_mm *,uint64_t,uint32_t,struct kernel_mm_user_pin *);

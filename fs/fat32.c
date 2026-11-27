@@ -1017,8 +1017,10 @@ static int prepare_write(struct kernel_vfs_node *node, uint64_t offset, size_t s
     int stored = store_inode(m, i);
     return stored ? stored : r;
 }
-static int writeback(struct kernel_vfs_node *node, struct file_write_span *spans, size_t count)
+static int writeback(struct kernel_vfs_node *node, struct file_write_span *spans, size_t count,
+    struct file_writeback_wait *wait)
 {
+    (void)wait;
     struct fat_mount *m = fm(node->instance); struct fat_inode *i = fi(node);
     KERNEL_LOCK_SCOPE(g); kernel_mutex_lock(&m->metadata, &g);
     int r = fat_error(node->instance);

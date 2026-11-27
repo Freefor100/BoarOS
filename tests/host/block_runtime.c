@@ -40,7 +40,7 @@ static struct model_lock *lookup(struct kernel_rwlock *lock)
 }
 extern void block_model_before_lock(struct kernel_rwlock *) __attribute__((weak));
 extern void block_model_lock_waiting(struct kernel_rwlock *) __attribute__((weak));
-static void acquire(struct kernel_rwlock *lock,struct kernel_lock_guard *guard,int write)
+static int acquire(struct kernel_rwlock *lock,struct kernel_lock_guard *guard,int write,int try_only)
 {
     assert(!guard->lock);
     struct kernel_lock_guard *previous=model_io.locks;
@@ -51,16 +51,20 @@ static void acquire(struct kernel_rwlock *lock,struct kernel_lock_guard *guard,i
     int result=write?pthread_rwlock_trywrlock(&object->lock):pthread_rwlock_tryrdlock(&object->lock);
     if (result) {
         assert(result==EBUSY);
+        if (try_only) return 0;
         if (block_model_lock_waiting)block_model_lock_waiting(lock);
         assert(!(write?pthread_rwlock_wrlock(&object->lock):pthread_rwlock_rdlock(&object->lock)));
     }
     *guard=(struct kernel_lock_guard){.lock=lock,.owner=&model_io,.previous=previous,.write=write};
     model_io.locks=guard;
+    return 1;
 }
 void kernel_rwlock_write(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
-{ acquire(lock,guard,1); }
+{ (void)acquire(lock,guard,1,0); }
 void kernel_rwlock_read(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
-{ acquire(lock,guard,0); }
+{ (void)acquire(lock,guard,0,0); }
+int kernel_rwlock_try_read(struct kernel_rwlock *lock,struct kernel_lock_guard *guard)
+{ return acquire(lock,guard,0,1); }
 void kernel_lock_release(struct kernel_lock_guard *guard)
 {
     assert(guard->lock && guard->owner==&model_io && model_io.locks==guard);

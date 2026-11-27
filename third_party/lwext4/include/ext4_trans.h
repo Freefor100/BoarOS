@@ -90,7 +90,7 @@ struct kernel_block_span;
 int ext4_trans_write_data_sync(struct ext4_blockdev *bdev, uint64_t lba,
     uint32_t offset, const void *data, uint32_t length, bool initialize);
 int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
-    struct kernel_block_span *spans, unsigned count);
+    struct kernel_block_span *spans, unsigned count, bool try_phase);
 
 struct file_data_source;
 /* A private replacement version makes abort discard-only. Full blocks can

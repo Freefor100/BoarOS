@@ -5064,7 +5064,7 @@ static int direct_transfer(struct kernel_vfs_file *file,uint64_t offset,
             error=node->instance->ops->direct_io(node,offset,buffer,size,writing,done);
         else if (writing>0) {
             struct file_write_span span={.offset=offset,.buffer=buffer,.size=size};
-            error=node->instance->ops->writeback(node,&span,1);
+            error=node->instance->ops->writeback(node,&span,1,NULL);
             *done=span.written;
         } else if (!writing) error=node->instance->ops->pread(node,offset,buffer,size,done);
         if (writing>0 && *done) {
@@ -8114,18 +8114,21 @@ int kernel_vfs_file_snapshot(const struct kernel_vfs_file *file,
 }
 
 int kernel_vfs_node_writeback(struct kernel_vfs_node *node,
-    struct file_write_span *spans, size_t count)
+    struct file_write_span *spans, size_t count, struct file_writeback_wait *wait)
 {
     if (!node || !node->mount || !node->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = node->mount->private_data;
-    int result = instance->ops->writeback(node, spans, count);
+    int result = instance->ops->writeback(node, spans, count, wait);
     for (size_t i = 0; i < count; i++) {
         if (spans[i].written > spans[i].size) __builtin_trap();
+        if (wait && wait->sequence && spans[i].written) __builtin_trap();
         if (!result && spans[i].written != spans[i].size) result = -KERNEL_EIO;
     }
     /* One backend submission publishes one error before its cache completion;
      * foreground, background and mount callers only propagate this result. */
-    if (result) kernel_vfs_record_writeback_error(node, result);
+    if (wait && wait->sequence) {
+        if (result != -KERNEL_EAGAIN || !instance->ops->wait_writeback) __builtin_trap();
+    } else if (result) kernel_vfs_record_writeback_error(node, result);
     return result;
 }
 

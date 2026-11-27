@@ -19,8 +19,8 @@ esac
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_journal.c" \
     "$root/tests/host/block_fault.c" "$root/kernel/block.c" "$root/tests/host/block_runtime.c" "$root/kernel/raw_lock.c" "$root/tests/host/sync/notifications.c" -I"$root/tests/host/block_model" -pthread -o "$work/probe"
 case "${JOURNAL_TEST_CASE:-}" in
-write-unwritten|ordered-idle|metadata-age|'')
-    cases=${JOURNAL_TEST_CASE:-"write-unwritten ordered-idle metadata-age"}
+write-unwritten|ordered-idle|metadata-age|deferred-prewrite|deferred-admission|'')
+    cases=${JOURNAL_TEST_CASE:-"write-unwritten ordered-idle metadata-age deferred-prewrite deferred-admission"}
     printf 'Old data' > "$work/data"
     for block in 1024 4096; do
         truncate -s 32M "$work/writeback-base.img"
