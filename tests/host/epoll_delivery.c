@@ -46,10 +46,12 @@ void kernel_cpu_flush_notifications(void) {CHECK(!kernel_cpu_current()->outbound
 #endif
 static unsigned preempt_depth, scopes[2], wait_live[2], protocol_cancel;
 static unsigned service_entries;
+#if BOAROS_USER_SMP
 void kernel_service_scope_begin(struct kernel_service_scope *scope)
 { CHECK(!scope->entered);scope->entered=1;service_entries++; }
 void kernel_service_scope_end(struct kernel_service_scope *scope)
 { scope->entered=0; }
+#endif
 
 static unsigned prepares, parks, finishes, task_wakes, poll_action;
 static unsigned direct_wakes;
@@ -68,6 +70,7 @@ static size_t allocations, allocation_calls, copy_remaining = SIZE_MAX;
 static void (*allocation_interleave)(void);
 static void (*poll_interleave)(void);
 static unsigned poll_notification, copy_action, poll_calls, readable[2];
+static unsigned stream_snapshot_enabled;
 static jmp_buf cancelled;
 static struct kernel_epoll *copy_poll_epoll;
 static void cancel_at_protocol_entry(void)
@@ -209,6 +212,14 @@ uint32_t kernel_open_file_poll(struct kernel_open_file_description *f,uint32_t r
     uint32_t result=readable[i] ? requested & KERNEL_POLLIN : 0;
     if(socket) { CHECK(scopes[actor]);kernel_socket_protocol_leave(&scope); }
     return result;
+}
+int kernel_socket_stream_ready_snapshot(struct kernel_socket *socket, uint32_t interest,
+    uint32_t *ready)
+{
+    if (!stream_snapshot_enabled) return 0;
+    CHECK(!network_host_irq && socket == (void *)&targets[0]);
+    *ready = readable[0] ? interest & KERNEL_POLLIN : 0;
+    return 1;
 }
 struct kernel_wait_queue *kernel_socket_wait_queue(struct kernel_socket *socket)
 {
@@ -719,8 +730,37 @@ static void scan_admission(void)
     teardown();
 }
 
+static void stale_stream_snapshot(void)
+{
+    setup(0);
+    control(KERNEL_EPOLL_CTL_DEL, 0, 0);
+    targets[0].kind = KERNEL_OPEN_FILE_KIND_SOCKET;
+    stream_snapshot_enabled = 1;
+    control(KERNEL_EPOLL_CTL_ADD, 0, 51);
+    struct linux_epoll_event event;
+    CHECK(wait_events(&event, 1) == 1 && event.data == 51);
+    readable[0] = 0;
+    unsigned before = epoll_state_acquires;
+    CHECK(wait_events(&event, 1) == 0 && epoll_state_acquires == before + 1);
+    CHECK(!epfile.epoll->ready_head && !epfile.epoll->scan_owner);
+    readable[0] = 1;
+    CHECK(!kernel_wait_queue_wake_all(&target_wait[0]));
+    CHECK(wait_events(&event, 1) == 1 && event.data == 51);
+    readable[0] = 0;
+    int64_t ctl;
+    CHECK(!kernel_files_epoll_ctl(&files, 0, KERNEL_EPOLL_CTL_ADD, 2, KERNEL_EPOLLIN, 62, &ctl) && !ctl);
+    CHECK(wait_events(&event, 1) == 1 && event.data == 62);
+    stream_snapshot_enabled = 0;
+    teardown();
+    puts("PASS epoll discards a stale stream snapshot before claiming a scan");
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "stale-stream")) {
+        stale_stream_snapshot();
+        return 0;
+    }
     candidate_retirement();
     scan_admission();
     socket_registration();
