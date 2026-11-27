@@ -262,6 +262,10 @@ enum kernel_block_status kernel_block_write_batch_prio(
  * capacity and RAM bounds. A missing callback writes in producer order. */
 enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *device,
     kernel_block_phase_next_fn next, const void *next_context, const void *first);
+/* NOT_SUBMITTED means that the device already has an exclusive phase or
+ * transfer owner. A successful admission still drains published I/O. */
+enum kernel_block_status kernel_block_try_write_phase(struct kernel_block_device *device,
+    kernel_block_phase_next_fn next, const void *next_context, const void *first);
 
 /* Preflight all spans before I/O. Disk ranges may overlap, but mutable outputs
  * must be disjoint from each other and these descriptors. Every span reports

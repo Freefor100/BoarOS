@@ -18,6 +18,11 @@ static int next(const void *context,const void **cursor,struct kernel_block_span
 {
     (void)context;if (!*cursor)return 0;*span=*(const struct kernel_block_span *)*cursor;*cursor=0;return 1;
 }
+static void *try_during_exclusive_phase(void *input)
+{
+    assert(kernel_block_try_write_phase(active_device,next,0,input)==KERNEL_BLOCK_STATUS_NOT_SUBMITTED);
+    return NULL;
+}
 static enum kernel_block_status write_phase(void *context,kernel_block_phase_next_fn produce,
     const void *owner,const void *first,int unordered)
 {
@@ -48,6 +53,16 @@ int main(void)
     struct kernel_block_span span={0,bytes,sizeof(bytes)};
     assert(!kernel_block_write_phase(&device,next,0,&span));
     assert(calls==1 && !memcmp(bytes,disk,sizeof(bytes)) && !device.references);
+    {
+        KERNEL_LOCK_SCOPE(flush);
+        kernel_rwlock_write(&device.phase_barrier,&flush);
+        pthread_t writer;
+        assert(!pthread_create(&writer,NULL,try_during_exclusive_phase,&span));
+        assert(!pthread_join(writer,NULL));
+        assert(calls==1 && !device.references);
+    }
+    assert(!kernel_block_try_write_phase(&device,next,0,&span));
+    assert(calls==2 && !device.references);
     memset(disk,0,sizeof(disk));calls=0;fail_call=1;
     assert(kernel_block_write_phase(&device,next,0,&span)==KERNEL_BLOCK_STATUS_IO);
     assert(calls==1 && !device.references && !memcmp(bytes,disk,128*1024));

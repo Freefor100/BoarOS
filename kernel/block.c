@@ -502,14 +502,19 @@ static __attribute__((noinline)) enum kernel_block_status write_phase_windows(
     return KERNEL_BLOCK_STATUS_OK;
 }
 
-enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *device,
-    kernel_block_phase_next_fn next, const void *next_context, const void *first)
+static enum kernel_block_status write_phase(struct kernel_block_device *device,
+    kernel_block_phase_next_fn next, const void *next_context, const void *first,
+    int try_only)
 {
     if (!device || !device->logical_block_size || !next) return KERNEL_BLOCK_STATUS_INVALID;
     if (!physical(device)->write && !physical(device)->write_batch && !physical(device)->write_phase) return KERNEL_BLOCK_STATUS_UNSUPPORTED;
     BLOCK_REQUEST(device);
     struct kernel_block_device *disk = physical(device);
-    KERNEL_LOCK_SCOPE(io); kernel_rwlock_read(&disk->phase_barrier, &io);
+    KERNEL_LOCK_SCOPE(io);
+    if (try_only) {
+        if (!disk->write_phase || !kernel_rwlock_try_read(&disk->phase_barrier, &io))
+            return KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
+    } else kernel_rwlock_read(&disk->phase_barrier, &io);
     const uint64_t limit = capacity(device);
     const void *cursor = first;
     struct kernel_block_span span;
@@ -533,7 +538,11 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
         /* Keep the immutable producer live until every DMA completes. The
          * driver refills free request slots without draining artificial windows.
          * Aligned peers remain concurrent; RMW waits for this finite phase. */
-        KERNEL_LOCK_SCOPE(transfer); kernel_rwlock_read(&disk->transfer_lock, &transfer);
+        KERNEL_LOCK_SCOPE(transfer);
+        if (try_only) {
+            if (!kernel_rwlock_try_read(&disk->transfer_lock, &transfer))
+                return KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
+        } else kernel_rwlock_read(&disk->transfer_lock, &transfer);
         uint64_t started = block_io_begin(device);
         const struct translated_phase phase = { next, next_context, device->start_bytes };
         enum kernel_block_status result = device->start_bytes ?
@@ -544,6 +553,14 @@ enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *de
     }
     return write_phase_windows(device,next,next_context,first);
 }
+
+enum kernel_block_status kernel_block_write_phase(struct kernel_block_device *device,
+    kernel_block_phase_next_fn next, const void *next_context, const void *first)
+{ return write_phase(device, next, next_context, first, 0); }
+
+enum kernel_block_status kernel_block_try_write_phase(struct kernel_block_device *device,
+    kernel_block_phase_next_fn next, const void *next_context, const void *first)
+{ return write_phase(device, next, next_context, first, 1); }
 
 struct translated_completion {
     struct block_read_span *spans;

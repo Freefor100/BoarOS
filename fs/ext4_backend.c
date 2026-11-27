@@ -167,7 +167,7 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
                           size_t size,
                           size_t *bytes_read);
 static int ext4_backend_writeback(struct kernel_vfs_node *node,
-    struct file_write_span *spans, size_t count);
+    struct file_write_span *spans, size_t count, struct file_writeback_wait *);
 
 static struct kernel_vfs_backend ext4_backend, ext2_backend, ext3_backend;
 static int ext4_check_domain(const struct kernel_vfs_node *node,
@@ -1055,6 +1055,18 @@ static int block_write_batch(struct ext4_blockdev *device,
     }
 }
 
+static int block_write_batch_try_phase(struct ext4_blockdev *device,
+    const struct kernel_block_span *spans, unsigned count)
+{
+    struct lwext4_mount_adapter *adapter = device->bdif->p_user;
+    enum kernel_block_status status = kernel_block_try_write_phase(adapter->block,
+        block_write_array_next, spans + count, spans);
+    if (status == KERNEL_BLOCK_STATUS_NOT_SUBMITTED) return EAGAIN;
+    if (status == KERNEL_BLOCK_STATUS_OK) return EOK;
+    if (status == KERNEL_BLOCK_STATUS_NO_MEMORY) return ENOMEM;
+    return EIO;
+}
+
 static int block_phase_next(const void *context, const void **cursor, struct kernel_block_span *span)
 {
     (void)context;
@@ -1513,7 +1525,7 @@ static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait
     unsigned work = EXT4_JOURNAL_WORK_COMMIT;
     if (kind == EXT4_JOURNAL_WAIT_CHECKPOINT) work |= EXT4_JOURNAL_WORK_CHECKPOINT;
     journal_request_flags(adapter, work);
-    unsigned depth = boaros_lwext4_pause();
+    unsigned depth = kernel_io_context_current()->backend_depth ? boaros_lwext4_pause() : 0;
     if (changed) complete_sync_waiters(adapter);
     int result;
     for (;;) {
@@ -1528,7 +1540,7 @@ static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait
         enum kernel_wait_wake_reason reason;
         if (kernel_wait_park(&token, &reason) || kernel_wait_finish(&token)) __builtin_trap();
     }
-    boaros_lwext4_resume(&adapter->backend_lock, depth);
+    if (depth) boaros_lwext4_resume(&adapter->backend_lock, depth);
     return result;
 }
 
@@ -1923,6 +1935,8 @@ static int mount_ext_filesystem(struct kernel_vfs_mount *mount,
     adapter->interface.bwrite_batch = block_write_batch;
     adapter->interface.bwrite_phase = block_write_phase;
     adapter->interface.write_phase_bytes = kernel_block_write_phase_bytes(block);
+    if (adapter->interface.write_phase_bytes)
+        adapter->interface.bwrite_batch_try_phase = block_write_batch_try_phase;
     adapter->interface.close = block_close;
     adapter->interface.flush = block_flush;
     adapter->interface.lock = 0;
@@ -3484,17 +3498,24 @@ static int ext4_backend_writeback_mapped(struct kernel_vfs_node *node,
 }
 
 static int ext4_backend_writeback(struct kernel_vfs_node *node,
-    struct file_write_span *spans, size_t count)
+    struct file_write_span *spans, size_t count, struct file_writeback_wait *wait)
 {
     _Static_assert(KERNEL_VFS_GROWTH_WRITEBACK_MAX <= EXT4_FILE_WRITEBACK_MAX,
         "VFS writeback batches must fit ext4");
     if (count > KERNEL_VFS_GROWTH_WRITEBACK_MAX) __builtin_trap();
     for (size_t i = 0; i < count; i++) COST_ADD(BACKEND_REQUESTED, spans[i].size);
-    int result = ext4_fpwrite_batch(lwext4_node_file(node), spans, count);
+    int result = wait ? ext4_fpwrite_batch_wait(lwext4_node_file(node), spans, count, wait) :
+        ext4_fpwrite_batch(lwext4_node_file(node), spans, count);
     for (size_t i = 0; i < count; i++) {
         COST_ADD(BACKEND_ACCEPTED, spans[i].written);
     }
     return lwext4_error(result);
+}
+
+static int ext4_backend_wait_writeback(struct kernel_vfs_instance *instance,
+    const struct file_writeback_wait *wait)
+{
+    return lwext4_error(journal_wait(lwext4_instance(instance), wait->sequence, wait->kind));
 }
 
 static int ext4_backend_writeback_files(struct kernel_vfs_node *const *nodes,
@@ -3602,7 +3623,7 @@ static int ext4_backend_direct_io(struct kernel_vfs_node *node,uint64_t offset,
     if (writing>0) {
         struct file_write_span span={.offset=offset,.buffer=buffer,.size=size};
         bool journal=lwext4_instance(node->instance)->device.fs->jbd_journal!=NULL;
-        result=journal?ext4_backend_writeback(node,&span,1):
+        result=journal?ext4_backend_writeback(node,&span,1,NULL):
             lwext4_error(ext4_fpwrite_direct(lwext4_node_file(node),&span));
         uint64_t accepted=ext4_fsize(lwext4_node_file(node));
         if (accepted>node->size) __atomic_store_n(&node->size,accepted,__ATOMIC_RELEASE);
@@ -4101,6 +4122,7 @@ static void initialize_backend(void)
     ops->read_directory = ext4_backend_read_directory;
     ops->pread = ext4_backend_pread;
     ops->writeback = ext4_backend_writeback;
+    ops->wait_writeback = ext4_backend_wait_writeback;
     ops->writeback_files = ext4_backend_writeback_files;
     ops->writeback_small_candidate = ext4_backend_writeback_small_candidate;
     ops->writeback_mapped = ext4_backend_writeback_mapped;

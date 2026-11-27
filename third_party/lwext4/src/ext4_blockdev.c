@@ -742,11 +742,11 @@ int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
 {
     int checked=ext4_blocks_check_batch(bdev,spans,count);
     if (checked || !count) return checked;
-    return ext4_blocks_submit_batch(bdev,spans,count);
+    return ext4_blocks_submit_batch(bdev,spans,count,false);
 }
 
 int ext4_blocks_submit_batch(struct ext4_blockdev *bdev,
-    struct kernel_block_span *spans,unsigned count)
+    struct kernel_block_span *spans,unsigned count,bool try_phase)
 {
 	if (!bdev->bdif->bwrite_batch) {
 		for (unsigned i = 0; i < count; i++) {
@@ -761,8 +761,10 @@ int ext4_blocks_submit_batch(struct ext4_blockdev *bdev,
 	 * filesystem-relative offsets before cache updates and failed-map cleanup. */
 	for (unsigned i = 0; i < count; i++) spans[i].offset += bdev->part_offset;
 	ext4_bdif_lock(bdev);
-	int r = bdev->bdif->bwrite_batch(bdev, spans, count);
-	__atomic_fetch_add(&bdev->bdif->bwrite_ctr,count,__ATOMIC_RELAXED);
+	int r = try_phase ? bdev->bdif->bwrite_batch_try_phase(bdev, spans, count) :
+		bdev->bdif->bwrite_batch(bdev, spans, count);
+	if (!try_phase || r != EAGAIN)
+		__atomic_fetch_add(&bdev->bdif->bwrite_ctr,count,__ATOMIC_RELAXED);
 	ext4_bdif_unlock(bdev);
 	for (unsigned i = 0; i < count; i++) spans[i].offset -= bdev->part_offset;
 	return r;

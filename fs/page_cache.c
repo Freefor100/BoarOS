@@ -4193,9 +4193,9 @@ static void capture_writeback(struct kernel_page_cache *cache,
 }
 
 static int submit_writeback_spans(struct kernel_vfs_node *node,struct file_write_span *spans,
-    const uint8_t *owners,size_t count,struct prepared_writeback *prepared)
+    const uint8_t *owners,size_t count,struct prepared_writeback *prepared,struct file_writeback_wait *wait)
 {
-    int result=kernel_vfs_node_writeback(node,spans,count);
+    int result=kernel_vfs_node_writeback(node,spans,count,wait);
     for (size_t i=0;i<count;i++) {
         if (spans[i].written>spans[i].size || (!result && spans[i].written!=spans[i].size)) __builtin_trap();
         prepared[owners[i]].written+=spans[i].written;
@@ -4249,6 +4249,8 @@ static int writeback_run(struct kernel_page_cache *cache,
         KERNEL_LOCK_SCOPE(io);
         if (done) kernel_vfs_node_lock(entries[first]->node,&io,0);
         capture_writeback(cache,entries+first,prepared,done,limit);
+        struct file_writeback_wait wait = {0};
+        struct file_writeback_wait *defer = background ? &wait : NULL;
         int submitted=0;
         for (size_t i=0;i<done && !submitted;i++) {
             if (!prepared[i].version) continue;
@@ -4256,17 +4258,30 @@ static int writeback_run(struct kernel_page_cache *cache,
             while (next_writeback_span(entries[first+i],&prepared[i],&cursor,&spans[ready])) {
                 span_owners[ready++]=(uint8_t)i;
                 if (ready==span_capacity) {
-                    submitted=submit_writeback_spans(entries[first]->node,spans,span_owners,ready,prepared);
+                    submitted=submit_writeback_spans(entries[first]->node,spans,span_owners,ready,prepared,defer);
+                    defer=NULL;
                     ready=0;
                     if (submitted) break;
                 }
             }
         }
         if (ready && !submitted)
-            submitted=submit_writeback_spans(entries[first]->node,spans,span_owners,ready,prepared);
+            submitted=submit_writeback_spans(entries[first]->node,spans,span_owners,ready,prepared,defer);
         if (submitted) result=submitted;
         /* 后端已结束实际访问；完成发布只依赖entry借用和缓存保护。 */
         if (io.lock) kernel_lock_release(&io);
+        if (wait.sequence) {
+            /* No span was accepted. Release the snapshot before waiting and
+             * qualify the current cache pages again after journal progress. */
+            for (size_t i=0;i<done;i++)
+                if (prepared[i].version) writeback_unprepare(cache,entries[first+i],&prepared[i]);
+            struct kernel_vfs_node *node=entries[first]->node;
+            result=node->instance->ops->wait_writeback(node->instance,&wait);
+            if (!result) continue;
+            kernel_vfs_record_writeback_error(node,result);
+            *used=first+done;
+            return result;
+        }
         {
             CACHE_SCOPE(guard,cache);
             for (size_t i=done;i>0;i--) {

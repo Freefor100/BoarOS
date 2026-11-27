@@ -145,7 +145,7 @@ int ext4_trans_block_get(struct ext4_blockdev *bdev,
 { return ext4_trans_block_get_range(bdev,b,lba,0,bdev->lg_bsize); }
 
 int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
-    struct kernel_block_span *spans, unsigned count)
+    struct kernel_block_span *spans, unsigned count, bool try_phase)
 {
     int checked=ext4_blocks_check_batch(bdev,spans,count);
     if (checked || !count) return checked;
@@ -156,7 +156,8 @@ int ext4_trans_write_data_batch(struct ext4_blockdev *bdev,
         int r=ext4_block_flush_lba(bdev,spans[i].offset/bdev->lg_bsize+j);
         if (r) return r;
     }
-    int r = ext4_blocks_submit_batch(bdev, spans, count);
+    int r = ext4_blocks_submit_batch(bdev, spans, count, try_phase);
+    if (try_phase && r == EAGAIN) return r;
     if (r) {
         for (unsigned i=0;i<count;i++) ext4_bcache_invalidate_lba(bdev->bc,
             spans[i].offset/bdev->lg_bsize,spans[i].size/bdev->lg_bsize);
@@ -191,7 +192,7 @@ static int write_data(struct ext4_blockdev *bdev, uint64_t lba,
 	if (synchronous || (source && source->retain)) {
         if (!offset && length == bdev->lg_bsize && data) {
             struct kernel_block_span span = {lba * bdev->lg_bsize, data, bdev->lg_bsize};
-            return ext4_trans_write_data_batch(bdev, &span, 1);
+            return ext4_trans_write_data_batch(bdev, &span, 1, false);
         }
 		struct ext4_block cached = EXT4_BLOCK_ZERO();
 		struct ext4_buf *old = ext4_bcache_find_get(bdev->bc, &cached, lba, NULL);

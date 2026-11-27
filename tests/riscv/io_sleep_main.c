@@ -571,7 +571,7 @@ int __wrap_kernel_vfs_node_pread_batch(struct kernel_vfs_node *node, struct file
     }
     return __real_kernel_vfs_node_pread_batch(node, spans, count, workspace, completion);
 }
-int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct file_write_span *, size_t);
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, struct file_write_span *, size_t, struct file_writeback_wait *);
 int __real_ext4_fpwrite_batch(ext4_file *, struct file_write_span *, unsigned);
 int __wrap_ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count)
 {
@@ -584,7 +584,7 @@ int __wrap_ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, un
     }
     return __real_ext4_fpwrite_batch(file,spans,count);
 }
-int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_write_span *spans, size_t count)
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_write_span *spans, size_t count, struct file_writeback_wait *wait)
 {
     const void *buffer=count?spans[0].buffer:NULL;
     if (instance_hold && kernel_io_context_current()->background_reclaim) {
@@ -610,7 +610,7 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, struct file_w
         check(*(const unsigned char *)buffer == first, 21);
         riscv_interrupt_restore(irq);
     }
-    return __real_kernel_vfs_node_writeback(node,spans,count);
+    return __real_kernel_vfs_node_writeback(node,spans,count,wait);
 }
 static void write_worker(void *argument)
 {

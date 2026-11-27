@@ -187,6 +187,58 @@ int __wrap_ext4_trans_write_data(struct ext4_blockdev *bdev, uint64_t lba,
     return result;
 }
 
+static unsigned try_prewrite_calls;
+static int defer_prewrite(struct ext4_blockdev *dev, const struct kernel_block_span *spans,
+    unsigned count)
+{
+    (void)dev;
+    CHECK(count && spans[0].size);
+    try_prewrite_calls++;
+    return EAGAIN;
+}
+static int unexpected_prewrite(struct ext4_blockdev *dev, const struct kernel_block_span *spans,
+    unsigned count)
+{
+    (void)dev; (void)spans; (void)count;
+    CHECK(!"deferred prewrite fell back to a blocking device call");
+    return EIO;
+}
+
+static void write_deferred_prewrite(struct ext4_blockdev *dev)
+{
+    CHECK(ext4_journal_start("/") == EOK);
+    const struct ext4_journal_runtime runtime = {.now_ns = resource_now, .prewrite_fresh = true};
+    CHECK(ext4_journal_group_enable("/", &runtime, 4 * 1024 * 1024) == EOK);
+    ext4_file file;
+    struct ext4_delalloc delalloc = {0};
+    CHECK(ext4_fopen(&file, "/fresh", "w+") == EOK);
+    file.delalloc = &delalloc;
+    size_t length = 4 * dev->lg_bsize;
+    unsigned char *input = malloc(length), *output = malloc(length);
+    CHECK(input && output);
+    for (size_t i = 0; i < length; i++) input[i] = (unsigned char)(i / dev->lg_bsize + i);
+    struct resource_source owner = {.data = input};
+    struct file_write_span span = {.buffer = input, .size = length,
+        .source = {.context = &owner, .bytes = length, .retain = resource_retain, .release = resource_release}};
+    dev->bdif->bwrite_batch = unexpected_prewrite;
+    dev->bdif->bwrite_batch_try_phase = defer_prewrite;
+    kernel_io_context_current()->background_reclaim = 1;
+    CHECK(ext4_fpwrite_batch(&file, &span, 1) == EOK && span.written == length);
+    kernel_io_context_current()->background_reclaim = 0;
+    CHECK(try_prewrite_calls == 1 && owner.references == 1);
+    dev->bdif->bwrite_batch = NULL;
+    dev->bdif->bwrite_batch_try_phase = NULL;
+    CHECK(ext4_journal_group_commit("/", true) == EOK);
+    CHECK(ext4_journal_group_checkpoint("/") == EOK && !owner.references);
+    size_t got;
+    CHECK(ext4_fpread(&file, 0, output, length, &got) == EOK && got == length);
+    CHECK(memcmp(input, output, length) == 0);
+    free(input); free(output);
+    CHECK(ext4_fclose(&file) == EOK && ext4_journal_stop("/") == EOK);
+    CHECK(ext4_umount("/") == EOK && fault_block_crash(&disk) == 0);
+    puts("PASS occupied device phase: deferred data stayed ordered and matched after commit");
+}
+
 static void write_unwritten_range(struct ext4_blockdev *dev)
 {
     CHECK(ext4_journal_start("/") == EOK);
@@ -668,7 +720,7 @@ static void resource_reclaim(struct ext4_blockdev *dev, struct jbd_journal *jour
 }
 
 static void resource_admission(struct ext4_blockdev *dev, struct jbd_journal *journal,
-    ext4_file *file, ext4_fsblk_t home, unsigned fault)
+    ext4_file *file, ext4_fsblk_t home, unsigned fault, bool defer)
 {
     struct resource_wait wait = {.journal = journal, .expected = EXT4_JOURNAL_WAIT_DURABLE, .target = 1};
     struct ext4_journal_runtime runtime = {.context = &wait, .now_ns = resource_now,
@@ -700,6 +752,13 @@ static void resource_admission(struct ext4_blockdev *dev, struct jbd_journal *jo
     CHECK(jbd_journal_operation_resources(journal, NULL, 1, 0, sources, 1) == JBD_JOURNAL_MEMORY);
     if (fault == 1) disk.fail_write = disk.writes + 1;
     if (fault == 2) disk.fail_flush = disk.flushes + 1;
+    if (defer) {
+        struct file_writeback_wait pending = {0};
+        CHECK(ext4_fpwrite_batch_wait(file, &span, 1, &pending) == EAGAIN);
+        CHECK(pending.kind == wait.expected && pending.sequence == wait.target);
+        CHECK(!wait.calls && !span.written && old.references == 1 && !next.references);
+        CHECK(resource_wait(&wait, pending.sequence, pending.kind) == EOK);
+    }
     int result = ext4_fpwrite_batch(file, &span, 1);
     if (fault) {
         CHECK(result == EIO && !span.written && journal->error == EIO && wait.calls == 1);
@@ -1944,6 +2003,10 @@ int main(int argc, char **argv)
         ext4_mount("journal-test", "/", read_only);
     CHECK(mounted == EOK);
 #ifdef TEST_WRITEBACK_REGRESSIONS
+    if (!strcmp(argv[2], "deferred-prewrite")) {
+        write_deferred_prewrite(&dev);
+        return 0;
+    }
     if (!strcmp(argv[2], "write-unwritten")) {
         write_unwritten_range(&dev);
         return 0;
@@ -2072,8 +2135,9 @@ int main(int argc, char **argv)
         wide_ordered_range(&dev,&journal,&file);
         return 0;
     }
-    if (!strcmp(argv[2], "resource-admission")) {
-        resource_admission(&dev, &journal, &file, home, argc > 3 ? (unsigned)atoi(argv[3]) : 0);
+    if (!strcmp(argv[2], "resource-admission") || !strcmp(argv[2], "deferred-admission")) {
+        resource_admission(&dev, &journal, &file, home, argc > 3 ? (unsigned)atoi(argv[3]) : 0,
+            !strcmp(argv[2], "deferred-admission"));
         return 0;
     }
     if (!strcmp(argv[2], "resource-wait")) {

@@ -923,8 +923,8 @@ static void observe_parallel_writeback(struct kernel_vfs_node *node, struct file
     if (!i && parallel_writeback.fail_first) fail_lane_backend=1;
 }
 #endif
-int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct file_write_span *,size_t);
-int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_write_span *spans,size_t count)
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *,struct file_write_span *,size_t, struct file_writeback_wait *);
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_write_span *spans,size_t count, struct file_writeback_wait *wait)
 {
 #if BOAROS_USER_SMP
     observe_parallel_writeback(node, spans);
@@ -975,7 +975,7 @@ int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node,struct file_wr
         __atomic_store_n(&write_entered,1,__ATOMIC_RELEASE);
         while (!__atomic_load_n(&resume_write,__ATOMIC_ACQUIRE)) sched_yield();
     }
-    return __real_kernel_vfs_node_writeback(node,spans,count);
+    return __real_kernel_vfs_node_writeback(node,spans,count,wait);
 }
 static void *sync_file(void *arg)
 {

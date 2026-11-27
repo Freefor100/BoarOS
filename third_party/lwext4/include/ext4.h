@@ -245,6 +245,9 @@ int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid, uint32_t pr
  * offset/size advance file size and completion. An ordinary buffer (empty source)
  * is copied into a private version. */
 int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count);
+/* Credit pressure before acceptance can return EAGAIN with a journal target. */
+int ext4_fpwrite_batch_wait(ext4_file *file, struct file_write_span *spans,
+	unsigned count, struct file_writeback_wait *wait);
 /* Bounded mount writeback for distinct new files under their inode locks.
  * An error leaves all spans unaccepted for ordinary per-file retry. */
 #define EXT4_SMALL_WRITEBACK_MAX 8U
