@@ -748,8 +748,10 @@ static void epoll_scan_finish(struct kernel_epoll_wait_request *request)
         if (item) epoll_item_put(item);
         return;
     }
+    if (!request->scanning) return;
     EPOLL_STATE(irq);
     struct kernel_epoll_item *release = NULL;
+    request->scanning = 0;
     if (epoll->scan_owner == request) {
         /* 尚未交付的项目仍由扫描引用保活；DEL只撤销注册引用。 */
         if (request->current) {
@@ -798,27 +800,22 @@ struct epoll_candidate {
     struct linux_epoll_event event;
 };
 
-static int epoll_scan_begin(struct kernel_epoll_wait_request *request)
-{
-    EPOLL_STATE(irq);
-    struct kernel_epoll *epoll = request->epoll;
-    int begin = !epoll->scan_owner && epoll->ready_head;
-    if (begin) epoll->scan_owner = request;
-    epoll_state_release(&irq);
-    return begin;
-}
-
 /* poll和wait共用候选刷新；只跨可能睡眠的目标query持有item/OFD借用。 */
 static int epoll_candidate_refresh(struct kernel_epoll_wait_request *request, struct epoll_candidate *candidate)
 {
     struct kernel_epoll *epoll = request->epoll;
     EPOLL_STATE(irq);
     struct kernel_epoll_item *item = request->observing ? request->current : epoll->ready_head;
-    if (!item) {
+    if (!item || (!request->observing && !request->scanning && epoll->scan_owner)) {
         epoll_state_release(&irq);
         return 0;
     }
     if (!request->observing) {
+        /* The first candidate and the scan owner are claimed together. */
+        if (!request->scanning) {
+            epoll->scan_owner = request;
+            request->scanning = 1;
+        }
         epoll_remove_from_ready_list(epoll, item);
         if (item->references == UINT32_MAX || item->in_scan) __builtin_trap();
         item->references++;
@@ -977,7 +974,6 @@ uint32_t kernel_epoll_poll(struct kernel_epoll *epoll, uint32_t requested_events
 static int64_t epoll_deliver(struct kernel_epoll_wait_request *request,
     struct kernel_mm *mm, uint64_t user_events, size_t maximum)
 {
-    if (!epoll_scan_begin(request)) return 0;
     int64_t delivered = 0;
     struct epoll_candidate candidate;
     while ((size_t)delivered < maximum && epoll_candidate_refresh(request, &candidate)) {

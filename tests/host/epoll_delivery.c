@@ -696,7 +696,6 @@ static void candidate_retirement(void)
     setup(KERNEL_EPOLLET);
     struct kernel_epoll_wait_request request={.epoll=epfile.epoll};
     struct epoll_candidate candidate;
-    CHECK(epoll_scan_begin(&request));
     CHECK(epoll_candidate_refresh(&request,&candidate) && candidate.event.events);
     unsigned before=epoll_state_acquires;
     CHECK(!epoll_candidate_finish(&request,&candidate,1,0));
@@ -706,9 +705,24 @@ static void candidate_retirement(void)
     teardown();
 }
 
+static void scan_admission(void)
+{
+    setup(KERNEL_EPOLLONESHOT);
+    struct linux_epoll_event event;
+    unsigned before=epoll_state_acquires;
+    CHECK(wait_events(&event,1)==1 && event.data==42);
+    /* Claim plus snapshot, poll recheck, delivery and scan completion. */
+    CHECK(epoll_state_acquires==before+4);
+    before=epoll_state_acquires;
+    CHECK(wait_events(&event,1)==0);
+    CHECK(epoll_state_acquires==before+1);
+    teardown();
+}
+
 int main(int argc, char **argv)
 {
     candidate_retirement();
+    scan_admission();
     socket_registration();
     pollfree_during_delete();
     delete_publication();
