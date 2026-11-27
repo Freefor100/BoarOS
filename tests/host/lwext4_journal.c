@@ -285,6 +285,35 @@ static void write_deferred_prewrite(struct ext4_blockdev *dev)
     CHECK(ext4_fpread(&file, 0, output, length, &got) == EOK && got == length);
     CHECK(memcmp(input, output, length) == 0);
 #ifdef TEST_JBD_RECORD_COPY
+    ext4_file live;
+    CHECK(ext4_fopen(&live, "/live", "w+") == EOK);
+    live.delalloc = &delalloc;
+    struct file_write_span borrowed = {.buffer = input, .size = length};
+    dev->bdif->bwrite_batch = unexpected_prewrite;
+    dev->bdif->bwrite_batch_try_phase = defer_prewrite;
+    accepted = journal->accepted_sequence;
+    CHECK(ext4_fpwrite_mapped_try(&live, &borrowed, 1) == EAGAIN);
+    CHECK(!borrowed.written && !ext4_fsize(&live) && journal->accepted_sequence == accepted);
+    dev->bdif->bwrite_batch_try_phase = write_checked_prewrite;
+    CHECK(ext4_fpwrite_mapped_try(&live, &borrowed, 1) == EOK && borrowed.written == length);
+    CHECK(ext4_journal_group_commit("/", true) == EOK);
+    CHECK(ext4_journal_group_checkpoint("/") == EOK);
+    CHECK(ext4_fpread(&live, 0, output, length, &got) == EOK && got == length);
+    CHECK(memcmp(input, output, length) == 0);
+    dev->bdif->bwrite_batch = NULL;
+    dev->bdif->bwrite_batch_try_phase = NULL;
+    bool changed;
+    CHECK(ext4_fallocate(&live, EXT4_FALLOC_KEEP_SIZE, length, length,
+        &changed, UINT32_MAX) == EOK && changed);
+    borrowed.offset = length;
+    dev->bdif->bwrite_batch = unexpected_prewrite;
+    dev->bdif->bwrite_batch_try_phase = unexpected_prewrite;
+    accepted = journal->accepted_sequence;
+    CHECK(ext4_fpwrite_mapped_try(&live, &borrowed, 1) == ENOTSUP);
+    CHECK(!borrowed.written && ext4_fsize(&live) == length && journal->accepted_sequence == accepted);
+    dev->bdif->bwrite_batch = NULL;
+    dev->bdif->bwrite_batch_try_phase = NULL;
+    CHECK(ext4_fclose(&live) == EOK);
     check_prewrite_cache(dev, &file, input, length);
     CHECK(ext4_fpread(&file, 0, output, length, &got) == EOK && got == length);
     CHECK(memcmp(input, output, length) == 0);

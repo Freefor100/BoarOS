@@ -5898,6 +5898,7 @@ struct ext4_direct_write_batch {
     struct ext4_direct_write_logical *logical;
     unsigned count, capacity;
     size_t bytes, byte_limit;
+    bool fresh_try;
     struct kernel_block_span blocks[];
 };
 /* Drop the highest mapped blocks before any queued prefix. Releasing a middle
@@ -5923,7 +5924,7 @@ static int ext4_direct_write_flush(struct ext4_inode_ref *ref, ext4_file *file,
     struct jbd_trans *transaction = ext4_current_trans(ref->fs);
     bool rollback = transaction != NULL;
     bool try_phase = rollback && bdev->bdif->bwrite_batch_try_phase &&
-        kernel_io_context_current()->background_reclaim;
+        (batch->fresh_try || kernel_io_context_current()->background_reclaim);
     int r = ext4_trans_write_data_batch(bdev, batch->blocks, batch->count, try_phase);
     if (r == EAGAIN && try_phase) {
         if (wait) {
@@ -5969,8 +5970,14 @@ static int ext4_direct_write_flush(struct ext4_inode_ref *ref, ext4_file *file,
     return r;
 }
 
+enum ext4_write_mode {
+    EXT4_WRITE_BUFFERED,
+    EXT4_WRITE_SYNCHRONOUS,
+    EXT4_WRITE_FRESH_TRY,
+};
+
 static int ext4_write_spans(ext4_file *file, ext4_file *owner,
-    struct file_write_span *spans, unsigned count, bool synchronous,
+    struct file_write_span *spans, unsigned count, enum ext4_write_mode mode,
     const struct file_data_source **sources, struct file_writeback_wait *wait)
 {
 	if (!file || !file->mp || count > EXT4_FILE_WRITEBACK_MAX || (count && !spans)) return EINVAL;
@@ -5980,6 +5987,8 @@ static int ext4_write_spans(ext4_file *file, ext4_file *owner,
 	uint64_t write_end = 0;
 	size_t blocks = 0, data_images = 0;
 	unsigned source_count = 0;
+	bool fresh_try = mode == EXT4_WRITE_FRESH_TRY;
+	bool synchronous = mode == EXT4_WRITE_SYNCHRONOUS;
 	unsigned block_size = ext4_sb_get_block_size(ext4_fs_super(&file->mp->fs));
 	for (unsigned i = 0; i < count; i++) {
 		struct file_write_span *span = &spans[i];
@@ -5989,6 +5998,7 @@ static int ext4_write_spans(ext4_file *file, ext4_file *owner,
 		if (i && span->offset < spans[i-1].offset + spans[i-1].size) return EINVAL;
 		if (!span->size) continue;
         size_t leading = span->offset % block_size;
+        if (fresh_try && (leading || span->size % block_size)) return ENOTSUP;
         size_t n = (span->size - 1 + leading) / block_size + 1;
         if (n > SIZE_MAX - blocks) return ENOMEM;
         blocks += n;
@@ -6019,12 +6029,26 @@ static int ext4_write_spans(ext4_file *file, ext4_file *owner,
 	struct jbd_journal *journal = file->mp->fs.jbd_journal;
 	struct ext4_operation *operation=ext4_current_operation(&file->mp->fs);
 	bool outer=!operation;
+	bool prewrite_fresh = file->mp->journal_runtime.prewrite_fresh;
+#if BOAROS_MAX_CPUS == 1
+	prewrite_fresh = prewrite_fresh || blocks >= (128U * 1024U) / block_size;
+#endif
+	bool prewrite = prewrite_fresh && journal && journal->grouped && outer &&
+	    file->delalloc && file->mp->fs.bdev->bdif->bwrite_batch;
+	if (fresh_try) {
+		if (!prewrite || !file->mp->fs.bdev->bdif->bwrite_batch_try_phase ||
+		    blocks <= 1 || spans[0].offset < file->fsize || file->fsize % block_size)
+			return ENOTSUP;
+		bool truncate_pending;
+		int check = ext4_orphan_truncate_pending(&file->mp->fs, file->inode, &truncate_pending);
+		if (check || truncate_pending) return check ? check : ENOTSUP;
+	}
 	struct ext4_small_writeback *batch=outer?NULL:operation->small_writeback;
 	int r = outer || batch ? EOK : ext4_track_nested_file(owner);
 	if (r) return r;
 Retry:
-	r = batch ? EOK : ext4_prepare_growth(file, write_end);
-	if (!r && journal && journal->grouped && outer) {
+	r = batch || fresh_try ? EOK : ext4_prepare_growth(file, write_end);
+	if (!r && journal && journal->grouped && outer && !fresh_try) {
 		while (!r) {
             struct jbd_journal_reclaim goal;
             {
@@ -6039,7 +6063,7 @@ Retry:
                 ext4_reclaim_wait_kind(file->mp, &goal), wait);
 		}
 	}
-	if (!r) r = ext4_trans_start(file->mp);
+	if (!r) r = ext4_trans_start_mode(file->mp, !fresh_try);
 	if (r) return r;
 	struct ext4_fs *fs = &file->mp->fs;
 	struct ext4_inode_ref ref;
@@ -6047,8 +6071,9 @@ Retry:
 	r = ext4_fs_get_inode_ref(fs, file->inode, &ref);
 	if (r) { r = ext4_file_data_finish(file, r); goto Completed; }
 	saved_size = ext4_inode_get_size(ext4_fs_super(fs), ref.inode);
+    if (fresh_try && (spans[0].offset < saved_size || saved_size % block_size)) r = ENOTSUP;
     if (batch && batch->completion && write_end < saved_size) batch->completion=NULL;
-    if (file->delalloc && journal) {
+    if (!r && file->delalloc && journal) {
         EXT4_STATE_SCOPE(state,fs);
         /* 在同一次预留遍历中清除即将修改的映射知识；abort 后重新查询。 */
         uint64_t credit=delalloc_spans(file->delalloc,spans,count,block_size,false);
@@ -6063,16 +6088,8 @@ Retry:
         }
     }
     struct ext4_direct_write_batch *direct = NULL;
-    bool fresh_ordered = journal && journal->grouped && outer && file->delalloc &&
-#if BOAROS_MAX_CPUS == 1
-        /* A full page-cache window can use one existing device batch. */
-        (file->mp->journal_runtime.prewrite_fresh || blocks >= (128U * 1024U) / block_size) &&
-        source_count &&
-#else
-        file->mp->journal_runtime.prewrite_fresh && source_count &&
-#endif
-        spans[0].offset >= saved_size && fs->bdev->bdif->bwrite_batch;
-    if ((!journal || fresh_ordered) && blocks > 1 && (source_count || synchronous)) {
+    bool fresh_ordered = prewrite && (source_count || fresh_try) && spans[0].offset >= saved_size;
+    if (!r && (!journal || fresh_ordered) && blocks > 1 && (source_count || synchronous || fresh_try)) {
         size_t byte_limit = EXT4_WRITE_BATCH_BYTES;
         unsigned capacity = EXT4_BLOCK_BATCH_MAX;
         if (fresh_ordered && fs->bdev->bdif->write_phase_bytes > byte_limit &&
@@ -6087,8 +6104,9 @@ Retry:
             direct->capacity = capacity;
             direct->byte_limit = byte_limit;
             direct->logical = (void *)(direct->blocks + capacity);
+            direct->fresh_try = fresh_try;
         }
-        if (!direct && !journal) r = ENOMEM;
+        if (!direct && (!journal || fresh_try)) r = ENOMEM;
     }
     struct ext4_inode_block_range range = {0};
     ext4_lblk_t range_next = 0;
@@ -6172,7 +6190,13 @@ Retry:
              * remains hidden through the write, and the journal's precommit
              * flush orders these device-completed bytes before the commit. */
             bool queued = direct && (!journal || (allocated && !offset && length == block_size)) &&
-                !data_offset && data_length == block_size && (span->source.retain || synchronous);
+                !data_offset && data_length == block_size && (span->source.retain || synchronous || fresh_try);
+            /* A live cache page cannot become a retained ordered record. An
+             * existing mapping requires the snapshot-based writeback path. */
+            if (fresh_try && !queued) {
+                r = ENOTSUP;
+                break;
+            }
             if (queued) {
                 unsigned n = direct->count;
                 bool merge = n && direct->logical[n-1].span == span &&
@@ -6244,7 +6268,7 @@ Completed:
 	if (ext4_file_rolled_back(file, r)) {
 		file->fsize = saved_size; file->fpos = saved_pos;
 		for (unsigned i = 0; i < count; i++) spans[i].written = 0;
-        if (wait && wait->device_phase) return r;
+		if (fresh_try || (wait && wait->device_phase)) return r;
 		if (r == EAGAIN && outer && ext4_operation_resource_retry(&file->mp->fs)) goto Retry;
         if (outer && ext4_operation_retry_reclaim(file->mp, &r)) goto Retry;
 	}
@@ -6252,11 +6276,11 @@ Completed:
 }
 
 static __attribute__((noinline)) int ext4_write_spans_small(ext4_file *file,
-    ext4_file *owner, struct file_write_span *spans, unsigned count, bool synchronous,
+    ext4_file *owner, struct file_write_span *spans, unsigned count, enum ext4_write_mode mode,
     struct file_writeback_wait *wait)
 {
     const struct file_data_source *sources[EXT4_BLOCK_BATCH_MAX];
-    return ext4_write_spans(file, owner, spans, count, synchronous, sources, wait);
+    return ext4_write_spans(file, owner, spans, count, mode, sources, wait);
 }
 
 int ext4_fwrite(ext4_file *file, const void *buffer, size_t size, size_t *written)
@@ -6264,14 +6288,14 @@ int ext4_fwrite(ext4_file *file, const void *buffer, size_t size, size_t *writte
 	if (!file || !file->mp) return EINVAL;
 	EXT4_MP_LOCK(file->mp);
 	struct file_write_span span = {.offset=file->fpos, .buffer=buffer, .size=size};
-	int r = ext4_write_spans_small(file, file, &span, 1, false, NULL);
+	int r = ext4_write_spans_small(file, file, &span, 1, EXT4_WRITE_BUFFERED, NULL);
 	if (written) *written = span.written;
 	EXT4_MP_UNLOCK(file->mp);
 	return r;
 }
 
 static int ext4_fpwrite_batch_mode(ext4_file *file, struct file_write_span *spans,
-    unsigned count, bool synchronous, struct file_writeback_wait *wait)
+    unsigned count, enum ext4_write_mode mode, struct file_writeback_wait *wait)
 {
 	if (!file || !file->mp || count > EXT4_FILE_WRITEBACK_MAX || (count && !spans)) return EINVAL;
     const struct file_data_source **sources = NULL;
@@ -6290,8 +6314,8 @@ static int ext4_fpwrite_batch_mode(ext4_file *file, struct file_write_span *span
         local = *file;
         initial_size = file->fsize;
     }
-    int r = sources ? ext4_write_spans(&local, file, spans, count, synchronous, sources, wait) :
-        ext4_write_spans_small(&local, file, spans, count, synchronous, wait);
+    int r = sources ? ext4_write_spans(&local, file, spans, count, mode, sources, wait) :
+        ext4_write_spans_small(&local, file, spans, count, mode, wait);
     ext4_file_drain_reservations(file);
     {
         EXT4_STATE_SCOPE(state, &file->mp->fs);
@@ -6305,11 +6329,11 @@ static int ext4_fpwrite_batch_mode(ext4_file *file, struct file_write_span *span
 }
 
 int ext4_fpwrite_batch(ext4_file *file, struct file_write_span *spans, unsigned count)
-{ return ext4_fpwrite_batch_mode(file, spans, count, false, NULL); }
+{ return ext4_fpwrite_batch_mode(file, spans, count, EXT4_WRITE_BUFFERED, NULL); }
 
 int ext4_fpwrite_batch_wait(ext4_file *file, struct file_write_span *spans,
     unsigned count, struct file_writeback_wait *wait)
-{ return ext4_fpwrite_batch_mode(file, spans, count, false, wait); }
+{ return ext4_fpwrite_batch_mode(file, spans, count, EXT4_WRITE_BUFFERED, wait); }
 
 int ext4_fpwrite_files(ext4_file *const *files, const struct file_write_set *sets,
     unsigned count, int *data_result)
@@ -6378,7 +6402,7 @@ int ext4_fpwrite_files(ext4_file *const *files, const struct file_write_set *set
         while (batch->prepared<count) {
             unsigned i=batch->prepared;
             ext4_file local=*files[i];
-            result=ext4_write_spans_small(&local,files[i],sets[i].spans,sets[i].count,false,NULL);
+            result=ext4_write_spans_small(&local,files[i],sets[i].spans,sets[i].count,EXT4_WRITE_BUFFERED,NULL);
             if (result) break;
             batch->prepared++;
         }
@@ -6523,14 +6547,22 @@ int ext4_fpwrite_mapped_batch(ext4_file *file, struct file_write_span *spans, un
 { return ext4_write_mapped_mode(file, spans, count, false); }
 
 int ext4_fpwrite_mapped_try(ext4_file *file, struct file_write_span *spans, unsigned count)
-{ return ext4_write_mapped_mode(file, spans, count, true); }
+{
+    int result = ext4_write_mapped_mode(file, spans, count, true);
+    if (result != ENOTSUP || !count || count > EXT4_FILE_WRITEBACK_MAX) return result;
+    struct file_writeback_wait wait = {0};
+    result = ext4_fpwrite_batch_mode(file, spans, count, EXT4_WRITE_FRESH_TRY, &wait);
+    if ((result == EAGAIN && !wait.device_phase) || result == ENOMEM || result == ENOSPC)
+        return ENOTSUP;
+    return result;
+}
 
 /* Nonjournal synchronous storage is borrowed only until device completion.
  * Journal users need the ordered-owner completion protocol instead. */
 int ext4_fpwrite_direct(ext4_file *file, struct file_write_span *span)
 {
     if (!file || !file->mp || file->mp->fs.jbd_journal) return EINVAL;
-    return ext4_fpwrite_batch_mode(file, span, 1, true, NULL);
+    return ext4_fpwrite_batch_mode(file, span, 1, EXT4_WRITE_SYNCHRONOUS, NULL);
 }
 
 int ext4_fpwrite(ext4_file *file, uint64_t offset, const void *buffer, size_t size, size_t *written)
