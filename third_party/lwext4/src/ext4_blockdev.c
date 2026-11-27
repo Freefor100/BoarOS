@@ -214,7 +214,7 @@ int ext4_block_flush_buf(struct ext4_blockdev *bdev, struct ext4_buf *buf)
 
 /* The extent of one batch is a metadata phase. The scope owns the buffer
  * descriptors, and the loans below cover their exact versions until I/O drains. */
-static int flush_ext2_scope(struct ext4_bcache *bc,struct ext4_writeback_scope *scope)
+static int flush_metadata_scope(struct ext4_bcache *bc,struct ext4_writeback_scope *scope)
 {
     struct ext4_blockdev *bdev=bc->bdev;
     struct ext4_scope_batch *batch=scope->batch;
@@ -264,7 +264,7 @@ static int flush_ext2_scope(struct ext4_bcache *bc,struct ext4_writeback_scope *
 int ext4_bcache_scope_flush(struct ext4_bcache *bc,struct ext4_writeback_scope *scope)
 {
     struct ext4_blockdev *bdev=bc->bdev;
-    if (scope->batch) return flush_ext2_scope(bc,scope);
+    if (scope->batch) return flush_metadata_scope(bc,scope);
     for (struct ext4_buf *buf=scope->head;buf;buf=buf->writeback_next) {
         int result=ext4_block_flush_buf(bdev,buf);
         if (result) return result;

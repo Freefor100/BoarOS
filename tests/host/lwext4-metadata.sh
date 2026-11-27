@@ -26,7 +26,7 @@ if [ "${1:-all}" = nojournal-direct ]; then
         mkfs.ext4 -q -F -b "$block" -O ^has_journal "$work/direct.img"
         timeout 30 "$work/probe" "$work/direct.img" seed
         cp "$work/direct.img" "$work/seed.img"
-        for mode in nojournal-direct direct-data-batch direct-data-error direct-range-error direct-full-leaf-error extent-middle-oom; do
+        for mode in nojournal-direct nojournal-unwritten-write direct-data-batch direct-data-error direct-range-error direct-full-leaf-error extent-middle-oom; do
             cp "$work/seed.img" "$work/direct.img"
             timeout 30 "$work/probe" "$work/direct.img" "$mode"
             check_fs "$work/direct.img"

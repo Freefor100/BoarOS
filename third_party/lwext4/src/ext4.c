@@ -2189,7 +2189,8 @@ int ext4_recover(const char *mount_point __unused)
 	return r;
 }
 
-static int ext4_trans_start_mode(struct ext4_mountpoint *mp __unused, bool wait __unused)
+static int ext4_trans_start_mode(struct ext4_mountpoint *mp __unused, bool wait __unused,
+    bool batch_metadata)
 {
     if (!mp) return ENOENT;
     if (mp->fs.super_replay_required) return EUCLEAN;
@@ -2203,7 +2204,7 @@ static int ext4_trans_start_mode(struct ext4_mountpoint *mp __unused, bool wait 
 #endif
     if (operation && operation->depth == UINT32_MAX) return EOVERFLOW;
     if (!operation) {
-        bool batch = mp->fs.ext2_format && mp->fs.bdev->bdif->bwrite_batch;
+        bool batch = (mp->fs.ext2_format || batch_metadata) && mp->fs.bdev->bdif->bwrite_batch;
         size_t size = sizeof(*operation) + (batch ? sizeof(struct ext4_scope_batch) : 0);
         operation = ext4_calloc(1, size);
         if (!operation) return ENOMEM;
@@ -2219,7 +2220,7 @@ static int ext4_trans_start_mode(struct ext4_mountpoint *mp __unused, bool wait 
 }
 
 static int ext4_trans_start(struct ext4_mountpoint *mp)
-{ return ext4_trans_start_mode(mp, true); }
+{ return ext4_trans_start_mode(mp, true, false); }
 
 static int ext4_trans_finish_accept(struct ext4_mountpoint *mp __unused, int result,
     void (*accepted)(void *), void *context)
@@ -2574,7 +2575,7 @@ static int ext4_file_set_times_common(ext4_file *file, unsigned fields,
     }
     if (!fields) goto Unlock;
     if (mp->fs.read_only) { r = EROFS; goto Unlock; }
-    r = ext4_trans_start_mode(mp, wait);
+    r = ext4_trans_start_mode(mp, wait, false);
     if (r != EOK) goto Unlock;
     if (!publish && !wait) {
         struct jbd_trans *trans = ext4_current_trans(&mp->fs);
@@ -4996,7 +4997,7 @@ Retry:
                 }
             }
             if (r) break;
-            r=ext4_trans_start(file->mp);
+            r=ext4_trans_start_mode(file->mp,true,extent && !journal);
             if (r) break;
             r=ext4_fs_get_inode_ref(fs,file->inode,&ref);
             if (!r) {
@@ -6004,6 +6005,7 @@ struct ext4_direct_write_batch {
     unsigned count, capacity;
     size_t bytes, byte_limit;
     bool fresh_try;
+    bool unwritten;
     struct kernel_block_span blocks[];
 };
 /* Drop the highest mapped blocks before any queued prefix. Releasing a middle
@@ -6050,8 +6052,15 @@ static int ext4_direct_write_flush(struct ext4_inode_ref *ref, ext4_file *file,
                     0, (const uint8_t *)io->buffer + done, bdev->lg_bsize, true, source);
         }
     }
-    if (r && !rollback) r = ext4_write_discard_range(ref, range, range_next, r);
     unsigned block_size = ref->fs->bdev->lg_bsize;
+#if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
+    /* The whole batch belongs to one unwritten run. Keep it invisible until
+     * every submitted block has completed. A failed batch leaves zeros. */
+    if (!r && batch->unwritten)
+        r = ext4_extent_complete_write(ref, batch->logical[0].offset / block_size,
+            batch->blocks[0].offset / block_size, batch->bytes / block_size);
+#endif
+    if (r && !rollback) r = ext4_write_discard_range(ref, range, range_next, r);
     for (unsigned step = 0; step < batch->count; step++) {
         unsigned i = r ? batch->count - 1 - step : step;
         if (!r) {
@@ -6071,7 +6080,7 @@ static int ext4_direct_write_flush(struct ext4_inode_ref *ref, ext4_file *file,
         }
     }
     if (r) file->fpos = batch->logical[0].offset;
-    batch->count = 0; batch->bytes = 0;
+    batch->count = 0; batch->bytes = 0; batch->unwritten = false;
     return r;
 }
 
@@ -6174,7 +6183,7 @@ Retry:
                 ext4_reclaim_wait_kind(file->mp, &goal), wait);
 		}
 	}
-	if (!r) r = ext4_trans_start_mode(file->mp, !fresh_try);
+	if (!r) r = ext4_trans_start_mode(file->mp, !fresh_try, false);
 	if (r) return r;
 	struct ext4_fs *fs = &file->mp->fs;
 	struct ext4_inode_ref ref;
@@ -6269,6 +6278,10 @@ Retry:
 			ext4_lblk_t logical_block = file->fpos / block_size;
             ext4_assert(!range.count || range_next == logical_block);
 			if (!range.count) {
+                if (direct && direct->unwritten) {
+                    r = ext4_direct_write_flush(&ref, file, direct, &range, range_next, wait);
+                    if (r) break;
+                }
                 /* Form each contiguous request run once. A fragmented physical
                  * map may need several queries without rescanning later spans. */
                 if (file->fpos >= mapping_end) {
@@ -6285,7 +6298,7 @@ Retry:
                     (EXT4_WRITE_BATCH_BYTES - (direct ? direct->bytes : 0)) / block_size;
                 if (needed < maximum) maximum = needed;
                 uint32_t overwritten = 0;
-                if (journal && !offset) {
+                if (!offset && (journal || (direct && !synchronous))) {
                     uint64_t complete = (mapping_end - file->fpos) / block_size;
                     overwritten = complete < maximum ? complete : maximum;
                 }
@@ -6293,6 +6306,10 @@ Retry:
                     ext4_fs_get_inode_dblk_write_range(&ref, logical_block, maximum, overwritten, &range) :
                     ext4_fs_get_inode_dblk_range(&ref, logical_block, maximum, true, &range);
                 if (r) break;
+                if (direct && range.unwritten && direct->count) {
+                    r = ext4_direct_write_flush(&ref, file, direct, &range, range_next, wait);
+                    if (r) break;
+                }
                 if (batch && batch->completion && !ext4_collect_physical(batch->completion,&range))
                     batch->completion=NULL;
                 range_next = logical_block;
@@ -6313,7 +6330,8 @@ Retry:
              * remains hidden through the write, and the journal's precommit
              * flush orders these device-completed bytes before the commit. */
             bool queued = direct && (!journal || (allocated && !offset && length == block_size)) &&
-                !data_offset && data_length == block_size && (span->source.retain || synchronous || fresh_try);
+                !data_offset && data_length == block_size &&
+                (range.unwritten || span->source.retain || synchronous || fresh_try);
             /* A live cache page cannot become a retained ordered record. An
              * existing mapping requires the snapshot-based writeback path. */
             if (fresh_try && !queued) {
@@ -6340,7 +6358,10 @@ Retry:
                     direct->logical[n].length = length; direct->logical[n].allocated = allocated;
                     direct->count++;
                 }
-                if (!r) direct->bytes += block_size;
+                if (!r) {
+                    direct->bytes += block_size;
+                    direct->unwritten = range.unwritten;
+                }
             } else {
                 r = ext4_direct_write_flush(&ref, file, direct, &range, range_next, wait);
                 if (!r) r = synchronous
@@ -6518,7 +6539,7 @@ int ext4_fpwrite_files(ext4_file *const *files, const struct file_write_set *set
     struct ext4_data_completion completion={0};
     struct ext4_small_writeback *batch=ext4_malloc(sizeof(*batch));
     if (!batch) {result=ENOMEM;goto Unlock;}
-    result=ext4_trans_start_mode(mp,false);
+    result=ext4_trans_start_mode(mp,false,false);
     if (!result) {
         batch->files=files;
         batch->sets=sets;
