@@ -215,6 +215,38 @@ static err_t hold_pair_received(void *context, struct tcp_pcb *pcb, struct pbuf 
     return ERR_OK;
 }
 
+static int tcp_data_heap_recovery(int trim)
+{
+    void *left=mem_malloc(4200), *join=mem_malloc(trim ? 1000 : 64);
+    void *right=mem_malloc(trim ? 7500 : 4200);
+    void *guards[3], *holes[2];
+    for (unsigned i=0; i<2; i++) {
+        guards[i]=mem_malloc(2048);
+        holes[i]=mem_malloc(6144);
+    }
+    guards[2]=mem_malloc(2048);
+    void *filler=mem_malloc(MEM_SIZE-STATS_GET(mem.used)-6144U);
+    if (!left || !join || !right || !filler || !guards[0] || !guards[1] ||
+        !guards[2] || !holes[0] || !holes[1]) return 141;
+    mem_free(left);
+    mem_free(right);
+    mem_free(holes[0]);
+    mem_free(holes[1]);
+    if (boaros_lwip_mem_malloc_tcp_data(8192) || boaros_lwip_mem_malloc_tcp_data(8192)) return 142;
+    if (trim) {
+        if (mem_trim(join,64)!=join) return 143;
+    } else {
+        mem_free(join);
+    }
+    void *data=boaros_lwip_mem_malloc_tcp_data(8192);
+    if (!data) return 144;
+    mem_free(data);
+    if (trim) mem_free(join);
+    for (unsigned i=0; i<3; i++) mem_free(guards[i]);
+    mem_free(filler);
+    return 0;
+}
+
 static int tcp_copy_heap_reserve(struct tcp_pcb *sender, struct tcp_pcb *receiver)
 {
     static unsigned char bytes[8192];
@@ -568,6 +600,10 @@ int main(void)
     }
     int vector_result=tcp_vector_prefix(tcp_client,tcp_accepted,loop);
     if(vector_result) return vector_result;
+    int recovery=tcp_data_heap_recovery(0);
+    if(recovery) return recovery;
+    recovery=tcp_data_heap_recovery(1);
+    if(recovery) return recovery;
     int reserve_result=tcp_copy_heap_reserve(tcp_client,tcp_accepted);
     if(reserve_result) return reserve_result;
     int retransmit_result=tcp_shared_retransmit(tcp_client,tcp_accepted,loop);

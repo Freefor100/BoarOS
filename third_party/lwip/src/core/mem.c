@@ -417,6 +417,11 @@ static volatile u8_t mem_free_count;
 
 /** pointer to the lowest free block, this is used for faster search */
 static struct mem * LWIP_MEM_LFREE_VOLATILE lfree;
+#if BOAROS_LWIP_TCP_WRITEV
+/* A complete failed body scan can bound the largest free extent. Allocating
+ * only shrinks free extents. Free and trim publish the coalesced extent. */
+static mem_size_t tcp_free_extent_upper;
+#endif
 
 #if MEM_SANITY_CHECK
 static void mem_sanity(void);
@@ -468,7 +473,7 @@ mem_to_ptr(void *mem)
  * This assumes access to the heap is protected by the calling function
  * already.
  */
-static void
+static struct mem *
 plug_holes(struct mem *mem)
 {
   struct mem *nmem;
@@ -504,8 +509,19 @@ plug_holes(struct mem *mem)
     if (mem->next != MEM_SIZE_ALIGNED) {
       ptr_to_mem(mem->next)->prev = mem_to_ptr(pmem);
     }
+    return pmem;
   }
+  return mem;
 }
+
+#if BOAROS_LWIP_TCP_WRITEV
+static void
+tcp_free_extent_grew(struct mem *block)
+{
+  const mem_size_t extent = block->next - mem_to_ptr(block);
+  if (extent > tcp_free_extent_upper) tcp_free_extent_upper = extent;
+}
+#endif
 
 /**
  * Zero the heap and initialize start, end and lowest-free
@@ -534,6 +550,9 @@ mem_init(void)
 
   /* initialize the lowest-free pointer to the start of the heap */
   lfree = (struct mem *)(void *)ram;
+#if BOAROS_LWIP_TCP_WRITEV
+  tcp_free_extent_upper = MEM_SIZE_ALIGNED;
+#endif
 
   MEM_STATS_AVAIL(avail, MEM_SIZE_ALIGNED);
 
@@ -675,7 +694,11 @@ mem_free(void *rmem)
   MEM_STATS_DEC_USED(used, mem->next - (mem_size_t)(((u8_t *)mem - ram)));
 
   /* finally, see if prev or next are free also */
-  plug_holes(mem);
+#if BOAROS_LWIP_TCP_WRITEV
+  tcp_free_extent_grew(plug_holes(mem));
+#else
+  (void)plug_holes(mem);
+#endif
   MEM_SANITY();
 #if LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT
   mem_free_count = 1;
@@ -778,6 +801,9 @@ mem_trim(void *rmem, mem_size_t new_size)
       ptr_to_mem(mem2->next)->prev = ptr2;
     }
     MEM_STATS_DEC_USED(used, (size - newsize));
+#if BOAROS_LWIP_TCP_WRITEV
+    tcp_free_extent_grew(mem2);
+#endif
     /* no need to plug holes, we've already done that */
   } else if (newsize + SIZEOF_STRUCT_MEM + MIN_SIZE_ALIGNED <= size) {
     /* Next struct is used but there's room for another struct mem with
@@ -801,6 +827,9 @@ mem_trim(void *rmem, mem_size_t new_size)
       ptr_to_mem(mem2->next)->prev = ptr2;
     }
     MEM_STATS_DEC_USED(used, (size - newsize));
+#if BOAROS_LWIP_TCP_WRITEV
+    tcp_free_extent_grew(mem2);
+#endif
     /* the original mem->next is used, so no need to plug holes! */
   }
   /* else {
@@ -878,6 +907,8 @@ mem_malloc(mem_size_t size_in)
     const mem_size_t limit = MEM_SIZE_ALIGNED - reserve;
     budget = used < limit ? limit - used : 0;
     if (budget < size + SIZEOF_STRUCT_MEM) goto exhausted;
+    if (size >= BOAROS_LWIP_LOOPBACK_MSS &&
+        tcp_free_extent_upper < size + SIZEOF_STRUCT_MEM) goto exhausted;
   }
 #endif
 #if LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT
@@ -999,6 +1030,12 @@ mem_malloc_adjust_lfree:
   } while (local_mem_free_count != 0);
 #endif /* LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT */
 #if BOAROS_LWIP_TCP_WRITEV
+  /* If even the most costly near fit would stay under the reserve, this
+   * scan could not have rejected a physically fitting block on budget. */
+  if (reserve && size >= BOAROS_LWIP_LOOPBACK_MSS &&
+      budget >= size + 2U * SIZEOF_STRUCT_MEM + MIN_SIZE_ALIGNED - MEM_ALIGNMENT) {
+    tcp_free_extent_upper = size + SIZEOF_STRUCT_MEM - 1U;
+  }
 exhausted:
 #endif
   MEM_STATS_INC(err);
