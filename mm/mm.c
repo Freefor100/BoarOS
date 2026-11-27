@@ -3023,6 +3023,60 @@ unsigned kernel_mm_try_pin_user_read_batch(const struct kernel_mm *mm, uint64_t 
     return ready;
 }
 
+#if defined(__loongarch__) && BOAROS_MAX_CPUS == 1
+unsigned kernel_mm_copy_from_ready_user_pages(const struct kernel_mm *mm, uint64_t address,
+    const struct kernel_mm_copy_target *target, unsigned count)
+{
+    struct kernel_mm_record *record;
+    size_t skew = address & BOAROS_PAGE_MASK;
+    unsigned extra = skew != 0;
+    if (!count || count > KERNEL_MM_USER_READ_BATCH ||
+        mm->state != KERNEL_MM_LIVE || resolve_record(mm, &record) ||
+        kernel_cpu_current()->active_mm_record != record)
+        return 0;
+
+    uint64_t low = target[0].physical, high = low;
+    for (unsigned i = 1; i < count; i++) {
+        uint64_t physical = target[i].physical;
+        if (physical < low) low = physical;
+        if (physical > high) high = physical;
+    }
+    uint64_t pages[KERNEL_MM_USER_READ_BATCH + 1];
+    unsigned ready = 0;
+    /* On one CPU, no task can edit these verified mappings or replace the
+     * active root until copying ends. Drop the metadata lock for the copy. */
+    kernel_preempt_disable();
+    {
+        KERNEL_RAW_READ_SCOPE(guard, &record->metadata);
+        if (pin_admission_closed(record) != 1 && !record->pending_retirement) {
+            unsigned mapped = la_mmu_readable_base_pages(&record->space, address - skew,
+                count + extra, pages);
+            for (; ready < mapped; ready++) {
+                uint64_t physical = pages[ready];
+                /* File aliases use the ordered fragment copy, including
+                 * overlapping input and output within a single page. */
+                if ((physical >= low && physical <= high) ||
+                    (record->has_secret_mappings && kernel_secretmem_page_protected(physical)))
+                    break;
+            }
+        }
+    }
+    unsigned complete = ready > extra ? ready - extra : 0;
+    for (unsigned first = 0; first < complete;) {
+        unsigned end = first + 1;
+        while (end < complete &&
+               target[end].physical == target[end - 1].physical + BOAROS_PAGE_SIZE &&
+               (uintptr_t)target[end].data == (uintptr_t)target[end - 1].data + BOAROS_PAGE_SIZE)
+            end++;
+        memcpy(target[first].data, (const void *)(uintptr_t)(address + (uint64_t)first * BOAROS_PAGE_SIZE),
+            (size_t)(end - first) * BOAROS_PAGE_SIZE);
+        first = end;
+    }
+    kernel_preempt_enable();
+    return complete;
+}
+#endif
+
 #if defined(__riscv) && BOAROS_MAX_CPUS == 1
 unsigned kernel_mm_copy_to_ready_user_pages(struct kernel_mm *mm, uint64_t first,
     const void *const *source, unsigned count)
