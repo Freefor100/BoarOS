@@ -146,10 +146,19 @@ struct kernel_mm_copy_target {
 /* Complete a prefix of whole destination pages using the current user MM. */
 unsigned kernel_mm_copy_from_ready_user_pages(const struct kernel_mm *, uint64_t address,
     const struct kernel_mm_copy_target *, unsigned count);
+struct kernel_mm_copy_source_page {
+    const void *data;
+    uint64_t physical;
+};
+/* The caller holds each cache source until return. */
+unsigned kernel_mm_copy_cache_to_ready_user_pages(const struct kernel_mm *, uint64_t address,
+    const struct kernel_mm_copy_source_page *, unsigned count);
 #endif
 
-#if defined(__riscv) && BOAROS_MAX_CPUS == 1
+#if (defined(__riscv) || defined(__loongarch__)) && BOAROS_MAX_CPUS == 1
 #define KERNEL_MM_COPY_READY_PAGES 16U
+#endif
+#if defined(__riscv) && BOAROS_MAX_CPUS == 1
 /* Resident writable base pages, excluding shared file-write aliases. */
 unsigned kernel_mm_copy_to_ready_user_pages(struct kernel_mm *, uint64_t first,
     const void *const *source, unsigned count);

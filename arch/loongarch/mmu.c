@@ -530,9 +530,15 @@ int arch_mmu_user_base_page(const struct arch_mmu_user_space *s,uint64_t address
     return 1;
 }
 
-unsigned la_mmu_readable_base_pages(const struct arch_mmu_user_space *s, uint64_t first,
-    unsigned count, uint64_t *physical)
+unsigned la_mmu_accessible_base_pages(const struct arch_mmu_user_space *s, uint64_t first,
+    unsigned count, uint32_t access, uint64_t *physical)
 {
+    uint64_t required = PTE_PRESENT | PTE_VALID;
+    uint64_t rejected = PTE_NONE | PTE_HUGE;
+    if (access == ARCH_MMU_WRITE) {
+        required |= PTE_DIRTY | PTE_WRITE;
+        rejected |= PTE_COW | PTE_FILE;
+    } else rejected |= PTE_NR;
     unsigned ready = 0;
     while (ready < count) {
         uint64_t address = first + (uint64_t)ready * BOAROS_PAGE_SIZE;
@@ -543,8 +549,7 @@ unsigned la_mmu_readable_base_pages(const struct arch_mmu_user_space *s, uint64_
         if (end > count) end = count;
         for (; ready < end; ready++, slot++) {
             uint64_t entry = *slot;
-            if ((entry & (PTE_PRESENT | PTE_VALID | PTE_NONE | PTE_NR | PTE_HUGE)) !=
-                (PTE_PRESENT | PTE_VALID)) return ready;
+            if ((entry & (required | rejected)) != required) return ready;
             physical[ready] = entry & PTE_ADDRESS;
         }
     }

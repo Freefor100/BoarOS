@@ -199,6 +199,14 @@ static void local_user_copy(int fd)
     CHECK(!mprotect(input+batch,page,PROT_READ|PROT_WRITE));
     CHECK(pread(fd,output,batch,0)==(ssize_t)batch && !memcmp(input+skew,output,batch-skew));
     for (size_t i=batch-skew;i<batch;i++) CHECK(output[i]==(unsigned char)(input[skew+i]-1));
+    memcpy(input,output,batch);
+    memset(output,0x91,mapped_length);
+    CHECK(!mprotect(output+batch,page,PROT_NONE));
+    CHECK(pread(fd,output+skew,batch,0)==(ssize_t)(batch-skew));
+    CHECK(!memcmp(input,output+skew,batch-skew));
+    for (size_t i=0;i<skew;i++) CHECK(output[i]==0x91);
+    CHECK(!mprotect(output+batch,page,PROT_READ|PROT_WRITE));
+    CHECK(pread(fd,output+skew,batch,0)==(ssize_t)batch && !memcmp(input,output+skew,batch));
     CHECK(!ftruncate(fd,size));
 
     for(size_t i=0;i<size;i++)input[i]=(unsigned char)(i*17+3);
@@ -226,6 +234,9 @@ static void local_user_copy(int fd)
     unsigned char *shared=mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_SHARED,shared_fd,0);
     CHECK(shared!=MAP_FAILED && pread(fd,shared,size,0)==(ssize_t)size);
     CHECK(!msync(shared,size,MS_SYNC));
+    CHECK(pread(shared_fd,output,size,0)==(ssize_t)size && !memcmp(input,output,size));
+    memset(shared,0x52,size);
+    CHECK(pread(fd,shared,size,0)==(ssize_t)size && !msync(shared,size,MS_SYNC));
     CHECK(pread(shared_fd,output,size,0)==(ssize_t)size && !memcmp(input,output,size));
     CHECK(pwrite(shared_fd,shared,size,0)==(ssize_t)size);
     CHECK(pread(shared_fd,output,size,0)==(ssize_t)size && !memcmp(input,output,size));

@@ -3049,8 +3049,8 @@ unsigned kernel_mm_copy_from_ready_user_pages(const struct kernel_mm *mm, uint64
     {
         KERNEL_RAW_READ_SCOPE(guard, &record->metadata);
         if (pin_admission_closed(record) != 1 && !record->pending_retirement) {
-            unsigned mapped = la_mmu_readable_base_pages(&record->space, address - skew,
-                count + extra, pages);
+            unsigned mapped = la_mmu_accessible_base_pages(&record->space, address - skew,
+                count + extra, ARCH_MMU_READ, pages);
             for (; ready < mapped; ready++) {
                 uint64_t physical = pages[ready];
                 /* File aliases use the ordered fragment copy, including
@@ -3073,6 +3073,62 @@ unsigned kernel_mm_copy_from_ready_user_pages(const struct kernel_mm *mm, uint64
         first = end;
     }
     kernel_preempt_enable();
+    return complete;
+}
+
+unsigned kernel_mm_copy_cache_to_ready_user_pages(const struct kernel_mm *mm, uint64_t address,
+    const struct kernel_mm_copy_source_page *source, unsigned count)
+{
+    struct kernel_mm_record *record;
+    size_t skew = address & BOAROS_PAGE_MASK;
+    unsigned extra = skew != 0;
+    if (!count || count > KERNEL_MM_COPY_READY_PAGES ||
+        kernel_user_range_check(address, (size_t)count * BOAROS_PAGE_SIZE) ||
+        mm->state != KERNEL_MM_LIVE || resolve_record(mm, &record) ||
+        kernel_cpu_current()->active_mm_record != record)
+        return 0;
+
+    uint64_t low = source[0].physical, high = low;
+    for (unsigned i = 1; i < count; i++) {
+        uint64_t physical = source[i].physical;
+        if (physical < low) low = physical;
+        if (physical > high) high = physical;
+    }
+    uint64_t pages[KERNEL_MM_COPY_READY_PAGES + 1];
+    unsigned ready = 0;
+    /* The local address space stays installed on UP until the copy ends.
+     * The leaf check excludes COW and file-backed destination writes. */
+    kernel_preempt_disable();
+    {
+        KERNEL_RAW_READ_SCOPE(guard, &record->metadata);
+        if (!pin_admission_closed(record) && !record->pending_retirement) {
+            unsigned mapped = la_mmu_accessible_base_pages(&record->space, address - skew,
+                count + extra, ARCH_MMU_WRITE, pages);
+            for (; ready < mapped; ready++) {
+                uint64_t physical = pages[ready];
+                if ((physical >= low && physical <= high) ||
+                    (record->has_secret_mappings && kernel_secretmem_page_protected(physical)))
+                    break;
+                uint64_t virtual_page = address - skew + (uint64_t)ready * BOAROS_PAGE_SIZE;
+                struct mm_file_alias_resident *resident =
+                    file_alias_resident(find_file_resident(record, virtual_page));
+                if (resident && kernel_page_cache_alias_active(&resident->alias)) break;
+            }
+        }
+    }
+    unsigned complete = ready > extra ? ready - extra : 0;
+    for (unsigned first = 0; first < complete;) {
+        unsigned end = first + 1;
+        while (end < complete &&
+               source[end].physical == source[end - 1].physical + BOAROS_PAGE_SIZE &&
+               (uintptr_t)source[end].data == (uintptr_t)source[end - 1].data + BOAROS_PAGE_SIZE)
+            end++;
+        memcpy((void *)(uintptr_t)(address + (uint64_t)first * BOAROS_PAGE_SIZE),
+            source[first].data, (size_t)(end - first) * BOAROS_PAGE_SIZE);
+        first = end;
+    }
+    kernel_preempt_enable();
+    COST_ADD(COPY_TO_USER, (size_t)complete * BOAROS_PAGE_SIZE);
     return complete;
 }
 #endif
