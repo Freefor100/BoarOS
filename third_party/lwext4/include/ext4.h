@@ -258,6 +258,9 @@ int ext4_fpwrite_files(ext4_file *const *files, const struct file_write_set *set
 /* Called with the adapter's inode I/O qualification. ENOTSUP leaves the
  * entire batch to transactional writeback. */
 int ext4_fpwrite_mapped_batch(ext4_file *file, struct file_write_span *spans, unsigned count);
+/* The background caller keeps the cache pages immutable until return. Fresh
+ * aligned growth may use the same borrow through device completion. EAGAIN
+ * releases the private mapping and asks the caller to wait for the device. */
 int ext4_fpwrite_mapped_try(ext4_file *file, struct file_write_span *spans, unsigned count);
 /* Synchronous no-journal data path; caller storage is never retained. */
 int ext4_fpwrite_direct(ext4_file *file, struct file_write_span *span);
