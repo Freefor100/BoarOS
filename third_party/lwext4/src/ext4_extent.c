@@ -508,9 +508,11 @@ static ext4_fsblk_t ext4_new_meta_blocks(struct ext4_inode_ref *inode_ref,
 
 static int ext4_ext_free_blocks(struct ext4_inode_ref *inode_ref,
 				 ext4_fsblk_t block, uint32_t count,
-				 uint32_t flags __unused)
+				 bool data)
 {
-	return ext4_balloc_free_blocks(inode_ref, block, count);
+	bool file_data = data && ext4_inode_is_type(ext4_fs_super(inode_ref->fs),
+	    inode_ref->inode, EXT4_INODE_MODE_FILE);
+	return ext4_balloc_free_blocks(inode_ref, block, count, file_data);
 }
 
 static uint16_t ext4_ext_space_block(struct ext4_inode_ref *inode_ref)
@@ -1640,7 +1642,7 @@ static int ext4_ext_remove_blocks(struct ext4_inode_ref *inode_ref,
 		 "Freeing %" PRIu32 " at %" PRIu64 ", %" PRIu32 "\n", from,
 		 start, len);
 
-	return ext4_ext_free_blocks(inode_ref, start, len, 0);
+	return ext4_ext_free_blocks(inode_ref, start, len, true);
 }
 
 static int ext4_ext_remove_idx(struct ext4_inode_ref *inode_ref,
@@ -1712,7 +1714,7 @@ static int ext4_ext_remove_leaf(struct ext4_inode_ref *inode_ref,
 	start_ex = ex;
 	new_entries = to_le16(eh->entries_count);
 	if (run) {
-		err = ext4_ext_free_blocks(inode_ref, run->first, run->count, 0);
+		err = ext4_ext_free_blocks(inode_ref, run->first, run->count, true);
 		if (err != EOK) return err;
 	}
 	while (ex <= EXT_LAST_EXTENT(path[depth].header) &&
@@ -1937,7 +1939,7 @@ static int ext4_extent_remove_space_path(struct ext4_inode_ref *inode_ref,
         /* Splitting preserves both neighbors; the removed middle still owns
          * bitmap bits until it is explicitly freed after successful insertion. */
         if (ret == EOK)
-            ret = ext4_ext_free_blocks(inode_ref, removed, to - from + 1, 0);
+            ret = ext4_ext_free_blocks(inode_ref, removed, to - from + 1, true);
 		goto out;
 	}
 

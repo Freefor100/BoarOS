@@ -102,7 +102,7 @@ int ext4_balloc_free_block(struct ext4_inode_ref *inode_ref,
  * @param   count block count
  * @return  standard error code*/
 int ext4_balloc_free_blocks(struct ext4_inode_ref *inode_ref,
-			    ext4_fsblk_t first, uint32_t count);
+			  ext4_fsblk_t first, uint32_t count, bool file_data);
 
 /**@brief   Allocate block procedure.
  * @param   inode_ref inode reference

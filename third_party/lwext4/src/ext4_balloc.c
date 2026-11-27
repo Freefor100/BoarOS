@@ -293,7 +293,7 @@ int ext4_balloc_free_block(struct ext4_inode_ref *inode_ref, ext4_fsblk_t baddr)
 }
 
 int ext4_balloc_free_blocks(struct ext4_inode_ref *inode_ref,
-			    ext4_fsblk_t first, uint32_t count)
+			    ext4_fsblk_t first, uint32_t count, bool file_data)
 {
 	int rc = EOK;
 	uint32_t blk_cnt = count;
@@ -305,7 +305,8 @@ int ext4_balloc_free_blocks(struct ext4_inode_ref *inode_ref,
 	uint32_t bg_last = ext4_balloc_get_bgid_of_block(sb, first + count - 1);
 	rc = ext4_balloc_prepare_free_groups(inode_ref, bg_first, bg_last);
 	if (rc != EOK) return rc;
-	int quarantine = jbd_trans_quarantine(fs, first, count, false);
+	int quarantine = jbd_trans_quarantine_range(fs, first, count,
+	    file_data ? JBD_QUARANTINE_FILE_DATA : JBD_QUARANTINE_BLOCK);
     if (quarantine != EOK) return quarantine;
 
 	if (!ext4_sb_feature_incom(sb, EXT4_FINCOM_FLEX_BG)) {
