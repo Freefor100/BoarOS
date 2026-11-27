@@ -849,15 +849,19 @@ static enum kernel_block_status publish_segments(struct virtio_block_device *dev
     const struct virtio_descriptor *segments, unsigned count, int bounce)
 {
     if (!device_live(device)) return KERNEL_BLOCK_STATUS_IO;
-    if (count + 2 > device->queue.size) __builtin_trap();
-    uint16_t indices[VIRTIO_SPLIT_MAX_SIZE];
-    unsigned found = 0;
+    if (device->queue.size < 2 || count > device->queue.size - 2U) __builtin_trap();
     uint64_t free = free_descriptor_mask(device);
-    while (free && found < count + 2) {
-        indices[found++] = first_descriptor(free);
+    uint64_t next = free & (free - 1);
+    if (!next) return KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
+    uint16_t indices[VIRTIO_SPLIT_MAX_SIZE];
+    indices[0] = first_descriptor(free);
+    indices[1] = first_descriptor(next);
+    free = next & (next - 1);
+    for (unsigned i = 2; i < count + 2; i++) {
+        if (!free) return KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
+        indices[i] = first_descriptor(free);
         free &= free - 1;
     }
-    if (found != count + 2) return KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
     uint32_t data_length = 0;
     struct virtio_descriptor *d = device->queue.descriptors;
     uint64_t physical = request_physical(device, r);
