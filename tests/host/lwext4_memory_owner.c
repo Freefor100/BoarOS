@@ -54,6 +54,10 @@ void ext4_user_free(void *pointer)
     if(pointer)assert(__atomic_fetch_sub(&live,1,__ATOMIC_RELAXED));
     free(pointer);
 }
+void ext4_user_free_small_batch(void *const *objects, unsigned count)
+{
+    for (unsigned i = 0; i < count; i++) ext4_user_free(objects[i]);
+}
 void ext4_operation_memory_denied(struct ext4_fs *fs) { (void)fs;abort(); }
 int jbd_trans_borrow_private(struct jbd_trans *trans,struct ext4_block *block,
     ext4_fsblk_t lba,uint32_t offset,uint32_t length,enum ext4_block_access access,bool *found)
