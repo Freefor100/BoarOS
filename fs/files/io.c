@@ -538,31 +538,47 @@ static enum kernel_files_status direct_read(struct kernel_files *files,struct ke
     return 0;
 }
 
-#if defined(__riscv) && BOAROS_MAX_CPUS == 1
+#if (defined(__riscv) || defined(__loongarch__)) && BOAROS_MAX_CPUS == 1
 static unsigned copy_cached_pages(struct kernel_mm *mm, struct kernel_uaccess_iov_cursor *cursor,
     const struct kernel_page_cache_read_page *pages, size_t count, uint64_t bytes, int *miss)
 {
     if (cursor->count!=1 || cursor->index || cursor->offset>=cursor->iov->length) return 0;
     uint64_t address=cursor->iov->base+cursor->offset;
+#if defined(__riscv)
     if (address&BOAROS_PAGE_MASK) return 0;
+#endif
     uint64_t available=cursor->iov->length-cursor->offset;
     if (bytes>available) bytes=available;
     if (count>bytes/BOAROS_PAGE_SIZE) count=bytes/BOAROS_PAGE_SIZE;
     unsigned done=0;
     while (count-done>1) {
+#if defined(__loongarch__)
+        struct kernel_mm_copy_source_page source[KERNEL_MM_COPY_READY_PAGES];
+#else
         const void *source[KERNEL_MM_COPY_READY_PAGES];
+#endif
         unsigned window=count-done;
         if (window>KERNEL_MM_COPY_READY_PAGES) window=KERNEL_MM_COPY_READY_PAGES;
         unsigned prepared=0;
         while (prepared<window) {
             const struct kernel_page_cache_read_page *page=&pages[done+prepared];
             if (page->status || page->valid_bytes!=BOAROS_PAGE_SIZE) break;
-            source[prepared++]=kernel_page_cache_read_data(page);
+#if defined(__loongarch__)
+            source[prepared]=(struct kernel_mm_copy_source_page){
+                kernel_page_cache_read_data(page), page->physical_address};
+#else
+            source[prepared]=kernel_page_cache_read_data(page);
+#endif
+            prepared++;
         }
         if (prepared<2) break;
+#if defined(__loongarch__)
+        unsigned copied=kernel_mm_copy_cache_to_ready_user_pages(mm,address,source,prepared);
+#else
         unsigned copied=kernel_mm_copy_to_ready_user_pages(mm,address,source,prepared);
         if (!copied && !done)
             copied=kernel_mm_copy_to_missing_anon_pages(mm,address,source,prepared);
+#endif
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
         for (unsigned i=0;i<copied && !*miss;i++) *miss=pages[done+i].cache_miss;
 #else
@@ -632,7 +648,7 @@ static enum kernel_files_status disk_read(
         }
         struct kernel_uaccess_write_cursor user_copy={0};
         unsigned ready=0;
-#if defined(__riscv) && BOAROS_MAX_CPUS == 1
+#if (defined(__riscv) || defined(__loongarch__)) && BOAROS_MAX_CPUS == 1
         if (!start && count>1) {
             ready=copy_cached_pages(mm,cursor,pages,count,remaining,&cache_miss);
             size_t copied=(size_t)ready*BOAROS_PAGE_SIZE;
