@@ -3082,6 +3082,10 @@ static int jbd_publish_private(struct jbd_trans *trans, struct jbd_trans *runnin
     }
     jbd_return_merged_buffers(retired, retired_count);
     jbd_discard_allocation_claims(trans);
+    if (trans->file_allocation_end>journal->file_allocation_end)
+        journal->file_allocation_end=trans->file_allocation_end;
+    if (trans->recycled_first && trans->recycled_first==journal->reuse_first)
+        __atomic_store_n(&journal->reuse_count,0,__ATOMIC_RELAXED);
     return EOK;
 }
 
@@ -3149,10 +3153,13 @@ static void jbd_remove_quarantine(struct jbd_journal *journal, struct jbd_quaran
     jbd_free(q);
 }
 
+enum { JBD_REUSE_MIN_BYTES = 256U * 1024U };
+
 static void jbd_release_committed_file_blocks(struct jbd_journal *journal,
                                               struct jbd_trans *trans)
 {
     struct ext4_bcache *cache = journal->jbd_fs->bdev->bc;
+    uint32_t best_count=0;
     struct jbd_quarantine *q, *next;
     LIST_FOREACH_SAFE(q, &trans->quarantine, node, next) {
         if (!q->file_data) continue;
@@ -3164,6 +3171,11 @@ static void jbd_release_committed_file_blocks(struct jbd_journal *journal,
         if ((record && record->lba - q->first < q->count) ||
             ext4_bcache_has_lba(cache, q->first, q->first + q->count))
             continue;
+        if (q->count>best_count && (uint64_t)q->count*journal->block_size>=JBD_REUSE_MIN_BYTES) {
+            best_count=q->count;
+            journal->reuse_first=q->first;
+            __atomic_store_n(&journal->reuse_count,q->count,__ATOMIC_RELAXED);
+        }
         jbd_remove_quarantine(journal, q);
     }
 }
@@ -4298,8 +4310,40 @@ int jbd_journal_find_reusable(struct ext4_fs *fs,const void *bitmap,
         base,bit,end,maximum,found,length,NULL);
 }
 
+static bool jbd_find_recycled_range(struct jbd_journal *journal, const void *bitmap,
+    ext4_fsblk_t base, uint32_t start, uint32_t maximum, uint32_t *found)
+{
+    if (base+start!=journal->file_allocation_end || journal->reuse_first<base ||
+        journal->reuse_first-base>=start) return false;
+    uint32_t first=journal->reuse_first-base;
+    uint32_t minimum=JBD_REUSE_MIN_BYTES/journal->block_size;
+    uint32_t available=__atomic_load_n(&journal->reuse_count,__ATOMIC_RELAXED);
+    /* Verify a useful contiguous window before switching away from the goal. */
+    if (maximum>minimum || minimum>available || minimum>start-first ||
+        !ext4_bmap_is_bit_clr(bitmap,first)) return false;
+    uint32_t candidate,count;
+    if (jbd_find_reusable_state_held(&journal->quarantine_index[0],bitmap,base,
+            first,first+minimum,minimum,&candidate,&count,NULL) || count!=minimum)
+        return false;
+    *found=candidate;
+    return true;
+}
+
+bool jbd_journal_find_recycled_range(struct ext4_fs *fs, const void *bitmap,
+    ext4_fsblk_t base, uint32_t start, uint32_t maximum, uint32_t *found)
+{
+    struct jbd_journal *journal=fs->jbd_journal;
+    if (!__atomic_load_n(&journal->reuse_count,__ATOMIC_RELAXED)) return false;
+    JBD_STATE_READ_SCOPE(journal);
+    if (!jbd_find_recycled_range(journal,bitmap,base,start,maximum,found))
+        return false;
+    ext4_current_trans(fs)->recycled_first=base+*found;
+    return true;
+}
+
 int jbd_trans_claim_blocks(struct ext4_block_group_ref *bg,struct ext4_block *block,
-    uint32_t start,uint32_t end,uint32_t maximum,uint32_t *found,uint32_t *length,bool *contended)
+    uint32_t start,uint32_t end,uint32_t maximum,bool append,
+    uint32_t *found,uint32_t *length,bool *contended)
 {
     struct ext4_fs *fs=bg->fs;
     struct ext4_sblock *sb=ext4_fs_super(fs);
@@ -4352,7 +4396,10 @@ int jbd_trans_claim_blocks(struct ext4_block_group_ref *bg,struct ext4_block *bl
                 result=jbd_journal_error(journal);
                 if (!result && !valid) result=EUCLEAN;
                 if (!result && ext4_bg_get_free_blocks_count(accepted,sb)) {
-                    for (unsigned pass=0;pass<(start?2U:1U);pass++) {
+                    if (append && jbd_find_recycled_range(journal,bytes,base,start,maximum,found)) {
+                        *length=maximum;
+                        trans->recycled_first=base+*found;
+                    } else for (unsigned pass=0;pass<(start?2U:1U);pass++) {
                         uint32_t bit,limit=pass?start:end;
                         if (!ext4_bmap_bit_find_clr(bytes,pass?0:start,limit,&bit) &&
                             !jbd_find_reusable_state_held(&journal->quarantine_index[0],

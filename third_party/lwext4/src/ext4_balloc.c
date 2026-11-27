@@ -490,16 +490,21 @@ int ext4_balloc_alloc_blocks(struct ext4_inode_ref *inode_ref,
         uint32_t end = ext4_blocks_in_group_cnt(sb, group);
         uint32_t start = step ? 0 : ext4_fs_addr_to_idx_bg(sb, goal);
         uint32_t found = end, length=0;
-        /* Search the goal suffix, then the same group's prefix, without
-         * borrowing or checksumming its bitmap a second time. */
-        if (shared) r=jbd_trans_claim_blocks(bg,bitmap,start,end,max_blocks,&found,&length,&contended);
-        else for (unsigned pass = 0; pass < (start ? 2U : 1U); pass++) {
-            uint32_t limit = pass ? start : end;
-            int scan=jbd_journal_find_reusable(fs,bitmap->data,
-                ext4_fs_bg_idx_to_addr(sb,0,group),pass ? 0 : start,limit,
-                max_blocks,false,&found,&length);
-            if (scan==EOK) break;
-            if (scan!=ENOSPC) __builtin_trap();
+        bool append=!step && operation && operation->append_allocation;
+        if (shared)
+            r=jbd_trans_claim_blocks(bg,bitmap,start,end,max_blocks,append,&found,&length,&contended);
+        else if (append && jbd_journal_find_recycled_range(fs,bitmap->data,
+            ext4_fs_bg_idx_to_addr(sb,0,group),start,max_blocks,&found))
+            length=max_blocks;
+        else {
+            for (unsigned pass=0;pass<(start?2U:1U);pass++) {
+                uint32_t limit=pass?start:end;
+                int scan=jbd_journal_find_reusable(fs,bitmap->data,
+                    ext4_fs_bg_idx_to_addr(sb,0,group),pass?0:start,limit,
+                    max_blocks,false,&found,&length);
+                if (scan==EOK) break;
+                if (scan!=ENOSPC) __builtin_trap();
+            }
         }
         if (!r && length && !shared) {
             length = ext4_fs_reserve_block_range(fs, length);

@@ -61,6 +61,7 @@ struct ext4_operation {
     bool orphan_presence_touched;
     bool log_reservation_failed;
     bool memory_reservation_failed;
+    bool append_allocation;
 };
 
 #endif
